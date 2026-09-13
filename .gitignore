@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment files — NEVER commit real environment values or secrets
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+.next/
+out/
+*.tsbuildinfo
+
+# Local databases (embedded Postgres dev/test data)
+.dev/
+.test/
+.pgdata/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
