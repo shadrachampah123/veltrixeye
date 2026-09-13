@@ -631,29 +631,50 @@ function normalizeConfig(raw: StrategyVersionConfigInput): StrategyVersionConfig
 // ----------------------------------------------------------------------
 
 async function readVersionConfig(client: pg.PoolClient, versionId: string): Promise<StrategyVersionConfig> {
-  const [tfRes, scopeRes, scopeInstRes, sfRes, riskRes, filterRes, groupRes, condRes] = await Promise.all([
-    client.query<TimeframeRow>('SELECT role, timeframe FROM strategy_timeframes WHERE version_id = $1', [versionId]),
-    client.query<ScopeRow>('SELECT mode FROM strategy_market_scopes WHERE version_id = $1', [versionId]),
-    client.query<ScopeInstrumentRow>(
-      `SELECT i.asset_class, i.symbol, i.display_name
+  // Sequential, one query at a time: these all run over a SINGLE pooled
+  // connection, so the Postgres protocol serializes them anyway — `Promise.all`
+  // bought no parallelism and only triggered pg's "client is already executing
+  // a query" deprecation (removed in pg@9). Real parallelism would require one
+  // connection per query, which is not worth 8 pool slots for this read.
+  const tfRes = await client.query<TimeframeRow>(
+    'SELECT role, timeframe FROM strategy_timeframes WHERE version_id = $1',
+    [versionId],
+  );
+  const scopeRes = await client.query<ScopeRow>(
+    'SELECT mode FROM strategy_market_scopes WHERE version_id = $1',
+    [versionId],
+  );
+  const scopeInstRes = await client.query<ScopeInstrumentRow>(
+    `SELECT i.asset_class, i.symbol, i.display_name
        FROM strategy_market_scope_instruments si
        JOIN instruments i ON i.id = si.instrument_id
        WHERE si.version_id = $1`,
-      [versionId],
-    ),
-    client.query<SessionFilterRow>('SELECT session, mode, timezone FROM strategy_session_filters WHERE version_id = $1 ORDER BY id', [versionId]),
-    client.query<RiskRow>('SELECT * FROM strategy_risk_config WHERE version_id = $1', [versionId]),
-    client.query<FilterRow>('SELECT filter_type, enabled, params, position FROM strategy_filters WHERE version_id = $1 ORDER BY position', [versionId]),
-    client.query<GroupRow>('SELECT id, name, logic, position FROM strategy_rule_groups WHERE version_id = $1 ORDER BY position', [versionId]),
-    client.query<ConditionRow>(
-      `SELECT c.group_id, c.condition_type, c.classification, c.timeframe_role, c.params, c.description, c.position
+    [versionId],
+  );
+  const sfRes = await client.query<SessionFilterRow>(
+    'SELECT session, mode, timezone FROM strategy_session_filters WHERE version_id = $1 ORDER BY id',
+    [versionId],
+  );
+  const riskRes = await client.query<RiskRow>(
+    'SELECT * FROM strategy_risk_config WHERE version_id = $1',
+    [versionId],
+  );
+  const filterRes = await client.query<FilterRow>(
+    'SELECT filter_type, enabled, params, position FROM strategy_filters WHERE version_id = $1 ORDER BY position',
+    [versionId],
+  );
+  const groupRes = await client.query<GroupRow>(
+    'SELECT id, name, logic, position FROM strategy_rule_groups WHERE version_id = $1 ORDER BY position',
+    [versionId],
+  );
+  const condRes = await client.query<ConditionRow>(
+    `SELECT c.group_id, c.condition_type, c.classification, c.timeframe_role, c.params, c.description, c.position
        FROM strategy_conditions c
        JOIN strategy_rule_groups g ON g.id = c.group_id
        WHERE g.version_id = $1
        ORDER BY g.position, c.position`,
-      [versionId],
-    ),
-  ]);
+    [versionId],
+  );
 
   const tfRow = tfRes.rows[0];
   const timeframes =
