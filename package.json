@@ -1,0 +1,38 @@
+{
+  "name": "veltrixeye",
+  "version": "0.1.0",
+  "private": true,
+  "description": "VeltrixEye — SaaS trading-strategy scanner and alert platform (monorepo)",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "dev": "concurrently -k -n db,api,web -c blue,magenta,cyan \"npm:db:dev\" \"npm:api:dev\" \"npm:web:dev\"",
+    "db:dev": "node scripts/db/dev-up.mjs",
+    "db:migrate": "tsx scripts/db/migrate-cli.ts",
+    "api:dev": "npm run dev --workspace @veltrixeye/api",
+    "api:build": "npm run build --workspace @veltrixeye/api",
+    "api:start": "npm run start --workspace @veltrixeye/api",
+    "web:dev": "npm run dev --workspace @veltrixeye/web",
+    "web:build": "npm run build --workspace @veltrixeye/web",
+    "test": "npm run test --workspace @veltrixeye/contracts && npm run test --workspace @veltrixeye/core && npm run test --workspace @veltrixeye/api",
+    "typecheck": "npm run typecheck --workspace @veltrixeye/contracts && npm run typecheck --workspace @veltrixeye/core && npm run typecheck --workspace @veltrixeye/api && npm run typecheck --workspace @veltrixeye/web",
+    "lint": "eslint .",
+    "build": "npm run api:build && npm run web:build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "concurrently": "^9.1.0",
+    "embedded-postgres": "^18.4.0-beta.17",
+    "eslint": "^9.17.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.18.0"
+  }
+}
