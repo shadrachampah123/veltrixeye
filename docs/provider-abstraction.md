@@ -70,9 +70,10 @@ id → `MarketDataProvider` map:
 - `register(provider)` — throws on duplicate id (fail fast on config
   errors).
 - `get(id)`, `list()`, `size`.
-- The registry starts **empty** in M1; boot-time wiring of real providers
-  (from config/env, later milestones) will `register` implementations
-  here. `GET /api/market-data/providers` lists what's registered.
+- The registry starts **empty**; the API registers implementations at boot
+  from config/env (M2 registers Twelve Data when `TWELVE_DATA_API_KEY` is
+  set — see [market-data.md](./market-data.md)).
+  `GET /api/market-data/providers` lists what's registered.
 
 ## Adding a provider
 

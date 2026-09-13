@@ -4,7 +4,20 @@ import assert from 'node:assert/strict';
 import {
   TIMEFRAMES,
   normalizeTimeframe,
+  timeframeMinutes,
   strategyTimeframesSchema,
+  ERROR_CODES,
+  ProviderError,
+  isProviderError,
+  RETENTION_DAYS,
+  retentionCutoffMs,
+  MAX_CANDLES_PER_REQUEST,
+  MAX_BACKFILL_CANDLES,
+  MAX_BACKFILL_INSTRUMENTS,
+  candleQuerySchema,
+  candleDtoSchema,
+  backfillRequestSchema,
+  coverageDtoSchema,
   qualityGrade,
   CONDITION_TYPE_REGISTRY,
   CONDITION_CLASSIFICATIONS,
@@ -305,4 +318,112 @@ test('strategy create: name rules and nested config validation', () => {
   );
   // unknown top-level key rejected
   assert.equal(strategyCreateSchema.safeParse({ name: 'My Strategy', bogus: 1 }).success, false);
+});
+
+// ---------------------------------------------------------------------------
+// Timeframe durations + ingestion contracts (M2)
+// ---------------------------------------------------------------------------
+
+test('timeframe: timeframeMinutes reports the documented durations', () => {
+  assert.equal(timeframeMinutes('1m'), 1);
+  assert.equal(timeframeMinutes('15m'), 15);
+  assert.equal(timeframeMinutes('1h'), 60);
+  assert.equal(timeframeMinutes('4h'), 240);
+  assert.equal(timeframeMinutes('1d'), 1440);
+  assert.equal(timeframeMinutes('1w'), 10080);
+  assert.equal(timeframeMinutes('1M'), 43200);
+  for (const tf of TIMEFRAMES) {
+    assert.ok(timeframeMinutes(tf) > 0, `${tf} has a duration`);
+  }
+});
+
+test('ingestion: retention table matches the approved M2 policy', () => {
+  assert.equal(RETENTION_DAYS['1m'], 30);
+  assert.equal(RETENTION_DAYS['5m'], 90);
+  assert.equal(RETENTION_DAYS['15m'], 180);
+  assert.equal(RETENTION_DAYS['1h'], 365);
+  assert.equal(RETENTION_DAYS['1d'], 1825);
+  for (const tf of TIMEFRAMES) {
+    assert.ok(RETENTION_DAYS[tf] > 0, `${tf} has retention`);
+  }
+  const now = Date.UTC(2026, 8, 13);
+  assert.equal(retentionCutoffMs('1d', now), now - 1825 * 86_400_000);
+  assert.equal(retentionCutoffMs('1m', now), now - 30 * 86_400_000);
+});
+
+test('ingestion: candle query validates instrument, range, and limit', () => {
+  const base = { assetClass: 'forex', symbol: 'eurusd', timeframe: '1h', from: 1000, to: 2000 };
+  const ok = candleQuerySchema.safeParse(base);
+  assert.equal(ok.success, true);
+  if (ok.success) {
+    assert.equal(ok.data.symbol, 'EURUSD'); // normalized
+    assert.equal(ok.data.limit, 500); // default
+  }
+  assert.equal(candleQuerySchema.safeParse({ ...base, from: 2000, to: 2000 }).success, false); // from >= to
+  assert.equal(candleQuerySchema.safeParse({ ...base, from: 3000, to: 2000 }).success, false);
+  assert.equal(candleQuerySchema.safeParse({ ...base, limit: MAX_CANDLES_PER_REQUEST + 1 }).success, false);
+  assert.equal(candleQuerySchema.safeParse({ ...base, timeframe: '2d' }).success, false);
+  assert.equal(candleQuerySchema.safeParse({ ...base, assetClass: 'fx' }).success, false);
+  assert.equal(candleQuerySchema.safeParse({ ...base, bogus: 1 }).success, false); // strict
+  // query-string coercion (numbers arrive as strings over HTTP)
+  const coerced = candleQuerySchema.safeParse({ ...base, from: '1000', to: '2000', limit: '100' });
+  assert.equal(coerced.success, true);
+});
+
+test('ingestion: candle DTO enforces the OHLC invariant', () => {
+  const good = { time: 1000, open: 1, high: 2, low: 0.5, close: 1.5, volume: null };
+  assert.equal(candleDtoSchema.safeParse(good).success, true);
+  assert.equal(candleDtoSchema.safeParse({ ...good, volume: 12.5 }).success, true);
+  assert.equal(candleDtoSchema.safeParse({ ...good, low: 5 }).success, false); // low > open/close
+  assert.equal(candleDtoSchema.safeParse({ ...good, high: 0.1 }).success, false);
+  assert.equal(candleDtoSchema.safeParse({ ...good, open: -1 }).success, false);
+  assert.equal(candleDtoSchema.safeParse({ ...good, volume: -2 }).success, false);
+  assert.equal(candleDtoSchema.safeParse({ ...good, time: 1.5 }).success, false);
+});
+
+test('ingestion: backfill request is bounded and deduped', () => {
+  const inst = { assetClass: 'forex', symbol: 'EURUSD' };
+  const base = { instruments: [inst], timeframes: ['1d'], from: 1000, to: 2000 };
+  assert.equal(backfillRequestSchema.safeParse(base).success, true);
+  assert.equal(backfillRequestSchema.safeParse({ ...base, instruments: [] }).success, false);
+  assert.equal(
+    backfillRequestSchema.safeParse({ ...base, instruments: [inst, inst] }).success,
+    false,
+    'duplicate instruments rejected',
+  );
+  assert.equal(
+    backfillRequestSchema.safeParse({ ...base, timeframes: ['1d', '1d'] }).success,
+    false,
+    'duplicate timeframes rejected',
+  );
+  assert.equal(backfillRequestSchema.safeParse({ ...base, from: 2000, to: 1000 }).success, false);
+  const tooMany = { ...base, instruments: Array.from({ length: MAX_BACKFILL_INSTRUMENTS + 1 }, (_, i) => ({ ...inst, symbol: `S${i}` })) };
+  assert.equal(backfillRequestSchema.safeParse(tooMany).success, false);
+  assert.ok(MAX_BACKFILL_CANDLES > 0);
+});
+
+test('ingestion: coverage DTO shape', () => {
+  const row = {
+    assetClass: 'crypto',
+    symbol: 'btcusd',
+    displayName: null,
+    timeframe: '1h',
+    candleCount: 10,
+    earliestTime: 1000,
+    latestTime: 2000,
+  };
+  const parsed = coverageDtoSchema.safeParse(row);
+  assert.equal(parsed.success, true);
+  if (parsed.success) assert.equal(parsed.data.symbol, 'BTCUSD');
+  assert.equal(coverageDtoSchema.safeParse({ ...row, candleCount: -1 }).success, false);
+});
+
+test('market-data: ProviderError kinds + error code registry', () => {
+  assert.equal(ERROR_CODES.PROVIDER_UNAVAILABLE, 'provider_unavailable');
+  for (const kind of ['unavailable', 'rate_limited', 'invalid_request', 'not_found', 'unauthorized'] as const) {
+    const err = new ProviderError(kind, 'msg');
+    assert.equal(err.kind, kind);
+    assert.ok(isProviderError(err));
+  }
+  assert.equal(isProviderError(new Error('x')), false);
 });

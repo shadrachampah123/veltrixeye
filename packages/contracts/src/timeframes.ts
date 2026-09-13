@@ -103,3 +103,15 @@ export function normalizeTimeframe(input: string): Timeframe | null {
 export function describeTimeframe(tf: Timeframe): string {
   return tf.toUpperCase();
 }
+
+/**
+ * Nominal duration of a canonical timeframe in minutes (the 1M month is the
+ * conventional 30-day 43200). Used for provider pagination, backfill
+ * estimates, and resampling math — never for business-logic branching
+ * (that belongs to the role; see docs/timeframes.md).
+ */
+export function timeframeMinutes(tf: Timeframe): number {
+  const minutes = CANONICAL_MINUTES[tf];
+  if (minutes === undefined) throw new Error(`Unknown timeframe: ${tf}`);
+  return minutes;
+}

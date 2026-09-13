@@ -10,6 +10,8 @@ export const ERROR_CODES = {
   CONFLICT: 'conflict',
   IMMUTABLE: 'immutable',
   RATE_LIMITED: 'rate_limited',
+  /** An upstream market-data provider failed (maps to HTTP 502). */
+  PROVIDER_UNAVAILABLE: 'provider_unavailable',
   INTERNAL: 'internal',
 } as const;
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];

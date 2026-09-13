@@ -12,6 +12,8 @@ import {
   StrategyService,
   AuditService,
   createProviderRegistry,
+  CandleStore,
+  IngestionService,
   type ProviderRegistry,
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
@@ -27,17 +29,23 @@ export interface AppContext {
   strategies: StrategyService;
   audit: AuditService;
   providerRegistry: ProviderRegistry;
+  candles: CandleStore;
+  ingestion: IngestionService;
 }
 
 export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   const audit = new AuditService(pool);
+  const providerRegistry = createProviderRegistry();
+  const candles = new CandleStore(pool);
   return {
     pool,
     users: new UserService(pool),
     sessions: new SessionService(pool, config.SESSION_TTL_DAYS),
     strategies: new StrategyService(pool, audit),
     audit,
-    providerRegistry: createProviderRegistry(),
+    providerRegistry,
+    candles,
+    ingestion: new IngestionService(pool, providerRegistry, candles),
   };
 }
 

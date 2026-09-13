@@ -7,6 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 
 import type pg from 'pg';
+import {
+  TIMEFRAMES,
+  type Candle,
+  type HistoricalCandlesRequest,
+  type MarketDataProvider,
+  type NormalizedInstrument,
+} from '@veltrixeye/contracts';
 import { buildApp, createAppContext } from '../src/app.js';
 import { loadConfig, type AppConfig } from '../src/config.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
@@ -20,6 +27,7 @@ const DB_NAME = 'veltrixeye_test_api';
 let stopDb: () => Promise<void>;
 let pool: pg.Pool;
 let app: Awaited<ReturnType<typeof buildApp>>;
+let ctx: ReturnType<typeof createAppContext>;
 
 const PASSWORD = 'correct-horse-42';
 const uniqueEmail = () => `api_${randomBytes(6).toString('hex')}@example.com`;
@@ -67,7 +75,7 @@ before(async () => {
     SESSION_TTL_DAYS: '30',
     LOG_LEVEL: 'silent',
   } as NodeJS.ProcessEnv);
-  const ctx = createAppContext(pool, config);
+  ctx = createAppContext(pool, config);
   app = await buildApp(config, ctx);
   await app.ready();
 }, { timeout: 180_000 });
@@ -668,5 +676,314 @@ describe('market data & meta', () => {
   test('meta requires auth', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/strategies/meta' });
     assert.equal(res.statusCode, 401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M2 market data: ingestion over HTTP
+// ---------------------------------------------------------------------------
+
+const M2_DAY = 86_400_000;
+
+/** Deterministic provider stub served over HTTP (no network). */
+class ApiFakeProvider implements MarketDataProvider {
+  readonly id = 'twelve-data';
+  readonly name = 'Fake Twelve Data';
+  readonly capabilities = { historical: true, realtime: false, timeframes: TIMEFRAMES, maxLookbackDays: 2190 };
+
+  async getSymbols(): Promise<NormalizedInstrument[]> {
+    return [];
+  }
+
+  async getHistoricalCandles(req: HistoricalCandlesRequest): Promise<Candle[]> {
+    const out: Candle[] = [];
+    const start = req.from - (req.from % M2_DAY);
+    for (let t = start; t < req.to; t += M2_DAY) {
+      out.push({ time: t, open: 1, high: 1.1, low: 0.9, close: 1.05, volume: 100, state: 'closed' });
+    }
+    return out;
+  }
+
+  subscribeRealtime(): never {
+    throw new Error('no realtime');
+  }
+
+  async getTradingSessions(): Promise<[]> {
+    return [];
+  }
+
+  async getMarketStatus(instrument: NormalizedInstrument) {
+    return { instrument, state: 'unknown' as const };
+  }
+}
+
+/** Recent aligned 3-day window (well inside every M2 retention window). */
+function recentWindow(days = 3): { from: number; to: number } {
+  const to = Math.floor(Date.now() / M2_DAY) * M2_DAY;
+  return { from: to - days * M2_DAY, to };
+}
+
+describe('m2 market data', () => {
+  test('all market routes require auth', async () => {
+    const { from, to } = recentWindow();
+    const gets = [
+      '/api/market-data/providers',
+      '/api/markets/instruments',
+      `/api/market-data/candles?assetClass=forex&symbol=EURUSD&timeframe=1d&from=${from}&to=${to}`,
+      '/api/market-data/coverage',
+    ];
+    for (const url of gets) {
+      const res = await app.inject({ method: 'GET', url, headers: { 'x-forwarded-for': freshIp() } });
+      assert.equal(res.statusCode, 401, url);
+      assert.equal(res.json().error.code, 'unauthorized', url);
+    }
+    const post = await app.inject({
+      method: 'POST',
+      url: '/api/market-data/backfill',
+      headers: { 'x-forwarded-for': freshIp() },
+      payload: { instruments: [], timeframes: ['1d'], from, to },
+    });
+    assert.equal(post.statusCode, 401);
+  });
+
+  test('providers endpoint: unkeyed registry reports the actionable note', async () => {
+    const { cookie } = await registerUser();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/market-data/providers',
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.json().providers, []);
+    assert.match(res.json().note, /TWELVE_DATA_API_KEY/);
+  });
+
+  test('unkeyed reads answer 502 provider_unavailable (nothing else breaks)', async () => {
+    const { cookie } = await registerUser();
+    const { from, to } = recentWindow();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/market-data/candles?assetClass=forex&symbol=GBPUSD&timeframe=1d&from=${from}&to=${to}`,
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 502);
+    assert.equal(res.json().error.code, 'provider_unavailable');
+    // providers + instruments + coverage still work unkeyed
+    const cov = await app.inject({
+      method: 'GET',
+      url: '/api/market-data/coverage',
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(cov.statusCode, 200);
+    assert.ok(Array.isArray(cov.json().coverage));
+  });
+
+  test('unkeyed backfill answers 502 and writes no audit row', async () => {
+    const { cookie, user } = await registerUser();
+    const { from, to } = recentWindow(2);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/market-data/backfill',
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+      payload: { instruments: [{ assetClass: 'forex', symbol: 'GBPUSD' }], timeframes: ['1d'], from, to },
+    });
+    assert.equal(res.statusCode, 502);
+    assert.equal(res.json().error.code, 'provider_unavailable');
+    const audit = await pool.query('SELECT count(*)::text AS n FROM audit_events WHERE user_id = $1 AND action = $2', [
+      user.id,
+      'market_data.backfill',
+    ]);
+    assert.equal(audit.rows[0]?.n, '0');
+  });
+
+  test('candle query validation: range, timeframe, limit, strictness', async () => {
+    const { cookie } = await registerUser();
+    const { from, to } = recentWindow();
+    const base = { assetClass: 'forex', symbol: 'EURUSD', timeframe: '1d', from, to };
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ['from >= to', { ...base, from: to, to: from }],
+      ['unknown timeframe', { ...base, timeframe: '2d' }],
+      ['limit 0', { ...base, limit: 0 }],
+      ['limit over max', { ...base, limit: 6000 }],
+      ['missing symbol', { assetClass: 'forex', timeframe: '1d', from, to }],
+      ['unknown key', { ...base, bogus: 1 }],
+    ];
+    for (const [name, q] of cases) {
+      const qs = new URLSearchParams(Object.entries(q).map(([k, v]): [string, string] => [k, String(v)])).toString();
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/market-data/candles?${qs}`,
+        headers: { cookie, 'x-forwarded-for': freshIp() },
+      });
+      assert.equal(res.statusCode, 400, name);
+      assert.equal(res.json().error.code, 'invalid_input', name);
+    }
+  });
+
+  test('unknown instrument answers 404 (before any provider is needed)', async () => {
+    const { cookie } = await registerUser();
+    const { from, to } = recentWindow();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/market-data/candles?assetClass=forex&symbol=NOPE&timeframe=1d&from=${from}&to=${to}`,
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 404);
+    assert.equal(res.json().error.code, 'not_found');
+  });
+
+  test('registering a provider surfaces it with honest capabilities', async () => {
+    ctx.providerRegistry.register(new ApiFakeProvider());
+    const { cookie } = await registerUser();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/market-data/providers',
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200);
+    const providers = res.json().providers;
+    assert.equal(providers.length, 1);
+    assert.equal(providers[0].id, 'twelve-data');
+    assert.equal(providers[0].capabilities.historical, true);
+    assert.equal(providers[0].capabilities.realtime, false);
+    assert.equal(providers[0].capabilities.timeframes.length, 14);
+  });
+
+  test('fetch-through over HTTP: fill once, then cache-hit', async () => {
+    const { cookie } = await registerUser();
+    const { from, to } = recentWindow();
+    const first = await app.inject({
+      method: 'GET',
+      url: `/api/market-data/candles?assetClass=crypto&symbol=ETHUSD&timeframe=1d&from=${from}&to=${to}`,
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(first.statusCode, 200);
+    const body = first.json();
+    assert.equal(body.fetchedFromProvider, true);
+    assert.equal(body.candles.length, 3);
+    assert.equal(body.instrument.symbol, 'ETHUSD');
+    assert.deepEqual(
+      body.candles.map((c: { time: number }) => c.time),
+      [from, from + M2_DAY, from + 2 * M2_DAY],
+    );
+
+    const bar = body.candles[1].time;
+    const second = await app.inject({
+      method: 'GET',
+      url: `/api/market-data/candles?assetClass=crypto&symbol=ETHUSD&timeframe=1d&from=${bar}&to=${bar + 1}`,
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().fetchedFromProvider, false);
+    assert.equal(second.json().candles.length, 1);
+  });
+
+  test('over-limit ranges answer 400 (never truncated)', async () => {
+    const { cookie } = await registerUser();
+    const { from, to } = recentWindow();
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/market-data/candles?assetClass=crypto&symbol=ETHUSD&timeframe=1d&from=${from}&to=${to}&limit=1`,
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.json().error.code, 'invalid_input');
+  });
+
+  test('backfill validation: bounds, dedupe, strictness', async () => {
+    const { cookie } = await registerUser();
+    const { from, to } = recentWindow(2);
+    const inst = { assetClass: 'forex', symbol: 'EURUSD' };
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ['empty instruments', { instruments: [], timeframes: ['1d'], from, to }],
+      ['duplicate instruments', { instruments: [inst, inst], timeframes: ['1d'], from, to }],
+      ['duplicate timeframes', { instruments: [inst], timeframes: ['1d', '1d'], from, to }],
+      ['from >= to', { instruments: [inst], timeframes: ['1d'], from: to, to: from }],
+      ['unknown key', { instruments: [inst], timeframes: ['1d'], from, to, bogus: 1 }],
+    ];
+    for (const [name, payload] of cases) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/market-data/backfill',
+        headers: { cookie, 'x-forwarded-for': freshIp() },
+        payload,
+      });
+      assert.equal(res.statusCode, 400, name);
+      assert.equal(res.json().error.code, 'invalid_input', name);
+    }
+  });
+
+  test('backfill unknown instrument answers 404', async () => {
+    const { cookie } = await registerUser();
+    const { from, to } = recentWindow(2);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/market-data/backfill',
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+      payload: { instruments: [{ assetClass: 'forex', symbol: 'NOPE' }], timeframes: ['1d'], from, to },
+    });
+    assert.equal(res.statusCode, 404);
+    assert.equal(res.json().error.code, 'not_found');
+  });
+
+  test('backfill succeeds and writes an audit row', async () => {
+    const { cookie, user } = await registerUser();
+    const { from, to } = recentWindow(2);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/market-data/backfill',
+      headers: { cookie, 'x-forwarded-for': freshIp(), 'user-agent': 'm2-test' },
+      payload: { instruments: [{ assetClass: 'crypto', symbol: 'BTCUSD' }], timeframes: ['1d'], from, to },
+    });
+    assert.equal(res.statusCode, 200);
+    const body = res.json();
+    assert.equal(body.status, 'completed');
+    assert.equal(body.provider, 'twelve-data');
+    assert.equal(body.candlesUpserted, 2);
+    assert.ok(body.runId.length > 0);
+
+    const audit = await pool.query<{ action: string; entity_id: string; metadata: Record<string, unknown> }>(
+      'SELECT action, entity_id, metadata FROM audit_events WHERE user_id = $1 AND action = $2',
+      [user.id, 'market_data.backfill'],
+    );
+    assert.equal(audit.rows.length, 1);
+    assert.equal(audit.rows[0]!.entity_id, body.runId);
+    assert.equal(audit.rows[0]!.metadata['status'], 'completed');
+    assert.equal(audit.rows[0]!.metadata['candlesUpserted'], 2);
+  });
+
+  test('coverage reflects ingested candles', async () => {
+    const { cookie } = await registerUser();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/market-data/coverage',
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200);
+    const rows = res.json().coverage as Array<{ symbol: string; timeframe: string; candleCount: number }>;
+    const btc = rows.find((r) => r.symbol === 'BTCUSD' && r.timeframe === '1d');
+    assert.ok(btc, 'BTCUSD/1d coverage present');
+    assert.equal(btc.candleCount, 2);
+  });
+
+  test('backfill is rate-limited per IP (5/minute)', async () => {
+    const { cookie } = await registerUser();
+    const { from, to } = recentWindow(1);
+    const ip = freshIp();
+    let succeeded = 0;
+    let last = 0;
+    for (let i = 0; i < 6; i++) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/market-data/backfill',
+        headers: { cookie, 'x-forwarded-for': ip },
+        payload: { instruments: [{ assetClass: 'etf', symbol: 'SPY' }], timeframes: ['1d'], from, to },
+      });
+      last = res.statusCode;
+      if (last === 429) break;
+      if (last === 200) succeeded += 1;
+    }
+    assert.equal(succeeded, 5, 'exactly 5 backfills should succeed from one IP');
+    assert.equal(last, 429, 'expected a 429 on the 6th backfill from one IP');
   });
 });

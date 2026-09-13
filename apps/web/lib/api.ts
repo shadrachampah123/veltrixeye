@@ -12,7 +12,36 @@ import type {
   StrategyUpdateInput,
   StrategyVersionCreateInput,
   StrategyVersionUpdateInput,
+  CandlesResponseDto,
+  CoverageResponseDto,
+  BackfillRequest,
+  BackfillResponseDto,
+  ProviderCapabilities,
 } from '@veltrixeye/contracts';
+
+/** Registered provider row from GET /api/market-data/providers. */
+export interface RegisteredProvider {
+  id: string;
+  name: string;
+  capabilities: ProviderCapabilities;
+}
+
+/** Normalized instrument row from GET /api/markets/instruments. */
+export interface MarketInstrument {
+  assetClass: string;
+  symbol: string;
+  displayName: string | null;
+}
+
+/** Query-string params for GET /api/market-data/candles (all strings over HTTP). */
+export interface CandleQueryParams {
+  assetClass: string;
+  symbol: string;
+  timeframe: string;
+  from: string;
+  to: string;
+  limit?: string;
+}
 
 export class ApiError extends Error {
   readonly code: string;
@@ -83,6 +112,20 @@ export const api = {
     request<{ version: StrategyVersionDetailDto }>(`/strategies/${strategyId}/versions/${versionId}/publish`, { method: 'POST' }),
   deprecateVersion: (strategyId: string, versionId: string) =>
     request<{ version: StrategyVersionDetailDto }>(`/strategies/${strategyId}/versions/${versionId}/deprecate`, { method: 'POST' }),
+
+  // market data (M2: historical ingestion over the shared candle store)
+  listProviders: () => request<{ providers: RegisteredProvider[]; note?: string }>('/market-data/providers'),
+  listInstruments: () => request<{ instruments: MarketInstrument[] }>('/markets/instruments'),
+  getCandles: (params: CandleQueryParams) => {
+    const qs = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== undefined) qs.set(key, value);
+    }
+    return request<CandlesResponseDto>(`/market-data/candles?${qs.toString()}`);
+  },
+  getCoverage: () => request<CoverageResponseDto>('/market-data/coverage'),
+  backfill: (input: BackfillRequest) =>
+    request<BackfillResponseDto>('/market-data/backfill', { method: 'POST', body: JSON.stringify(input) }),
 };
 
 /** Summary row shape from the API list endpoint. */

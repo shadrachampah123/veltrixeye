@@ -8,6 +8,15 @@ import { fileURLToPath } from 'node:url';
 import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 
 import {
+  TIMEFRAMES,
+  ProviderError,
+  type Candle,
+  type HistoricalCandlesRequest,
+  type MarketDataProvider,
+  type NormalizedInstrument,
+  type Timeframe,
+} from '@veltrixeye/contracts';
+import {
   createPool,
   runMigrations,
   migrationStatus,
@@ -21,6 +30,10 @@ import {
   isDomainError,
   qualityGrade,
   createProviderRegistry,
+  CandleStore,
+  IngestionService,
+  mapProviderError,
+  missingRanges,
 } from '../src/index.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -691,5 +704,515 @@ describe('audit', () => {
       [owner],
     );
     assert.ok(res.rows.some((r) => r.action === 'strategy.created'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M2 market data: migration 0008, candle store, ingestion
+// ---------------------------------------------------------------------------
+
+const M2_NOW = Date.UTC(2026, 8, 13, 12, 0, 0);
+const DAY = 86_400_000;
+const HOUR = 3_600_000;
+
+function m2Candle(time: number, close = 1.05, volume: number | null = 100): Candle {
+  return { time, open: 1, high: 1.1, low: 0.9, close, volume, state: 'closed' };
+}
+
+/** Deterministic provider stub: serves aligned bars across the requested range. */
+function gridGen(stepMs: number): (req: HistoricalCandlesRequest) => Candle[] {
+  return (req) => {
+    const out: Candle[] = [];
+    const start = req.from - (req.from % stepMs);
+    for (let t = start; t < req.to; t += stepMs) out.push(m2Candle(t));
+    return out;
+  };
+}
+
+class FakeProvider implements MarketDataProvider {
+  readonly name = 'Fake Provider';
+  readonly capabilities = { historical: true, realtime: false, timeframes: TIMEFRAMES, maxLookbackDays: 2190 };
+  readonly calls: HistoricalCandlesRequest[] = [];
+
+  constructor(
+    readonly id: string,
+    private readonly gen: (req: HistoricalCandlesRequest) => Candle[],
+  ) {}
+
+  async getSymbols(): Promise<NormalizedInstrument[]> {
+    return [];
+  }
+
+  async getHistoricalCandles(req: HistoricalCandlesRequest): Promise<Candle[]> {
+    this.calls.push(req);
+    return this.gen(req);
+  }
+
+  subscribeRealtime(): never {
+    throw new Error('no realtime');
+  }
+
+  async getTradingSessions(): Promise<[]> {
+    return [];
+  }
+
+  async getMarketStatus(instrument: NormalizedInstrument) {
+    return { instrument, state: 'unknown' as const };
+  }
+}
+
+function m2Setup(gen: (req: HistoricalCandlesRequest) => Candle[], providerId = 'twelve-data') {
+  const registry = createProviderRegistry();
+  const fake = new FakeProvider(providerId, gen);
+  registry.register(fake);
+  const store = new CandleStore(pool);
+  const ingestion = new IngestionService(pool, registry, store);
+  return { registry, fake, store, ingestion };
+}
+
+async function latestRun() {
+  const res = await pool.query<{
+    trigger: string;
+    status: string;
+    provider_slug: string;
+    request: Record<string, unknown>;
+    candles_upserted: number;
+    error: string | null;
+    initiated_by: string | null;
+    finished_at: Date | null;
+  }>('SELECT trigger, status, provider_slug, request, candles_upserted, error, initiated_by, finished_at FROM ingestion_runs ORDER BY started_at DESC LIMIT 1');
+  return first(res.rows, 'ingestion run');
+}
+
+describe('m2 migration', () => {
+  test('0008 seeds the provider, 8 mappings, and excludes SPX500', async () => {
+    const provider = await pool.query<{ status: string }>("SELECT status FROM data_providers WHERE slug = 'twelve-data'");
+    assert.equal(first(provider.rows, 'provider row').status, 'active');
+
+    const mappings = await pool.query<{ n: string }>('SELECT count(*)::text AS n FROM instrument_provider_symbols');
+    assert.equal(Number(first(mappings.rows, 'mapping count').n), 8);
+
+    const spx = await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM instrument_provider_symbols m
+       JOIN instruments i ON i.id = m.instrument_id WHERE i.symbol = 'SPX500'`,
+    );
+    assert.equal(Number(first(spx.rows, 'spx mapping count').n), 0);
+
+    // tables exist and accept the documented shapes
+    await pool.query('SELECT count(*) FROM candles');
+    await pool.query('SELECT count(*) FROM ingestion_runs');
+  });
+});
+
+describe('m2 candle store', () => {
+  test('resolves instruments case-insensitively; unknown returns null', async () => {
+    const store = new CandleStore(pool);
+    const eurusd = await store.resolveInstrument('forex', 'eurusd');
+    assert.ok(eurusd);
+    assert.equal(eurusd.symbol, 'EURUSD');
+    assert.equal(eurusd.assetClass, 'forex');
+    assert.equal(eurusd.displayName, 'EUR / USD');
+    // SPX500 keeps its M1 identifier (exclusion is at the mapping/ingestion layer)
+    assert.ok(await store.resolveInstrument('index', 'SPX500'));
+    assert.equal(await store.resolveInstrument('forex', 'NOPE'), null);
+  });
+
+  test('upsert/query round-trips ascending candles with numeric types', async () => {
+    const store = new CandleStore(pool);
+    const inst = first([await store.resolveInstrument('forex', 'EURUSD')], 'eurusd')!;
+    const t0 = M2_NOW - 5 * DAY;
+    const n = await store.upsertCandles({
+      instrumentId: inst.id,
+      timeframe: '1d',
+      providerSlug: 'twelve-data',
+      candles: [m2Candle(t0), m2Candle(t0 + DAY, 1.06, null), m2Candle(t0 + 2 * DAY)],
+    });
+    assert.equal(n, 3);
+    const rows = await store.queryCandles({ instrumentId: inst.id, timeframe: '1d', from: t0, to: t0 + 3 * DAY, limit: 10 });
+    assert.equal(rows.length, 3);
+    assert.deepEqual(
+      rows.map((r) => r.time),
+      [t0, t0 + DAY, t0 + 2 * DAY],
+    );
+    assert.equal(typeof rows[0]!.open, 'number');
+    assert.equal(rows[0]!.open, 1);
+    assert.equal(rows[1]!.volume, null);
+    assert.equal(rows[2]!.volume, 100);
+  });
+
+  test('upsert is idempotent: corrections overwrite, batches dedupe (last wins)', async () => {
+    const store = new CandleStore(pool);
+    const inst = (await store.resolveInstrument('forex', 'EURUSD'))!;
+    const t0 = M2_NOW - 5 * DAY;
+    await store.upsertCandles({
+      instrumentId: inst.id,
+      timeframe: '1d',
+      providerSlug: 'twelve-data',
+      candles: [m2Candle(t0, 1.09), m2Candle(t0, 1.08)],
+    });
+    const rows = await store.queryCandles({ instrumentId: inst.id, timeframe: '1d', from: t0, to: t0 + 3 * DAY, limit: 10 });
+    assert.equal(rows.length, 3); // still 3 rows — correction, not duplication
+    assert.equal(rows[0]!.close, 1.08); // last wins
+  });
+
+  test('upsert rejects invalid candles and persists nothing', async () => {
+    const store = new CandleStore(pool);
+    const inst = (await store.resolveInstrument('forex', 'EURUSD'))!;
+    const t0 = M2_NOW - 5 * DAY;
+    const before = await store.queryCandles({ instrumentId: inst.id, timeframe: '1d', from: t0, to: t0 + 3 * DAY, limit: 10 });
+    const bad = [
+      { ...m2Candle(t0), time: 0 },
+      { ...m2Candle(t0), open: Number.NaN },
+      { ...m2Candle(t0), open: 0 },
+      { ...m2Candle(t0), low: 5 },
+      { ...m2Candle(t0), high: 0.1 },
+      { ...m2Candle(t0), volume: -1 },
+    ];
+    for (const candle of bad) {
+      await assert.rejects(
+        () => store.upsertCandles({ instrumentId: inst.id, timeframe: '1d', providerSlug: 'twelve-data', candles: [candle] }),
+        (e: unknown) => isDomainError(e) && e.code === 'invalid_input',
+        JSON.stringify(candle),
+      );
+    }
+    const after = await store.queryCandles({ instrumentId: inst.id, timeframe: '1d', from: t0, to: t0 + 3 * DAY, limit: 10 });
+    assert.equal(after.length, before.length);
+  });
+
+  test('rangeStats reports count/earliest/latest; empty windows are zeroed', async () => {
+    const store = new CandleStore(pool);
+    const inst = (await store.resolveInstrument('forex', 'EURUSD'))!;
+    const t0 = M2_NOW - 5 * DAY;
+    const stats = await store.rangeStats({ instrumentId: inst.id, timeframe: '1d', from: t0, to: t0 + 3 * DAY });
+    assert.equal(stats.count, 3);
+    assert.equal(stats.earliest, t0);
+    assert.equal(stats.latest, t0 + 2 * DAY);
+    const empty = await store.rangeStats({ instrumentId: inst.id, timeframe: '1d', from: t0 + 100 * DAY, to: t0 + 101 * DAY });
+    assert.deepEqual(empty, { count: 0, earliest: null, latest: null });
+  });
+
+  test('pruneBeyondRetention deletes only rows older than the cutoff', async () => {
+    const store = new CandleStore(pool);
+    const inst = (await store.resolveInstrument('forex', 'EURUSD'))!;
+    const removed = await store.pruneBeyondRetention({ instrumentId: inst.id, timeframe: '1d', cutoffMs: M2_NOW - 3 * DAY });
+    assert.equal(removed, 2); // t0 and t0+DAY fall before the cutoff
+    const rows = await store.queryCandles({ instrumentId: inst.id, timeframe: '1d', from: 0, to: M2_NOW, limit: 10 });
+    assert.equal(rows.length, 1);
+    const removedAgain = await store.pruneBeyondRetention({ instrumentId: inst.id, timeframe: '1d', cutoffMs: M2_NOW - 3 * DAY });
+    assert.equal(removedAgain, 0);
+  });
+});
+
+describe('m2 missingRanges', () => {
+  test('head/tail gap math', () => {
+    assert.deepEqual(missingRanges(0, 10, null, null, 1), [[0, 10]]);
+    assert.deepEqual(missingRanges(0, 10, 2, 8, 1), [
+      [0, 2],
+      [8, 10],
+    ]);
+    assert.deepEqual(missingRanges(0, 10, 0, 8, 1), [[8, 10]]);
+    assert.deepEqual(missingRanges(0, 10, 2, 10, 1), [[0, 2]]);
+    assert.deepEqual(missingRanges(0, 10, 0, 10, 1), []);
+  });
+});
+
+describe('m2 mapProviderError', () => {
+  test('maps every failure kind to its domain code', () => {
+    const codeOf = (err: unknown): string => {
+      assert.ok(isDomainError(err), 'expected a DomainError');
+      return err.code;
+    };
+    assert.equal(codeOf(mapProviderError(new ProviderError('rate_limited', 'x'))), 'rate_limited');
+    assert.equal(codeOf(mapProviderError(new ProviderError('invalid_request', 'x'))), 'invalid_input');
+    assert.equal(codeOf(mapProviderError(new ProviderError('not_found', 'x'))), 'not_found');
+    assert.equal(codeOf(mapProviderError(new ProviderError('unavailable', 'x'))), 'provider_unavailable');
+    assert.equal(codeOf(mapProviderError(new ProviderError('unauthorized', 'x'))), 'provider_unavailable');
+    const plain = new Error('boom');
+    assert.equal(mapProviderError(plain), plain);
+    assert.equal(codeOf(mapProviderError('weird')), 'internal');
+  });
+});
+
+describe('m2 ingestion reads', () => {
+  test('fetch-through fills an empty range, then serves covered windows from store', async () => {
+    const { fake, ingestion } = m2Setup(gridGen(DAY));
+    const from = Date.UTC(2026, 8, 10); // aligned to midnight
+    const to = Date.UTC(2026, 8, 13);
+    const first = await ingestion.getCandles({ assetClass: 'forex', symbol: 'USDJPY', timeframe: '1d', from, to, limit: 500, nowMs: M2_NOW });
+    assert.equal(first.fetchedFromProvider, true);
+    assert.equal(first.candles.length, 3);
+    assert.equal(fake.calls.length, 1);
+    assert.deepEqual([fake.calls[0]!.from, fake.calls[0]!.to], [from, to]);
+
+    // a window fully inside stored bars (latest >= to) is a pure cache hit
+    const bar = first.candles[1]!;
+    const second = await ingestion.getCandles({ assetClass: 'forex', symbol: 'USDJPY', timeframe: '1d', from: bar.time, to: bar.time + 1, limit: 500, nowMs: M2_NOW });
+    assert.equal(second.fetchedFromProvider, false);
+    assert.equal(fake.calls.length, 1); // no second provider call
+    assert.deepEqual(second.candles, [bar]);
+  });
+
+  test('fetch-through fills head AND tail gaps (at most two calls)', async () => {
+    const { fake, store, ingestion } = m2Setup(gridGen(HOUR));
+    const inst = (await store.resolveInstrument('forex', 'GBPUSD'))!;
+    const t0 = M2_NOW - 6 * HOUR;
+    await store.upsertCandles({ instrumentId: inst.id, timeframe: '1h', providerSlug: 'twelve-data', candles: [m2Candle(t0 + 2 * HOUR)] });
+    const res = await ingestion.getCandles({ assetClass: 'forex', symbol: 'GBPUSD', timeframe: '1h', from: t0, to: t0 + 5 * HOUR, limit: 500, nowMs: M2_NOW });
+    assert.equal(res.fetchedFromProvider, true);
+    assert.equal(fake.calls.length, 2);
+    assert.deepEqual(
+      fake.calls.map((c) => [c.from, c.to]),
+      [
+        [t0, t0 + 2 * HOUR],
+        [t0 + 2 * HOUR, t0 + 5 * HOUR],
+      ],
+    );
+    assert.deepEqual(
+      res.candles.map((c) => c.time),
+      [t0, t0 + HOUR, t0 + 2 * HOUR, t0 + 3 * HOUR, t0 + 4 * HOUR],
+    );
+  });
+
+  test('successful fetch-through records a completed run', async () => {
+    const run = await latestRun();
+    assert.equal(run.trigger, 'fetch_through');
+    assert.equal(run.status, 'completed');
+    assert.equal(run.provider_slug, 'twelve-data');
+    assert.ok(run.finished_at !== null);
+  });
+
+  test('over-limit ranges are rejected, never truncated', async () => {
+    const { ingestion } = m2Setup(() => []);
+    const t0 = M2_NOW - 5 * DAY;
+    await assert.rejects(
+      () => ingestion.getCandles({ assetClass: 'forex', symbol: 'EURUSD', timeframe: '1d', from: t0, to: M2_NOW, limit: 0, nowMs: M2_NOW }),
+      (e: unknown) => isDomainError(e) && e.code === 'invalid_input',
+    );
+  });
+
+  test('ranges before retention are rejected without calling the provider', async () => {
+    const { fake, ingestion } = m2Setup(gridGen(DAY));
+    await assert.rejects(
+      () =>
+        ingestion.getCandles({
+          assetClass: 'stock',
+          symbol: 'AAPL',
+          timeframe: '1d',
+          from: M2_NOW - 1825 * DAY - 1,
+          to: M2_NOW - 1825 * DAY + DAY,
+          limit: 500,
+          nowMs: M2_NOW,
+        }),
+      (e: unknown) => isDomainError(e) && e.code === 'invalid_input',
+    );
+    assert.equal(fake.calls.length, 0);
+  });
+
+  test('unknown instruments are rejected without calling the provider', async () => {
+    const { fake, ingestion } = m2Setup(gridGen(DAY));
+    await assert.rejects(
+      () => ingestion.getCandles({ assetClass: 'forex', symbol: 'NOPE', timeframe: '1d', from: M2_NOW - DAY, to: M2_NOW, limit: 500, nowMs: M2_NOW }),
+      (e: unknown) => isDomainError(e) && e.code === 'not_found',
+    );
+    assert.equal(fake.calls.length, 0);
+  });
+
+  test('empty registry answers provider_unavailable', async () => {
+    const store = new CandleStore(pool);
+    const ingestion = new IngestionService(pool, createProviderRegistry(), store);
+    await assert.rejects(
+      () => ingestion.getCandles({ assetClass: 'etf', symbol: 'SPY', timeframe: '1d', from: M2_NOW - DAY, to: M2_NOW, limit: 500, nowMs: M2_NOW }),
+      (e: unknown) => isDomainError(e) && e.code === 'provider_unavailable',
+    );
+  });
+
+  test('provider failure maps to provider_unavailable and records a failed run', async () => {
+    const owner = await makeUser();
+    const { ingestion } = m2Setup(() => {
+      throw new ProviderError('unavailable', 'upstream down');
+    });
+    await assert.rejects(
+      () =>
+        ingestion.getCandles({
+          assetClass: 'commodity',
+          symbol: 'XAUUSD',
+          timeframe: '15m',
+          from: M2_NOW - HOUR,
+          to: M2_NOW,
+          limit: 500,
+          nowMs: M2_NOW,
+          initiatedBy: owner,
+        }),
+      (e: unknown) => isDomainError(e) && e.code === 'provider_unavailable',
+    );
+    const run = await latestRun();
+    assert.equal(run.trigger, 'fetch_through');
+    assert.equal(run.status, 'failed');
+    assert.equal(run.error, 'unavailable: upstream down');
+    assert.equal(run.initiated_by, owner);
+  });
+
+  test('the store is global: different users read identical candles', async () => {
+    const { ingestion } = m2Setup(gridGen(DAY));
+    const a = await makeUser();
+    const b = await makeUser();
+    const query = { assetClass: 'crypto' as const, symbol: 'ETHUSD', timeframe: '1d' as Timeframe, from: M2_NOW - 2 * DAY, to: M2_NOW, limit: 500, nowMs: M2_NOW };
+    const ra = await ingestion.getCandles({ ...query, initiatedBy: a });
+    const rb = await ingestion.getCandles({ ...query, initiatedBy: b });
+    assert.deepEqual(rb.candles, ra.candles);
+  });
+});
+
+describe('m2 ingestion backfill', () => {
+  test('bounded backfill completes and closes its run', async () => {
+    const owner = await makeUser();
+    const { fake, ingestion } = m2Setup((req) =>
+      gridGen(req.timeframe === '1d' ? DAY : HOUR)(req),
+    );
+    const from = M2_NOW - 2 * DAY;
+    const res = await ingestion.backfill({
+      instruments: [{ assetClass: 'crypto', symbol: 'BTCUSD' }],
+      timeframes: ['1d', '1h'],
+      from,
+      to: M2_NOW,
+      initiatedBy: owner,
+      nowMs: M2_NOW,
+    });
+    assert.equal(res.status, 'completed');
+    assert.equal(res.provider, 'twelve-data');
+    assert.equal(res.pairs.length, 2);
+    assert.ok(res.pairs.every((p) => p.status === 'completed' && p.error === null));
+    assert.equal(res.candlesUpserted, 3 + 48);
+    assert.equal(fake.calls.length, 2);
+    assert.ok(res.runId.length > 0);
+
+    const row = await pool.query<{ status: string; candles_upserted: number; finished_at: Date | null }>(
+      'SELECT status, candles_upserted, finished_at FROM ingestion_runs WHERE id = $1',
+      [res.runId],
+    );
+    assert.equal(first(row.rows, 'run row').status, 'completed');
+    assert.equal(first(row.rows, 'run row').candles_upserted, 51);
+    assert.ok(first(row.rows, 'run row').finished_at !== null);
+  });
+
+  test('one failing pair yields partial (others still complete)', async () => {
+    const owner = await makeUser();
+    const { ingestion } = m2Setup((req) => {
+      if (req.timeframe === '1h') throw new ProviderError('unavailable', 'hourly down');
+      return gridGen(DAY)(req);
+    });
+    const res = await ingestion.backfill({
+      instruments: [{ assetClass: 'stock', symbol: 'AAPL' }],
+      timeframes: ['1d', '1h'],
+      from: M2_NOW - 2 * DAY,
+      to: M2_NOW,
+      initiatedBy: owner,
+      nowMs: M2_NOW,
+    });
+    assert.equal(res.status, 'partial');
+    assert.equal(res.pairs.length, 2);
+    assert.equal(res.pairs[0]!.status, 'completed');
+    assert.equal(res.pairs[1]!.status, 'failed');
+    assert.equal(res.pairs[1]!.error, 'unavailable: hourly down');
+  });
+
+  test('over-cap backfills are rejected before any fetch', async () => {
+    const owner = await makeUser();
+    const { fake, ingestion } = m2Setup(gridGen(DAY));
+    await assert.rejects(
+      () =>
+        ingestion.backfill({
+          instruments: [
+            { assetClass: 'crypto', symbol: 'BTCUSD' },
+            { assetClass: 'crypto', symbol: 'ETHUSD' },
+          ],
+          timeframes: ['1m'],
+          from: M2_NOW - 30 * DAY, // inside retention, over the 50k cap
+          to: M2_NOW,
+          initiatedBy: owner,
+          nowMs: M2_NOW,
+        }),
+      (e: unknown) => isDomainError(e) && e.code === 'invalid_input',
+    );
+    assert.equal(fake.calls.length, 0);
+  });
+
+  test('unknown instruments and out-of-retention ranges are rejected', async () => {
+    const owner = await makeUser();
+    const { fake, ingestion } = m2Setup(gridGen(DAY));
+    await assert.rejects(
+      () =>
+        ingestion.backfill({
+          instruments: [{ assetClass: 'forex', symbol: 'NOPE' }],
+          timeframes: ['1d'],
+          from: M2_NOW - DAY,
+          to: M2_NOW,
+          initiatedBy: owner,
+          nowMs: M2_NOW,
+        }),
+      (e: unknown) => isDomainError(e) && e.code === 'not_found',
+    );
+    await assert.rejects(
+      () =>
+        ingestion.backfill({
+          instruments: [{ assetClass: 'forex', symbol: 'EURUSD' }],
+          timeframes: ['1d'],
+          from: M2_NOW - 1826 * DAY,
+          to: M2_NOW - 1825 * DAY,
+          initiatedBy: owner,
+          nowMs: M2_NOW,
+        }),
+      (e: unknown) => isDomainError(e) && e.code === 'invalid_input',
+    );
+    assert.equal(fake.calls.length, 0);
+  });
+
+  test('falls back to any registered historical provider; empty registry fails', async () => {
+    const owner = await makeUser();
+    const { ingestion } = m2Setup(gridGen(DAY), 'other-vendor');
+    const res = await ingestion.backfill({
+      instruments: [{ assetClass: 'etf', symbol: 'SPY' }],
+      timeframes: ['1d'],
+      from: M2_NOW - DAY,
+      to: M2_NOW,
+      initiatedBy: owner,
+      nowMs: M2_NOW,
+    });
+    assert.equal(res.provider, 'other-vendor');
+
+    const empty = new IngestionService(pool, createProviderRegistry(), new CandleStore(pool));
+    await assert.rejects(
+      () =>
+        empty.backfill({
+          instruments: [{ assetClass: 'etf', symbol: 'SPY' }],
+          timeframes: ['1d'],
+          from: M2_NOW - DAY,
+          to: M2_NOW,
+          initiatedBy: owner,
+          nowMs: M2_NOW,
+        }),
+      (e: unknown) => isDomainError(e) && e.code === 'provider_unavailable',
+    );
+  });
+});
+
+describe('m2 coverage', () => {
+  test('ledger reflects stored candles; SPX500 never appears', async () => {
+    const store = new CandleStore(pool);
+    const all = await store.getCoverage({});
+    const btc = all.find((r) => r.symbol === 'BTCUSD' && r.timeframe === '1d');
+    assert.ok(btc);
+    assert.equal(btc.assetClass, 'crypto');
+    assert.equal(btc.candleCount, 3);
+    assert.ok(btc.earliestTime !== null && btc.latestTime !== null && btc.earliestTime < btc.latestTime);
+    assert.ok(!all.some((r) => r.symbol === 'SPX500'), 'SPX500 has no coverage');
+
+    const inst = (await store.resolveInstrument('crypto', 'BTCUSD'))!;
+    const filtered = await store.getCoverage({ instrumentId: inst.id });
+    assert.ok(filtered.length >= 2);
+    assert.ok(filtered.every((r) => r.symbol === 'BTCUSD'));
+    const hourly = await store.getCoverage({ timeframe: '1h' });
+    assert.ok(hourly.length >= 1);
+    assert.ok(hourly.every((r) => r.timeframe === '1h'));
   });
 });

@@ -30,6 +30,14 @@ export {
   ProviderRegistry,
   type RegisteredProviderInfo,
 } from './market-data/registry.js';
+export { CandleStore, type ResolvedInstrument } from './market-data/candles.js';
+export {
+  IngestionService,
+  mapProviderError,
+  missingRanges,
+  type BackfillRequest as IngestionBackfillRequest,
+  type CandleReadRequest,
+} from './market-data/ingestion.js';
 
 // Scoring (foundation re-exports)
 export { qualityGrade, QUALITY_GRADE_BANDS } from '@veltrixeye/contracts';

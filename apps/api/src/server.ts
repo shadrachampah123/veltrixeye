@@ -1,6 +1,7 @@
 import { loadConfig, loadDotEnv } from './config.js';
 import { buildApp, createAppContext } from './app.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
+import { createTwelveDataProvider } from '@veltrixeye/provider-twelve-data';
 
 /**
  * API entrypoint.
@@ -29,6 +30,27 @@ async function main(): Promise<void> {
   }
 
   const ctx = createAppContext(pool, config);
+
+  // M2 primary market-data provider. The API boots without a key on purpose
+  // (dev/test, or an unkeyed deploy); market-data reads/backfills answer 502
+  // until TWELVE_DATA_API_KEY is set. Production user-facing display
+  // additionally requires a Business (Venture+) plan — see
+  // docs/provider-licensing.md. The key itself is never logged.
+  if (config.TWELVE_DATA_API_KEY !== '') {
+    ctx.providerRegistry.register(
+      createTwelveDataProvider({
+        apiKey: config.TWELVE_DATA_API_KEY,
+        baseUrl: config.TWELVE_DATA_BASE_URL,
+        timeoutMs: config.TWELVE_DATA_TIMEOUT_MS,
+        maxRequestsPerMinute: config.TWELVE_DATA_MAX_RPM,
+        cryptoExchange: config.TWELVE_DATA_CRYPTO_EXCHANGE,
+      }),
+    );
+    console.info('[api] market-data provider registered: twelve-data (historical)');
+  } else {
+    console.warn('[api] TWELVE_DATA_API_KEY is not set — market-data ingestion is unavailable (502)');
+  }
+
   const app = await buildApp(config, ctx);
 
   await app.listen({ port: config.PORT, host: config.HOST });

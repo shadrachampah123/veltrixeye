@@ -4,6 +4,7 @@ export * from './conditions.js';
 export * from './risk.js';
 export * from './scoring.js';
 export * from './market-data.js';
+export * from './ingestion.js';
 export * from './strategies.js';
 export * from './auth.js';
 export * from './users.js';

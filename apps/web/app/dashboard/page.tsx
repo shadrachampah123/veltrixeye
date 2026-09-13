@@ -38,11 +38,11 @@ function DashboardContent() {
         }
       />
 
-      {/* M1 status banner */}
+      {/* M2 status banner */}
       <div className="mb-6 rounded-lg border border-info-450/30 bg-info-450/10 px-4 py-3 text-sm text-info-450">
-        <strong className="font-semibold">M1 foundation.</strong> Strategy definitions, versioning and scoring
-        foundations are live. Market-data ingestion, live scanning and alert delivery arrive in later milestones —
-        your strategies will scan automatically once they are connected.
+        <strong className="font-semibold">M2 market data.</strong> Historical candles are ingested and stored
+        per instrument — explore them under Markets. Strategy evaluation, live scanning and alert delivery
+        arrive in later milestones.
       </div>
 
       {strategies === null ? (

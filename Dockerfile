@@ -12,9 +12,10 @@
 #
 # Notes
 #  - The API runs TypeScript directly through `tsx`: the workspace packages
-#    (@veltrixeye/core, @veltrixeye/contracts) are consumed as TS sources, so
-#    there is no compile step (`npm run api:build` is a strict typecheck).
-#    `tsx` is therefore a *runtime* dependency of the API workspace.
+#    (@veltrixeye/core, @veltrixeye/contracts, @veltrixeye/provider-twelve-data)
+#    are consumed as TS sources, so there is no compile step
+#    (`npm run api:build` is a strict typecheck). `tsx` is therefore a
+#    *runtime* dependency of the API workspace.
 #  - No secrets are baked in. Every value comes from the environment, and the
 #    API fails fast at boot if a required one is missing or malformed.
 
@@ -32,6 +33,7 @@ ENV npm_config_update_notifier=false \
 COPY package.json package-lock.json ./
 COPY packages/contracts/package.json packages/contracts/
 COPY packages/core/package.json packages/core/
+COPY packages/providers/twelve-data/package.json packages/providers/twelve-data/
 COPY apps/api/package.json apps/api/
 COPY apps/web/package.json apps/web/
 RUN npm ci --omit=dev --workspace @veltrixeye/api
@@ -57,6 +59,8 @@ COPY --chown=node:node packages/contracts/package.json packages/contracts/packag
 COPY --chown=node:node packages/contracts/src packages/contracts/src
 COPY --chown=node:node packages/core/package.json packages/core/package.json
 COPY --chown=node:node packages/core/src packages/core/src
+COPY --chown=node:node packages/providers/twelve-data/package.json packages/providers/twelve-data/package.json
+COPY --chown=node:node packages/providers/twelve-data/src packages/providers/twelve-data/src
 COPY --chown=node:node apps/api/package.json apps/api/package.json
 COPY --chown=node:node apps/api/tsconfig.json apps/api/tsconfig.json
 COPY --chown=node:node apps/api/src apps/api/src
