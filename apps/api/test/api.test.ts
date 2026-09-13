@@ -320,6 +320,27 @@ describe('security baseline', () => {
     assert.equal(last, 429, 'expected a 429 after 10 rapid logins');
   });
 
+  test('register is rate-limited per IP (5/hour)', async () => {
+    const ip = freshIp();
+    let created = 0;
+    let last = 0;
+    for (let i = 0; i < 7; i++) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/auth/register',
+        headers: { 'x-forwarded-for': ip },
+        payload: { email: uniqueEmail(), password: PASSWORD, name: 'Api Trader' },
+      });
+      last = res.statusCode;
+      if (res.statusCode === 429) break;
+      if (res.statusCode === 201) created += 1;
+    }
+    // Pins the documented control in docs/security.md (5/hour per IP) so the
+    // documentation and the route config cannot drift apart again.
+    assert.equal(created, 5, 'exactly 5 registrations should succeed from one IP');
+    assert.equal(last, 429, 'expected a 429 after 5 registrations from one IP');
+  });
+
   test('audit log records auth events', async () => {
     const { email } = await registerUser();
     await loginUser(email);

@@ -55,7 +55,10 @@ engine, backtester, and alert workers pluggable without touching the UI.
 
 1. `server.ts` boots the pool, **runs migrations at boot**
    (`runMigrations`, tracked in a `schema_migrations` table), applies
-   helmet/CORS/rate-limit/body-limit middleware, registers routes, listens.
+   helmet/rate-limit/body-limit middleware, registers routes, listens.
+   (No CORS plugin is registered — the web app calls the API same-origin
+   via the Next rewrite, so no `Access-Control-Allow-Origin` is ever
+   emitted. See [security.md](./security.md).)
 2. Authenticated routes go through `createSessionAuth`
    (`apps/api/src/session-auth.ts`): read the `ve_session` cookie, look up
    the stored sha256 token hash, attach `{ user, sessionToken }` to the
@@ -63,7 +66,8 @@ engine, backtester, and alert workers pluggable without touching the UI.
    `{"error":{"code":"unauthorized",...}}` body (no user enumeration).
 3. Every route validates input with **contracts' zod schemas** before
    touching a service. Validation failures return a structured 400
-   (`{error:{code:'invalid_input', fields:[...]}}`).
+   (`{error:{code:'invalid_input', message, fields:{<path>: string[]}}}`,
+   where `fields` is keyed by the offending field path).
 4. Services throw domain errors (`Errors.notFound/conflict/...` from
    `packages/core/src/errors.ts`); the API error handler maps them to
    status codes and the canonical error shape. Unexpected errors → 500

@@ -42,14 +42,27 @@ remaining items are listed at the bottom.
   `Referrer-Policy: no-referrer`, `Cross-Origin-Resource-Policy:
   same-origin`, `Cross-Origin-Opener-Policy: same-origin`,
   `Origin-Agent-Cluster: ?1`, `X-Permitted-Cross-Domain-Policies: none`.
-- `X-Powered-By` hidden; CORS is locked to the web origin
-  (`WEB_ORIGIN` env, default `http://localhost:3000`), no wildcard.
+- `X-Powered-By` hidden.
+- **No CORS headers are emitted at all** — there is no `@fastify/cors`
+  registration and no `WEB_ORIGIN` variable. This is deliberate and
+  *stricter* than an allowlist: without `Access-Control-Allow-Origin`,
+  browsers refuse to read any cross-origin response from the API, and
+  preflights are not answered. The web app never makes a cross-origin
+  call — `next.config.mjs` rewrites same-origin `/api/*` to
+  `API_INTERNAL_BASE` server-side — and the session cookie is
+  `SameSite=Strict`, so it is not sent on cross-site requests either.
+  If a future client needs direct cross-origin API access, add
+  `@fastify/cors` with an explicit origin allowlist (never `*`) and
+  document the variable here.
 
 ## Rate limiting
 
 - Global: 300 req/min per IP.
 - `POST /api/auth/login`: **10/min per IP** (brute-force).
-- `POST /api/auth/register`: **1 per 5 hours per IP** (account spam).
+- `POST /api/auth/register`: **5/hour per IP** (account spam).
+- All three are per-IP limits configured in `apps/api/src/app.ts` (global)
+  and `apps/api/src/routes/auth.ts` (per-route overrides), and each is
+  covered by a test in `apps/api/test/api.test.ts`.
 - 429 responses carry a structured body
   (`{error:{code:'rate_limited', message:'... Try again in Ns.'}}`).
 

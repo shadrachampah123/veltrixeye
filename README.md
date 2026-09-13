@@ -50,9 +50,9 @@ Open **http://localhost:3000**, register an account, and start building strategi
 | --- | --- |
 | `npm run setup` | Create local `.env` files with generated dev secrets |
 | `npm run dev` | Run embedded DB + API + Web together |
-| `npm run db:migrate` | Apply SQL migrations to `DATABASE_URL` |
+| `npm run db:migrate` | Apply SQL migrations to `DATABASE_URL` (add `-- --status` to list applied migrations without changing anything) |
 | `npm test` | Run all test suites (contracts, core, API — real Postgres) |
-| `npm run typecheck` | Strict TypeScript check (project references) |
+| `npm run typecheck` | Strict TypeScript check across all 4 workspaces |
 | `npm run lint` | ESLint |
 | `npm run build` | Production build of API and Web |
 
