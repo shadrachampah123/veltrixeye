@@ -56,6 +56,43 @@ Open **http://localhost:3000**, register an account, and start building strategi
 | `npm run lint` | ESLint |
 | `npm run build` | Production build of API and Web |
 
+## Deploying the web app to Vercel (monorepo)
+
+The web app lives at `apps/web` inside an npm-workspaces monorepo, and
+`@veltrixeye/contracts` is a **private workspace package** (not on the npm
+registry). This has two consequences for the Vercel project:
+
+1. **Root Directory must be `apps/web`** (Project → Settings → General).
+   With the Root Directory at the monorepo root, the build still succeeds but
+   writes the Next.js output to `apps/web/.next`, so Vercel's Next.js builder
+   fails with `Routes Manifest Could Not Be Found` (it looks for
+   `.next/routes-manifest.json` inside the Root Directory).
+2. **Dependencies must be installed from the monorepo root**, otherwise the
+   workspace package `@veltrixeye/contracts` cannot be resolved. This is
+   pinned in `apps/web/vercel.json`:
+
+```jsonc
+// apps/web/vercel.json
+{
+  "framework": "nextjs",
+  "installCommand": "cd ../.. && npm ci", // install all workspaces at the repo root
+  "buildCommand": "next build"            // build in apps/web, output -> apps/web/.next
+}
+```
+
+So the required Vercel project settings are:
+
+| Setting | Value |
+| --- | --- |
+| Framework | Next.js |
+| **Root Directory** | **`apps/web`** |
+| Install Command | `cd ../.. && npm ci` (pinned in `apps/web/vercel.json`) |
+| Build Command | `next build` (pinned in `apps/web/vercel.json`) |
+
+> The Fastify API (`apps/api`) is a separate service and is **not** deployed
+> by this Vercel project; in M1 the web app calls it via the same-origin
+> `/api` rewrite (`API_INTERNAL_BASE`).
+
 ## Documentation
 
 Start here:
