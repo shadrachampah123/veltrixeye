@@ -1,0 +1,51 @@
+# Render Blueprint — production deployment target for the Fastify API
+# (apps/api). See docs/deployment.md for the full runbook.
+#
+# The Next.js web app is deliberately NOT defined here: it is deployed on
+# Vercel (Root Directory: apps/web) and reaches this service server-side via
+# the /api/* rewrite configured by API_INTERNAL_BASE. Nothing in this file
+# contains a credential — `sync: false` asks the operator for the value in the
+# Render Dashboard and stores it encrypted on the service.
+#
+# One-off manual choice: `plan: free` keeps this deployable without a payment
+# method, but free web services spin down after ~15 minutes of inactivity and
+# take ~1 minute to wake. Switch to `starter` (or change it in the dashboard)
+# for an always-on production API — see docs/deployment.md.
+services:
+  - type: web
+    name: veltrixeye-api
+    runtime: docker
+    branch: main
+    plan: free
+    # Readiness: database reachable + this build's migrations applied.
+    healthCheckPath: /api/health/ready
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: '4000'
+      # The only secret the service needs. Paste the managed Postgres
+      # connection string (Neon / Supabase / Render / RDS …) in the dashboard.
+      - key: DATABASE_URL
+        sync: false
+      # Managed Postgres over TLS. Use `verify-full` (plus NODE_EXTRA_CA_CERTS
+      # pointing at the provider's CA) where the provider publishes one.
+      - key: DATABASE_SSL_MODE
+        value: require
+      - key: DATABASE_POOL_MAX
+        value: '10'
+      - key: LOG_LEVEL
+        value: info
+    # Only rebuild the API when something it actually ships changed; the web
+    # app deploys independently on Vercel.
+    buildFilter:
+      paths:
+        - apps/api/**
+        - packages/**
+        - Dockerfile
+        - .dockerignore
+        - package.json
+        - package-lock.json
+        - tsconfig.base.json

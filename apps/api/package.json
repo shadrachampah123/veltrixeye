@@ -25,6 +25,7 @@
     "@veltrixeye/core": "*",
     "fastify": "^5.2.1",
     "pg": "^8.13.1",
+    "tsx": "^4.19.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
