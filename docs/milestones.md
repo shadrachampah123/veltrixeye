@@ -33,8 +33,17 @@ live data, or delivers alerts.
 - **Security baseline** — helmet headers, rate limiting, audit log, strict
   input validation, same-origin web↔API.
 - **UI shell** — auth, dashboard, strategy list/create/edit, settings.
-- **Documentation** — 10 topics (this directory).
-- **Automated tests** — 73 passing (contracts 20, core 28, api 25) plus
+- **Production deployment target for the API** — `Dockerfile` (multi-stage,
+  non-root, pinned by the lockfile) plus a `render.yaml` Blueprint declaring
+  the Docker web service, its health check and its environment; the production
+  web app reaches the API through the same-origin `/api` rewrite configured by
+  `API_INTERNAL_BASE`, which now fails a Vercel production build when it is
+  missing or not HTTPS. Migrations are applied at boot under a Postgres
+  advisory lock (or explicitly via `npm run db:migrate`), and
+  `GET /api/health/ready` reports database connectivity **and** migration /
+  schema state. Runbook: [deployment.md](./deployment.md).
+- **Documentation** — 11 topics (this directory).
+- **Automated tests** — 77 passing (contracts 20, core 30, api 27) plus
   clean typecheck, lint and production build.
 
 ## Explicitly NOT in M1 (by design, deferred)

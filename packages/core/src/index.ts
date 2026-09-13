@@ -2,8 +2,12 @@
 export { createPool, type DatabaseConfig } from './db/pool.js';
 export {
   runMigrations,
+  migrationStatus,
+  listMigrationFiles,
   MIGRATIONS_DIR,
+  type MigrationFile,
   type MigrationRecord,
+  type MigrationStatus,
   type RunMigrationsResult,
 } from './db/migrate.js';
 

@@ -51,6 +51,11 @@ web  →  contracts (types only, for typed API responses)
 Keeping these arrows one-directional is what makes the future signal
 engine, backtester, and alert workers pluggable without touching the UI.
 
+In production the same arrows hold, only the transport changes: the web app
+runs on Vercel, the API runs as a container behind HTTPS, and the web server
+proxies `/api/*` to it via `API_INTERNAL_BASE`. The browser still only ever
+talks to one origin. See [deployment.md](./deployment.md).
+
 ## Request lifecycle (API)
 
 1. `server.ts` boots the pool, **runs migrations at boot**

@@ -1,0 +1,41 @@
+# Keep the build context small and keep secrets out of the image.
+# `.env` files are generated locally by `npm run setup` and must never be
+# copied into an image (see docs/security.md).
+
+# Secrets / local configuration
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!.env.example
+
+# VCS / editors
+.git
+.gitignore
+.github
+.idea
+.vscode
+.DS_Store
+
+# Installed dependencies (the image installs its own, from the lockfile)
+node_modules
+**/node_modules
+
+# Build output / caches
+**/.next
+**/dist
+**/*.tsbuildinfo
+coverage
+
+# Local databases and logs
+.dev
+.test
+.pgdata
+**/*.log
+
+# Test suites, docs and tooling that the runtime image does not need
+**/test
+docs
+README.md
+eslint.config.mjs

@@ -10,6 +10,7 @@ import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 import {
   createPool,
   runMigrations,
+  migrationStatus,
   MIGRATIONS_DIR,
   hashPassword,
   verifyPassword,
@@ -93,6 +94,30 @@ describe('migrations', () => {
       () => runMigrations(pool, tmp),
       (err: Error) => err.message.includes('immutable') && err.message.includes('new migration'),
     );
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('migrationStatus reports a fully migrated schema (no writes)', async () => {
+    const before = await pool.query<{ n: number }>('SELECT count(*)::int AS n FROM schema_migrations');
+    const status = await migrationStatus(pool, MIGRATIONS_DIR);
+    assert.equal(status.appliedCount, before.rows[0]!.n);
+    assert.equal(status.expectedCount, status.appliedCount);
+    assert.deepEqual(status.pending, []);
+    assert.equal(status.checksumsMatch, true);
+    assert.ok(status.latestApplied?.endsWith('.sql'));
+  });
+
+  test('migrationStatus reports pending migrations shipped by a newer build', async () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'vex-mig-status-'));
+    const files = (await import('node:fs')).readdirSync(MIGRATIONS_DIR);
+    for (const f of files) copyFileSync(path.join(MIGRATIONS_DIR, f), path.join(tmp, f));
+    // A migration that exists in the build but has not been applied yet.
+    (await import('node:fs')).writeFileSync(path.join(tmp, '9999_not_applied_yet.sql'), '-- noop\n');
+
+    const status = await migrationStatus(pool, tmp);
+    assert.deepEqual(status.pending, ['9999_not_applied_yet.sql']);
+    assert.equal(status.expectedCount, status.appliedCount + 1);
+    assert.equal(status.checksumsMatch, true);
     rmSync(tmp, { recursive: true, force: true });
   });
 });

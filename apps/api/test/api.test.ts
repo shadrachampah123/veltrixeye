@@ -121,6 +121,25 @@ describe('health', () => {
     assert.equal(res.statusCode, 200);
     assert.equal(res.json().database, 'up');
   });
+
+  // The readiness payload is what a platform health check and an operator use
+  // to tell "database reachable" from "schema actually migrated".
+  test('GET /api/health/ready → reports migration/schema state', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/health/ready' });
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as {
+      status: string;
+      schema: { applied: number; expected: number; latest: string | null; pending: string[]; checksumsMatch: boolean };
+    };
+    assert.equal(body.status, 'ready');
+    assert.ok(body.schema.applied >= 7, 'all shipped migrations applied');
+    assert.equal(body.schema.applied, body.schema.expected);
+    assert.deepEqual(body.schema.pending, []);
+    assert.equal(body.schema.checksumsMatch, true);
+    assert.ok(String(body.schema.latest).endsWith('.sql'));
+    // Health endpoints never leak credentials or the connection string.
+    assert.ok(!res.body.includes('postgres://'), 'no database URL in the payload');
+  });
 });
 
 // ---------------------------------------------------------------------------

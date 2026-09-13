@@ -90,8 +90,39 @@ So the required Vercel project settings are:
 | Build Command | `next build` (pinned in `apps/web/vercel.json`) |
 
 > The Fastify API (`apps/api`) is a separate service and is **not** deployed
-> by this Vercel project; in M1 the web app calls it via the same-origin
-> `/api` rewrite (`API_INTERNAL_BASE`).
+> by this Vercel project; the web app calls it via the same-origin `/api`
+> rewrite (`API_INTERNAL_BASE`) — see [Production deployment](#production-deployment).
+
+## Production deployment
+
+The API is a long-running Node/Fastify service (Postgres pool, boot-time
+migrations, in-memory rate limiting, server-side sessions), so it deploys as a
+container — **not** as a Vercel Function. The repository contains everything
+the deployment needs:
+
+| File | Purpose |
+| --- | --- |
+| `Dockerfile` | Production image for `apps/api` (multi-stage, non-root, dependencies pinned by `package-lock.json`, no secrets inside) |
+| `render.yaml` | Render Blueprint: one Docker web service, health check `/api/health/ready`, `DATABASE_URL` entered as an encrypted secret |
+| `docs/deployment.md` | Step-by-step runbook (database → API → migrations → Vercel env var → verification) |
+
+```bash
+# what the platform does, locally
+docker build -t veltrixeye-api .
+docker run --rm -p 4000:4000 -e DATABASE_URL='postgres://…' -e DATABASE_SSL_MODE=require veltrixeye-api
+```
+
+Production wiring: set `API_INTERNAL_BASE` in the Vercel project to the
+deployed API's HTTPS origin (Production, and Preview if you want working PR
+previews). Missing or non-HTTPS values fail the Vercel production build on
+purpose instead of silently proxying to `localhost`.
+
+Health: `GET /api/health` is liveness; `GET /api/health/ready` reports database
+connectivity **and** migration/schema state (`applied`, `expected`, `latest`,
+`pending`, `checksumsMatch`) and returns `503` when the schema is behind.
+
+Full details, including the manual steps and the operational caveats (free
+instance spin-down, per-instance rate limits): [docs/deployment.md](docs/deployment.md).
 
 ## Documentation
 

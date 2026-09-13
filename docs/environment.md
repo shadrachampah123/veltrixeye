@@ -40,7 +40,20 @@ git-ignored and never contain values you would commit.
 | variable | default | notes |
 |---|---|---|
 | `WEB_PORT` | `3000` | dev server port. |
-| `API_INTERNAL_BASE` | `http://127.0.0.1:4000` | server-side address the Next.js `/api/*` rewrite proxies to. The **browser only ever sees same-origin `/api`** — this URL is never exposed to the client. |
+| `API_INTERNAL_BASE` | `http://127.0.0.1:4000` | server-side address the Next.js `/api/*` rewrite proxies to. The **browser only ever sees same-origin `/api`** — this URL is never exposed to the client (it is read in `next.config.mjs`, not a `NEXT_PUBLIC_*` variable). |
+
+`API_INTERNAL_BASE` is resolved **at build time** (the rewrite destination is
+compiled into the build), so in production it must be set in the Vercel project
+before the deployment is built, and the web app must be redeployed after
+changing it:
+
+| Environment | Value |
+|---|---|
+| local dev / tests | `http://127.0.0.1:4000` (written to `apps/web/.env.local` by `npm run setup`) |
+| Vercel **Production** | the deployed API's HTTPS origin, e.g. `https://<your-api-host>` — **required**; a production build without it (or with a non-HTTPS value) fails on purpose |
+| Vercel **Preview** | optional, same or a staging API origin, so PR previews have a backend |
+
+See [deployment.md](./deployment.md) for the full production runbook.
 
 ## Per-environment guidance
 
@@ -49,11 +62,14 @@ git-ignored and never contain values you would commit.
 - **test** — each suite boots its own embedded Postgres on a dedicated
   port (core `5434`, api `5435`) and passes explicit variables; the
   `.env` file is not used by tests.
-- **production** — a hosted Postgres 14+ (Neon, RDS, Supabase, …) that the
-  **operator** provides. You supply the real credentials in the deployment
+- **production** — a hosted Postgres 14+ (Neon, RDS, Supabase, Render, …) that
+  the **operator** provides. You supply the real credentials in the deployment
   environment; **this repo never contains production secrets**. Set
   `NODE_ENV=production`, `COOKIE_SECURE=auto` (→ Secure), and
-  `DATABASE_SSL_MODE=verify-full`.
+  `DATABASE_SSL_MODE=require` (or `verify-full` plus `NODE_EXTRA_CA_CERTS`
+  when the provider publishes its CA). The API runs in a container
+  (`Dockerfile`) behind an HTTPS terminator; the concrete variables and the
+  manual steps are listed in [deployment.md](./deployment.md).
 
 ## Secrets policy
 
