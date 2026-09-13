@@ -35,7 +35,7 @@ browser ──https──> Vercel (Next.js web app, apps/web)
 | `Dockerfile` | Production image for `apps/api` (multi-stage, non-root, no dev deps, no secrets). Host-agnostic: Render, Fly, Railway, Cloud Run, ECS, a plain VM. |
 | `.dockerignore` | Keeps `.env*`, `.git`, `node_modules`, tests and docs out of the image. |
 | `render.yaml` | Render **Blueprint**: one Docker web service, health check `/api/health/ready`, env vars wired, `DATABASE_URL` prompted as a secret (`sync: false`). |
-| `apps/api` | Unchanged API. Runs TypeScript through `tsx` (the workspace packages are TS sources), so the image has no compile step. `tsx` is a runtime dependency of the API workspace for that reason. |
+| `apps/api` | The existing API (routes, sessions, rate limits, helmet, owner scoping) is unchanged apart from the readiness payload. It runs TypeScript through `tsx` because the workspace packages are TS sources, so the image has no compile step — which is why `tsx` is a runtime dependency of the API workspace. |
 | `scripts/db/migrate-cli.ts` | Existing migration CLI (`npm run db:migrate`), also usable inside the image. |
 | `apps/web/next.config.mjs` | Same-origin `/api/*` rewrite driven by `API_INTERNAL_BASE`, with build-time fail-fast in production. |
 

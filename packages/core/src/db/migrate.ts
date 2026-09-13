@@ -46,10 +46,10 @@ export interface MigrationStatus {
 const MIGRATION_FILE_RE = /^(\d{4})_(.+)\.sql$/;
 
 /**
- * Advisory-lock id that serialises migration runs across processes.
- * Any two instances (or a boot-time run racing an operator CLI run) that use
- * the same transaction id queue behind each other instead of applying the
- * same migration twice. Arbitrary but must never change.
+ * Advisory-lock key that serialises migration runs across processes.
+ * Any two instances (or a boot-time run racing an operator CLI run) that ask
+ * for the same key queue behind each other instead of applying the same
+ * migration twice. Arbitrary, but it must never change.
  */
 const MIGRATION_LOCK_KEY = 611_231_007;
 const MIGRATION_LOCK_WAIT_MS = 60_000;
