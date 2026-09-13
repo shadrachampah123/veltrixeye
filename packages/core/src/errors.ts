@@ -20,6 +20,9 @@ export const Errors = {
   notFound: (message = 'Resource not found') => new DomainError(ERROR_CODES.NOT_FOUND, message),
   conflict: (message: string) => new DomainError(ERROR_CODES.CONFLICT, message),
   immutable: (message: string) => new DomainError(ERROR_CODES.IMMUTABLE, message),
+  rateLimited: (message: string) => new DomainError(ERROR_CODES.RATE_LIMITED, message),
+  providerUnavailable: (message: string, cause?: unknown) =>
+    new DomainError(ERROR_CODES.PROVIDER_UNAVAILABLE, message, { cause }),
   internal: (message: string, cause?: unknown) => new DomainError(ERROR_CODES.INTERNAL, message, { cause }),
 };
 

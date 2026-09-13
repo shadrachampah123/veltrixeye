@@ -207,8 +207,8 @@ curl -sS "$API_BASE/api/health"            # {"status":"ok",...}
 
 # readiness: database + migration/schema state
 curl -sS "$API_BASE/api/health/ready"
-# {"status":"ready","database":"up","schema":{"applied":7,"expected":7,
-#   "latest":"0007_version_immutability.sql","pending":[],"checksumsMatch":true}}
+# {"status":"ready","database":"up","schema":{"applied":8,"expected":8,
+#   "latest":"0008_market_candles.sql","pending":[],"checksumsMatch":true}}
 
 # security headers + no CORS
 curl -sSI "$API_BASE/api/health" | grep -Ei 'strict-transport|x-frame|content-security|access-control'
@@ -221,6 +221,18 @@ curl -sS -X POST "$WEB_BASE/api/auth/register" -H 'content-type: application/jso
   -d '{"email":"you@example.com","password":"<strong-password>","name":"You"}'
 curl -sS -i -X POST "$WEB_BASE/api/auth/login" -H 'content-type: application/json' \
   -d '{"email":"you@example.com","password":"<strong-password>"}' | grep -i 'set-cookie'
+
+# market data (M2): provider registered, then a first small backfill.
+# Log in first and reuse the session cookie ($COOKIE).
+curl -sS "$WEB_BASE/api/market-data/providers" -H "cookie: $COOKIE"
+# {"providers":[{"id":"twelve-data",...}]}
+curl -sS -X POST "$WEB_BASE/api/market-data/backfill" -H "cookie: $COOKIE" \
+  -H 'content-type: application/json' \
+  -d '{"instruments":[{"assetClass":"forex","symbol":"EURUSD"}],"timeframes":["1d"],"from":<ms>,"to":<ms>}'
+# {"runId":"...","status":"completed","candlesUpserted":N,...}
+# Start small (one instrument × one timeframe × a short range), confirm the
+# candles against the vendor dashboard, then widen. Never backfill past the
+# retention windows — the API rejects it (see docs/market-data.md).
 ```
 
 A `503` from `/api/health/ready` is meaningful: `database: down` means the
@@ -233,6 +245,7 @@ disagree. The failing `schema` block is included in the response.
 | Variable | Required | Production value |
 |---|---|---|
 | `DATABASE_URL` | **yes** | managed Postgres connection string (secret) |
+| `TWELVE_DATA_API_KEY` | for market data | Twelve Data API key (secret, `sync: false` in `render.yaml`). Without it the API boots but market routes answer 502. Production display requires a Business (Venture+) plan — see [provider-licensing.md](./provider-licensing.md) |
 | `NODE_ENV` | yes (set by blueprint) | `production` |
 | `PORT` / `HOST` | recommended | `4000` / `0.0.0.0` (Render injects `PORT`; the blueprint pins both) |
 | `DATABASE_SSL_MODE` | recommended | `require` (or `verify-full` + `NODE_EXTRA_CA_CERTS`) |

@@ -1,13 +1,13 @@
 # VeltrixEye
 
-> **Milestone M1 — Product Foundation & Architecture**
+> **Milestones M1 + M2 — Foundation & Historical Market Data**
 > A general-purpose SaaS platform where traders define **their own** deterministic trading strategies, scan markets against them, and receive explained, scored alerts.
 
 ## Status
 
-This repository currently contains **M1 only**: application foundation, domain model, database schema with migrations, authentication, strategy versioning, market/instrument abstractions, provider abstraction interfaces, security baseline, UI shell, tests, and documentation.
+This repository currently contains **M1 + M2**: application foundation, domain model, database schema with migrations, authentication, strategy versioning, market/instrument abstractions, security baseline, UI shell — plus the first real market-data provider (Twelve Data, historical), a global shared candle store with fetch-through reads and audited backfills, retention enforcement, a coverage ledger, and the Markets UI.
 
-**Not yet implemented** (by design, later milestones): market-data ingestion, technical-analysis/structure detection, live scanner, backtesting, alert delivery, billing. See [docs/milestones.md](docs/milestones.md).
+**Not yet implemented** (by design, later milestones): strategy evaluation engine, technical-analysis/structure detection, live scanner, backtesting, alert delivery, billing. See [docs/milestones.md](docs/milestones.md).
 
 ## Stack
 
@@ -25,11 +25,13 @@ This repository currently contains **M1 only**: application foundation, domain m
 ```
 packages/contracts   Shared types + Zod schemas (used by API and Web)
 packages/core        Server-side domain: DB access, migrations, auth, strategy services,
-                     provider/scoring abstractions (no HTTP)
+                     ingestion + candle store (no HTTP)
+packages/providers/twelve-data   First market-data provider (historical OHLCV)
 apps/api             Fastify HTTP layer (routes, validation, sessions, rate limits)
-apps/web             Next.js UI shell (auth, dashboard, strategies, settings)
+apps/web             Next.js UI (auth, dashboard, strategies, markets, settings)
 scripts/             Dev/test database bootstrap, setup, migration CLI
-docs/                Architecture, domain model, strategy model, security, environment
+docs/                Architecture, domain model, strategy model, market data,
+                     provider licensing, security, environment
 ```
 
 ## Quickstart (development)

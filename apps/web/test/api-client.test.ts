@@ -16,7 +16,7 @@
  */
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 
 interface RecordedCall {
   url: string;
@@ -87,4 +87,87 @@ test('api.register() — body-bearing POST still sends Content-Type: application
   assert.equal(call.init?.method, 'POST');
   assert.equal(contentTypeOf(call), 'application/json', 'JSON content-type preserved for bodies');
   assert.deepEqual(JSON.parse(String(call.init?.body)), { email: 'trader@example.com', password: 'hunter22' });
+});
+
+// ---------------------------------------------------------------------------
+// M2 market-data client: request shapes + error surfacing
+// ---------------------------------------------------------------------------
+
+test('api.listProviders() — GET /api/market-data/providers, body-less', async () => {
+  await api.listProviders();
+  assert.equal(calls.length, 1, 'exactly one fetch call');
+  const call = calls[0];
+  assert.ok(call, 'fetch was called');
+  assert.equal(call.url, '/api/market-data/providers');
+  assert.equal(call.init?.body, undefined, 'no body');
+  assert.equal(contentTypeOf(call), null, 'must not declare an empty JSON body');
+});
+
+test('api.listInstruments() — GET /api/markets/instruments, body-less', async () => {
+  await api.listInstruments();
+  const call = calls[0];
+  assert.ok(call, 'fetch was called');
+  assert.equal(call.url, '/api/markets/instruments');
+  assert.equal(call.init?.body, undefined, 'no body');
+  assert.equal(contentTypeOf(call), null);
+});
+
+test('api.getCandles() — GET with encoded query params, limit optional', async () => {
+  await api.getCandles({ assetClass: 'forex', symbol: 'EURUSD', timeframe: '1d', from: '1000', to: '2000', limit: '100' });
+  const call = calls[0];
+  assert.ok(call, 'fetch was called');
+  assert.equal(
+    call.url,
+    '/api/market-data/candles?assetClass=forex&symbol=EURUSD&timeframe=1d&from=1000&to=2000&limit=100',
+  );
+  assert.equal(call.init?.body, undefined, 'no body');
+  assert.equal(contentTypeOf(call), null);
+
+  calls = [];
+  await api.getCandles({ assetClass: 'forex', symbol: 'EURUSD', timeframe: '1d', from: '1000', to: '2000' });
+  assert.ok(!calls[0]!.url.includes('limit='), 'limit omitted when not passed');
+});
+
+test('api.getCoverage() — GET /api/market-data/coverage, body-less', async () => {
+  await api.getCoverage();
+  const call = calls[0];
+  assert.ok(call, 'fetch was called');
+  assert.equal(call.url, '/api/market-data/coverage');
+  assert.equal(call.init?.body, undefined, 'no body');
+  assert.equal(contentTypeOf(call), null);
+});
+
+test('api.backfill() — POST JSON body + Content-Type', async () => {
+  const input = {
+    instruments: [{ assetClass: 'forex', symbol: 'EURUSD' }],
+    timeframes: ['1d'],
+    from: 1000,
+    to: 2000,
+  } as const;
+  await api.backfill({ instruments: [...input.instruments], timeframes: [...input.timeframes], from: input.from, to: input.to });
+  assert.equal(calls.length, 1, 'exactly one fetch call');
+  const call = calls[0];
+  assert.ok(call, 'fetch was called');
+  assert.equal(call.url, '/api/market-data/backfill');
+  assert.equal(call.init?.method, 'POST');
+  assert.equal(contentTypeOf(call), 'application/json');
+  assert.deepEqual(JSON.parse(String(call.init?.body)), input);
+});
+
+test('market-data failures surface as ApiError with code/status/message', async () => {
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ error: { code: 'provider_unavailable', message: 'upstream down' } }), {
+      status: 502,
+      headers: { 'content-type': 'application/json' },
+    })) as typeof globalThis.fetch;
+  await assert.rejects(
+    () => api.getCandles({ assetClass: 'forex', symbol: 'EURUSD', timeframe: '1d', from: '1000', to: '2000' }),
+    (e: unknown) => {
+      assert.ok(e instanceof ApiError, 'rejects with ApiError');
+      assert.equal(e.code, 'provider_unavailable');
+      assert.equal(e.status, 502);
+      assert.equal(e.message, 'upstream down');
+      return true;
+    },
+  );
 });

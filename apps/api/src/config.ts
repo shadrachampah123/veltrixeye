@@ -35,10 +35,11 @@ export function loadDotEnv(): void {
 /**
  * Environment configuration (fail-fast at boot).
  *
- * Secrets policy: the ONLY secret this service needs is the DATABASE_URL
- * credentials (the database account itself). Session tokens are server-side
- * (random per session, stored hashed) — no JWT secret is required.
- * See docs/environment.md and docs/security.md.
+ * Secrets policy: this service needs two secrets — the DATABASE_URL
+ * credentials (the database account itself) and the market-data provider key
+ * (TWELVE_DATA_API_KEY; server-side only, never sent to browsers).
+ * Session tokens are server-side (random per session, stored hashed) — no
+ * JWT secret is required. See docs/environment.md and docs/security.md.
  */
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -64,6 +65,22 @@ const envSchema = z.object({
   SESSION_TTL_DAYS: z.coerce.number().int().positive().max(90).default(30),
   /** fastify log level. */
   LOG_LEVEL: z.string().min(1).default('info'),
+  /**
+   * Twelve Data API key (M2 primary provider). Empty = no market data: the
+   * API boots and market routes answer 502. Server-side only — the vendor
+   * takes it in query strings, so it must never reach logs or browsers.
+   * Production user-facing display requires a Business (Venture+) plan —
+   * see docs/provider-licensing.md.
+   */
+  TWELVE_DATA_API_KEY: z.string().max(128).default(''),
+  /** Provider REST base (override for tests only). */
+  TWELVE_DATA_BASE_URL: z.string().url().default('https://api.twelvedata.com'),
+  /** Per-request upstream timeout. */
+  TWELVE_DATA_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120000).default(15000),
+  /** Client-side upstream cap — keep under the plan's credits/min. */
+  TWELVE_DATA_MAX_RPM: z.coerce.number().int().min(1).max(10000).default(50),
+  /** Pinned crypto venue (defines the stored series — don't change casually). */
+  TWELVE_DATA_CRYPTO_EXCHANGE: z.string().min(1).max(32).default('Binance'),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

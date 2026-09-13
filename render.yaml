@@ -26,9 +26,15 @@ services:
         value: 0.0.0.0
       - key: PORT
         value: '4000'
-      # The only secret the service needs. Paste the managed Postgres
-      # connection string (Neon / Supabase / Render / RDS …) in the dashboard.
+      # Secret 1 of 2. Paste the managed Postgres connection string
+      # (Neon / Supabase / Render / RDS …) in the dashboard.
       - key: DATABASE_URL
+        sync: false
+      # Secret 2 of 2 (M2 market data). Paste the Twelve Data API key in the
+      # dashboard. Production user-facing display requires a Business
+      # (Venture+) plan — see docs/provider-licensing.md. Without a key the
+      # API still boots; market-data routes answer 502.
+      - key: TWELVE_DATA_API_KEY
         sync: false
       # Managed Postgres over TLS. Use `verify-full` (plus NODE_EXTRA_CA_CERTS
       # pointing at the provider's CA) where the provider publishes one.

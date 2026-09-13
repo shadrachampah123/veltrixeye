@@ -97,9 +97,9 @@ export interface ProviderCapabilities {
  * - getMarketStatus(): open/closed state for an instrument
  */
 export interface MarketDataProvider {
-  /** Stable machine id, e.g. "provider-example". Never change once released. */
+  /** Stable machine id, e.g. "twelve-data". Never change once released. */
   readonly id: string;
-  /** Human-readable name, e.g. "Example Data". */
+  /** Human-readable name, e.g. "Twelve Data". */
   readonly name: string;
   readonly capabilities: ProviderCapabilities;
   getSymbols(query?: SymbolQuery): Promise<NormalizedInstrument[]>;
@@ -107,4 +107,32 @@ export interface MarketDataProvider {
   subscribeRealtime(subscription: RealtimeSubscription): RealtimeCandleStream;
   getTradingSessions(instrument: NormalizedInstrument): Promise<TradingSession[]>;
   getMarketStatus(instrument: NormalizedInstrument): Promise<MarketStatus>;
+}
+
+/**
+ * Provider-agnostic failure thrown by MarketDataProvider implementations.
+ * The message is user-safe (no API keys, URLs, or vendor internals); detail
+ * for operators goes to `cause`. Core maps `kind` to domain errors:
+ *
+ *  - rate_limited   → 429 rate_limited (caller should back off + retry)
+ *  - invalid_request → 400 invalid_input (bad symbol/range the caller sent)
+ *  - not_found      → 404 not_found (unknown instrument at the provider)
+ *  - unavailable | unauthorized → 502 provider_unavailable (upstream or
+ *    server-side credential problem; `unauthorized` additionally means the
+ *    operator must check the provider API key)
+ */
+export type ProviderFailureKind = 'unavailable' | 'rate_limited' | 'invalid_request' | 'not_found' | 'unauthorized';
+
+export class ProviderError extends Error {
+  readonly kind: ProviderFailureKind;
+
+  constructor(kind: ProviderFailureKind, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'ProviderError';
+    this.kind = kind;
+  }
+}
+
+export function isProviderError(err: unknown): err is ProviderError {
+  return err instanceof ProviderError;
 }

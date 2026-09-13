@@ -23,6 +23,7 @@
     "@fastify/rate-limit": "^10.2.1",
     "@veltrixeye/contracts": "*",
     "@veltrixeye/core": "*",
+    "@veltrixeye/provider-twelve-data": "*",
     "fastify": "^5.2.1",
     "pg": "^8.13.1",
     "tsx": "^4.19.0",

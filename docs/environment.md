@@ -27,13 +27,18 @@ git-ignored and never contain values you would commit.
 | `NODE_ENV` | `development` \| `test` \| `production` | `development` | switches prod behavior (e.g. Secure cookies). |
 | `PORT` | int 1–65535 | `4000` | API listen port. |
 | `HOST` | string | `0.0.0.0` | API bind address. |
-| `DATABASE_URL` | connection string | **required** | the only secret the service needs. |
+| `DATABASE_URL` | connection string | **required** | secret 1 of 2 (with `TWELVE_DATA_API_KEY`). |
 | `DATABASE_SSL_MODE` | `disable` \| `require` \| `verify-full` | `disable` | production should use `verify-full`. |
 | `DATABASE_POOL_MAX` | int 1–50 | `10` | pool size. |
 | `SESSION_COOKIE_NAME` | string 3–64 | `ve_session` | renaming forces re-login. |
 | `COOKIE_SECURE` | `auto` \| `always` \| `never` | `auto` | `auto` = Secure only in production. |
 | `SESSION_TTL_DAYS` | int 1–90 | `30` | session lifetime. |
 | `LOG_LEVEL` | string | `info` | fastify log level. |
+| `TWELVE_DATA_API_KEY` | secret, ≤128 chars | *(empty = no market data)* | M2 primary provider key. **Server-side only** — never in the repo, image, or browser. Unset: API boots, market routes answer 502. Production display requires a Business (Venture+) plan — see [provider-licensing.md](./provider-licensing.md). |
+| `TWELVE_DATA_BASE_URL` | URL | `https://api.twelvedata.com` | Provider REST base (override for tests only). |
+| `TWELVE_DATA_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-request upstream timeout. |
+| `TWELVE_DATA_MAX_RPM` | int 1–10000 | `50` | Client-side upstream cap (keep under plan credits/min). |
+| `TWELVE_DATA_CRYPTO_EXCHANGE` | string 1–32 | `Binance` | Pinned crypto venue (defines the stored series — don't change casually). |
 
 ## Web variables (`apps/web`)
 
@@ -73,8 +78,10 @@ See [deployment.md](./deployment.md) for the full production runbook.
 
 ## Secrets policy
 
-- The **only** secret this service needs is the `DATABASE_URL`
-  credentials. Session tokens are server-side (random per session, stored
+- The service needs **two** secrets: the `DATABASE_URL` credentials and
+  the `TWELVE_DATA_API_KEY` provider key (server-side only — it travels in
+  upstream query strings by vendor design, so it must never reach logs or
+  browsers). Session tokens are server-side (random per session, stored
   hashed) — no JWT secret is required.
 - **No secrets in source control, none in the frontend.** Never commit
   `.env` / `.env.local`.
