@@ -32,7 +32,11 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     credentials: 'same-origin',
     headers: {
-      'Content-Type': 'application/json',
+      // Only declare a JSON body when we actually send one: Fastify rejects
+      // an empty body with `Content-Type: application/json` (400,
+      // FST_ERR_CTP_EMPTY_JSON_BODY), which silently broke the body-less
+      // logout and session-revoke calls. See test/api-client.test.ts.
+      ...(init.body != null ? { 'Content-Type': 'application/json' } : {}),
       ...(init.headers ?? {}),
     },
   });

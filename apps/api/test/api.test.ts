@@ -249,6 +249,66 @@ describe('auth', () => {
     void email;
   });
 
+  // Regression: the web client (apps/web/lib/api.ts) sends body-less calls
+  // with NO content-type header — the exact shape production requests take.
+  // The browser must receive an explicit cookie clear, otherwise a "signed
+  // out" user still presents a live session and /login bounces to /dashboard.
+  test('logout (web-client shape: body-less, no content-type) revokes + clears the cookie', async () => {
+    const { cookie } = await registerUser();
+    const out = await app.inject({
+      method: 'POST',
+      url: '/api/auth/logout',
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(out.statusCode, 200, out.body);
+    const setCookieRaw = out.headers['set-cookie'];
+    const setCookie = Array.isArray(setCookieRaw) ? setCookieRaw.join('; ') : String(setCookieRaw ?? '');
+    assert.ok(/ve_session=;/.test(setCookie), `clearing set-cookie present (got: ${setCookie})`);
+    assert.ok(/max-age=0/i.test(setCookie), 'cleared cookie expires immediately');
+    const me = await app.inject({
+      method: 'GET',
+      url: '/api/users/me',
+      headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(me.statusCode, 401);
+  });
+
+  // Regression: the Settings "Revoke" button issues a body-less DELETE in the
+  // same client shape (this endpoint previously had no test coverage).
+  test('revoke a non-current session via DELETE (web-client shape: no content-type)', async () => {
+    const first = await registerUser();
+    const second = await loginUser(first.email);
+    assert.equal(second.status, 200);
+
+    const me = await app.inject({
+      method: 'GET',
+      url: '/api/users/me',
+      headers: { cookie: second.cookie, 'x-forwarded-for': freshIp() },
+    });
+    const sessions = me.json().sessions as { id: string; current: boolean }[];
+    assert.equal(sessions.length, 2);
+    const other = sessions.find((s) => !s.current);
+    assert.ok(other, 'a non-current session is listed');
+
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/api/users/me/sessions/${other.id}`,
+      headers: { cookie: second.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    assert.ok(!res.headers['set-cookie'], 'no set-cookie when a non-current session is revoked');
+
+    const after = await app.inject({
+      method: 'GET',
+      url: '/api/users/me',
+      headers: { cookie: second.cookie, 'x-forwarded-for': freshIp() },
+    });
+    const remaining = after.json().sessions as { id: string; current: boolean }[];
+    assert.equal(remaining.length, 1, 'only the current session remains');
+    assert.equal(remaining[0]?.current, true, 'the current session survived');
+    void first.cookie;
+  });
+
   test('password change rotates sessions', async () => {
     const { cookie, email } = await registerUser();
     const res = await app.inject({
