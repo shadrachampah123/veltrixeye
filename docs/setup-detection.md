@@ -18,13 +18,15 @@ market candles → M3 strategy evaluation → M4 detected setup + lifecycle
   is repeated, including under concurrent requests.
 - Transitions setups through an explicit state machine, one event per
   transition, fully atomic.
-- Leaves scoring entirely to M5: `setup_scores` is never written and
-  `quality_score` stays NULL.
+- Leaves scoring entirely to M5: detection never writes `setup_scores`
+  and never sets `quality_score` (M5's scoring service owns both — see
+  [setup-scoring.md](./setup-scoring.md)).
 
 ## What M4 does NOT do
 
-No quality scoring (M5), no alerts (M6), no backtester, no realtime
-streaming, no scheduler/cron/queue workers, no provider calls, no AI.
+No quality scoring (M5 owns it — [setup-scoring.md](./setup-scoring.md)),
+no alerts (M6), no backtester, no realtime streaming, no
+scheduler/cron/queue workers, no provider calls, no AI.
 
 ## Lifecycle
 
@@ -100,12 +102,14 @@ Pure function: `detectionLevels` in `@veltrixeye/core`.
 
 The detection key `(strategy_version_id, instrument_id, direction,
 as_of_ms)` is a UNIQUE constraint (migration 0009). Repeats fast-path on
-a SELECT; concurrent duplicates serialize on the constraint — the loser
-catches `23505` and re-selects the winner's committed row, so exactly one
-setup and one event exist per key. Transitions take `SELECT … FOR UPDATE`
-inside a transaction: concurrent same-state repeats collapse into one
-transition plus idempotent no-ops, and invalid transitions roll back with
-zero partial writes.
+a SELECT; concurrent duplicates serialize on the constraint via
+`INSERT … ON CONFLICT DO NOTHING` — exactly one insert wins and the loser
+commits a no-op and re-selects the winner's committed row (the conflict
+path never aborts the transaction), so exactly one setup and one event
+exist per key. Transitions take `SELECT … FOR UPDATE` inside a
+transaction: concurrent same-state repeats collapse into one transition
+plus idempotent no-ops, and invalid transitions roll back with zero
+partial writes.
 
 ## Setup endpoints
 

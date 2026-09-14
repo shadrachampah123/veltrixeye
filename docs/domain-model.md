@@ -81,11 +81,14 @@ never destructive).
     the 8 lifecycle states), `direction`, `detected_at`, `as_of_ms` (the M3
     anchor; part of the M4 0009 idempotency key with version/instrument/
     direction), `entry_price`, `stop_loss_price`, `tp1/tp2/tp3`,
-    `quality_score` (NULL until M5), `metadata`.
+    `quality_score` (latest M5 score total; NULL until scored), `metadata`.
   - `setup_state_events`: append-only state transitions
     (`from_state`, `to_state`, `reason`).
   - `setup_scores`: append-only quality scores — `total` CHECK 0–100,
-    `grade` CHECK restricted to the known grades, `components` JSONB.
+    `grade` CHECK restricted to the known grades, `components` JSONB,
+    `engine_version`, and `as_of_ms` (the M3 scoring anchor; part of the
+    M5 0010 idempotency key with setup/engine version). See
+    [setup-scoring.md](./setup-scoring.md).
 - Lifecycle states: `developing | watching | almost_ready | confirmed |
   triggered | invalidated | expired | completed`.
 

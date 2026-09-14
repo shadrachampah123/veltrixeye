@@ -16,6 +16,7 @@ import {
   IngestionService,
   EvaluationService,
   SetupService,
+  ScoringService,
   type ProviderRegistry,
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
@@ -36,6 +37,7 @@ export interface AppContext {
   ingestion: IngestionService;
   evaluation: EvaluationService;
   setups: SetupService;
+  scoring: ScoringService;
 }
 
 export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
@@ -59,6 +61,10 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     // M4: consumes the M3 evaluation service; writes setups + state events,
     // never scores, never providers.
     setups: new SetupService(pool, evaluation, candles),
+    // M5: consumes the M3 evaluation service to rebuild the scoring context;
+    // writes append-only setup_scores + refreshes setups.quality_score,
+    // never transitions setups, never providers.
+    scoring: new ScoringService(pool, strategies, evaluation),
   };
 }
 

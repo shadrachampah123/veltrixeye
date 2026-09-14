@@ -90,3 +90,14 @@ export { detectionLevels, mirrorPrice, type DetectionLevels } from './setups/lev
 
 // Scoring (foundation re-exports)
 export { qualityGrade, QUALITY_GRADE_BANDS } from '@veltrixeye/contracts';
+
+// Deterministic setup quality scoring (M5)
+export { ScoringService } from './scoring/service.js';
+export {
+  createQualityScoringEngine,
+  scoreSetupQuality,
+  parseScoringContext,
+  M5_COMPONENT_WEIGHTS,
+  M5_FAILING_DIRECTION_CAP,
+  type M5ComponentName,
+} from './scoring/engine.js';
