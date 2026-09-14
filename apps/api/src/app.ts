@@ -15,6 +15,7 @@ import {
   CandleStore,
   IngestionService,
   EvaluationService,
+  SetupService,
   type ProviderRegistry,
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
@@ -22,6 +23,7 @@ import { authRoutes } from './routes/auth.js';
 import { userRoutes } from './routes/users.js';
 import { strategyRoutes } from './routes/strategies.js';
 import { marketDataRoutes } from './routes/market-data.js';
+import { setupRoutes } from './routes/setups.js';
 
 export interface AppContext {
   pool: pg.Pool;
@@ -33,6 +35,7 @@ export interface AppContext {
   candles: CandleStore;
   ingestion: IngestionService;
   evaluation: EvaluationService;
+  setups: SetupService;
 }
 
 export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
@@ -40,6 +43,9 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   const providerRegistry = createProviderRegistry();
   const candles = new CandleStore(pool);
   const strategies = new StrategyService(pool, audit);
+  // M3: reads the shared candle store ONLY (never the ingestion fetch-through),
+  // so evaluation never triggers a provider call.
+  const evaluation = new EvaluationService(pool, strategies, candles);
   return {
     pool,
     users: new UserService(pool),
@@ -49,9 +55,10 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     providerRegistry,
     candles,
     ingestion: new IngestionService(pool, providerRegistry, candles),
-    // M3: reads the shared candle store ONLY (never the ingestion fetch-through),
-    // so evaluation never triggers a provider call.
-    evaluation: new EvaluationService(pool, strategies, candles),
+    evaluation,
+    // M4: consumes the M3 evaluation service; writes setups + state events,
+    // never scores, never providers.
+    setups: new SetupService(pool, evaluation, candles),
   };
 }
 
@@ -145,6 +152,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await userRoutes(app, ctx, config);
   await strategyRoutes(app, ctx, config);
   await marketDataRoutes(app, ctx, config);
+  await setupRoutes(app, ctx, config);
 
   return app;
 }

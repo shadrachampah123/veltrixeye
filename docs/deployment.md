@@ -267,7 +267,7 @@ The web app's only deployment variable is `API_INTERNAL_BASE` (Step 4).
 | Authentication | `apps/api/src/routes/auth.ts` | argon2id hashes, generic 401s, timing parity on unknown users |
 | Sessions | `apps/api/src/session-auth.ts` | server-side hashed session tokens; `HttpOnly`, `SameSite=Strict`, `Secure` cookie (HTTPS + `NODE_ENV=production`); token is never sent to a different origin (same-origin proxy only) |
 | Owner isolation | `packages/core/src/strategies/*` | every query is scoped to the acting user; other users' resources return 404 |
-| Rate limiting | `apps/api/src/app.ts`, `routes/auth.ts` | 300/min global, 10/min login, 5/h register — per instance (see below) |
+| Rate limiting | `apps/api/src/app.ts`, route modules | 300/min global, 10/min login, 5/h register, 20/min evaluate, 20/min detect, 60/min setup transitions — per instance (see below) |
 | Client IP attribution | `apps/api/src/trust-proxy.ts`, `config.ts` | `req.ip` — the rate-limit key and the IP in `audit_events` / `sessions` — is resolved through Render's Cloudflare-fronted chain, so `X-Forwarded-For` is never caller-controlled (see below) |
 | Audit logging | `packages/core/src/audit.ts` | register/login/failure/logout/password-change/strategy actions recorded in `audit_events` |
 | Security headers | Fastify helmet | CSP deny-all, `nosniff`, `X-Frame-Options: DENY`, HSTS in production, no CORS headers, `X-Powered-By` hidden |

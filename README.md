@@ -1,13 +1,13 @@
 # VeltrixEye
 
-> **Milestones M1 + M2 — Foundation & Historical Market Data**
+> **Milestones M1-M4 — Foundation, Market Data, Evaluation & Setup Detection**
 > A general-purpose SaaS platform where traders define **their own** deterministic trading strategies, scan markets against them, and receive explained, scored alerts.
 
 ## Status
 
-This repository currently contains **M1 + M2**: application foundation, domain model, database schema with migrations, authentication, strategy versioning, market/instrument abstractions, security baseline, UI shell — plus the first real market-data provider (Twelve Data, historical), a global shared candle store with fetch-through reads and audited backfills, retention enforcement, a coverage ledger, and the Markets UI.
+This repository currently contains **M1–M4**: application foundation, domain model, database schema with migrations, authentication, strategy versioning, market/instrument abstractions, security baseline, UI shell — plus the first real market-data provider (Twelve Data, historical), a global shared candle store with fetch-through reads and audited backfills, retention enforcement, a coverage ledger, the Markets UI, the deterministic strategy-evaluation engine (M3), and the setup-detection + lifecycle layer (M4).
 
-**Not yet implemented** (by design, later milestones): strategy evaluation engine, technical-analysis/structure detection, live scanner, backtesting, alert delivery, billing. See [docs/milestones.md](docs/milestones.md).
+**Not yet implemented** (by design, later milestones): quality scoring, alert delivery, backtesting, live scanner, billing. See [docs/milestones.md](docs/milestones.md).
 
 ## Stack
 

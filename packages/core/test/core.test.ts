@@ -583,8 +583,8 @@ describe('setup lifecycle (foundation schema)', () => {
     const instrumentId = first(inst.rows, 'seeded instrument').id;
 
     const setup = await pool.query<{ id: string }>(
-      `INSERT INTO setups (strategy_version_id, instrument_id, state, direction, detected_at)
-       VALUES ($1, $2, 'developing', 'long', now()) RETURNING id`,
+      `INSERT INTO setups (strategy_version_id, instrument_id, state, direction, detected_at, as_of_ms)
+       VALUES ($1, $2, 'developing', 'long', now(), 1_700_000_000_000) RETURNING id`,
       [v1.id, instrumentId],
     );
     const setupId = first(setup.rows, 'setup').id;
@@ -606,7 +606,7 @@ describe('setup lifecycle (foundation schema)', () => {
       "SELECT id FROM instruments WHERE asset_class = 'forex' AND symbol = 'EURUSD'",
     );
     const setup = await pool.query<{ id: string }>(
-      `INSERT INTO setups (strategy_version_id, instrument_id, direction, detected_at) VALUES ($1, $2, 'short', now()) RETURNING id`,
+      `INSERT INTO setups (strategy_version_id, instrument_id, direction, detected_at, as_of_ms) VALUES ($1, $2, 'short', now(), 1_700_000_001_000) RETURNING id`,
       [v1.id, first(inst.rows, 'seeded instrument').id],
     );
     const setupId = first(setup.rows, 'setup').id;
@@ -631,7 +631,7 @@ describe('setup lifecycle (foundation schema)', () => {
       "SELECT id FROM instruments WHERE asset_class = 'forex' AND symbol = 'EURUSD'",
     );
     const setup = await pool.query<{ id: string }>(
-      `INSERT INTO setups (strategy_version_id, instrument_id, direction, detected_at) VALUES ($1, $2, 'long', now()) RETURNING id`,
+      `INSERT INTO setups (strategy_version_id, instrument_id, direction, detected_at, as_of_ms) VALUES ($1, $2, 'long', now(), 1_700_000_002_000) RETURNING id`,
       [v1.id, first(inst.rows, 'seeded instrument').id],
     );
     const setupId = first(setup.rows, 'setup').id;

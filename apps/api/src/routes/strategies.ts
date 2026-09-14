@@ -4,6 +4,7 @@ import {
   strategyUpdateSchema,
   strategyVersionCreateSchema,
   strategyVersionUpdateSchema,
+  detectionRequestSchema,
   evaluationRequestSchema,
   TIMEFRAMES,
   TIMEFRAME_ROLES,
@@ -226,6 +227,59 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
           truncated: result.truncated,
           asOfMs: result.asOfMs,
           anyPassed: result.instruments.some((i) => i.anyPassed),
+        },
+      });
+      return result;
+    },
+  );
+
+  /**
+   * Setup detection from a PUBLISHED version (M4).
+   *
+   * Consumes the M3 evaluation for one instrument at an explicit anchor and
+   * persists a setup per qualifying direction. Idempotent per
+   * (version, instrument, direction, asOfMs): repeats return the existing
+   * setup and write nothing. Never scores, never touches a provider.
+   * `asOf` is REQUIRED — M4 performs no wall-clock read.
+   */
+  app.post(
+    '/api/strategies/:strategyId/versions/:versionId/detect',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const { strategyId, versionId } = req.params as { strategyId: string; versionId: string };
+      if (!isUuid(strategyId) || !isUuid(versionId)) throw Errors.notFound('Version not found');
+      const parsed = detectionRequestSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendZodError(reply, parsed.error, 'body');
+        return;
+      }
+      const result = await ctx.setups.detect({
+        userId: user.id,
+        strategyId,
+        versionId,
+        assetClass: parsed.data.instrument.assetClass,
+        symbol: parsed.data.instrument.symbol,
+        direction: parsed.data.direction,
+        asOf: parsed.data.asOf,
+      });
+      await ctx.audit.log({
+        userId: user.id,
+        action: 'setup.detected',
+        entityType: 'strategy_version',
+        entityId: versionId,
+        ip: req.ip,
+        userAgent: req.headers['user-agent'] ?? null,
+        metadata: {
+          strategyId,
+          versionNumber: result.versionNumber,
+          assetClass: result.instrument.assetClass,
+          symbol: result.instrument.symbol,
+          asOfMs: result.asOfMs,
+          qualified: result.detections.filter((d) => d.qualified).map((d) => d.direction),
+          created: result.detections.filter((d) => d.created).map((d) => d.direction),
         },
       });
       return result;

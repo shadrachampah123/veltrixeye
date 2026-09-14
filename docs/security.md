@@ -60,9 +60,14 @@ remaining items are listed at the bottom.
 - Global: 300 req/min per IP.
 - `POST /api/auth/login`: **10/min per IP** (brute-force).
 - `POST /api/auth/register`: **5/hour per IP** (account spam).
-- All three are per-IP limits configured in `apps/api/src/app.ts` (global)
-  and `apps/api/src/routes/auth.ts` (per-route overrides), and each is
-  covered by a test in `apps/api/test/api.test.ts`.
+- `GET /api/market-data/candles`: **60/min per IP**.
+- `POST /api/market-data/backfill`: **5/min per IP**.
+- `POST …/versions/:versionId/evaluate`: **20/min per IP** (M3).
+- `POST …/versions/:versionId/detect`: **20/min per IP** (M4).
+- `POST /api/setups/:setupId/transitions`: **60/min per IP** (M4).
+- All are per-IP limits configured in `apps/api/src/app.ts` (global) and
+  the route modules (per-route overrides); the auth, evaluate, and detect
+  limits each have a dedicated 429 regression test.
 - 429 responses carry a structured body
   (`{error:{code:'rate_limited', message:'... Try again in Ns.'}}`).
 - **"Per IP" means an IP the caller cannot choose** — see the next section.
