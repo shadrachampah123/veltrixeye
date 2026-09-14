@@ -24,6 +24,50 @@ export { AuditService, readAuditEvents, type AuditEntry } from './audit.js';
 export { StrategyService } from './strategies/strategies.js';
 export { validatePublishable, type PublishValidationResult } from './strategies/validation.js';
 
+// Deterministic strategy evaluation (M3)
+export {
+  EvaluationService,
+  requiredWindows,
+} from './strategies/evaluation/service.js';
+export {
+  createEvaluationEngine,
+  deriveCandidate,
+} from './strategies/evaluation/engine.js';
+export {
+  CONDITION_HANDLERS,
+  parseParams,
+  type ConditionHandler,
+  type HandlerContext,
+  type HandlerResult,
+} from './strategies/evaluation/handlers.js';
+export {
+  atrWilder,
+  bufferToPrice,
+  candleAnatomy,
+  countTouches,
+  findFvg,
+  findOrderBlock,
+  findPivots,
+  hourInSession,
+  isDisplacement,
+  isEngulfing,
+  lastPivotHighAbove,
+  lastPivotLowBelow,
+  levelTolerance,
+  pipSizeFor,
+  sma,
+  structuralTarget,
+  structureBias,
+  timeInSession,
+  SESSION_WINDOWS_UTC,
+  LEVEL_TOLERANCE_PCT,
+  PIVOT_HALF_WIDTH,
+  type Candle as EvaluationCandle,
+  type CandleAnatomy,
+  type Pivot,
+  type Zone,
+} from './strategies/evaluation/indicators.js';
+
 // Market data / provider abstraction
 export {
   createProviderRegistry,

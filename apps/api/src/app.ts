@@ -14,6 +14,7 @@ import {
   createProviderRegistry,
   CandleStore,
   IngestionService,
+  EvaluationService,
   type ProviderRegistry,
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
@@ -31,21 +32,26 @@ export interface AppContext {
   providerRegistry: ProviderRegistry;
   candles: CandleStore;
   ingestion: IngestionService;
+  evaluation: EvaluationService;
 }
 
 export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   const audit = new AuditService(pool);
   const providerRegistry = createProviderRegistry();
   const candles = new CandleStore(pool);
+  const strategies = new StrategyService(pool, audit);
   return {
     pool,
     users: new UserService(pool),
     sessions: new SessionService(pool, config.SESSION_TTL_DAYS),
-    strategies: new StrategyService(pool, audit),
+    strategies,
     audit,
     providerRegistry,
     candles,
     ingestion: new IngestionService(pool, providerRegistry, candles),
+    // M3: reads the shared candle store ONLY (never the ingestion fetch-through),
+    // so evaluation never triggers a provider call.
+    evaluation: new EvaluationService(pool, strategies, candles),
   };
 }
 
