@@ -17,6 +17,8 @@ never destructive).
 0005_rules_and_conditions.sql    strategy_rule_groups, strategy_conditions
 0006_setups_lifecycle.sql        setups, setup_state_events, setup_scores
 0007_version_immutability.sql    trigger-based immutability guards
+0008_market_candles.sql          candles, ingestion_runs
+0009_setup_detection_keys.sql    setups.as_of_ms + detection idempotency key
 ```
 
 ## Entities
@@ -73,11 +75,13 @@ never destructive).
   snapshot. See [strategy-model.md](./strategy-model.md).
 
 ### setups / setup_state_events / setup_scores
-- Foundation for the engine's output (no engine in M1):
+- The engine's persisted output (schema in M1, written from M4):
   - `setups`: a detected setup instance — `strategy_version_id` (FK, the
     traceability anchor), `instrument_id`, `state` (CHECK-constrained to
-    the 8 lifecycle states), `direction`, `detected_at`, `entry_price`,
-    `stop_loss`, `tp1/tp2/tp3`, `invalidated_at`, `completed_at`.
+    the 8 lifecycle states), `direction`, `detected_at`, `as_of_ms` (the M3
+    anchor; part of the M4 0009 idempotency key with version/instrument/
+    direction), `entry_price`, `stop_loss_price`, `tp1/tp2/tp3`,
+    `quality_score` (NULL until M5), `metadata`.
   - `setup_state_events`: append-only state transitions
     (`from_state`, `to_state`, `reason`).
   - `setup_scores`: append-only quality scores — `total` CHECK 0–100,

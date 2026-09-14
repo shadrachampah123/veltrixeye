@@ -7,6 +7,7 @@ export * from './market-data.js';
 export * from './ingestion.js';
 export * from './strategies.js';
 export * from './evaluation.js';
+export * from './detection.js';
 export * from './auth.js';
 export * from './users.js';
 export * from './errors.js';

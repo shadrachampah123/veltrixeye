@@ -131,7 +131,8 @@ errors. Same version + same store + same `asOf` → byte-identical response.
 
 ## What M3 does NOT provide (the M4 boundary)
 
-No setup detection or persistence, no setup-lifecycle transitions, no
-quality scoring, no scheduler/cron or live scanner, no realtime streaming,
-no alert delivery, no backtester, and no provider fetch-through. The M3
-result DTO is deliberately shaped so M4 can consume it additively.
+M4 consumes this exact result DTO additively: setup detection, persistence
+and lifecycle transitions shipped in M4 (see
+[setup-detection.md](./setup-detection.md)). Still out of scope: quality
+scoring (M5), alert delivery (M6), backtester, scheduler/cron and live
+scanners, realtime streaming, and provider fetch-through.

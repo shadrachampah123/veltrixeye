@@ -1,10 +1,11 @@
 # Milestone Boundaries
 
-This repository currently contains **Milestones M1 + M2 + M3**. The
+This repository currently contains **Milestones M1 + M2 + M3 + M4**. The
 boundaries below are deliberate and enforced: M1 shipped foundations and
-contracts; M2 added real historical market data; M3 adds deterministic
-strategy evaluation — and nothing that persists setups, scores, schedules,
-streams, backtests, or delivers alerts.
+contracts; M2 added real historical market data; M3 added deterministic
+strategy evaluation; M4 adds deterministic setup detection and lifecycle
+management — and nothing that scores, backtests, schedules, streams, or
+delivers alerts.
 
 ## M1 — delivered (Product Foundation & Architecture)
 
@@ -121,10 +122,52 @@ streams, backtests, or delivers alerts.
 - **Automated tests** — 253 passing (contracts 27, core 106, provider 33,
   api 77, web 10) plus clean typecheck, lint and production build.
 
-## Explicitly NOT in M1+M2+M3 (by design, deferred)
+## M4 — delivered (Setup Detection)
 
-- Signal / setup **detection**, setup **persistence**, lifecycle
-  transitions and any live **scanner** (M4 consumes the M3 result).
+- **Detection contracts** — `packages/contracts/src/detection.ts`: the
+  eight repo-defined lifecycle states, the explicit transition table, the
+  pinned `detectorVersion` (`m4-setup-detect-1`), detection/transition/list
+  zod schemas, and setup/event/detection response DTOs — exported from
+  the contracts index.
+- **Setup detection service** — `SetupService` consumes the M3
+  `EvaluationService` (never condition logic of its own): ownership
+  masking, published-only (deprecated detects, matching M3), and
+  store-only reads are all inherited. Qualifying directions (`passed`)
+  persist exactly one `confirmed` setup plus one `NULL → confirmed` event;
+  anything else writes nothing and returns the M3 failure reasons.
+- **Per-direction levels** — long setups keep the M3 LONG-convention
+  candidate; short setups mirror every leg around the entry (same risk
+  distance, stop above, targets below) via the pure `detectionLevels`
+  function; null/degenerate candidates degrade to nulls, never fabrications.
+- **Explicit state machine** — forward chain plus
+  invalidated/expired exits from every non-terminal state; terminal states
+  absorbing. Every transition validates first, runs under
+  `SELECT … FOR UPDATE` in a transaction, and records exactly one event;
+  invalid transitions roll back with zero partial writes.
+- **Idempotency** — migration 0009 adds `as_of_ms` plus
+  `UNIQUE (strategy_version_id, instrument_id, direction, as_of_ms)`;
+  repeats return the existing setup and concurrent duplicates serialize on
+  the constraint (one setup, one event per key, proven by tests).
+- **Determinism** — `asOf` is required on every detection/transition call;
+  no `Date.now` exists anywhere in the M4 decision path. Same version +
+  instrument + direction + anchor + candles ⇒ same setup.
+- **Setup API** — `POST …/versions/:versionId/detect` (20 req/min,
+  `setup.detected` audit), `GET /api/setups` (owner-scoped filters),
+  `GET /api/setups/:setupId` (setup + lifecycle history), and
+  `POST /api/setups/:setupId/transitions` (60 req/min,
+  `setup.transitioned` audit); foreign/malformed ids are masked 404s.
+- **No scoring, no providers, no scheduler** — `setup_scores` is never
+  written and `quality_score` stays NULL (M5 owns scoring); M4 performs no
+  provider call and detection is explicitly invoked (no cron/workers).
+- **Docs** — [setup-detection.md](./setup-detection.md) specifies the
+  implemented M4 semantics and the M4/M5 boundary.
+- **Automated tests** — 295 passing (contracts 37, core 116, provider 33,
+  api 99, web 10) plus clean typecheck, lint and production build.
+
+## Explicitly NOT in M1+M2+M3+M4 (by design, deferred)
+
+- A live **scanner** (detection stays explicitly invoked), **quality
+  scoring** (M5), and setup **realtime** updates.
 - **Realtime streaming / WebSockets**; session calendar and market-state
   feeds (provider honestly reports gaps).
 - **Backtester**.
@@ -139,14 +182,12 @@ streams, backtests, or delivers alerts.
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M3 (later milestones, outline only)
+## After M4 (later milestones, outline only)
 
-1. Setup detection + persistence + lifecycle transitions, consuming the M3
-   evaluation result (see
-   [strategy-engine-contract.md](./strategy-engine-contract.md)).
-2. A quality-scoring engine over the stored setups.
-3. Backtester, then alert delivery.
+1. A quality-scoring engine over the stored setups (M5).
+2. Alert delivery (M6).
+3. Backtester, then a live scanner on top of the M4 detection service.
 
-Each of these is its own milestone. The M3 engine, result DTO, store, and
-provider abstraction are specifically shaped so each is additive — no
-rewrite of the schema, contracts, or UI is required.
+Each of these is its own milestone. The M3 engine, M4 detector, result DTOs,
+store, and provider abstraction are specifically shaped so each is additive —
+no rewrite of the schema, contracts, or UI is required.

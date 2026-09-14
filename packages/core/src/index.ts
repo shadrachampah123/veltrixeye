@@ -83,5 +83,10 @@ export {
   type CandleReadRequest,
 } from './market-data/ingestion.js';
 
+// Setup detection + lifecycle (M4)
+export { SetupService } from './setups/service.js';
+export { allowedTransitions, assertTransition, isTerminalState } from './setups/machine.js';
+export { detectionLevels, mirrorPrice, type DetectionLevels } from './setups/levels.js';
+
 // Scoring (foundation re-exports)
 export { qualityGrade, QUALITY_GRADE_BANDS } from '@veltrixeye/contracts';
