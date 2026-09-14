@@ -34,11 +34,68 @@ git-ignored and never contain values you would commit.
 | `COOKIE_SECURE` | `auto` \| `always` \| `never` | `auto` | `auto` = Secure only in production. |
 | `SESSION_TTL_DAYS` | int 1–90 | `30` | session lifetime. |
 | `LOG_LEVEL` | string | `info` | fastify log level. |
+| `TRUSTED_PROXY_CIDRS` | comma/space-separated CIDRs, IPs, or `loopback`\|`linklocal`\|`uniquelocal` | Cloudflare edge + Render-internal ranges | **Security boundary**: the only proxies allowed to speak for the client in `X-Forwarded-For`. Decides `req.ip`, which keys every rate limit and is stored in `audit_events.ip` / `sessions.ip`. Replaces (never appends to) the default; a `/0` or malformed entry fails the boot. See [Client IP attribution](#client-ip-attribution-trusted_proxy_cidrs). |
 | `TWELVE_DATA_API_KEY` | secret, ≤128 chars | *(empty = no market data)* | M2 primary provider key. **Server-side only** — never in the repo, image, or browser. Unset: API boots, market routes answer 502. Production display requires a Business (Venture+) plan — see [provider-licensing.md](./provider-licensing.md). |
 | `TWELVE_DATA_BASE_URL` | URL | `https://api.twelvedata.com` | Provider REST base (override for tests only). |
 | `TWELVE_DATA_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-request upstream timeout. |
 | `TWELVE_DATA_MAX_RPM` | int 1–10000 | `50` | Client-side upstream cap (keep under plan credits/min). |
 | `TWELVE_DATA_CRYPTO_EXCHANGE` | string 1–32 | `Binance` | Pinned crypto venue (defines the stored series — don't change casually). |
+
+### Client IP attribution (`TRUSTED_PROXY_CIDRS`)
+
+`req.ip` is not a raw socket value: Fastify walks the `X-Forwarded-For` chain
+from the TCP peer outward and returns the **first address that is not in the
+trusted list**. The list therefore decides who is allowed to claim a client
+address — and `req.ip` is the key for every rate limit (300/min global,
+10/min login, 5/h register, 60/min candles, 5/min backfill) as well as the
+value written to `audit_events.ip` and `sessions.ip`.
+
+The default pins exactly the infrastructure in front of the deployed API:
+
+| Hop | Trusted entries | Why |
+|---|---|---|
+| Render's own network | `loopback`, `linklocal`, `uniquelocal` | the load balancer and internal hops are private/link-local addresses; `loopback` also keeps local dev and tests working |
+| Cloudflare | the 15 published IPv4 + 7 published IPv6 ranges | every Render public web service sits behind Cloudflare, which appends the address it saw |
+
+The full default value (what the schema substitutes when the variable is
+unset), if you need to extend it:
+
+```
+loopback,linklocal,uniquelocal,173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32
+```
+
+Rules and consequences:
+
+- **Setting the variable replaces the default**; it does not append. Copy the
+  value above and add your hop if you need to change it.
+- `0.0.0.0/0`, `::/0`, a malformed address/prefix, an unknown name, or an
+  empty list are **rejected at boot** with
+  `Invalid environment configuration: - TRUSTED_PROXY_CIDRS: …`. Trusting
+  everybody is the vulnerability this variable exists to prevent, so it cannot
+  be expressed.
+- Never set Fastify's `trustProxy` to `true` or a number in code. `true` makes
+  `req.ip` the leftmost (client-chosen) header value; a number does **not**
+  mean "N hops" in Fastify 5 — it fails closed and trusts nothing, which
+  collapses every caller into one bucket. Both are covered by regression tests
+  in `apps/api/test/trust-proxy.test.ts`.
+- **Stale Cloudflare ranges fail closed**: if the list ever lags behind
+  Cloudflare's published ranges, the walk stops at the Cloudflare edge and
+  those callers share a bucket. Symptom to watch: rate-limit 429s that hit
+  many unrelated users at once. Re-fetch
+  <https://www.cloudflare.com/ips-v4> / <https://www.cloudflare.com/ips-v6>
+  and update `apps/api/src/trust-proxy.ts`.
+
+**Known limit — Vercel-proxied traffic.** The web app rewrites `/api/*`
+server-side (`next.config.mjs`), so those requests reach Cloudflare from a
+**Vercel egress** address. Vercel publishes no egress range, so that hop cannot
+be pinned by default: `req.ip` resolves to the Vercel egress address and all
+web-proxied callers share one rate-limit bucket. This is coarser than ideal but
+never attacker-chosen, and it is the reason the API's own origin
+(`*.onrender.com`) is the one that must be spoof-proof. The remedy is
+configuration, not code: enable **Vercel Static IPs** (paid add-on) and add the
+fixed egress addresses to `TRUSTED_PROXY_CIDRS`. Vercel overwrites
+`X-Forwarded-For` rather than appending to it, so once that hop is trusted the
+walk lands on the browser address Vercel vouches for.
 
 ## Web variables (`apps/web`)
 

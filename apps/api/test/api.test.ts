@@ -16,6 +16,7 @@ import {
 } from '@veltrixeye/contracts';
 import { buildApp, createAppContext } from '../src/app.js';
 import { loadConfig, type AppConfig } from '../src/config.js';
+import { DEFAULT_TRUSTED_PROXIES } from '../src/trust-proxy.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -28,13 +29,38 @@ let stopDb: () => Promise<void>;
 let pool: pg.Pool;
 let app: Awaited<ReturnType<typeof buildApp>>;
 let ctx: ReturnType<typeof createAppContext>;
+/** URL of the embedded Postgres the root `before` starts; tests that build an
+ *  extra app need it, because `TEST_ENV` deliberately carries no DATABASE_URL. */
+let dbUrl: string;
 
 const PASSWORD = 'correct-horse-42';
 const uniqueEmail = () => `api_${randomBytes(6).toString('hex')}@example.com`;
 
 /** Every test uses a unique client IP (via X-Forwarded-For + trustProxy) so
- *  per-IP rate limits never leak between tests. */
+ *  per-IP rate limits never leak between tests.
+ *  Still correct with the pinned trust list: `inject` connects from loopback,
+ *  which is a trusted hop, so a single X-Forwarded-For value resolves to that
+ *  value exactly as it did under `trustProxy: true`. */
 const freshIp = () => `10.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}`;
+
+/** Environment every test app in this file is built from. It carries no
+ *  DATABASE_URL: the root `before` supplies the embedded Postgres URL, and
+ *  tests that build an extra app pass `DATABASE_URL: dbUrl`. */
+const TEST_ENV: Record<string, string> = {
+  NODE_ENV: 'test',
+  PORT: '4999',
+  HOST: '127.0.0.1',
+  DATABASE_SSL_MODE: 'disable',
+  SESSION_COOKIE_NAME: 've_session',
+  COOKIE_SECURE: 'never',
+  SESSION_TTL_DAYS: '30',
+  LOG_LEVEL: 'silent',
+};
+
+/** Validated config for a test app, with per-test overrides. */
+function makeConfig(overrides: Record<string, string> = {}): AppConfig {
+  return loadConfig({ ...TEST_ENV, ...overrides } as NodeJS.ProcessEnv);
+}
 
 function cookieFrom(res: { headers: Record<string, string | number | string[] | undefined> }): string {
   const setCookie = res.headers['set-cookie'];
@@ -64,19 +90,14 @@ before(async () => {
   pool = createPool({ databaseUrl: db.dbUrl });
   await runMigrations(pool, MIGRATIONS_DIR);
 
-  const config: AppConfig = loadConfig({
-    NODE_ENV: 'test',
-    PORT: '4999',
-    HOST: '127.0.0.1',
-    DATABASE_URL: db.dbUrl,
-    DATABASE_SSL_MODE: 'disable',
-    SESSION_COOKIE_NAME: 've_session',
-    COOKIE_SECURE: 'never',
-    SESSION_TTL_DAYS: '30',
-    LOG_LEVEL: 'silent',
-  } as NodeJS.ProcessEnv);
+  dbUrl = db.dbUrl;
+  const config: AppConfig = makeConfig({ DATABASE_URL: dbUrl });
   ctx = createAppContext(pool, config);
   app = await buildApp(config, ctx);
+  // Test-only probe: reports how the app resolved the client address for this
+  // request. Production code registers no such route (see buildApp) — it exists
+  // so the F1 regressions can assert on `req.ip` without a database round-trip.
+  app.get('/__test/client-ip', (req) => ({ ip: req.ip, ips: req.ips, protocol: req.protocol }));
   await app.ready();
 }, { timeout: 180_000 });
 
@@ -985,5 +1006,188 @@ describe('m2 market data', () => {
     }
     assert.equal(succeeded, 5, 'exactly 5 backfills should succeed from one IP');
     assert.equal(last, 429, 'expected a 429 on the 6th backfill from one IP');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1: client-IP resolution + rate-limit keying behind the real proxy chain
+// ---------------------------------------------------------------------------
+
+/**
+ * Production topology on Render: client → Cloudflare → Render LB → this
+ * process. The socket peer is a private Render address, Cloudflare appends the
+ * address it saw, and Render's LB appends the Cloudflare edge — so everything
+ * to the LEFT of the Cloudflare-appended value came from the caller and must
+ * never become `req.ip` (the rate-limit key, the audit IP, the session IP).
+ */
+const RENDER_LB = '10.128.0.7';
+const CF_EDGE = '173.245.48.7'; // inside Cloudflare's published 173.245.48.0/20
+const VERCEL_EGRESS = '76.76.21.21'; // Vercel publishes no egress range ⇒ unpinned by default
+
+/** Attacker-chosen values (RFC 2544 benchmark range — never a real client). */
+const spoofed = (n: number) => `198.18.${Math.floor(n / 250)}.${(n % 250) + 1}`;
+
+/** A distinct real client per test (RFC 5737 documentation range) so
+ *  rate-limit buckets never leak between tests. */
+let clientSeq = 0;
+const aClient = () => `203.0.113.${(clientSeq++ % 200) + 1}`;
+
+/** Inject a request shaped like production traffic arriving through Render. */
+async function throughRender(
+  xff: string[],
+  opts: {
+    peer?: string;
+    url?: string;
+    method?: 'GET' | 'POST';
+    payload?: Record<string, unknown>;
+    cookie?: string;
+    headers?: Record<string, string>;
+  } = {},
+) {
+  return app.inject({
+    method: opts.method ?? 'GET',
+    url: opts.url ?? '/__test/client-ip',
+    remoteAddress: opts.peer ?? RENDER_LB,
+    headers: {
+      'x-forwarded-for': xff.join(', '),
+      ...(opts.cookie ? { cookie: opts.cookie } : {}),
+      ...opts.headers,
+    },
+    ...(opts.payload ? { payload: opts.payload } : {}),
+  });
+}
+
+describe('client IP resolution (F1: X-Forwarded-For is not caller-controlled)', () => {
+  test('resolves the real client through Cloudflare + the Render LB', async () => {
+    const client = aClient();
+    const res = await throughRender([client, CF_EDGE]);
+    assert.equal(res.statusCode, 200);
+    const body = res.json();
+    assert.equal(body.ip, client);
+    assert.deepEqual(body.ips, [RENDER_LB, CF_EDGE, client], 'only the trusted hops and the client survive the walk');
+  });
+
+  test('ignores a single spoofed X-Forwarded-For value', async () => {
+    const client = aClient();
+    const res = await throughRender([spoofed(1), client, CF_EDGE]);
+    assert.equal(res.json().ip, client, 'the spoofed leftmost value must never become req.ip');
+  });
+
+  test('ignores a long spoofed X-Forwarded-For prefix', async () => {
+    const client = aClient();
+    const res = await throughRender([spoofed(1), spoofed(2), spoofed(3), spoofed(4), client, CF_EDGE]);
+    assert.equal(res.json().ip, client);
+  });
+
+  test('ignores spoofed values that mimic infrastructure (private and Cloudflare ranges)', async () => {
+    const client = aClient();
+    const res = await throughRender(['10.0.0.9', '192.168.1.1', CF_EDGE, '173.245.48.99', client, CF_EDGE]);
+    assert.equal(res.json().ip, client, 'the walk stops at the first non-infrastructure address from the right');
+  });
+
+  test('ignores X-Forwarded-For and X-Forwarded-Proto from a peer that is not a trusted proxy', async () => {
+    const direct = '198.51.100.44';
+    const res = await throughRender([spoofed(1), aClient()], {
+      peer: direct,
+      headers: { 'x-forwarded-proto': 'https' },
+    });
+    assert.equal(res.json().ip, direct, 'a direct (non-proxied) caller cannot claim an address');
+    assert.equal(res.json().protocol, 'http', 'and cannot claim the protocol either');
+  });
+
+  test('honours X-Forwarded-Proto from a trusted hop (Render terminates TLS upstream)', async () => {
+    const res = await throughRender([aClient(), CF_EDGE], { headers: { 'x-forwarded-proto': 'https' } });
+    assert.equal(res.json().protocol, 'https');
+  });
+
+  test('falls back to the socket peer when there is no X-Forwarded-For', async () => {
+    const res = await app.inject({ method: 'GET', url: '/__test/client-ip', remoteAddress: RENDER_LB });
+    assert.equal(res.json().ip, RENDER_LB);
+  });
+});
+
+describe('rate limits cannot be bypassed by rotating X-Forwarded-For (F1)', () => {
+  test('global 300/min: a rotating spoofed prefix does not mint new buckets', async () => {
+    const client = aClient();
+    const codes: number[] = [];
+    for (let i = 0; i < 301; i++) {
+      const res = await throughRender([spoofed(i), client, CF_EDGE], { url: '/api/health' });
+      codes.push(res.statusCode);
+      if (res.statusCode === 429) break;
+    }
+    assert.equal(codes.filter((c) => c === 200).length, 300, 'exactly the 300/min budget from one real client');
+    assert.equal(codes[codes.length - 1], 429, 'request 301 is limited despite 301 distinct spoofed values');
+    assert.equal(
+      codes.filter((c) => c === 429).length,
+      1,
+      'the limit fired once, on the shared bucket — not once per spoofed value',
+    );
+  });
+
+  test('login 10/min: credential stuffing cannot rotate its way past the limit', async () => {
+    const client = aClient();
+    const codes: number[] = [];
+    for (let i = 0; i < 11; i++) {
+      const res = await throughRender([spoofed(100 + i), client, CF_EDGE], {
+        url: '/api/auth/login',
+        method: 'POST',
+        payload: { email: `nobody_${i}@example.com`, password: 'wrong-password-42' },
+      });
+      codes.push(res.statusCode);
+    }
+    assert.deepEqual(codes.slice(0, 10), Array(10).fill(401), 'ten real attempts, ten generic 401s');
+    assert.equal(codes[10], 429, 'the eleventh is limited even though every request claimed a new IP');
+  });
+
+  test('different real clients keep different buckets (limits were not collapsed onto one IP)', async () => {
+    const { from, to } = recentWindow(1);
+    const url = `/api/market-data/candles?assetClass=forex&symbol=EURUSD&timeframe=1d&from=${from}&to=${to}`;
+    const busy = aClient();
+    const other = aClient();
+
+    let last = 0;
+    for (let i = 0; i < 61; i++) {
+      // Unauthenticated on purpose: the limiter runs before the auth guard, so
+      // this exercises the 60/min candles bucket without touching market data.
+      last = (await throughRender([busy, CF_EDGE], { url })).statusCode;
+      if (last === 429) break;
+    }
+    assert.equal(last, 429, 'the 60/min candles budget is exhausted for that client');
+
+    const fresh = await throughRender([other, CF_EDGE], { url });
+    assert.equal(fresh.statusCode, 401, 'a different client still gets through to the auth guard (401, not 429)');
+  });
+
+  test('web-proxied traffic: coarse bucket today, per-browser once the Vercel hop is pinned', async () => {
+    // Vercel OVERWRITES X-Forwarded-For with the browser address, Cloudflare
+    // appends Vercel's egress, Render's LB appends the Cloudflare edge.
+    const browser = aClient();
+    const chain = [browser, VERCEL_EGRESS, CF_EDGE];
+
+    const today = await throughRender(chain);
+    assert.equal(
+      today.json().ip,
+      VERCEL_EGRESS,
+      'fails closed to the Vercel hop: a shared bucket, never a caller-chosen one',
+    );
+
+    // The remedy is configuration, not code: pin the hop (Vercel Static IPs).
+    const pinnedConfig = makeConfig({
+      DATABASE_URL: dbUrl,
+      // Same knob an operator would turn in production — the remedy is
+      // configuration (Vercel Static IPs), not another code change.
+      TRUSTED_PROXY_CIDRS: [...DEFAULT_TRUSTED_PROXIES, VERCEL_EGRESS].join(','),
+    });
+    const pinned = await buildApp(pinnedConfig, ctx);
+    pinned.get('/__test/client-ip', (req) => ({ ip: req.ip }));
+    await pinned.ready();
+    const after = await pinned.inject({
+      method: 'GET',
+      url: '/__test/client-ip',
+      remoteAddress: RENDER_LB,
+      headers: { 'x-forwarded-for': chain.join(', ') },
+    });
+    assert.equal(after.json().ip, browser, 'per-browser attribution once the hop is trusted');
+    await pinned.close();
   });
 });

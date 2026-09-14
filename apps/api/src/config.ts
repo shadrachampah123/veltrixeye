@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { DEFAULT_TRUSTED_PROXIES, parseTrustedProxies } from './trust-proxy.js';
 
 /**
  * Minimal .env loader (no dependency): reads the repo-root .env and fills
@@ -66,6 +67,21 @@ const envSchema = z.object({
   /** fastify log level. */
   LOG_LEVEL: z.string().min(1).default('info'),
   /**
+   * Proxy addresses allowed to speak for the client in `X-Forwarded-For`
+   * (comma- or whitespace-separated CIDRs / IPs, plus proxy-addr's named
+   * ranges `loopback`, `linklocal`, `uniquelocal`).
+   *
+   * This is a SECURITY boundary, not a convenience flag: it decides which IP
+   * every rate limit is keyed on and which IP lands in `audit_events.ip`. The
+   * default pins exactly the infrastructure in front of this service on Render
+   * (Cloudflare's published edge ranges + Render's internal load-balancer
+   * hops), so a client-supplied `X-Forwarded-For` can never choose its own
+   * bucket. Widen it only for a hop you actually operate — e.g. add Vercel's
+   * Static IP egress addresses to attribute web-proxied traffic per browser.
+   * A `/0` entry is rejected at boot. See apps/api/src/trust-proxy.ts.
+   */
+  TRUSTED_PROXY_CIDRS: z.string().min(1).default(DEFAULT_TRUSTED_PROXIES.join(',')),
+  /**
    * Twelve Data API key (M2 primary provider). Empty = no market data: the
    * API boots and market routes answer 502. Server-side only — the vendor
    * takes it in query strings, so it must never reach logs or browsers.
@@ -83,7 +99,13 @@ const envSchema = z.object({
   TWELVE_DATA_CRYPTO_EXCHANGE: z.string().min(1).max(32).default('Binance'),
 });
 
-export type AppConfig = z.infer<typeof envSchema>;
+/**
+ * Validated environment plus the derived values the app needs at boot.
+ * `trustedProxies` is `TRUSTED_PROXY_CIDRS` parsed, validated and normalised
+ * (see apps/api/src/trust-proxy.ts) — the list handed to Fastify's
+ * `trustProxy`, which is what makes `req.ip` non-client-controlled.
+ */
+export type AppConfig = z.infer<typeof envSchema> & { trustedProxies: string[] };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const result = envSchema.safeParse(env);
@@ -94,7 +116,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // Deliberately loud: a misconfigured environment must fail at boot, not at runtime.
     throw new Error(`Invalid environment configuration:\n${issues}`);
   }
-  return result.data;
+  let trustedProxies: string[];
+  try {
+    trustedProxies = parseTrustedProxies(result.data.TRUSTED_PROXY_CIDRS);
+  } catch (err) {
+    // Same fail-fast contract as the schema above: a malformed trust list must
+    // stop the boot rather than silently change who may speak for the client.
+    throw new Error(`Invalid environment configuration:\n  - TRUSTED_PROXY_CIDRS: ${(err as Error).message}`);
+  }
+  return { ...result.data, trustedProxies };
 }
 
 export function isProduction(config: AppConfig): boolean {
