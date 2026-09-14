@@ -254,6 +254,7 @@ disagree. The failing `schema` block is included in the response.
 | `COOKIE_SECURE` | no (default `auto`) | `auto` → `Secure` in production |
 | `SESSION_TTL_DAYS` | no (default 30) | 1–90 |
 | `LOG_LEVEL` | no (default `info`) | `info` in production |
+| `TRUSTED_PROXY_CIDRS` | no (default = Cloudflare ranges + Render-internal) | Proxies allowed to speak for the client in `X-Forwarded-For` — this decides `req.ip`, the key for every rate limit. **Leave unset on Render**; the default is already the pinned production list. See [Scaling and rate limiting](#scaling-and-rate-limiting) |
 
 Missing or malformed values make the API **fail at boot** with an itemized
 error (`loadConfig` zod validation) instead of misbehaving at runtime.
@@ -267,6 +268,7 @@ The web app's only deployment variable is `API_INTERNAL_BASE` (Step 4).
 | Sessions | `apps/api/src/session-auth.ts` | server-side hashed session tokens; `HttpOnly`, `SameSite=Strict`, `Secure` cookie (HTTPS + `NODE_ENV=production`); token is never sent to a different origin (same-origin proxy only) |
 | Owner isolation | `packages/core/src/strategies/*` | every query is scoped to the acting user; other users' resources return 404 |
 | Rate limiting | `apps/api/src/app.ts`, `routes/auth.ts` | 300/min global, 10/min login, 5/h register — per instance (see below) |
+| Client IP attribution | `apps/api/src/trust-proxy.ts`, `config.ts` | `req.ip` — the rate-limit key and the IP in `audit_events` / `sessions` — is resolved through Render's Cloudflare-fronted chain, so `X-Forwarded-For` is never caller-controlled (see below) |
 | Audit logging | `packages/core/src/audit.ts` | register/login/failure/logout/password-change/strategy actions recorded in `audit_events` |
 | Security headers | Fastify helmet | CSP deny-all, `nosniff`, `X-Frame-Options: DENY`, HSTS in production, no CORS headers, `X-Powered-By` hidden |
 | Transport | Render/Vercel TLS | HTTPS end to end; `DATABASE_SSL_MODE` covers API→database |
@@ -277,11 +279,40 @@ The web app's only deployment variable is `API_INTERNAL_BASE` (Step 4).
 `@fastify/rate-limit` uses an in-memory store, so limits are **per instance**.
 Keep the API at one instance (`numInstances: 1`, the default) for exact
 limits; if you scale out, either accept per-instance limits or add a shared
-store. `trustProxy: true` is unchanged from M1: the app trusts the
-`X-Forwarded-For` chain it sits behind. If you ever expose the API directly
-(not just behind Vercel), pin the trusted proxy hops or key limits on a
-verified header — deployment hardening tracked in
-[milestones.md](./milestones.md).
+store.
+
+Limits are keyed on `req.ip`, which Fastify derives from `X-Forwarded-For` by
+stopping at the first address **not** in the trusted-proxy list — so that list
+is a deployment setting with security consequences, and it is pinned in code to
+the hops that really front this service: Render's internal load balancer
+(`loopback`, `linklocal`, `uniquelocal`) plus Cloudflare's published edge
+ranges, because all traffic to a Render public web service enters through
+Cloudflare. It is overridable with `TRUSTED_PROXY_CIDRS`
+([environment.md](./environment.md#client-ip-attribution-trusted_proxy_cidrs),
+rationale in `apps/api/src/trust-proxy.ts`).
+
+Operational consequences:
+
+- **No Render environment change is needed** for this configuration — the
+  default *is* the pinned production list.
+- Direct callers of `https://<api-host>.onrender.com` are limited by their real
+  address; a spoofed or repeated `X-Forwarded-For` no longer rotates
+  rate-limit buckets (regression tests:
+  `apps/api/test/trust-proxy.test.ts` and the F1 blocks in
+  `apps/api/test/api.test.ts`).
+- Requests proxied by the Vercel web app resolve to **Vercel's egress address**,
+  because Vercel publishes no egress range — those callers share one bucket
+  (coarser, never attacker-chosen). Buying **Vercel Static IPs** and adding them
+  to `TRUSTED_PROXY_CIDRS` restores per-browser attribution on that path.
+- A malformed list, an unknown name, or a `/0` ("trust everybody") **fails the
+  boot** instead of widening trust silently.
+- If Cloudflare ever changes its published ranges, update
+  `apps/api/src/trust-proxy.ts`. A stale list fails *closed*: the walk stops at
+  the Cloudflare edge and those callers share a bucket — watch for 429s hitting
+  many unrelated users at once.
+
+Other deployment hardening (WAF, secret manager, least-privilege DB roles) is
+tracked in [milestones.md](./milestones.md).
 
 ### Free instance caveats
 
@@ -313,6 +344,8 @@ migrations are unaffected.
 | Web app returns 500 on `/api/*` | `API_INTERNAL_BASE` wrong, unset at build time, or the API is asleep | fix the Vercel variable and redeploy; upgrade the API off the free plan to avoid spin-down |
 | Login succeeds but the session does not stick | cookie is `Secure` while the page is served over plain HTTP | always reach the app over HTTPS (the API sets `Secure` cookies in production by design) |
 | `429` on login/register | rate limits working as designed (10/min, 5/h per IP) | expected; wait or use another IP |
+| `429`s hit many unrelated users at once | every request resolving to the same hop — usually a stale Cloudflare range list, or an over-narrow `TRUSTED_PROXY_CIDRS` | re-fetch [Cloudflare's ranges](https://www.cloudflare.com/ips-v4) into `apps/api/src/trust-proxy.ts`, or fix the variable; the failure mode is deliberately coarse-but-safe |
+| Boot fails with `TRUSTED_PROXY_CIDRS: invalid trusted-proxy entries …` | malformed address/prefix, unknown name, `/0`, or empty value | correct the variable or delete it to take the pinned default (see `apps/api/src/trust-proxy.ts`) |
 
 ## Not part of M1
 

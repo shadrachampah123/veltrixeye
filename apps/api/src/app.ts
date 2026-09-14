@@ -56,7 +56,37 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
 export async function buildApp(config: AppConfig, ctx: AppContext): Promise<FastifyInstance> {
   const app = Fastify({
     logger: config.NODE_ENV === 'production' ? { level: config.LOG_LEVEL } : false,
-    trustProxy: true,
+    /**
+     * Client-IP resolution — pinned to the proxies that actually front this
+     * service, never `true`.
+     *
+     * `req.ip` keys every rate limit and is what `audit_events.ip` /
+     * `sessions.ip` record, so the trust list is a security boundary:
+     * proxy-addr walks `X-Forwarded-For` from the socket outward and returns
+     * the first address NOT in the list.
+     *
+     *  - `true` (the previous value) trusted every hop ⇒ `req.ip` was the
+     *    LEFTMOST header value, which any client can set. This API is publicly
+     *    reachable on *.onrender.com, so a caller could rotate that header and
+     *    mint a fresh bucket per request (300/min global, 10/min login,
+     *    60/min candles, 5/min backfill) — defeating all of them.
+     *  - a NUMBER such as `1` does not mean "one hop" in Fastify 5: hop-count
+     *    trust cannot validate the immediate peer, so Fastify fails closed and
+     *    trusts nothing. Every request would then key on Render's load
+     *    balancer address, collapsing all users into a single bucket.
+     *  - the explicit list in `config.trustedProxies` (Cloudflare's published
+     *    edge ranges + Render's internal hops, overridable via
+     *    TRUSTED_PROXY_CIDRS) is the narrowest correct setting: spoofed
+     *    entries sit to the LEFT of the address Cloudflare appended, so the
+     *    walk stops at the real client and never reads them.
+     *
+     * Trade-off (documented in trust-proxy.ts and docs/deployment.md): traffic
+     * proxied by the Vercel web app resolves to Vercel's egress address,
+     * because Vercel publishes no egress range to pin. Coarser buckets, never
+     * a client-chosen key; add Vercel Static IPs to TRUSTED_PROXY_CIDRS to
+     * attribute that path per browser.
+     */
+    trustProxy: config.trustedProxies,
     bodyLimit: 256 * 1024, // 256 KB — strategy configs are small; reject fat payloads
   });
 
@@ -84,6 +114,11 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   // per-route overrides (see routes/auth.ts via route config).
   // Note: the plugin THROWS the builder's result, so we return an Error
   // tagged with statusCode 429 and let the central error handler send it.
+  // `req.ip` is only a safe key because `trustProxy` above is pinned to the
+  // real infrastructure hops: it is the first address in the
+  // X-Forwarded-For chain that is NOT Cloudflare/Render-internal, so a caller
+  // cannot pick it by setting the header (regression tests in
+  // apps/api/test/api.test.ts → "rate limits cannot be bypassed …").
   await app.register(rateLimit, {
     global: true,
     max: 300,
