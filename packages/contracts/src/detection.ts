@@ -136,7 +136,7 @@ export const setupDtoSchema = z
     tp1Price: z.number().positive().finite().nullable(),
     tp2Price: z.number().positive().finite().nullable(),
     tp3Price: z.number().positive().finite().nullable(),
-    /** Always null until the M5 scoring engine exists. */
+    /** Latest M5 quality score total; null until the setup has been scored. */
     qualityScore: z.number().int().min(0).max(100).nullable(),
     metadata: z.record(z.string(), z.unknown()),
   })

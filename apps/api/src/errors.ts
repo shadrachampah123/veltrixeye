@@ -67,6 +67,14 @@ export function errorHandler(err: Error, req: FastifyRequest, reply: FastifyRepl
     sendZodError(reply, err as unknown as ZodError, 'request');
     return;
   }
+  // Fastify payload-limit errors (bodyLimit exceeded): client errors, never
+  // 500s — oversized requests must be rejected with a clean 413.
+  if ((err as { statusCode?: number }).statusCode === 413) {
+    void reply.code(413).send({
+      error: { code: ERROR_CODES.INVALID_INPUT, message: 'Request payload is too large' },
+    } satisfies ApiErrorBody);
+    return;
+  }
   // Fastify request-validation errors (schema / malformed JSON bodies).
   const withValidation = err as { validation?: unknown; statusCode?: number };
   if (withValidation.validation || withValidation.statusCode === 400) {

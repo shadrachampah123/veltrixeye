@@ -638,14 +638,14 @@ describe('setup lifecycle (foundation schema)', () => {
     await assert.rejects(
       () =>
         pool.query(
-          `INSERT INTO setup_scores (setup_id, engine_version, total, grade, components) VALUES ($1, 'e1', 150, 'A+', '[]')`,
+          `INSERT INTO setup_scores (setup_id, engine_version, total, grade, components, as_of_ms) VALUES ($1, 'e1', 150, 'A+', '[]', 1700000000000)`,
           [setupId],
         ),
       (err: unknown) => (err as { message?: string })?.message?.includes('total'),
     );
     const ok = await pool.query(
-      `INSERT INTO setup_scores (setup_id, engine_version, total, grade, components)
-       VALUES ($1, 'e1', 87, 'A', '[{"name":"structure","weight":1,"score":87,"explanation":"strong"}]') RETURNING id`,
+      `INSERT INTO setup_scores (setup_id, engine_version, total, grade, components, as_of_ms)
+       VALUES ($1, 'e1', 87, 'A', '[{"name":"structure","weight":1,"score":87,"explanation":"strong"}]', 1700000000000) RETURNING id`,
       [setupId],
     );
     const okId = first(ok.rows, 'score row').id;

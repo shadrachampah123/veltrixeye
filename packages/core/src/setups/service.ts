@@ -31,7 +31,9 @@ import { detectionLevels } from './levels.js';
  *    M4 always passes it).
  *  - idempotent: the 0009 unique key
  *    (version, instrument, direction, asOfMs) serializes concurrent
- *    duplicates — the loser re-selects the winner's row and writes nothing.
+ *    duplicates — `ON CONFLICT DO NOTHING` lets exactly one insert win and
+ *    the loser re-selects the winner's row and writes nothing (conflict
+ *    handling never aborts the transaction).
  *  - ownership: every setup read/write joins through
  *    `strategy_versions → strategies.user_id`; foreign setups are masked
  *    404s, exactly like strategies.
@@ -234,8 +236,10 @@ export class SetupService {
   /**
    * Insert the setup + initial event, or return the existing row when this
    * detection key was already detected. Concurrent duplicates serialize on
-   * the 0009 unique constraint: exactly one insert wins and the loser
-   * re-selects the winner's committed row.
+   * the 0009 unique constraint via `ON CONFLICT DO NOTHING`: exactly one
+   * insert wins and the loser commits a no-op and re-selects the winner's
+   * row. The conflict path never raises 23505, so the transaction never
+   * aborts mid-race.
    */
   private async insertOrGetSetup(args: {
     userId: string;
@@ -263,6 +267,7 @@ export class SetupService {
         `INSERT INTO setups (strategy_version_id, instrument_id, state, direction, detected_at, as_of_ms,
                              entry_price, stop_loss_price, tp1_price, tp2_price, tp3_price, metadata)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (strategy_version_id, instrument_id, direction, as_of_ms) DO NOTHING
          RETURNING *`,
         [
           args.versionId,
@@ -281,8 +286,17 @@ export class SetupService {
       );
       const row = inserted.rows[0];
       if (!row) {
-        await client.query('ROLLBACK');
-        throw Errors.internal('Failed to create setup');
+        // Lost the race: commit the no-op and return the winner's row.
+        await client.query('COMMIT');
+        const winner = await this.readOwnedSetupByKey(
+          args.userId,
+          args.versionId,
+          args.instrumentId,
+          args.direction,
+          args.asOfMs,
+        );
+        if (!winner) throw Errors.internal('Setup detection conflict could not be resolved');
+        return { setup: toSetupDto(winner), created: false };
       }
       await client.query(
         `INSERT INTO setup_state_events (setup_id, from_state, to_state, reason, payload, created_at)
@@ -295,18 +309,6 @@ export class SetupService {
       return { setup: toSetupDto(fresh), created: true };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
-      if (isDetectionKeyConflict(err)) {
-        // Lost a concurrent race: the winner committed; return its row.
-        const winner = await this.readOwnedSetupByKey(
-          args.userId,
-          args.versionId,
-          args.instrumentId,
-          args.direction,
-          args.asOfMs,
-        );
-        if (!winner) throw Errors.internal('Setup detection conflict could not be resolved');
-        return { setup: toSetupDto(winner), created: false };
-      }
       throw err;
     } finally {
       client.release();
@@ -346,13 +348,17 @@ export class SetupService {
   }
 }
 
-const SETUP_SELECT = `SELECT s.*, v.strategy_id, v.version_number, i.asset_class, i.symbol
+/**
+ * Owned-setup SELECT (exported for the M5 scoring service, which enforces
+ * the same ownership join — setup → strategy_versions → strategies.user_id).
+ */
+export const SETUP_SELECT = `SELECT s.*, v.strategy_id, v.version_number, i.asset_class, i.symbol
   FROM setups s
   JOIN strategy_versions v ON v.id = s.strategy_version_id
   JOIN strategies st ON st.id = v.strategy_id
   JOIN instruments i ON i.id = s.instrument_id`;
 
-interface SetupRow {
+export interface SetupRow {
   id: string;
   strategy_version_id: string;
   strategy_id: string;
@@ -385,7 +391,8 @@ interface EventRow {
   created_at: Date;
 }
 
-function toSetupDto(row: SetupRow): SetupDto {
+/** Exported for the M5 scoring service (same DTO mapping, no semantic change). */
+export function toSetupDto(row: SetupRow): SetupDto {
   return {
     id: row.id,
     strategyId: row.strategy_id,
@@ -424,9 +431,4 @@ function toNumberOrNull(value: string | null): number | null {
   if (value === null || value === undefined) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
-}
-
-function isDetectionKeyConflict(err: unknown): boolean {
-  const pgErr = err as { code?: string; constraint?: string };
-  return pgErr?.code === '23505' && pgErr?.constraint === 'setups_detection_key_uniq';
 }

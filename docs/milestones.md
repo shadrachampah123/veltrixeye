@@ -1,11 +1,11 @@
 # Milestone Boundaries
 
-This repository currently contains **Milestones M1 + M2 + M3 + M4**. The
-boundaries below are deliberate and enforced: M1 shipped foundations and
-contracts; M2 added real historical market data; M3 added deterministic
-strategy evaluation; M4 adds deterministic setup detection and lifecycle
-management — and nothing that scores, backtests, schedules, streams, or
-delivers alerts.
+This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5**.
+The boundaries below are deliberate and enforced: M1 shipped foundations
+and contracts; M2 added real historical market data; M3 added
+deterministic strategy evaluation; M4 added deterministic setup detection
+and lifecycle management; M5 adds deterministic setup quality scoring —
+and nothing that backtests, schedules, streams, or delivers alerts.
 
 ## M1 — delivered (Product Foundation & Architecture)
 
@@ -164,10 +164,55 @@ delivers alerts.
 - **Automated tests** — 295 passing (contracts 37, core 116, provider 33,
   api 99, web 10) plus clean typecheck, lint and production build.
 
-## Explicitly NOT in M1+M2+M3+M4 (by design, deferred)
+## M5 — delivered (Setup Quality Scoring)
 
-- A live **scanner** (detection stays explicitly invoked), **quality
-  scoring** (M5), and setup **realtime** updates.
+- **Scoring contracts** — `packages/contracts/src/scoring.ts` extended on
+  the M1 foundation (grade bands, `qualityGrade`, `ScoreComponent`,
+  `QualityScoringEngine`): the pinned engine version
+  `m5-quality-score-1`, score/history/request zod DTOs, and the typed M5
+  scoring context (M3 direction evaluation + `minRr` + anchor).
+- **Deterministic engine** — pure
+  `(direction evaluation, minRr, asOfMs) → score` in
+  `@veltrixeye/core`: seven pinned components whose weights sum to 100
+  (required 25, confirmation 15, disqualifier clearance 20, optional
+  support 15, directional alignment 10, setup completeness 10, data
+  sufficiency 5); gate components treat "none declared" as vacuously
+  clear, evidence components award nothing for absence of declaration;
+  directions that do not pass their M3 evaluation are capped at 64
+  (grade `ignore`), so insufficient data can never manufacture quality.
+  No clock, no randomness, no I/O inside scoring logic.
+- **Idempotency key** — additive migration **0010** adds
+  `setup_scores.as_of_ms` + `UNIQUE (setup_id, engine_version, as_of_ms)`;
+  concurrent duplicates serialize via `INSERT … ON CONFLICT DO NOTHING`
+  (the conflict path never aborts a transaction); replays return the
+  stored row without re-evaluating. Migrations 0001–0009 untouched.
+- **Scoring service + API** — `ScoringService` rebuilds the context
+  through the existing M3 `EvaluationService` (ownership masking,
+  published-only, store-only reads — never a provider); terminal setups
+  are refused, never mutated. `POST /api/setups/:setupId/score`
+  (20 req/min, `setup.scored` audit) and
+  `GET /api/setups/:setupId/scores` (append-only history); both
+  session-authenticated with masked 404s.
+- **Append-only persistence** — score row + `setups.quality_score`
+  refresh commit atomically; history rows are never updated or deleted
+  (0007 trigger); scoring never transitions a setup (M4 owns lifecycle).
+- **Robustness fix in M4's duplicate path (semantics unchanged)** — M4's
+  `insertOrGetSetup` now resolves detection-key races with
+  `ON CONFLICT DO NOTHING` instead of catching `23505`: under load the
+  error-based path could rarely leave a pooled client in an aborted
+  transaction (flaky 500s, pre-existing and reproduced on the M4-only
+  tree). Observable behaviour is identical — one setup and one event per
+  key, losers return the winner's row — and all M4 tests remain green.
+- **Docs** — [setup-scoring.md](./setup-scoring.md) specifies the pinned
+  formula, missing-data rules, idempotency, API, and the M4/M5/M6
+  boundaries.
+- **Automated tests** — 341 passing (contracts 45, core 138, provider 33,
+  api 115, web 10) plus clean typecheck, lint and production build.
+
+## Explicitly NOT in M1+M2+M3+M4+M5 (by design, deferred)
+
+- A live **scanner** (detection stays explicitly invoked), setup
+  **realtime** updates, and **alert delivery** (M6).
 - **Realtime streaming / WebSockets**; session calendar and market-state
   feeds (provider honestly reports gaps).
 - **Backtester**.
@@ -182,12 +227,13 @@ delivers alerts.
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M4 (later milestones, outline only)
+## After M5 (later milestones, outline only)
 
-1. A quality-scoring engine over the stored setups (M5).
-2. Alert delivery (M6).
-3. Backtester, then a live scanner on top of the M4 detection service.
+1. Alert delivery (M6) — consumes stored setups and their quality scores
+   (the risk-config `minQualityScore` gate becomes meaningful there).
+2. Backtester, then a live scanner on top of the M4 detection service.
 
-Each of these is its own milestone. The M3 engine, M4 detector, result DTOs,
-store, and provider abstraction are specifically shaped so each is additive —
-no rewrite of the schema, contracts, or UI is required.
+Each of these is its own milestone. The M3 engine, M4 detector, M5 scoring
+engine, result DTOs, store, and provider abstraction are specifically
+shaped so each is additive — no rewrite of the schema, contracts, or UI is
+required.
