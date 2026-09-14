@@ -4,6 +4,7 @@ import {
   strategyUpdateSchema,
   strategyVersionCreateSchema,
   strategyVersionUpdateSchema,
+  evaluationRequestSchema,
   TIMEFRAMES,
   TIMEFRAME_ROLES,
   TIMEFRAME_ROLE_LABELS,
@@ -180,6 +181,56 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
     const version = await ctx.strategies.deprecateVersion(user.id, strategyId, versionId);
     return { version };
   });
+
+  /**
+   * Deterministic evaluation of a PUBLISHED version (M3).
+   *
+   * Read-only over the shared candle store: this route never writes setups,
+   * scores or state events, and never triggers provider fetch-through
+   * (evaluation reads the store directly, so it works with no provider key).
+   * The optional `asOf` body field pins the evaluation anchor for
+   * reproducibility; omitting it pins the anchor to the current time at the
+   * API edge (the only wall-clock read in the evaluation path).
+   */
+  app.post(
+    '/api/strategies/:strategyId/versions/:versionId/evaluate',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const { strategyId, versionId } = req.params as { strategyId: string; versionId: string };
+      if (!isUuid(strategyId) || !isUuid(versionId)) throw Errors.notFound('Version not found');
+      const parsed = evaluationRequestSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendZodError(reply, parsed.error, 'body');
+        return;
+      }
+      const result = await ctx.evaluation.evaluateVersion({
+        userId: user.id,
+        strategyId,
+        versionId,
+        asOf: parsed.data.asOf,
+      });
+      await ctx.audit.log({
+        userId: user.id,
+        action: 'strategy.evaluated',
+        entityType: 'strategy_version',
+        entityId: versionId,
+        ip: req.ip,
+        userAgent: req.headers['user-agent'] ?? null,
+        metadata: {
+          strategyId,
+          versionNumber: result.versionNumber,
+          instruments: result.instruments.length,
+          truncated: result.truncated,
+          asOfMs: result.asOfMs,
+          anyPassed: result.instruments.some((i) => i.anyPassed),
+        },
+      });
+      return result;
+    },
+  );
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

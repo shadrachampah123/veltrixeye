@@ -1,9 +1,10 @@
 # Milestone Boundaries
 
-This repository currently contains **Milestones M1 + M2**. The boundaries
-below are deliberate and enforced: M1 shipped foundations and contracts; M2
-adds real historical market data — and nothing that detects signals, scores,
-backtests, or delivers alerts.
+This repository currently contains **Milestones M1 + M2 + M3**. The
+boundaries below are deliberate and enforced: M1 shipped foundations and
+contracts; M2 added real historical market data; M3 adds deterministic
+strategy evaluation — and nothing that persists setups, scores, schedules,
+streams, backtests, or delivers alerts.
 
 ## M1 — delivered (Product Foundation & Architecture)
 
@@ -78,11 +79,52 @@ backtests, or delivers alerts.
 - **Automated tests** — 167 passing (contracts 27, core 54, provider 33,
   api 43, web 10) plus clean typecheck, lint and production build.
 
-## Explicitly NOT in M1+M2 (by design, deferred)
+## M3 — delivered (Deterministic Strategy Evaluation)
 
-- Signal / setup **detection** and any live **scanner**.
-- Technical-analysis, liquidity, structure (BOS/CHoCH), order-block, FVG
-  and related **algorithms**.
+- **Evaluation contracts** — `packages/contracts/src/evaluation.ts`: the
+  evaluation request, per-condition/per-group/per-direction/per-instrument
+  result DTOs, the deterministic `engineVersion`
+  (`m3-deterministic-eval-1`), and scope caps — exported from the contracts
+  index.
+- **Pure indicator primitives** — `packages/core/src/strategies/evaluation/indicators.ts`:
+  Wilder ATR, strict-fractal swing/pivot detection, candle anatomy,
+  engulfing, ATR displacement, level touches, zones, order blocks, FVG,
+  supply/demand, break/retest, HTF trend/structure classification, and UTC
+  session windows — all pure functions, explicit edge cases, no clock, no
+  I/O.
+- **Condition handlers** — exactly one handler per one of the 19 registry
+  types, keyed by `conditionType`; direction-sensitive types evaluated per
+  direction; unknown types / invalid params → `unsupported`; short history →
+  `insufficient_data`; `news_filter`/`spread_filter` **always fail closed**
+  (no data source, never faked); the engine never silently passes.
+- **Deterministic engine** — pure
+  `(config, candlesByRole, asOfMs) → result`: group AND/OR under a top-level
+  AND, `required`/`confirmation` must satisfy, `disqualifying` vetoes,
+  `optional` reported only, fail-closed inside OR groups, per-direction
+  outcomes, deterministic candidate entry/SL/TP for `rr_requirement`
+  (LONG-convention levels; per-direction levels deferred to M4).
+- **Evaluation service + API** — `POST
+  /api/strategies/:strategyId/versions/:versionId/evaluate`: session auth,
+  owner-scoped with masked 404s, **published versions only** (draft → 400),
+  zod-validated `{ asOf? }` body, ≤ 50 instruments per evaluation, dedicated
+  20 req/min rate limit, `strategy.evaluated` audit event, generic safe
+  errors.
+- **Store-only data access** — evaluation reads the shared candle store and
+  **never triggers provider fetch-through**: it works identically with no
+  provider key, and unseeded instruments answer 200 with
+  `insufficient_data`. Explicit `asOf` anchor; only closed candles; no wall
+  clock inside the engine (same inputs → byte-identical result).
+- **Read-only guarantee** — evaluation writes nothing: zero rows in
+  `setups` / `setup_scores` / `setup_state_events`, enforced by tests.
+- **Docs** — [strategy-engine-contract.md](./strategy-engine-contract.md)
+  rewritten to the implemented M3 semantics and the M3/M4 boundary.
+- **Automated tests** — 253 passing (contracts 27, core 106, provider 33,
+  api 77, web 10) plus clean typecheck, lint and production build.
+
+## Explicitly NOT in M1+M2+M3 (by design, deferred)
+
+- Signal / setup **detection**, setup **persistence**, lifecycle
+  transitions and any live **scanner** (M4 consumes the M3 result).
 - **Realtime streaming / WebSockets**; session calendar and market-state
   feeds (provider honestly reports gaps).
 - **Backtester**.
@@ -97,16 +139,14 @@ backtests, or delivers alerts.
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M2 (later milestones, outline only)
+## After M3 (later milestones, outline only)
 
-1. A **deterministic strategy-evaluation engine** that consumes a
-   published `StrategyVersion` (see
-   [strategy-engine-contract.md](./strategy-engine-contract.md)), reading
-   candles from the M2 store.
-2. Setup detection + lifecycle transitions.
-3. A quality-scoring engine.
-4. Backtester, then alert delivery.
+1. Setup detection + persistence + lifecycle transitions, consuming the M3
+   evaluation result (see
+   [strategy-engine-contract.md](./strategy-engine-contract.md)).
+2. A quality-scoring engine over the stored setups.
+3. Backtester, then alert delivery.
 
-Each of these is its own milestone. The M2 store, coverage ledger, and
+Each of these is its own milestone. The M3 engine, result DTO, store, and
 provider abstraction are specifically shaped so each is additive — no
 rewrite of the schema, contracts, or UI is required.
