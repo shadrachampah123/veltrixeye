@@ -1,4 +1,4 @@
-# Setup Alerts (M6, Phases 1–3)
+# Setup Alerts (M6, Phases 1–4)
 
 M6 alerts notify an owner when one of their setups reaches an actionable state
 with sufficient quality. Like M4 detection and M5 scoring, alert generation is
@@ -11,6 +11,9 @@ or background worker anywhere in this milestone.
   (`/api/setups/:setupId/alerts`, `/api/alerts`).
 - **Phase 3** — the `AlertSender` stub boundary, the pinned generation gates,
   replay-safe ledgering, audit events, and the end-to-end lifecycle tests.
+- **Phase 4** — the web UI: alert list, alert detail, acknowledgement and
+  explicit generation from an owned setup (`apps/web`, frontend only — no new
+  endpoint, no backend change).
 
 Delivery is **stub-only**: an append-only ledger row is written in the same
 transaction as the alert, and nothing is transmitted. No email, webhook, push,
@@ -185,15 +188,47 @@ dedupes. `alert_deliveries` is the append-only ledger, unique on
 `(alert_id, channel, payload_hash)`. Both tables cascade with the setup and are
 owner-scoped through `alerts.user_id`.
 
-## 8. What M6 does NOT do (still)
+## 8. Web UI (M6 Phase 4)
 
-No UI/dashboard surface (Phase 4), no real alert delivery (email/webhook/push),
+Frontend only — `apps/web` consumes the endpoints above and adds no endpoint,
+migration, service or delivery channel of its own.
+
+| Route | Consumes |
+| --- | --- |
+| `/alerts` | `GET /api/alerts`, `GET /api/setups` (eligible states), `POST /api/setups/:setupId/alerts` |
+| `/alerts/:id` | `GET /api/alerts/:id`, `POST /api/alerts/:id/acknowledge` |
+
+- **List** — status/strategy filters, trigger state, quality score + grade,
+  status, created and acknowledged times, per-row link to detail. Owner scope is
+  the API's; the UI never infers ownership from an id.
+- **Detail** — instrument/setup identity, trigger state, score and grade, the
+  `minQualityScore` gate that allowed generation, levels from the structured
+  body (read field-by-field, never dumped as raw JSON), the delivery ledger and
+  acknowledgement.
+- **Acknowledge** — the control is disabled while the request is in flight and
+  stays disabled once the API reports `acknowledged`, mirroring the API's
+  idempotency; re-acknowledging is reported as a no-op that kept the original
+  timestamp.
+- **Generate** — the three outcomes are rendered distinctly: `created` (a new
+  alert), `created: false` with an alert (the existing dedup winner — "alert
+  already exists"), and `alert: null` with `skippedReason: 'below_min_quality'`
+  ("no alert generated"). 400s (terminal/ineligible state, missing score at the
+  detection anchor) and 429s are surfaced with the API's own message. Setups in
+  a non-eligible state show a disabled action with the reason.
+- **Stub-delivery messaging** — every alert surface states that delivery is a
+  local stub ledger record and that no email, webhook, push, SMS or broker
+  notification is sent. There is no notification-provider configuration
+  anywhere in the UI, because none exists in M6.
+
+## 9. What M6 does NOT do (still)
+
+No real alert delivery (email/webhook/push),
 no vendor SDKs, no new secrets or environment variables, no
 scheduler/worker/queue/cron/background job/polling/scanner, no AI, no billing,
 no trade execution (M8), no second market-data provider, and no Twelve Data
 credential requirement — alerts work with no provider registered at all.
 
-## 9. Future channel/provider architecture
+## 10. Future channel/provider architecture
 
 Real delivery is additive and deliberately deferred:
 

@@ -22,3 +22,13 @@ export function timeframesLabel(timeframes: { htf_bias: string; setup: string; e
   if (!timeframes) return 'not set';
   return `${timeframes.htf_bias.toUpperCase()} bias · ${timeframes.setup.toUpperCase()} setup · ${timeframes.entry.toUpperCase()} entry`;
 }
+
+/**
+ * A price exactly as the API returned it — never re-rounded, because a price
+ * is an instrument-quoted value and the API is authoritative about precision.
+ * Levels can legitimately be absent, so null renders as an em dash.
+ */
+export function formatPrice(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—';
+  return String(value);
+}

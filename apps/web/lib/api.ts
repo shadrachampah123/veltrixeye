@@ -17,7 +17,21 @@ import type {
   BackfillRequest,
   BackfillResponseDto,
   ProviderCapabilities,
+  // M6 Phase 4 — backtest + alert surfaces
+  AlertDetailDto,
+  AlertDto,
+  AlertGenerateResponse,
+  AlertStatus,
+  AlertTriggerState,
+  BacktestCostPolicyInput,
+  BacktestDirection,
+  BacktestExitPolicyInput,
+  BacktestRunDetailDto,
+  BacktestRunDto,
+  BacktestTrade,
+  SetupDto,
 } from '@veltrixeye/contracts';
+import { MAX_ALERTS_LIMIT, MAX_BACKTESTS_LIMIT, MAX_BACKTEST_TRADES, MAX_SETUPS_LIMIT } from '@veltrixeye/contracts';
 
 /** Registered provider row from GET /api/market-data/providers. */
 export interface RegisteredProvider {
@@ -41,6 +55,91 @@ export interface CandleQueryParams {
   from: string;
   to: string;
   limit?: string;
+}
+
+// ---------------------------------------------------------------------------
+// M6 Phase 4 — backtests, setups (read-only) and alerts
+// ---------------------------------------------------------------------------
+
+/** Body for POST /api/backtests (mirrors the route's strict body schema). */
+export interface BacktestCreateInput {
+  strategyId: string;
+  versionId: string;
+  instrument: { assetClass: string; symbol: string };
+  direction?: BacktestDirection;
+  /** Epoch-ms, UTC; inclusive. */
+  from: number;
+  /** Epoch-ms, UTC; exclusive. Must not be in the future. */
+  to: number;
+  exitPolicy?: BacktestExitPolicyInput;
+  costPolicy?: BacktestCostPolicyInput;
+}
+
+/** POST /api/backtests response: the run detail plus the replay indicator. */
+export interface BacktestCreateResponseDto extends BacktestRunDetailDto {
+  /** False when an identical run already existed (deterministic replay). */
+  created: boolean;
+}
+
+/** GET /api/backtests response. */
+export interface BacktestListResponseDto {
+  runs: BacktestRunDto[];
+}
+
+/** GET /api/backtests/:id/trades response. */
+export interface BacktestTradesResponseDto {
+  runId: string;
+  trades: BacktestTrade[];
+  truncated: boolean;
+}
+
+/** Query params for GET /api/backtests (all optional). */
+export interface BacktestListParams {
+  strategyId?: string;
+  versionId?: string;
+  limit?: number;
+}
+
+/** Query params for GET /api/setups (all optional). */
+export interface SetupListParams {
+  strategyId?: string;
+  versionId?: string;
+  state?: string;
+  direction?: string;
+  limit?: number;
+}
+
+/** GET /api/setups response. */
+export interface SetupListResponseDto {
+  setups: SetupDto[];
+}
+
+/** Query params for GET /api/alerts (all optional). */
+export interface AlertListParams {
+  strategyId?: string;
+  status?: AlertStatus;
+  limit?: number;
+}
+
+/** GET /api/alerts response. */
+export interface AlertListResponseDto {
+  alerts: AlertDto[];
+}
+
+/** Clamp a caller-supplied page size to the contract's maximum. */
+function clampLimit(limit: number | undefined, max: number): number | undefined {
+  if (limit === undefined) return undefined;
+  return Math.min(Math.max(1, Math.trunc(limit)), max);
+}
+
+/** Build a query string from defined params only (stable insertion order). */
+function toQueryString(params: Record<string, string | number | undefined>): string {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== '') qs.set(key, String(value));
+  }
+  const s = qs.toString();
+  return s === '' ? '' : `?${s}`;
 }
 
 export class ApiError extends Error {
@@ -126,6 +225,91 @@ export const api = {
   getCoverage: () => request<CoverageResponseDto>('/market-data/coverage'),
   backfill: (input: BackfillRequest) =>
     request<BackfillResponseDto>('/market-data/backfill', { method: 'POST', body: JSON.stringify(input) }),
+
+  // -------------------------------------------------------------------------
+  // Backtests (M6 Phase 2 API, Phase 4 UI)
+  // -------------------------------------------------------------------------
+
+  /** GET /api/backtests — the caller's runs, newest first (owner-scoped). */
+  listBacktests: (params: BacktestListParams = {}) =>
+    request<BacktestListResponseDto>(
+      `/backtests${toQueryString({
+        strategyId: params.strategyId,
+        versionId: params.versionId,
+        limit: clampLimit(params.limit, MAX_BACKTESTS_LIMIT),
+      })}`,
+    ),
+
+  /** POST /api/backtests — create a run, or replay an identical existing one. */
+  createBacktest: (input: BacktestCreateInput) =>
+    request<BacktestCreateResponseDto>('/backtests', { method: 'POST', body: JSON.stringify(input) }),
+
+  /** GET /api/backtests/:id — one owned run with its stored trades. */
+  getBacktest: (id: string) => request<BacktestRunDetailDto>(`/backtests/${encodeURIComponent(id)}`),
+
+  /** GET /api/backtests/:id/trades — paginated trades for one owned run. */
+  getBacktestTrades: (id: string, limit?: number) =>
+    request<BacktestTradesResponseDto>(
+      `/backtests/${encodeURIComponent(id)}/trades${toQueryString({ limit: clampLimit(limit, MAX_BACKTEST_TRADES) })}`,
+    ),
+
+  // -------------------------------------------------------------------------
+  // Setups (M4 API — read-only here; used to choose an owned setup)
+  // -------------------------------------------------------------------------
+
+  /** GET /api/setups — the caller's setups, newest first (owner-scoped). */
+  listSetups: (params: SetupListParams = {}) =>
+    request<SetupListResponseDto>(
+      `/setups${toQueryString({
+        strategyId: params.strategyId,
+        versionId: params.versionId,
+        state: params.state,
+        direction: params.direction,
+        limit: clampLimit(params.limit, MAX_SETUPS_LIMIT),
+      })}`,
+    ),
+
+  // -------------------------------------------------------------------------
+  // Alerts (M6 Phase 2–3 API, Phase 4 UI)
+  // -------------------------------------------------------------------------
+
+  /** GET /api/alerts — the caller's alerts, newest first (owner-scoped). */
+  listAlerts: (params: AlertListParams = {}) =>
+    request<AlertListResponseDto>(
+      `/alerts${toQueryString({
+        strategyId: params.strategyId,
+        status: params.status,
+        limit: clampLimit(params.limit, MAX_ALERTS_LIMIT),
+      })}`,
+    ),
+
+  /** GET /api/alerts/:id — one owned alert plus its stub delivery ledger. */
+  getAlert: (id: string) => request<AlertDetailDto>(`/alerts/${encodeURIComponent(id)}`),
+
+  /**
+   * POST /api/alerts/:id/acknowledge — idempotent acknowledgement.
+   *
+   * The body is an explicit empty JSON object: the route parses the body with
+   * a strict empty schema, and Fastify rejects a body-less request that
+   * declares `Content-Type: application/json` — so the client always sends
+   * `{}` (see test/api-client.test.ts for the body-less counterpart).
+   */
+  acknowledgeAlert: (id: string) =>
+    request<AlertDetailDto>(`/alerts/${encodeURIComponent(id)}/acknowledge`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+
+  /**
+   * POST /api/setups/:setupId/alerts — generate an alert from an owned setup.
+   * `created: false` with an alert is a dedup replay; `alert: null` means the
+   * quality gate skipped generation (never an error).
+   */
+  generateAlert: (setupId: string, triggerState?: AlertTriggerState) =>
+    request<AlertGenerateResponse>(`/setups/${encodeURIComponent(setupId)}/alerts`, {
+      method: 'POST',
+      body: JSON.stringify(triggerState ? { triggerState } : {}),
+    }),
 };
 
 /** Summary row shape from the API list endpoint. */
