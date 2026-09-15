@@ -10,6 +10,8 @@ import { Badge } from '@/components/ui';
 const NAV = [
   { href: '/dashboard', label: 'Dashboard', icon: '◧' },
   { href: '/strategies', label: 'Strategies', icon: '⌘' },
+  { href: '/workbench', label: 'Workbench', icon: '▶' },
+  { href: '/setups', label: 'Setups', icon: '◉' },
   { href: '/alerts', label: 'Alerts', icon: '◎' },
   { href: '/backtests', label: 'Backtests', icon: '◫' },
   { href: '/markets', label: 'Markets', icon: '◈' },

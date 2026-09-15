@@ -30,8 +30,25 @@ import type {
   BacktestRunDto,
   BacktestTrade,
   SetupDto,
+  // M7.1 — core browser workflow (evaluate → detect → score → transition)
+  DetectionRequestInput,
+  DetectionResponseDto,
+  EvaluationRequestInput,
+  EvaluationResultDto,
+  SetupDetailDto,
+  SetupScoreHistoryResponseDto,
+  SetupScoreRequestInput,
+  SetupScoreResponseDto,
+  SetupTransitionRequest,
+  SetupTransitionResponseDto,
 } from '@veltrixeye/contracts';
-import { MAX_ALERTS_LIMIT, MAX_BACKTESTS_LIMIT, MAX_BACKTEST_TRADES, MAX_SETUPS_LIMIT } from '@veltrixeye/contracts';
+import {
+  MAX_ALERTS_LIMIT,
+  MAX_BACKTESTS_LIMIT,
+  MAX_BACKTEST_TRADES,
+  MAX_SCORE_HISTORY_LIMIT,
+  MAX_SETUPS_LIMIT,
+} from '@veltrixeye/contracts';
 
 /** Registered provider row from GET /api/market-data/providers. */
 export interface RegisteredProvider {
@@ -254,7 +271,7 @@ export const api = {
     ),
 
   // -------------------------------------------------------------------------
-  // Setups (M4 API — read-only here; used to choose an owned setup)
+  // Setups (M4 API — read + lifecycle)
   // -------------------------------------------------------------------------
 
   /** GET /api/setups — the caller's setups, newest first (owner-scoped). */
@@ -268,6 +285,74 @@ export const api = {
         limit: clampLimit(params.limit, MAX_SETUPS_LIMIT),
       })}`,
     ),
+
+  /** GET /api/setups/:id — one owned setup plus its lifecycle event history. */
+  getSetup: (id: string) => request<SetupDetailDto>(`/setups/${encodeURIComponent(id)}`),
+
+  // -------------------------------------------------------------------------
+  // M7.1 — deterministic evaluation (M3), detection (M4) and scoring (M5)
+  // -------------------------------------------------------------------------
+
+  /**
+   * POST /api/strategies/:strategyId/versions/:versionId/evaluate — run the
+   * deterministic M3 engine over stored candles at an explicit anchor.
+   *
+   * The body is exactly the contract's `{ asOf? }`: the evaluated instruments
+   * come from the version's own market scope, so the client never sends an
+   * instrument. The UI always supplies `asOf` so the anchor — and therefore the
+   * result — is reproducible; omitting it would pin the API to the wall clock.
+   * Store-only: this can never trigger a provider fetch.
+   */
+  evaluateVersion: (strategyId: string, versionId: string, input: EvaluationRequestInput = {}) =>
+    request<EvaluationResultDto>(
+      `/strategies/${encodeURIComponent(strategyId)}/versions/${encodeURIComponent(versionId)}/evaluate`,
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+
+  /**
+   * POST /api/strategies/:strategyId/versions/:versionId/detect — persist one
+   * setup per qualifying direction at the explicit anchor.
+   *
+   * `created: false` means the (version, instrument, direction, anchor) setup
+   * already existed and was returned unchanged — a replay, never a second setup.
+   */
+  detectSetup: (strategyId: string, versionId: string, input: DetectionRequestInput) =>
+    request<DetectionResponseDto>(
+      `/strategies/${encodeURIComponent(strategyId)}/versions/${encodeURIComponent(versionId)}/detect`,
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+
+  /**
+   * POST /api/setups/:setupId/score — score one owned setup with the M5 engine.
+   *
+   * `asOf` omitted means "the setup's own detection anchor"; `created: false`
+   * is an idempotent replay of an existing (setup, engine, anchor) score.
+   * Scoring never changes the setup's lifecycle and never edits the strategy.
+   */
+  scoreSetup: (setupId: string, input: SetupScoreRequestInput = {}) =>
+    request<SetupScoreResponseDto>(`/setups/${encodeURIComponent(setupId)}/score`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  /** GET /api/setups/:setupId/scores — the append-only score history, newest anchor first. */
+  listSetupScores: (setupId: string, limit?: number) =>
+    request<SetupScoreHistoryResponseDto>(
+      `/setups/${encodeURIComponent(setupId)}/scores${toQueryString({
+        limit: clampLimit(limit, MAX_SCORE_HISTORY_LIMIT),
+      })}`,
+    ),
+
+  /**
+   * POST /api/setups/:setupId/transitions — request one M4 lifecycle
+   * transition. `asOf` is required and becomes the event timestamp; a repeat
+   * of the current state is an idempotent no-op (`transitioned: false`).
+   */
+  transitionSetup: (setupId: string, input: SetupTransitionRequest) =>
+    request<SetupTransitionResponseDto>(`/setups/${encodeURIComponent(setupId)}/transitions`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
 
   // -------------------------------------------------------------------------
   // Alerts (M6 Phase 2–3 API, Phase 4 UI)
