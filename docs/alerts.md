@@ -54,7 +54,13 @@ never re-scores, and never transitions a setup.
      generate alerts.`
 
    The state gate runs **before** the score gate, so an ineligible setup is
-   refused for the real reason.
+   refused for the real reason. It is then **re-checked under a row lock
+   inside the generation transaction** (`SELECT state FROM setups WHERE id =
+   $1 FOR SHARE`, immediately after `BEGIN`): that share lock conflicts with
+   the `FOR UPDATE` M4's `SetupService.transitionSetup` holds while changing
+   state, so a transition that lands while generation is in flight either
+   blocks until the alert commits or is seen by the re-check and refused —
+   an alert is never written for a setup that is terminal by commit time.
 3. **M5 score required** — a `setup_scores` row must exist at the setup's own
    detection anchor (`setups.as_of_ms`). Missing → **400**
    `Setup has no quality score at its detection anchor — score the setup before

@@ -299,6 +299,64 @@ async function alertRowsForSetup(setupId: string) {
   return res.rows;
 }
 
+/**
+ * Deterministic interleaving harness for the lifecycle TOCTOU race.
+ *
+ * `AlertService.generateAlert` reads the owned setup (state gate) on one pooled
+ * connection and only later opens its write transaction. This harness parks the
+ * generation path at its NEXT connection checkout after that state read — i.e.
+ * after the gate has already been evaluated and before the alert INSERT runs —
+ * so a lifecycle transition can be committed inside the window.
+ *
+ * Returns `restore()` (always call it), a promise that resolves once the path
+ * is parked, and `release()` which lets it continue.
+ */
+function parkGenerationWriteCheckout() {
+  const originalQuery = pool.query.bind(pool);
+  const originalConnect = pool.connect.bind(pool);
+  let restore: () => void = () => {};
+  let release: () => void = () => {};
+  let signalParked: () => void = () => {};
+  const parked = new Promise<void>((resolve) => {
+    signalParked = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let stateReadSeen = false;
+  let oneShotUsed = false;
+
+  (pool as any).query = async (...args: any[]) => {
+    const result = await (originalQuery as any)(...args);
+    // The service's owned-setup read (ownership chain + instrument join).
+    if (
+      !stateReadSeen &&
+      typeof args[0] === 'string' &&
+      args[0].includes('JOIN instruments i ON i.id = s.instrument_id')
+    ) {
+      stateReadSeen = true;
+    }
+    return result;
+  };
+
+  (pool as any).connect = async (...args: any[]) => {
+    if (stateReadSeen && !oneShotUsed) {
+      oneShotUsed = true;
+      signalParked();
+      await gate;
+    }
+    return (originalConnect as any)(...args);
+  };
+
+  restore = () => {
+    (pool as any).query = originalQuery;
+    (pool as any).connect = originalConnect;
+    release(); // never leave the generation path parked if the test throws
+  };
+
+  return { parked, release, restore };
+}
+
 async function deliveriesFor(alertId: string) {
   const res = await pool.query<any>(
     'SELECT * FROM alert_deliveries WHERE alert_id = $1 ORDER BY id ASC',
@@ -804,6 +862,74 @@ describe('m6 alerts api (phase 3)', () => {
     assert.equal(await auditCount(owner.userId, 'alert.created'), 1);
     assert.equal(await auditCount(owner.userId, 'alert.delivery_recorded'), 1);
     assert.equal(await auditCount(owner.userId, 'alert.replayed'), 7);
+  });
+
+  test('lifecycle race: a transition that lands mid-generation can never produce an alert (TOCTOU)', async () => {
+    const owner = await registerUser();
+    const { strategyId, versionId } = await createPublishedVersion(owner.cookie, engulfConfig('EURUSD'));
+    const anchor = AS_OF + 55 * HOUR;
+    await seedCandles('EURUSD', BULLISH_SHAPES, anchor);
+    const setupId = await detectSetup(owner.cookie, strategyId, versionId, 'EURUSD', anchor);
+    await scoreSetup(owner.cookie, setupId);
+
+    // Counters captured before the race: this setup has an eligible state and
+    // a passing M5 score, so without the in-transaction re-check the parked
+    // generation below would happily commit an alert.
+    const alertsBefore = await countRows('alerts');
+    const deliveriesBefore = await countRows('alert_deliveries');
+    const createdAuditsBefore = await auditCount(owner.userId, 'alert.created');
+
+    const harness = parkGenerationWriteCheckout();
+    let generateResponse: Awaited<ReturnType<typeof generate>>;
+    try {
+      // Start generation; it evaluates the state gate, then parks before its
+      // write transaction is opened.
+      const generation = generate(owner.cookie, setupId);
+      await harness.parked;
+
+      // While generation is parked, M4 moves the setup to a terminal state.
+      const transitioned = await app.inject({
+        method: 'POST',
+        url: `/api/setups/${setupId}/transitions`,
+        headers: { cookie: owner.cookie, 'x-forwarded-for': freshIp() },
+        payload: { toState: 'invalidated', asOf: anchor + 1 },
+      });
+      assert.equal(transitioned.statusCode, 200, transitioned.body);
+
+      harness.release();
+      generateResponse = await generation;
+    } finally {
+      harness.restore();
+    }
+
+    // The generation must observe the terminal state, not write an alert.
+    assert.equal(generateResponse.statusCode, 400, generateResponse.body);
+    assert.equal(generateResponse.json().error.code, 'invalid_input');
+    assert.match(generateResponse.json().error.message, /terminal state/);
+    assert.match(generateResponse.json().error.message, /invalidated/);
+
+    const state = await pool.query<{ state: string }>('SELECT state FROM setups WHERE id = $1', [setupId]);
+    assert.equal(state.rows[0]?.state, 'invalidated');
+
+    // Zero side effects for that setup: no alert row, no ledger row, no
+    // alert.created audit event, and no growth of the global counters.
+    assert.deepEqual(await alertRowsForSetup(setupId), []);
+    assert.equal(await countRows('alerts'), alertsBefore);
+    assert.equal(await countRows('alert_deliveries'), deliveriesBefore);
+    assert.equal(await auditCount(owner.userId, 'alert.created'), createdAuditsBefore);
+    const staleAudit = await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM audit_events
+       WHERE action IN ('alert.created', 'alert.replayed', 'alert.delivery_recorded')
+         AND metadata->>'setupId' = $1`,
+      [setupId],
+    );
+    assert.equal(staleAudit.rows[0]?.n, '0');
+
+    // The setup is still refused afterwards (terminal states stay refused).
+    const afterRace = await generate(owner.cookie, setupId);
+    assert.equal(afterRace.statusCode, 400);
+    assert.match(afterRace.json().error.message, /terminal state/);
+    assert.deepEqual(await alertRowsForSetup(setupId), []);
   });
 
   test('different trigger states do not collapse: confirmed and triggered are separate logical alerts', async () => {

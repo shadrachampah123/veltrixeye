@@ -163,9 +163,13 @@ export class AlertService {
    *     404 (foreign/unknown) or 400 (terminal/ineligible).
    *  2. M5 score exists at the detection anchor else 400.
    *  3. `score.total >= risk.minQualityScore` else silence (200 + skippedReason).
-   *  4. Insert onto `(setup_id, trigger_state)` idempotently; the loser of a
+   *  4. Read the setup's state again INSIDE the write transaction under
+   *     `FOR SHARE` (serializes against M4's `FOR UPDATE` transition lock) and
+   *     re-apply the step-1 lifecycle gate, so a setup that became terminal in
+   *     between can never receive an alert.
+   *  5. Insert onto `(setup_id, trigger_state)` idempotently; the loser of a
    *     race reads the winner's row.
-   *  5. If the alert has no ledger row yet, ask the (stub) sender to render it
+   *  6. If the alert has no ledger row yet, ask the (stub) sender to render it
    *     and insert exactly one row; replays insert nothing.
    */
   async generateAlert(args: GenerateAlertArgs): Promise<GenerateAlertResult> {
@@ -218,10 +222,42 @@ export class AlertService {
     });
     const body = buildBody({ setup, score, triggerState: effectiveTrigger, minQualityScore });
 
-    // 4 + 5. Transactional alert + stub delivery ledger
+    // 4–6. Transactional alert + stub delivery ledger
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+
+      // 4a. Re-validate the lifecycle gate INSIDE the transaction.
+      //
+      // The read at step 1 happened outside this transaction (on another
+      // pooled connection), and the score read + version read in between are
+      // additional round trips — long enough for M4's transition path to
+      // invalidate/expire/complete the setup before this INSERT commits. An
+      // alert must never be created for a setup that is terminal by the time
+      // it is written.
+      //
+      // `FOR SHARE` takes a row-level share lock, which CONFLICTS with the
+      // `FOR UPDATE OF s` that `SetupService.transitionSetup` holds while it
+      // changes the state (packages/core/src/setups/service.ts). The two
+      // operations therefore serialize in both directions:
+      //  - if the transition commits first, this read sees the new (terminal)
+      //    state and the gate below refuses generation;
+      //  - if this read runs first, the transition blocks until this short
+      //    transaction (one select + at most two inserts) commits, and the
+      //    alert is written for the still-eligible state it observed.
+      // Ownership is unchanged: `setup` was already resolved owner-scoped in
+      // step 1 (masked 404) and this reads that same id by primary key.
+      const guarded = await client.query<{ state: string }>(
+        'SELECT state FROM setups WHERE id = $1 FOR SHARE',
+        [setup.id],
+      );
+      const guardedRow = guarded.rows[0];
+      if (!guardedRow) {
+        // Deleted between step 1 and here (cascade): same masked 404 as ever.
+        await client.query('ROLLBACK');
+        throw Errors.notFound('Setup not found');
+      }
+      assertEligibleState(guardedRow.state);
 
       const inserted = await client.query<AlertRow>(
         `INSERT INTO alerts
