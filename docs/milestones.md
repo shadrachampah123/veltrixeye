@@ -1,14 +1,18 @@
 # Milestone Boundaries
 
-This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5 and
-M6 Phases 1–4**. The boundaries below are deliberate and enforced: M1 shipped
-foundations and contracts; M2 added real historical market data; M3 added
-deterministic strategy evaluation; M4 added deterministic setup detection and
-lifecycle management; M5 added deterministic setup quality scoring; M6 Phases
-1–3 add the backtest engine/service and explicit setup alerts with a
-**stub-only** delivery ledger; M6 Phase 4 adds the backtest and alert surfaces
-in the web app — and still nothing that schedules, streams, sends real
-notifications, or executes trades.
+This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
+M6 Phases 1–4, and M7.1 + M7.2**. The boundaries below are deliberate and
+enforced: M1 shipped foundations and contracts; M2 added real historical
+market data; M3 added deterministic strategy evaluation; M4 added
+deterministic setup detection and lifecycle management; M5 added
+deterministic setup quality scoring; M6 Phases 1–3 add the backtest
+engine/service and explicit setup alerts with a **stub-only** delivery
+ledger; M6 Phase 4 adds the backtest and alert surfaces in the web app; M7.1
+adds the core browser trading workflow (evaluate → detect → score →
+transition → alert → acknowledge); M7.2 hardens the whole surface for
+commercial readiness (reference-data protection, audit attribution,
+credential-endpoint limiting, session hygiene). Still, nothing that
+schedules, streams, sends real notifications, or executes trades.
 
 ## M1 — delivered (Product Foundation & Architecture)
 
@@ -318,6 +322,53 @@ migration, service, provider or delivery channel**.
   truncation), history/detail, alert list/detail, the created / replayed /
   skipped outcomes, acknowledgement idempotency, the API client's request
   shapes and error copy, and the truthfulness of the stub-delivery wording.
+
+## M7.2 — delivered (Commercial Readiness Hardening)
+
+M7.1 (PR #14) delivered the core browser workflow
+(evaluate → detect → score → transition → alert → acknowledge, frontend
+only). M7.2 is the hardening pass over the whole M1–M7.1 surface: every
+finding below was **verified against the current code** before changing
+it; the rest of the audit surface (authorization/owner scoping,
+server-side validation, state-machine and idempotency behaviour, error
+handling, rate-limit pinning, production env handling, stub-only
+delivery) was re-verified and already met the bar, so it is unchanged.
+
+- **Platform-managed `instruments` table** — a strategy version may only
+  *reference* instruments that already exist in the shared platform
+  universe. The previous upsert let any user create new instrument rows
+  (which then appeared in every other user's scope-`all` evaluations and
+  market lists) and rewrite a platform instrument's `display_name` for
+  everyone. Unknown symbols are now rejected with a 400 at version write
+  time; user-supplied `displayName` no longer mutates the shared table.
+- **Audit attribution on strategy lifecycle events** — `strategy.created`,
+  `strategy.updated`, `strategy.deleted`, `strategy.version_created`,
+  `strategy.version_updated`, `strategy.version_published` and
+  `strategy.version_deprecated` now record the acting request's IP and
+  user agent (previously NULL, unlike every other audit event). A
+  `strategy.updated` event is also written now (the update route
+  previously audited nothing).
+- **Password-change rate limit** — `POST /api/users/me/password` (a
+  credential endpoint: it verifies the current password) is limited to
+  5/min per IP, like login and register (previously only the global
+  300/min applied).
+- **Session hygiene** — expired sessions are deleted at API boot
+  (`runStartupHousekeeping`; the platform runs no scheduler by design),
+  and the per-user session list is capped at 100 newest sessions plus the
+  caller's current session whenever it would otherwise be cut off, so
+  `GET /api/users/me` stays bounded while the user can always see and
+  revoke their own device.
+- **No schema change**: all four fixes are additive at the service/route
+  layer; migrations 0001–0012 are untouched.
+- **Docs** — [security.md](./security.md) (rate limits, session hygiene,
+  reference-data protection, audit attribution).
+- **Tests** — `apps/api/test/commercial-hardening.test.ts` (11 tests:
+  pollution attempts, display-name overwrite, unknown-symbol swap,
+  legitimate workflow, cross-user isolation, unauthenticated access, audit
+  IP/UA for create/update/publish/delete, the 5-then-429 password boundary
+  with a separate-IP control, housekeeping, and the bounded
+  current-inclusive session list) plus core service-level regressions for
+  the instrument guard and the session cap/cleanup.
 
 ## Explicitly NOT in M1+M2+M3+M4+M5+M6 (by design, deferred)
 

@@ -17,11 +17,11 @@ export { DomainError, Errors, isDomainError } from './errors.js';
 // Auth
 export { hashPassword, verifyPassword } from './auth/passwords.js';
 export { UserService, type CreateUserData } from './auth/users.js';
-export { SessionService, type SessionRecord, type NewSessionMeta } from './auth/sessions.js';
+export { SessionService, MAX_SESSIONS_LISTED, type SessionRecord, type NewSessionMeta } from './auth/sessions.js';
 export { AuditService, readAuditEvents, type AuditEntry } from './audit.js';
 
 // Strategies
-export { StrategyService } from './strategies/strategies.js';
+export { StrategyService, type StrategyAuditMeta } from './strategies/strategies.js';
 export { validatePublishable, type PublishValidationResult } from './strategies/validation.js';
 
 // Deterministic strategy evaluation (M3)
