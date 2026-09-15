@@ -88,8 +88,17 @@ export { SetupService } from './setups/service.js';
 export { allowedTransitions, assertTransition, isTerminalState } from './setups/machine.js';
 export { detectionLevels, mirrorPrice, type DetectionLevels } from './setups/levels.js';
 
-// Deterministic backtesting (M6 Phase 1: pure engine only — no service, no API yet)
+// Deterministic backtesting (M6 Phase 1: pure engine; Phase 2: service + canonical hash)
 export { runBacktest } from './backtest/engine.js';
+export { BacktestService } from './backtest/service.js';
+export {
+  computeConfigHash,
+  isValidConfigHash,
+  CONFIG_HASH_RE as BACKTEST_CONFIG_HASH_RE,
+} from './backtest/canonical.js';
+
+// Setup alerts (M6 Phase 1: schema; Phase 2: service)
+export { AlertService } from './alerts/service.js';
 
 // Scoring (foundation re-exports)
 export { qualityGrade, QUALITY_GRADE_BANDS } from '@veltrixeye/contracts';
