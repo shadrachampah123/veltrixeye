@@ -88,7 +88,11 @@ export function BacktestForm(props: BacktestFormProps) {
       aria-busy={submitting}
     >
       <div className="space-y-5">
-        {props.optionsError && <Alert tone="danger">{props.optionsError}</Alert>}
+        {props.optionsError && (
+          <Alert tone="danger" role="alert">
+            {props.optionsError}
+          </Alert>
+        )}
 
         <Card>
           <CardHeader
@@ -343,7 +347,11 @@ export function BacktestForm(props: BacktestFormProps) {
           </div>
         </Card>
 
-        {props.submitError && <Alert tone="danger" title="Backtest failed">{props.submitError}</Alert>}
+        {props.submitError && (
+          <Alert tone="danger" title="Backtest failed" role="alert">
+            {props.submitError}
+          </Alert>
+        )}
 
         <div className="flex flex-wrap items-center gap-3">
           <Button type="submit" disabled={submitting}>
@@ -495,13 +503,17 @@ export function BacktestFormPanel() {
       {submitting && (
         <Card>
           <CardHeader title="Running replay" subtitle="Evaluating each setup close in the selected range" />
-          <Spinner />
+          <Spinner label="Running backtest" />
         </Card>
       )}
 
       {result && (
         <div className="space-y-5">
-          <Alert tone={result.created ? 'success' : 'info'} title={result.created ? 'Backtest completed' : 'Identical run replayed'}>
+          <Alert
+            tone={result.created ? 'success' : 'info'}
+            title={result.created ? 'Backtest completed' : 'Identical run replayed'}
+            role="status"
+          >
             {result.created
               ? 'A new run was recorded with these exact inputs.'
               : 'This exact configuration was already backtested, so the stored deterministic result was returned — nothing new was created.'}{' '}

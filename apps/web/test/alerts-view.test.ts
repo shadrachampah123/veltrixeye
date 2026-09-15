@@ -38,7 +38,6 @@ import {
   describeGenerateOutcome,
   gradeTone,
   isAcknowledged,
-  isKnownChannel,
   readAlertBody,
   setupGenerateEligibility,
   sortSetupsForGenerate,
@@ -247,8 +246,9 @@ test('deliveryChannelLabel() — stub is labelled, reserved channels are marked 
   assert.match(deliveryChannelLabel('email'), /reserved — not enabled/);
   assert.match(deliveryChannelLabel('webhook'), /reserved — not enabled/);
   assert.match(deliveryChannelLabel('push'), /reserved — not enabled/);
-  assert.equal(isKnownChannel('stub'), true);
-  assert.equal(isKnownChannel('carrier-pigeon'), false);
+  // A channel the contracts do not define is still described as reserved,
+  // never as a live integration.
+  assert.match(deliveryChannelLabel('carrier-pigeon'), /reserved — not enabled/);
 });
 
 // ---------------------------------------------------------------------------

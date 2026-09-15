@@ -6,7 +6,7 @@ import { AppShell, PageHeader } from '@/components/app-shell';
 import { RequireAuth } from '@/components/auth-context';
 import { api } from '@/lib/api';
 import { Alert, Button, Card, CardHeader, Field, Select, Spinner } from '@/components/ui';
-import { AlertsTable, AlertsNeverGeneratedState } from '@/components/alerts-table';
+import { AlertsTable, AlertsNeverGeneratedState, GENERATE_PANEL_ANCHOR } from '@/components/alerts-table';
 import { GenerateAlertPanel } from '@/components/generate-alert-panel';
 import { StubDeliveryNotice } from '@/components/stub-delivery-notice';
 import { ALERT_STATUS_FILTERS } from '@/lib/alerts-view';
@@ -75,7 +75,9 @@ function AlertsContent() {
 
       {error && (
         <div className="mb-4">
-          <Alert tone="danger">{error}</Alert>
+          <Alert tone="danger" role="alert">
+            {error}
+          </Alert>
         </div>
       )}
 
@@ -105,14 +107,14 @@ function AlertsContent() {
       </Card>
 
       {alerts === null ? (
-        <Spinner />
+        <Spinner label="Loading your alerts" />
       ) : alerts.length === 0 && status === '' && strategyId === '' ? (
         <AlertsNeverGeneratedState />
       ) : (
         <AlertsTable alerts={alerts} />
       )}
 
-      <div className="mt-6">
+      <div className="mt-6" id={GENERATE_PANEL_ANCHOR}>
         <GenerateAlertPanel />
       </div>
     </AppShell>

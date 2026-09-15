@@ -6,11 +6,12 @@ import type { SetupDto } from '@veltrixeye/contracts';
 import { api } from '@/lib/api';
 import { Alert, Badge, Button, Card, CardHeader, Monospace, Spinner } from '@/components/ui';
 import {
-  type GenerateAlertOutcome,
+  classifyGenerateOutcome,
   describeGenerateOutcome,
   isGenerateEligibleState,
   setupGenerateEligibility,
   sortSetupsForGenerate,
+  type GenerateAlertOutcome,
 } from '@/lib/alerts-view';
 import { describeApiError } from '@/lib/api-errors';
 import { formatDateTime, formatPrice } from '@/lib/formats';
@@ -29,7 +30,7 @@ import { StubDeliveryNotice } from '@/components/stub-delivery-notice';
 export function GenerateAlertOutcomeBanner({ outcome }: { outcome: GenerateAlertOutcome }) {
   const copy = describeGenerateOutcome(outcome);
   return (
-    <Alert tone={copy.tone} title={copy.title}>
+    <Alert tone={copy.tone} title={copy.title} role="status">
       <p>{copy.detail}</p>
       {outcome.kind !== 'skipped' && (
         <p className="mt-1.5">
@@ -149,11 +150,9 @@ export function GenerateAlertPanel() {
     setError(null);
     try {
       const res = await api.generateAlert(setupId);
-      setOutcome(
-        res.alert === null
-          ? { kind: 'skipped', reason: res.skippedReason ?? 'below_min_quality' }
-          : { kind: res.created ? 'created' : 'replayed', alert: res.alert, deliveries: res.deliveries ?? [] },
-      );
+      // Single source of truth for created / replayed / skipped — the same
+      // helper the tests exercise, so the UI cannot drift from them.
+      setOutcome(classifyGenerateOutcome(res));
     } catch (err) {
       setError(describeApiError(err, 'The alert could not be generated. Nothing was created.'));
     } finally {
@@ -180,10 +179,12 @@ export function GenerateAlertPanel() {
         )}
         {error && (
           <div className="px-5 pt-4">
-            <Alert tone="danger">{error}</Alert>
+            <Alert tone="danger" role="alert">
+              {error}
+            </Alert>
           </div>
         )}
-        {setups === null ? <Spinner /> : <SetupGenerateList setups={setups} pendingSetupId={pendingSetupId} onGenerate={(id) => void generate(id)} />}
+        {setups === null ? <Spinner label="Loading your setups" /> : <SetupGenerateList setups={setups} pendingSetupId={pendingSetupId} onGenerate={(id) => void generate(id)} />}
       </Card>
       <StubDeliveryNotice />
     </div>

@@ -3,7 +3,7 @@
 import * as React from 'react';
 import Link from 'next/link';
 import type { AlertDto } from '@veltrixeye/contracts';
-import { Badge, Button, Card, CardHeader, Monospace } from '@/components/ui';
+import { Badge, Card, CardHeader, Monospace, buttonClass } from '@/components/ui';
 import {
   alertStatusLabel,
   alertStatusTone,
@@ -14,6 +14,9 @@ import {
 } from '@/lib/alerts-view';
 import { formatDateTime } from '@/lib/formats';
 import { StubDeliveryHint } from '@/components/stub-delivery-notice';
+
+/** In-page id of the generate panel, targeted by the empty-state link. */
+export const GENERATE_PANEL_ANCHOR = 'generate-from-setup';
 
 /** Alert list (M6 Phase 4) — the caller's own alerts, newest first. */
 export function AlertsTable({ alerts }: { alerts: readonly AlertDto[] }) {
@@ -100,8 +103,14 @@ export function AlertsTable({ alerts }: { alerts: readonly AlertDto[] }) {
   );
 }
 
-/** Empty state used when the caller has never generated an alert. */
-export function AlertsNeverGeneratedState({ onGoToGenerator }: { onGoToGenerator?: () => void }) {
+/**
+ * Empty state used when the caller has never generated an alert.
+ *
+ * The call-to-action links to the generator panel on the same page (a real
+ * in-page anchor, not a button with an optional click handler that no caller
+ * ever supplied — an unreachable control is worse than none).
+ */
+export function AlertsNeverGeneratedState() {
   return (
     <Card className="px-6 py-14 text-center">
       <p className="text-sm text-ink-300">You have not generated any alerts yet.</p>
@@ -109,13 +118,11 @@ export function AlertsNeverGeneratedState({ onGoToGenerator }: { onGoToGenerator
         An alert is created explicitly from one of your setups — there is no background scanner in this milestone, so
         nothing is generated for you automatically.
       </p>
-      {onGoToGenerator && (
-        <div className="mt-4">
-          <Button variant="secondary" onClick={onGoToGenerator}>
-            Go to “Generate from a setup”
-          </Button>
-        </div>
-      )}
+      <div className="mt-4">
+        <Link href={`#${GENERATE_PANEL_ANCHOR}`} className={buttonClass('secondary')}>
+          Go to “Generate from a setup”
+        </Link>
+      </div>
     </Card>
   );
 }

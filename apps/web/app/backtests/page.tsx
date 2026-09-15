@@ -1,15 +1,13 @@
 'use client';
 
 import * as React from 'react';
-import Link from 'next/link';
 import type { BacktestRunDto, StrategySummaryDto } from '@veltrixeye/contracts';
 import { AppShell, PageHeader } from '@/components/app-shell';
 import { RequireAuth } from '@/components/auth-context';
 import { api } from '@/lib/api';
-import { Alert, Button, Card, CardHeader, Field, Select, Spinner } from '@/components/ui';
+import { Alert, Button, Card, CardHeader, Field, LinkButton, Select, Spinner } from '@/components/ui';
 import { BacktestHistoryTable } from '@/components/backtest-history';
-import { DEFAULT_BACKTESTS_PAGE_SIZE } from '@/lib/backtest-form';
-import { MAX_BACKTESTS_LIMIT } from '@veltrixeye/contracts';
+import { DEFAULT_BACKTESTS_PAGE_SIZE, backtestHistoryCopy } from '@/lib/backtest-form';
 import { describeApiError } from '@/lib/api-errors';
 
 /**
@@ -59,20 +57,20 @@ function BacktestsContent() {
         title="Backtests"
         subtitle="Deterministic replays of your published strategy versions over stored candles"
         actions={
-          <Link href="/backtests/new">
-            <Button>+ New backtest</Button>
-          </Link>
+          <LinkButton href="/backtests/new">+ New backtest</LinkButton>
         }
       />
 
       {error && (
         <div className="mb-4">
-          <Alert tone="danger">{error}</Alert>
+          <Alert tone="danger" role="alert">
+            {error}
+          </Alert>
         </div>
       )}
 
       <Card className="mb-5">
-        <CardHeader title="Filter" subtitle="Up to the most recent 100 runs" />
+        <CardHeader title="Filter" subtitle={backtestHistoryCopy().subtitle} />
         <div className="grid gap-4 px-5 py-4 sm:grid-cols-[minmax(0,1fr)_auto]">
           <Field label="Strategy">
             <Select value={strategyId} onChange={(e) => setStrategyId(e.target.value)}>
@@ -92,11 +90,11 @@ function BacktestsContent() {
         </div>
       </Card>
 
-      {runs === null ? <Spinner /> : <BacktestHistoryTable runs={runs} />}
+      {runs === null ? <Spinner label="Loading your backtests" /> : <BacktestHistoryTable runs={runs} />}
 
       <p className="mt-4 text-xs text-ink-500">
         A run reads the shared candle store only — it never calls a market-data provider and never writes a live setup.
-        Page size is capped at {MAX_BACKTESTS_LIMIT} runs by the API.
+        {backtestHistoryCopy().footnote}
       </p>
     </AppShell>
   );

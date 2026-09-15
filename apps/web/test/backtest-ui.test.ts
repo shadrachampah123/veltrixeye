@@ -327,7 +327,7 @@ test('BacktestTradesTable renders each trade the API returned', () => {
     }),
   ];
   const html = renderToStaticMarkup(
-    React.createElement(BacktestTradesTable, { trades, truncated: false, limit: 50 }),
+    React.createElement(BacktestTradesTable, { trades, truncated: false }),
   );
   assert.ok(html.includes('Take profit 3'), 'exit reason label');
   assert.ok(html.includes('Stop loss'));
@@ -344,29 +344,54 @@ test('BacktestTradesTable — empty state, truncation badge and load-more contro
   const empty = renderToStaticMarkup(React.createElement(BacktestTradesTable, { trades: [], truncated: false }));
   assert.ok(empty.includes('No setups qualified in this range'), 'honest empty state');
 
+  // Genuinely truncated: 100 of more than 100 stored trades are loaded.
   const truncated = renderToStaticMarkup(
     React.createElement(BacktestTradesTable, {
       trades: [tradeFixture()],
       truncated: true,
-      limit: 1,
       onLoadMore: noop,
       loadingMore: false,
     }),
   );
   assert.ok(truncated.includes('truncated'), 'truncation badge');
-  assert.ok(truncated.includes(`at most ${MAX_BACKTEST_TRADES} per run`), 'truncation limit stated');
+  assert.ok(truncated.includes('Showing the first 1 trades of this run'), 'caption states the loaded count');
+  assert.ok(truncated.includes('load more to see the rest'), 'caption explains what is missing');
+  assert.ok(truncated.includes('role="status"'), 'the caption is announced to assistive tech');
   assert.ok(truncated.includes('Load more trades'), 'paging control offered');
+  assert.ok(!truncated.includes(`at most ${MAX_BACKTEST_TRADES} trades are kept`), 'the 500 cap is only mentioned when actually hit');
 
   const loading = renderToStaticMarkup(
     React.createElement(BacktestTradesTable, {
       trades: [tradeFixture()],
       truncated: true,
-      limit: 1,
       onLoadMore: noop,
       loadingMore: true,
     }),
   );
   assert.ok(loading.includes('Loading…'), 'paging shows progress');
+  assert.ok(loading.includes('disabled'), 'the control is inert while loading');
+});
+
+test('BacktestTradesTable — a complete result offers no paging and no 500-trade warning', () => {
+  // Regression for the review finding: a run with 230 stored trades is
+  // `truncated: false` on GET /api/backtests/:id, so it must not claim a cap
+  // and must not offer a control that would shrink the visible rows.
+  const trades = Array.from({ length: 230 }, (_, index) => tradeFixture({ seq: index + 1 }));
+  const complete = renderToStaticMarkup(React.createElement(BacktestTradesTable, { trades, truncated: false }));
+  assert.ok(complete.includes('Trades (230)'), 'every stored trade stays visible');
+  assert.ok(!complete.includes('Load more trades'), 'no paging control for a complete result');
+  assert.ok(!complete.includes(`at most ${MAX_BACKTEST_TRADES}`), 'no false 500-trade warning');
+  assert.ok(!complete.includes('truncated'), 'no truncation badge');
+
+  // …and at the backend's real cap the message is true.
+  const atCap = renderToStaticMarkup(
+    React.createElement(BacktestTradesTable, {
+      trades: Array.from({ length: MAX_BACKTEST_TRADES }, (_, index) => tradeFixture({ seq: index + 1 })),
+      truncated: true,
+    }),
+  );
+  assert.ok(atCap.includes(`at most ${MAX_BACKTEST_TRADES} trades are kept, in signal order`), 'cap message only at the cap');
+  assert.ok(!atCap.includes('Load more trades'), 'nothing further to load at the cap');
 });
 
 test('BacktestNotesList surfaces engine notes verbatim, with an honest empty state', () => {

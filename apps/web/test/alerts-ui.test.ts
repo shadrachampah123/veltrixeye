@@ -13,13 +13,16 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import {
   alertDeliveryDtoSchema,
   alertDtoSchema,
+  alertGenerateResponseSchema,
   type AlertDeliveryDto,
   type AlertDto,
+  type AlertGenerateResponse,
   type SetupDto,
 } from '@veltrixeye/contracts';
-import { AlertsTable, AlertsNeverGeneratedState } from '../components/alerts-table';
+import { AlertsTable, AlertsNeverGeneratedState, GENERATE_PANEL_ANCHOR } from '../components/alerts-table';
 import { AlertDetailPanel } from '../components/alert-detail-panel';
 import { GenerateAlertOutcomeBanner, SetupGenerateList, SetupGenerateRow } from '../components/generate-alert-panel';
+import { classifyGenerateOutcome } from '../lib/alerts-view';
 import { StubDeliveryNotice } from '../components/stub-delivery-notice';
 
 const SETUP_ID = '33333333-3333-4333-8333-333333333333';
@@ -139,9 +142,14 @@ test('AlertsTable — empty state explains how an alert comes to exist', () => {
   assert.ok(html.includes('confirmed'), 'names an eligible trigger state');
   assert.ok(html.includes('Generate from a setup'), 'points at the generator');
 
-  const never = renderToStaticMarkup(React.createElement(AlertsNeverGeneratedState, { onGoToGenerator: noop }));
+  const never = renderToStaticMarkup(React.createElement(AlertsNeverGeneratedState, {}));
   assert.ok(never.includes('You have not generated any alerts yet.'));
   assert.ok(never.includes('no background scanner'), 'states that nothing is generated automatically');
+  // The call-to-action is a real in-page link to the generator, not a callback
+  // the page never wired up (the previous button's onClick was unreachable).
+  assert.match(never, new RegExp(`<a[^>]*href="#${GENERATE_PANEL_ANCHOR}"`), 'anchors to the generate panel');
+  assert.ok(!never.includes('<button'), 'no button nested inside that anchor');
+  assert.ok(never.includes('focus-visible:outline'), 'the link is keyboard reachable and visible');
 });
 
 // ---------------------------------------------------------------------------
@@ -215,12 +223,16 @@ test('AlertDetailPanel — errors and confirmations are rendered, safely', () =>
   const failed = detailPanel({ error: 'The alert could not be acknowledged. Try again.' });
   assert.ok(failed.includes('Could not acknowledge'), 'error heading');
   assert.ok(failed.includes('The alert could not be acknowledged. Try again.'));
+  assert.ok(failed.includes('role="alert"'), 'a failed acknowledgement interrupts immediately');
+  assert.ok(failed.includes('aria-live="assertive"'));
 
   const done = detailPanel({
     alert: alertFixture({ status: 'acknowledged', acknowledgedAt: '2024-05-21T08:30:00.000Z' }),
     notice: 'This alert was already acknowledged — the API kept the original timestamp and wrote nothing new.',
   });
   assert.ok(done.includes('This alert was already acknowledged'), 'idempotent replay is described honestly');
+  assert.ok(done.includes('role="status"'), 'the confirmation is announced politely');
+  assert.ok(done.includes('aria-live="polite"'));
 
   const noLedger = detailPanel({ deliveries: [] });
   assert.ok(noLedger.includes('No delivery rows were returned for this alert.'), 'honest empty ledger');
@@ -270,6 +282,50 @@ test('GenerateAlertOutcomeBanner — a quality-gate skip is not presented as gen
   assert.ok(html.includes('below the strategy version'), 'names the gate');
   assert.ok(html.includes('No alert row was written'), 'states nothing was persisted');
   assert.ok(!html.includes('href="/alerts/'), 'a skip links to no alert');
+});
+
+test('generate outcome — raw API responses classify and announce through the production helpers', () => {
+  // The panel chains classifyGenerateOutcome() → describeGenerateOutcome() →
+  // banner. Driving that exact chain from wire-shaped responses proves the
+  // created / replayed / skipped distinction a trader sees, rather than a
+  // hand-written expectation of it.
+  const created = alertGenerateResponseSchema.parse({
+    alert: alertFixture(),
+    created: true,
+    deliveries: [deliveryFixture()],
+  });
+  const replayed = alertGenerateResponseSchema.parse({
+    alert: alertFixture(),
+    created: false,
+    deliveries: [deliveryFixture()],
+  });
+  const skipped = alertGenerateResponseSchema.parse({
+    alert: null,
+    created: false,
+    skippedReason: 'below_min_quality',
+  });
+
+  const cases: Array<[AlertGenerateResponse, string[], string[]]> = [
+    [created, ['Alert generated', 'Stub delivery only', 'No external notification was sent'], ['Alert already exists', 'No alert generated']],
+    [replayed, ['Alert already exists', 'no second alert', 'no second delivery row'], ['Alert generated', 'No alert generated']],
+    [skipped, ['No alert generated', 'below the strategy version', 'No alert row was written'], ['Alert generated', 'Alert already exists']],
+  ];
+
+  for (const [response, expected, absent] of cases) {
+    const outcome = classifyGenerateOutcome(response);
+    const html = renderToStaticMarkup(React.createElement(GenerateAlertOutcomeBanner, { outcome }));
+    for (const text of expected) assert.ok(html.includes(text), `expected "${text}" for ${outcome.kind}`);
+    for (const text of absent) assert.ok(!html.includes(text), `must not say "${text}" for ${outcome.kind}`);
+    assert.ok(html.includes('role="status"'), 'every outcome is announced to assistive tech');
+    assert.ok(html.includes('aria-live="polite"'));
+  }
+
+  // The replay must point at the SAME alert id the API returned.
+  const replayHtml = renderToStaticMarkup(
+    React.createElement(GenerateAlertOutcomeBanner, { outcome: classifyGenerateOutcome(replayed) }),
+  );
+  assert.ok(replayHtml.includes(`href="/alerts/${ALERT_ID}"`), 'the replay links to the existing alert');
+  assert.equal(classifyGenerateOutcome(skipped).kind, 'skipped');
 });
 
 test('SetupGenerateRow — enabled for an eligible setup, disabled with a reason otherwise', () => {

@@ -75,8 +75,3 @@ export function fieldErrorsFromApiError(err: unknown): Record<string, string> {
   }
   return out;
 }
-
-/** The first per-field message for a path, when the API supplied one. */
-export function fieldErrorFor(errors: Record<string, string>, path: string): string | undefined {
-  return errors[path];
-}

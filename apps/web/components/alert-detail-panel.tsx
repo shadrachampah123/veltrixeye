@@ -46,8 +46,16 @@ export function AlertDetailPanel(props: AlertDetailPanelProps) {
 
   return (
     <div className="space-y-5">
-      {error && <Alert tone="danger" title="Could not acknowledge">{error}</Alert>}
-      {notice && <Alert tone="success">{notice}</Alert>}
+      {error && (
+        <Alert tone="danger" title="Could not acknowledge" role="alert">
+          {error}
+        </Alert>
+      )}
+      {notice && (
+        <Alert tone="success" role="status">
+          {notice}
+        </Alert>
+      )}
 
       <Card>
         <CardHeader

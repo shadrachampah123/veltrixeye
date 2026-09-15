@@ -12,6 +12,8 @@ import {
   formatR,
   metricTiles,
   truncationIndicators,
+  tradesHasMore,
+  tradesTruncationMessage,
 } from '@/lib/backtest-form';
 import { formatDateTime, formatPrice } from '@/lib/formats';
 
@@ -33,7 +35,7 @@ export function BacktestRunSummary({
   created?: boolean;
 }) {
   const outcome = created === undefined ? null : backtestOutcomeLabel(created);
-  const limits = truncationIndicators({ truncated: false, notes: run.notes });
+  const limits = truncationIndicators({ notes: run.notes });
 
   return (
     <Card>
@@ -155,18 +157,20 @@ export function BacktestNotesList({ notes }: { notes: readonly string[] }) {
 export function BacktestTradesTable({
   trades,
   truncated,
-  limit,
   onLoadMore,
   loadingMore,
 }: {
   trades: readonly BacktestTrade[];
   truncated: boolean;
-  /** How many trades are currently shown (from the trades endpoint's limit). */
-  limit?: number;
+  /** Called to fetch a larger page. Omit when the API can return nothing more. */
   onLoadMore?: () => void;
   loadingMore?: boolean;
 }) {
-  const hasMore = typeof limit === 'number' && trades.length >= limit;
+  // Both decisions come from the API's own `truncated` flag plus the storage
+  // cap — never from comparing the row count to a page size, which is how a
+  // smaller paged response used to replace (and shrink) a complete result.
+  const showLoadMore = onLoadMore !== undefined && tradesHasMore({ trades, truncated });
+  const caption = tradesTruncationMessage({ truncated, loaded: trades.length });
 
   return (
     <Card>
@@ -239,18 +243,18 @@ export function BacktestTradesTable({
           </table>
         </div>
       )}
-      {truncated && (
-        <p className="border-t border-ink-700 px-5 py-3 text-xs text-amber-450">
-          This run holds more trades than are shown — the API stores and returns at most 500 per run.
+      {caption && (
+        <p role="status" className="border-t border-ink-700 px-5 py-3 text-xs text-amber-450">
+          {caption}
         </p>
       )}
-      {hasMore && onLoadMore && (
+      {showLoadMore && (
         <div className="border-t border-ink-700 px-5 py-3">
           <button
             type="button"
             onClick={onLoadMore}
             disabled={loadingMore}
-            className="rounded-md border border-ink-600 px-3 py-1.5 text-xs text-ink-200 transition-colors hover:bg-ink-750 disabled:opacity-50"
+            className="rounded-md border border-ink-600 px-3 py-1.5 text-xs text-ink-200 transition-colors hover:bg-ink-750 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal-500 disabled:opacity-50"
           >
             {loadingMore ? 'Loading…' : 'Load more trades'}
           </button>

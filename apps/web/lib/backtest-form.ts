@@ -1,6 +1,7 @@
 import {
   BACKTEST_EXIT_REASONS,
   DEFAULT_BACKTESTS_LIMIT,
+  MAX_BACKTESTS_LIMIT,
   DEFAULT_MAX_HOLD_CANDLES,
   MAX_BACKTEST_STEPS,
   MAX_BACKTEST_TRADES,
@@ -10,6 +11,7 @@ import {
   type BacktestExitPolicyInput,
   type BacktestCostPolicyInput,
   type BacktestMetrics,
+  type BacktestTrade,
 } from '@veltrixeye/contracts';
 import type { BacktestCreateInput } from '@/lib/api';
 
@@ -369,24 +371,112 @@ export function directionLabel(direction: BacktestDirection | 'long' | 'short'):
 }
 
 /** True when a note reports the engine's anchor cap. */
-export function isAnchorTruncationNote(note: string): boolean {
+function isAnchorTruncationNote(note: string): boolean {
   return note.includes('MAX_BACKTEST_STEPS');
 }
 
 /**
  * Human-readable truncation/limit indicators, derived only from what the API
- * returned: the `truncated` flag (more trades than are stored per run) and the
- * engine's anchor-cap note.
+ * returned — here, the engine's anchor-cap note.
+ *
+ * Trade truncation is deliberately NOT part of this list: the two read
+ * endpoints define `truncated` differently (`GET /:id` compares setups against
+ * the stored rows, `GET /:id/trades` also compares against the requested
+ * limit), so the trades table derives its own message from the response it
+ * actually rendered — see `tradesTruncationMessage`.
  */
-export function truncationIndicators(input: { truncated: boolean; notes: readonly string[] }): string[] {
+export function truncationIndicators(input: { notes: readonly string[] }): string[] {
   const out: string[] = [];
   if (input.notes.some(isAnchorTruncationNote)) {
     out.push(`Anchor limit reached — the first ${MAX_BACKTEST_STEPS} setup closes were evaluated; split the range to cover the rest.`);
   }
-  if (input.truncated) {
-    out.push(`Trade list truncated — at most ${MAX_BACKTEST_TRADES} trades are stored per run.`);
-  }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Trade paging — monotonic by construction
+// ---------------------------------------------------------------------------
+
+/** What the trades table is currently showing, plus the API's own flag. */
+export interface TradesPageState {
+  /** Merged trades, ascending `seq`. */
+  trades: BacktestTrade[];
+  /** The `truncated` flag from the response that produced `trades`. */
+  truncated: boolean;
+  /** The largest page size requested so far. */
+  limit: TradesPageSize;
+}
+
+/**
+ * Union two trade lists by `seq`, ascending.
+ *
+ * Paging must never shrink what the user is looking at: `GET /:id` returns
+ * every stored trade while `GET /:id/trades?limit=N` returns only the first N,
+ * so a naive `setTrades(response.trades)` can *remove* rows that were already
+ * on screen. Merging makes a smaller response a no-op instead of a regression.
+ */
+export function mergeTrades(
+  existing: readonly BacktestTrade[],
+  incoming: readonly BacktestTrade[],
+): BacktestTrade[] {
+  const bySeq = new Map<number, BacktestTrade>();
+  for (const t of existing) bySeq.set(t.seq, t);
+  for (const t of incoming) bySeq.set(t.seq, t);
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+}
+
+/** Apply one trades response to the current view. The count never decreases. */
+export function applyTradesPage(
+  current: TradesPageState,
+  page: { trades: readonly BacktestTrade[]; truncated: boolean; limit: TradesPageSize },
+): TradesPageState {
+  const merged = mergeTrades(current.trades, page.trades);
+  const limit = page.limit > current.limit ? page.limit : current.limit;
+  return {
+    trades: merged,
+    // The response covering the most rows is the authority on what remains.
+    // The API computes `truncated` relative to the limit it was asked for
+    // (`setups > rows || setups > limit`), so a *smaller* page can report
+    // `true` for a run a larger page already showed in full — adopting it here
+    // would claim missing rows and offer a control that can never return one.
+    // A stale smaller page (e.g. a refetch of `?limit=100` over the complete
+    // detail result) therefore leaves the flag untouched.
+    truncated: page.limit >= current.limit ? page.truncated : current.truncated,
+    limit,
+  };
+}
+
+/**
+ * Whether more trades can actually be fetched.
+ *
+ * Driven by the API's `truncated` flag, not by comparing counts to the page
+ * size: the flag is false once the response covers every stored trade, and the
+ * API stores at most `MAX_BACKTEST_TRADES` per run, so asking again past that
+ * bound could never return another row.
+ */
+export function tradesHasMore(state: { trades: readonly BacktestTrade[]; truncated: boolean }): boolean {
+  return state.truncated && state.trades.length < MAX_BACKTEST_TRADES;
+}
+
+/** The next page size above what is already loaded, or undefined at the cap. */
+export function nextTradesPageSize(loaded: number): TradesPageSize | undefined {
+  return TRADES_PAGE_SIZES.find((size) => size > loaded);
+}
+
+/**
+ * The honest caption for the trades table:
+ *  - not truncated → nothing to say;
+ *  - truncated below the storage cap → a page-size limitation, so more can be
+ *    loaded;
+ *  - truncated at the cap → the run holds more setups than the API stores, and
+ *    no request can return them.
+ */
+export function tradesTruncationMessage(input: { truncated: boolean; loaded: number }): string | null {
+  if (!input.truncated) return null;
+  if (input.loaded >= MAX_BACKTEST_TRADES) {
+    return `This run detected more setups than the API stores per run — at most ${MAX_BACKTEST_TRADES} trades are kept, in signal order.`;
+  }
+  return `Showing the first ${input.loaded} trades of this run — load more to see the rest.`;
 }
 
 /** Copy for the deterministic-replay outcome of POST /api/backtests. */
@@ -455,3 +545,18 @@ export function metricTiles(metrics: BacktestMetrics, options: { showsCurrency: 
 
 /** Default page size for the backtest list. */
 export const DEFAULT_BACKTESTS_PAGE_SIZE = DEFAULT_BACKTESTS_LIMIT;
+
+/**
+ * Copy for the backtest history page, derived from the page size it actually
+ * requests — so the label can never claim a larger page than the query asks
+ * for (the API's own maximum is a separate fact and is stated as such).
+ */
+export function backtestHistoryCopy(limit: number = DEFAULT_BACKTESTS_PAGE_SIZE): {
+  subtitle: string;
+  footnote: string;
+} {
+  return {
+    subtitle: `Up to the most recent ${limit} runs`,
+    footnote: `This view requests the most recent ${limit} runs; the API caps a single page at ${MAX_BACKTESTS_LIMIT}.`,
+  };
+}

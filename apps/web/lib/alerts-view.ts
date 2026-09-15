@@ -1,5 +1,4 @@
 import {
-  ALERT_CHANNELS,
   ALERT_STATUSES,
   ALERT_TRIGGER_STATES,
   type AlertChannel,
@@ -148,9 +147,6 @@ export const ALERT_STATUS_FILTERS: Array<{ value: '' | AlertStatus; label: strin
   ...ALERT_STATUSES.map((s) => ({ value: s, label: alertStatusLabel(s) })),
 ];
 
-/** Filter options for the generate panel (the only states that can generate). */
-export const GENERATE_TRIGGER_STATES = ALERT_TRIGGER_STATES;
-
 /** Whether an alert is already acknowledged (the button must not re-offer it). */
 export function isAcknowledged(alert: AlertDto): boolean {
   return alert.status === 'acknowledged' && alert.acknowledgedAt !== null;
@@ -247,9 +243,4 @@ export function sortSetupsForGenerate(setups: readonly SetupDto[]): SetupDto[] {
     if (ae !== be) return ae - be;
     return b.detectedAt.localeCompare(a.detectedAt);
   });
-}
-
-/** Guard against a contract value the UI has not been taught to render. */
-export function isKnownChannel(channel: string): channel is AlertChannel {
-  return (ALERT_CHANNELS as readonly string[]).includes(channel);
 }

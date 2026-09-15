@@ -16,14 +16,22 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DEFAULT_BACKTESTS_LIMIT,
   DEFAULT_MAX_HOLD_CANDLES,
   MAX_BACKTEST_TRADES,
+  MAX_BACKTESTS_LIMIT,
   backtestRequestSchema,
+  backtestTradeDtoSchema,
+  type BacktestTrade,
 } from '@veltrixeye/contracts';
 import {
   BACKTEST_RANGE_PRESETS,
+  DEFAULT_BACKTESTS_PAGE_SIZE,
   MAX_BACKTEST_RANGE_MS,
+  TRADES_PAGE_SIZES,
   applyRangePreset,
+  applyTradesPage,
+  backtestHistoryCopy,
   buildBacktestRequest,
   createBacktestFormState,
   directionLabel,
@@ -33,10 +41,15 @@ import {
   formatR,
   formatRate,
   fromDateTimeLocalValue,
+  mergeTrades,
   metricTiles,
+  nextTradesPageSize,
   toDateTimeLocalValue,
+  tradesHasMore,
+  tradesTruncationMessage,
   truncationIndicators,
   type BacktestFormState,
+  type TradesPageState,
 } from '../lib/backtest-form';
 
 /** 2024-06-01T00:00:00.000Z — a fixed "now" so range rules are deterministic. */
@@ -243,14 +256,16 @@ test('exit reason labels/tones cover every contract value', () => {
   assert.equal(directionLabel('short'), 'Short');
 });
 
-test('truncationIndicators() — anchor-cap note and the truncated flag each surface once', () => {
+test('truncationIndicators() — reports the engine anchor cap only, never trade truncation', () => {
   const anchorNote = `Anchor range holds 2400 setup closes — evaluated the first 2000 in ascending order (MAX_BACKTEST_STEPS). Split the range to cover the rest.`;
-  const both = truncationIndicators({ truncated: true, notes: [anchorNote, 'unrelated note'] });
-  assert.equal(both.length, 2);
-  assert.match(both[0]!, /Anchor limit reached/);
-  assert.match(both[1]!, new RegExp(String(MAX_BACKTEST_TRADES)));
-  assert.deepEqual(truncationIndicators({ truncated: false, notes: [] }), [], 'no indicators when nothing was limited');
-  assert.equal(truncationIndicators({ truncated: false, notes: ['warm-up note'] }).length, 0);
+  const withNote = truncationIndicators({ notes: [anchorNote, 'unrelated note'] });
+  assert.equal(withNote.length, 1);
+  assert.match(withNote[0]!, /Anchor limit reached/);
+  assert.deepEqual(truncationIndicators({ notes: [] }), [], 'no indicators when nothing was limited');
+  assert.equal(truncationIndicators({ notes: ['warm-up note'] }).length, 0);
+  // Trade truncation is the trades table's job (the two read endpoints define
+  // `truncated` differently), so it must not leak into the run summary.
+  for (const line of withNote) assert.ok(!/trades are stored per run/.test(line));
 });
 
 test('metricTiles() — one tile per API metric, currency only with a risk per trade', () => {
@@ -297,4 +312,137 @@ test('metricTiles() — one tile per API metric, currency only with a risk per t
   const pf = noLoss.find((t) => t.label === 'Profit factor');
   assert.equal(pf?.value, '—');
   assert.match(pf?.hint ?? '', /undefined/);
+});
+
+// ---------------------------------------------------------------------------
+// Trade paging — the API's `truncated` flag is the only authority
+// ---------------------------------------------------------------------------
+
+/** A minimal, schema-valid trade; `seq` is the paging identity. */
+function pagingTrade(seq: number): BacktestTrade {
+  return backtestTradeDtoSchema.parse({
+    seq,
+    direction: 'long',
+    signalAsOfMs: 1_704_153_600_000 + seq * 3_600_000,
+    entryPrice: 1.085,
+    stopLossPrice: 1.08,
+    tp1Price: 1.095,
+    tp2Price: 1.105,
+    tp3Price: 1.12,
+    qualityScore: 82,
+    qualityGrade: 'A',
+    exitReason: 'take_profit_3',
+    exitPrice: 1.12,
+    exitAsOfMs: 1_704_326_400_000,
+    pnlR: 6.75,
+    pnlCurrency: 1687.5,
+  });
+}
+
+function tradesUpTo(count: number): BacktestTrade[] {
+  return Array.from({ length: count }, (_, i) => pagingTrade(i + 1));
+}
+
+/** Page state as produced by `GET /api/backtests/:id` (every stored trade). */
+function completeRunPage(count: number): TradesPageState {
+  return { trades: tradesUpTo(count), truncated: false, limit: TRADES_PAGE_SIZES[TRADES_PAGE_SIZES.length - 1] };
+}
+
+test('mergeTrades() — a smaller page never replaces the trades already loaded', () => {
+  // Regression for the review finding: the detail endpoint returns all 230
+  // stored trades with `truncated: false`; `?limit=100` returns 100 with
+  // `truncated: true`. Replacing instead of merging dropped 130 visible rows.
+  const loaded = tradesUpTo(230);
+  const smaller = tradesUpTo(100);
+  const merged = mergeTrades(loaded, smaller);
+  assert.equal(merged.length, 230, 'the visible count must not decrease');
+  assert.deepEqual(merged.map((t) => t.seq), Array.from({ length: 230 }, (_, i) => i + 1), 'ascending, no gaps');
+
+  assert.equal(mergeTrades([], smaller).length, 100, 'first page loads as-is');
+  assert.equal(mergeTrades(smaller, tradesUpTo(230)).length, 230, 'a bigger page grows the view');
+  assert.deepEqual(mergeTrades(smaller, smaller).map((t) => t.seq), Array.from({ length: 100 }, (_, i) => i + 1), 'identical pages dedupe by seq');
+});
+
+test('applyTradesPage() — paging grows the visible set and keeps the truncation signal', () => {
+  const start = completeRunPage(230);
+
+  // The bug path: a 100-row response arriving over a complete 230-row view.
+  const afterSmaller = applyTradesPage(start, { trades: tradesUpTo(100), truncated: true, limit: 100 });
+  assert.equal(afterSmaller.trades.length, 230, '230 visible trades are not replaced by 100');
+  // The complete detail result is the larger page, so its `truncated: false`
+  // stands: the stale 100-row page must not invent missing rows.
+  assert.equal(afterSmaller.truncated, false, 'a smaller page cannot un-truncate nothing');
+  assert.equal(afterSmaller.limit, 500, 'the largest page requested so far is remembered');
+  assert.equal(tradesHasMore(afterSmaller), false, 'so no Load more control is offered');
+  assert.equal(tradesTruncationMessage({ truncated: afterSmaller.truncated, loaded: afterSmaller.trades.length }), null, 'and no warning caption is rendered');
+
+  // Genuine pagination of a 300-trade run: every intermediate page is
+  // truncated (300 > limit) until the 500-slot page returns all 300 rows with
+  // `truncated: false`. The last response must win, or the table would keep
+  // offering a control that can never return another row.
+  const stored = 300;
+  let state: TradesPageState = { trades: tradesUpTo(50), truncated: true, limit: 50 };
+  const seen = [50];
+  for (const size of [100, 250, MAX_BACKTEST_TRADES] as const) {
+    const rows = Math.min(size, stored);
+    // The API's own formula: setups > rows returned, or setups > limit asked for.
+    const truncated = stored > rows || stored > size;
+    state = applyTradesPage(state, { trades: tradesUpTo(rows), truncated, limit: size });
+    seen.push(state.trades.length);
+    assert.equal(state.limit, size, 'the requested page size is recorded');
+  }
+  assert.deepEqual(seen, [50, 100, 250, stored], 'each page strictly grows the view');
+  assert.equal(state.trades.length, stored);
+  assert.equal(state.truncated, false, 'a page covering every stored trade clears the flag');
+  assert.equal(tradesHasMore(state), false, 'so no dead control is offered');
+  assert.equal(tradesTruncationMessage({ truncated: state.truncated, loaded: state.trades.length }), null);
+
+  // A run with more setups than the API stores stays honestly truncated at the cap.
+  const capped = applyTradesPage(
+    { trades: tradesUpTo(250), truncated: true, limit: 250 },
+    { trades: tradesUpTo(MAX_BACKTEST_TRADES), truncated: true, limit: MAX_BACKTEST_TRADES },
+  );
+  assert.equal(capped.trades.length, MAX_BACKTEST_TRADES);
+  assert.equal(capped.truncated, true, 'the cap message remains truthful');
+  assert.equal(tradesHasMore(capped), false, 'nothing further can be fetched');
+  assert.match(tradesTruncationMessage({ truncated: capped.truncated, loaded: capped.trades.length })!, /at most 500 trades are kept/);
+});
+
+test('tradesHasMore() — follows the API flag and stops at the storage cap', () => {
+  // A complete run of 230: the old `trades.length >= limit` heuristic offered a
+  // control that could only shrink the table.
+  assert.equal(tradesHasMore({ trades: tradesUpTo(230), truncated: false }), false, 'complete run — nothing more to fetch');
+  assert.equal(tradesHasMore({ trades: tradesUpTo(100), truncated: true }), true, 'truncated below the cap — more available');
+  assert.equal(tradesHasMore({ trades: tradesUpTo(MAX_BACKTEST_TRADES), truncated: true }), false, 'at the cap — no request can return another row');
+  assert.equal(tradesHasMore({ trades: [], truncated: false }), false);
+  assert.equal(MAX_BACKTEST_TRADES, 500, 'the backend maximum this UI must preserve');
+});
+
+test('nextTradesPageSize() — always asks for a strictly larger page', () => {
+  assert.equal(nextTradesPageSize(0), 50);
+  assert.equal(nextTradesPageSize(50), 100);
+  assert.equal(nextTradesPageSize(100), 250);
+  assert.equal(nextTradesPageSize(250), MAX_BACKTEST_TRADES);
+  assert.equal(nextTradesPageSize(MAX_BACKTEST_TRADES), undefined, 'no larger page exists at the cap');
+  assert.equal(nextTradesPageSize(230), 250, 'a complete 230-row view would still ask for a bigger page, never a smaller one');
+  for (const size of TRADES_PAGE_SIZES) assert.ok(size <= MAX_BACKTEST_TRADES, 'every page size respects the 500-trade maximum');
+});
+
+test('tradesTruncationMessage() — only the real 500-trade cap is described as a cap', () => {
+  assert.equal(tradesTruncationMessage({ truncated: false, loaded: 230 }), null, 'a complete result gets no warning');
+  const paging = tradesTruncationMessage({ truncated: true, loaded: 100 });
+  assert.match(paging!, /Showing the first 100 trades of this run/);
+  assert.match(paging!, /load more to see the rest/);
+  assert.ok(!paging!.includes(String(MAX_BACKTEST_TRADES)), 'no false "at most 500" claim mid-paging');
+  const atCap = tradesTruncationMessage({ truncated: true, loaded: MAX_BACKTEST_TRADES });
+  assert.match(atCap!, new RegExp(`at most ${MAX_BACKTEST_TRADES} trades are kept`));
+});
+
+test('backtestHistoryCopy() — the advertised page size is the one actually requested', () => {
+  const copy = backtestHistoryCopy();
+  assert.equal(DEFAULT_BACKTESTS_PAGE_SIZE, DEFAULT_BACKTESTS_LIMIT, 'the list requests the contract default');
+  assert.ok(copy.subtitle.includes(`most recent ${DEFAULT_BACKTESTS_PAGE_SIZE} runs`), `subtitle: ${copy.subtitle}`);
+  assert.ok(copy.footnote.includes(`most recent ${DEFAULT_BACKTESTS_PAGE_SIZE} runs`), `footnote: ${copy.footnote}`);
+  assert.ok(copy.footnote.includes(`caps a single page at ${MAX_BACKTESTS_LIMIT}`), 'the API maximum is stated separately and truthfully');
+  assert.ok(!copy.subtitle.includes('100'), 'the copy must not over-promise relative to the request');
 });

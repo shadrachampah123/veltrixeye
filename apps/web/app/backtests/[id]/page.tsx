@@ -1,21 +1,29 @@
 'use client';
 
 import * as React from 'react';
-import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import type { BacktestRunDto, BacktestTrade } from '@veltrixeye/contracts';
+import type { BacktestRunDto } from '@veltrixeye/contracts';
 import { AppShell, PageHeader } from '@/components/app-shell';
 import { RequireAuth } from '@/components/auth-context';
 import { api, ApiError } from '@/lib/api';
-import { Alert, Button, Card, Spinner } from '@/components/ui';
+import { Alert, Card, LinkButton, Spinner } from '@/components/ui';
 import {
   BacktestMetricsGrid,
   BacktestNotesList,
   BacktestRunSummary,
   BacktestTradesTable,
 } from '@/components/backtest-results';
-import { TRADES_PAGE_SIZES, type TradesPageSize } from '@/lib/backtest-form';
+import {
+  applyTradesPage,
+  nextTradesPageSize,
+  type TradesPageSize,
+  type TradesPageState,
+} from '@/lib/backtest-form';
 import { describeApiError } from '@/lib/api-errors';
+
+/** First trade page requested, and the empty view it is applied to. */
+const FIRST_TRADES_PAGE = 50 as const;
+const EMPTY_TRADES_PAGE: TradesPageState = { trades: [], truncated: false, limit: FIRST_TRADES_PAGE };
 
 /**
  * Backtest detail (M6 Phase 4).
@@ -31,9 +39,8 @@ function BacktestDetailContent() {
   const runId = params.id;
 
   const [run, setRun] = React.useState<BacktestRunDto | null>(null);
-  const [trades, setTrades] = React.useState<BacktestTrade[] | null>(null);
-  const [tradesTruncated, setTradesTruncated] = React.useState(false);
-  const [limit, setLimit] = React.useState<TradesPageSize>(TRADES_PAGE_SIZES[0]);
+  /** Trades currently shown, always the union of everything fetched so far. */
+  const [page, setPage] = React.useState<TradesPageState | null>(null);
   const [loadingMore, setLoadingMore] = React.useState(false);
   const [notFound, setNotFound] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -41,16 +48,23 @@ function BacktestDetailContent() {
   React.useEffect(() => {
     let cancelled = false;
     setRun(null);
-    setTrades(null);
+    setPage(null);
     setNotFound(false);
     setError(null);
-    api
-      .getBacktest(runId)
-      .then((detail) => {
+    // The run (metrics, policies, notes) comes from the detail endpoint; the
+    // trade list comes from the paged endpoint so that one response shape — and
+    // therefore one meaning of `truncated` — drives the table.
+    Promise.all([api.getBacktest(runId), api.getBacktestTrades(runId, FIRST_TRADES_PAGE)])
+      .then(([detail, first]) => {
         if (cancelled) return;
         setRun(detail.run);
-        setTrades(detail.trades);
-        setTradesTruncated(detail.truncated);
+        setPage(
+          applyTradesPage(EMPTY_TRADES_PAGE, {
+            trades: first.trades,
+            truncated: first.truncated,
+            limit: FIRST_TRADES_PAGE,
+          }),
+        );
       })
       .catch((err) => {
         if (cancelled) return;
@@ -62,14 +76,26 @@ function BacktestDetailContent() {
     };
   }, [runId]);
 
+  /**
+   * Fetch a larger page and MERGE it into what is on screen.
+   *
+   * A replacement would be wrong twice over: `GET /:id/trades?limit=N` returns
+   * only the first N rows, so overwriting a fuller list silently deletes
+   * trades the user was reading, and the limit-aware `truncated` flag would
+   * then be reported as if the run itself were cut short.
+   */
   const loadMore = async (next: TradesPageSize) => {
     setLoadingMore(true);
     setError(null);
     try {
       const res = await api.getBacktestTrades(runId, next);
-      setTrades(res.trades);
-      setTradesTruncated(res.truncated);
-      setLimit(next);
+      setPage((prev) =>
+        applyTradesPage(prev ?? EMPTY_TRADES_PAGE, {
+          trades: res.trades,
+          truncated: res.truncated,
+          limit: next,
+        }),
+      );
     } catch (err) {
       setError(describeApiError(err, 'Could not load more trades.'));
     } finally {
@@ -83,15 +109,15 @@ function BacktestDetailContent() {
         <Card className="px-6 py-14 text-center">
           <p className="text-sm text-ink-300">Backtest not found.</p>
           <p className="mt-1 text-xs text-ink-400">It may belong to another account, or it may never have existed.</p>
-          <Link href="/backtests" className="mt-3 inline-block">
-            <Button variant="secondary">Back to backtests</Button>
-          </Link>
+          <LinkButton href="/backtests" variant="secondary" className="mt-3">
+            Back to backtests
+          </LinkButton>
         </Card>
       </AppShell>
     );
   }
 
-  const nextLimit = TRADES_PAGE_SIZES.find((s) => s > limit);
+  const nextLimit = page ? nextTradesPageSize(page.trades.length) : undefined;
 
   return (
     <AppShell>
@@ -99,32 +125,33 @@ function BacktestDetailContent() {
         title="Backtest result"
         subtitle="Deterministic replay output — R-multiples first, currency only when a risk per trade was supplied"
         actions={
-          <Link href="/backtests">
-            <Button variant="secondary">All backtests</Button>
-          </Link>
+          <LinkButton href="/backtests" variant="secondary">
+            All backtests
+          </LinkButton>
         }
       />
 
       {error && (
         <div className="mb-4">
-          <Alert tone="danger">{error}</Alert>
+          <Alert tone="danger" role="alert">
+            {error}
+          </Alert>
         </div>
       )}
 
       {run === null ? (
-        <Spinner />
+        <Spinner label="Loading backtest" />
       ) : (
         <div className="space-y-5">
           <BacktestRunSummary run={run} />
           <BacktestMetricsGrid metrics={run.metrics} showsCurrency={run.costPolicy.riskPerTrade !== undefined} />
           <BacktestNotesList notes={run.notes} />
-          {trades === null ? (
-            <Spinner />
+          {page === null ? (
+            <Spinner label="Loading trades" />
           ) : (
             <BacktestTradesTable
-              trades={trades}
-              truncated={tradesTruncated}
-              limit={limit}
+              trades={page.trades}
+              truncated={page.truncated}
               loadingMore={loadingMore}
               onLoadMore={nextLimit === undefined ? undefined : () => void loadMore(nextLimit)}
             />

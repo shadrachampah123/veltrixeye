@@ -1,13 +1,12 @@
 'use client';
 
 import * as React from 'react';
-import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import type { AlertDetailDto } from '@veltrixeye/contracts';
 import { AppShell, PageHeader } from '@/components/app-shell';
 import { RequireAuth } from '@/components/auth-context';
 import { api, ApiError } from '@/lib/api';
-import { Alert, Button, Card, Spinner } from '@/components/ui';
+import { Alert, Card, LinkButton, Spinner } from '@/components/ui';
 import { AlertDetailPanel } from '@/components/alert-detail-panel';
 import { isAcknowledged } from '@/lib/alerts-view';
 import { describeApiError } from '@/lib/api-errors';
@@ -79,9 +78,9 @@ function AlertDetailContent() {
         <Card className="px-6 py-14 text-center">
           <p className="text-sm text-ink-300">Alert not found.</p>
           <p className="mt-1 text-xs text-ink-400">It may belong to another account, or it may never have existed.</p>
-          <Link href="/alerts" className="mt-3 inline-block">
-            <Button variant="secondary">Back to alerts</Button>
-          </Link>
+          <LinkButton href="/alerts" variant="secondary" className="mt-3">
+            Back to alerts
+          </LinkButton>
         </Card>
       </AppShell>
     );
@@ -93,9 +92,9 @@ function AlertDetailContent() {
         title="Alert detail"
         subtitle="Trigger state, quality score, delivery ledger and acknowledgement"
         actions={
-          <Link href="/alerts">
-            <Button variant="secondary">All alerts</Button>
-          </Link>
+          <LinkButton href="/alerts" variant="secondary">
+            All alerts
+          </LinkButton>
         }
       />
 
@@ -103,7 +102,7 @@ function AlertDetailContent() {
         error ? (
           <Alert tone="danger">{error}</Alert>
         ) : (
-          <Spinner />
+          <Spinner label="Loading alert" />
         )
       ) : (
         <AlertDetailPanel

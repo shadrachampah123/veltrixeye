@@ -1,25 +1,58 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 
 /** Minimal design-system primitives (no external UI dependency). */
+
+export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
+
+const BUTTON_BASE =
+  'inline-flex items-center justify-center gap-2 rounded-md px-3.5 py-2 text-sm font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal-500 disabled:opacity-50 disabled:pointer-events-none';
+
+const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
+  primary: 'bg-signal-600 text-white hover:bg-signal-500',
+  secondary: 'bg-ink-700 text-ink-100 hover:bg-ink-600 border border-ink-600',
+  ghost: 'text-ink-300 hover:text-ink-100 hover:bg-ink-750',
+  danger: 'bg-danger-450/15 text-danger-450 border border-danger-450/40 hover:bg-danger-450/25',
+};
+
+/** The shared button styling, so a link and a button can look identical. */
+export function buttonClass(variant: ButtonVariant = 'primary', className = ''): string {
+  return `${BUTTON_BASE} ${BUTTON_VARIANTS[variant]} ${className}`.trim();
+}
 
 export function Button({
   variant = 'primary',
   className = '',
   ...props
-}: React.ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: 'primary' | 'secondary' | 'ghost' | 'danger';
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: ButtonVariant }) {
+  return <button className={buttonClass(variant, className)} {...props} />;
+}
+
+/**
+ * A navigation control that looks like `Button` but is a real link.
+ *
+ * Nesting `<Button>` inside `<Link>` produces a `<button>` inside an `<a>`,
+ * which is invalid interactive nesting (focus and activation become
+ * browser-dependent, and assistive tech announces a button that navigates).
+ * Use this wherever a button-styled control navigates.
+ */
+export function LinkButton({
+  href,
+  variant = 'primary',
+  className = '',
+  children,
+  ...props
+}: Omit<React.ComponentProps<typeof Link>, 'className'> & {
+  variant?: ButtonVariant;
+  className?: string;
 }) {
-  const base =
-    'inline-flex items-center justify-center gap-2 rounded-md px-3.5 py-2 text-sm font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-signal-500 disabled:opacity-50 disabled:pointer-events-none';
-  const variants: Record<string, string> = {
-    primary: 'bg-signal-600 text-white hover:bg-signal-500',
-    secondary: 'bg-ink-700 text-ink-100 hover:bg-ink-600 border border-ink-600',
-    ghost: 'text-ink-300 hover:text-ink-100 hover:bg-ink-750',
-    danger: 'bg-danger-450/15 text-danger-450 border border-danger-450/40 hover:bg-danger-450/25',
-  };
-  return <button className={`${base} ${variants[variant]} ${className}`} {...props} />;
+  return (
+    <Link href={href} className={buttonClass(variant, className)} {...props}>
+      {children}
+    </Link>
+  );
 }
 
 export function Field({
@@ -114,10 +147,22 @@ export function Badge({
   );
 }
 
-export function Spinner() {
-  return (
+/**
+ * Loading indicator. Pass `label` to expose the wait to assistive tech: the
+ * spinner is a purely visual element, so without a label an async view change
+ * is silent. Omitting it keeps the original markup untouched.
+ */
+export function Spinner({ label }: { label?: string }) {
+  const spinner = (
     <div className="flex items-center justify-center py-16">
       <div className="h-6 w-6 animate-spin rounded-full border-2 border-ink-600 border-t-signal-500" />
+      {label && <span className="sr-only">{label}</span>}
+    </div>
+  );
+  if (!label) return spinner;
+  return (
+    <div role="status" aria-live="polite">
+      {spinner}
     </div>
   );
 }
@@ -125,11 +170,18 @@ export function Spinner() {
 export function Alert({
   tone = 'danger',
   title,
+  role,
   children,
 }: {
   tone?: 'danger' | 'info' | 'success' | 'warning';
   /** Optional bold lead-in (rendered as a heading for screen readers). */
   title?: string;
+  /**
+   * Opt-in live-region role for asynchronous messages: `status` for ordinary
+   * progress/outcome announcements, `alert` for errors that need to interrupt.
+   * Left unset, the markup is exactly as before (no global behaviour change).
+   */
+  role?: 'status' | 'alert';
   children: React.ReactNode;
 }) {
   const tones = {
@@ -139,7 +191,10 @@ export function Alert({
     warning: 'border-amber-450/40 bg-amber-450/10 text-amber-450',
   };
   return (
-    <div className={`rounded-md border px-3 py-2.5 text-sm ${tones[tone]}`}>
+    <div
+      className={`rounded-md border px-3 py-2.5 text-sm ${tones[tone]}`}
+      {...(role ? { role, 'aria-live': role === 'alert' ? 'assertive' : 'polite', 'aria-atomic': true } : {})}
+    >
       {title && <h3 className="mb-0.5 text-sm font-semibold">{title}</h3>}
       {children}
     </div>
