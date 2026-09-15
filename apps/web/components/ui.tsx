@@ -124,17 +124,26 @@ export function Spinner() {
 
 export function Alert({
   tone = 'danger',
+  title,
   children,
 }: {
-  tone?: 'danger' | 'info' | 'success';
+  tone?: 'danger' | 'info' | 'success' | 'warning';
+  /** Optional bold lead-in (rendered as a heading for screen readers). */
+  title?: string;
   children: React.ReactNode;
 }) {
   const tones = {
     danger: 'border-danger-450/40 bg-danger-450/10 text-danger-450',
     info: 'border-info-450/40 bg-info-450/10 text-info-450',
     success: 'border-signal-500/40 bg-signal-500/10 text-signal-400',
+    warning: 'border-amber-450/40 bg-amber-450/10 text-amber-450',
   };
-  return <div className={`rounded-md border px-3 py-2.5 text-sm ${tones[tone]}`}>{children}</div>;
+  return (
+    <div className={`rounded-md border px-3 py-2.5 text-sm ${tones[tone]}`}>
+      {title && <h3 className="mb-0.5 text-sm font-semibold">{title}</h3>}
+      {children}
+    </div>
+  );
 }
 
 export function Monospace({ children }: { children: React.ReactNode }) {

@@ -1,13 +1,14 @@
 # Milestone Boundaries
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5 and
-M6 Phases 1–3**. The boundaries below are deliberate and enforced: M1 shipped
+M6 Phases 1–4**. The boundaries below are deliberate and enforced: M1 shipped
 foundations and contracts; M2 added real historical market data; M3 added
 deterministic strategy evaluation; M4 added deterministic setup detection and
 lifecycle management; M5 added deterministic setup quality scoring; M6 Phases
 1–3 add the backtest engine/service and explicit setup alerts with a
-**stub-only** delivery ledger — and still nothing that schedules, streams,
-sends real notifications, or executes trades.
+**stub-only** delivery ledger; M6 Phase 4 adds the backtest and alert surfaces
+in the web app — and still nothing that schedules, streams, sends real
+notifications, or executes trades.
 
 ## M1 — delivered (Product Foundation & Architecture)
 
@@ -211,10 +212,9 @@ sends real notifications, or executes trades.
 - **Automated tests** — 341 passing (contracts 45, core 138, provider 33,
   api 115, web 10) plus clean typecheck, lint and production build.
 
-## M6 Phases 1–3 — delivered (Backtests + Setup Alerts, explicitly invoked)
+## M6 Phases 1–4 — delivered (Backtests + Setup Alerts, explicitly invoked)
 
-M6 has four planned phases. Phases 1–3 are delivered; Phase 4 (UI) is not
-started. Nothing in M6 runs automatically: there is **no scheduler, scanner,
+M6 has four planned phases, all delivered. Nothing in M6 runs automatically: there is **no scheduler, scanner,
 worker, queue, cron, polling loop or background job** anywhere in the API or
 core packages, and no real alert delivery of any kind.
 
@@ -286,6 +286,39 @@ core packages, and no real alert delivery of any kind.
   acknowledgement idempotency, rate limits, audit accuracy, zero network I/O,
   absence of stray DB writes, and non-collapse of distinct setups/triggers.
 
+### Phase 4 — backtest + alert UI (this change)
+
+Frontend only: `apps/web` consumes the Phase 2/3 API and adds **no endpoint,
+migration, service, provider or delivery channel**.
+
+- **Backtests** — `/backtests` (history, strategy filter), `/backtests/new`
+  (published-version + instrument + range + exit/cost/sizing inputs, built from
+  the shared `backtestRequestSchema`), `/backtests/:id` (run summary, metrics,
+  engine notes, truncation indicators, trade table with paging).
+- **Alerts** — `/alerts` (list, status/strategy filters, explicit generation
+  from an owned setup) and `/alerts/:id` (trigger state, score/grade, delivery
+  ledger, idempotent acknowledgement).
+- **Outcome honesty** — a backtest replay (`created: false`) is labelled as a
+  replay; an alert dedup replay is "alert already exists"; a
+  `below_min_quality` gate result is "no alert generated". None of the three is
+  presented as a new result.
+- **Stub-delivery messaging** — every alert surface states that delivery is a
+  local stub ledger record and that no email, webhook, push, SMS or broker
+  notification is sent; there is no notification-provider configuration in the
+  UI, because none exists in M6.
+- **Authorization** — unchanged and enforced by the API: every list is
+  owner-scoped, foreign/unknown ids stay masked 404s, and no page infers
+  ownership from a URL id.
+- **Docs** — [backtesting.md](./backtesting.md#web-ui-m6-phase-4) and
+  [alerts.md](./alerts.md#8-web-ui-m6-phase-4) gained a Phase 4 UI section.
+- **Automated tests** — 531 passing (contracts 68, core 187, provider 33,
+  api 160, web 83) plus clean typecheck, lint and production build. The 73 new
+  web tests cover form defaults/validation, the submitted request body against
+  the shared contract, metric and trade rendering (including null metrics and
+  truncation), history/detail, alert list/detail, the created / replayed /
+  skipped outcomes, acknowledgement idempotency, the API client's request
+  shapes and error copy, and the truthfulness of the stub-delivery wording.
+
 ## Explicitly NOT in M1+M2+M3+M4+M5+M6 (by design, deferred)
 
 - A live **scanner** (detection stays explicitly invoked) and setup
@@ -296,8 +329,6 @@ core packages, and no real alert delivery of any kind.
   local stub ledger entry only ([alerts.md](./alerts.md#3-stub-delivery-ledger-zero-external-io));
   a real channel needs an outbox + worker, provider credentials and its own
   security review. **TradingView integration** is likewise not built.
-- **Alert UI** (M6 Phase 4) — M6 Phases 1–3 expose the API only; the
-  dashboard has no alerts surface yet.
 - **Automated trade execution** (M8) — alerts are suggestions, never orders.
 - **Billing / subscriptions** — the M1 `users.tier` column exists, but no
   billing logic acts on it.
@@ -310,13 +341,13 @@ core packages, and no real alert delivery of any kind.
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M6 Phases 1–3 (later work, outline only)
+## After M6 (later work, outline only)
 
-1. **M6 Phase 4** — alert surfaces in the web app (list, detail, acknowledge)
-   on top of the existing API; no new backend delivery.
-2. **Real alert delivery** (channels + outbox/worker) with the security review
-   described in [alerts.md](./alerts.md#9-future-channelprovider-architecture).
-3. A **live scanner** on top of the M4 detection service (still explicitly
+1. **Real alert delivery** (channels + outbox/worker) with the security review
+   described in [alerts.md](./alerts.md#10-future-channelprovider-architecture).
+   The Phase 4 UI already labels delivery as stub-only, so enabling a real
+   channel is a backend change plus a copy change, not a UI rebuild.
+2. A **live scanner** on top of the M4 detection service (still explicitly
    owned by the user, never a hidden cron), then **M8 trade execution** and
    **billing** as their own milestones.
 

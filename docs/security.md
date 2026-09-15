@@ -178,7 +178,7 @@ user request.
   user cannot be notified out-of-band: alerts are visible only through the
   authenticated API/UI. Real delivery must ship with an outbox + worker,
   per-channel redaction, retry/backoff and delivery-rate limits
-  ([alerts.md](./alerts.md#9-future-channelprovider-architecture)).
+  ([alerts.md](./alerts.md#10-future-channelprovider-architecture)).
 
 ## Data integrity as security
 
@@ -224,7 +224,7 @@ user request.
   traffic is attributed per real client address.
 - **Alert delivery is local-only in M6** (`stub` channel + ledger). Real
   email/webhook/push needs an outbox + worker and provider credentials, and is
-  deliberately deferred — see [alerts.md](./alerts.md#9-future-channelprovider-architecture).
+  deliberately deferred — see [alerts.md](./alerts.md#10-future-channelprovider-architecture).
 - Production deployment hardening (TLS termination, WAF, secret manager,
   least-privilege DB roles, log redaction) is an operational task for
   deployment time — see [milestones.md](./milestones.md).

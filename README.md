@@ -1,13 +1,13 @@
 # VeltrixEye
 
-> **Milestones M1-M5 — Foundation, Market Data, Evaluation, Setup Detection & Quality Scoring**
+> **Milestones M1-M6 — Foundation, Market Data, Evaluation, Setup Detection, Quality Scoring, Backtests & Alerts**
 > A general-purpose SaaS platform where traders define **their own** deterministic trading strategies, scan markets against them, and receive explained, scored alerts.
 
 ## Status
 
-This repository currently contains **M1–M5**: application foundation, domain model, database schema with migrations, authentication, strategy versioning, market/instrument abstractions, security baseline, UI shell — plus the first real market-data provider (Twelve Data, historical), a global shared candle store with fetch-through reads and audited backfills, retention enforcement, a coverage ledger, the Markets UI, the deterministic strategy-evaluation engine (M3), the setup-detection + lifecycle layer (M4), and the deterministic setup quality-scoring engine (M5, version `m5-quality-score-1`, see [docs/setup-scoring.md](docs/setup-scoring.md)).
+This repository currently contains **M1–M6**: application foundation, domain model, database schema with migrations, authentication, strategy versioning, market/instrument abstractions, security baseline, UI shell — plus the first real market-data provider (Twelve Data, historical), a global shared candle store with fetch-through reads and audited backfills, retention enforcement, a coverage ledger, the Markets UI, the deterministic strategy-evaluation engine (M3), the setup-detection + lifecycle layer (M4), the deterministic setup quality-scoring engine (M5, version `m5-quality-score-1`, see [docs/setup-scoring.md](docs/setup-scoring.md)), and M6: the deterministic backtest engine/service/API (version `m6-backtest-1`, see [docs/backtesting.md](docs/backtesting.md)), explicitly-invoked setup alerts with a **stub-only** delivery ledger (see [docs/alerts.md](docs/alerts.md)), and the Phase 4 backtest + alert surfaces in the web app (`/backtests`, `/alerts`).
 
-**Not yet implemented** (by design, later milestones): alert delivery, backtesting, live scanner, billing. See [docs/milestones.md](docs/milestones.md).
+**Not yet implemented** (by design, later milestones): real alert delivery (email/webhook/push — M6 records a local stub ledger entry only), a live scanner, trade execution, billing. See [docs/milestones.md](docs/milestones.md).
 
 ## Stack
 

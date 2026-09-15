@@ -1,4 +1,4 @@
-# Deterministic Backtesting (M6, Phases 1 & 2)
+# Deterministic Backtesting (M6, Phases 1, 2 & 4)
 
 M6 backtesting replays a published strategy version over historical candles
 and records what its own detection, level, and scoring layers would have
@@ -114,10 +114,11 @@ writer of `backtest_runs` / `backtest_trades`:
 
 ## What M6 does NOT do
 
-No web UI (Phase 4), no scheduler/worker/queue/cron/background job/polling,
+No scheduler/worker/queue/cron/background job/polling,
 no realtime/streaming, no trade execution, no AI/ML, no billing, no second
 provider, no credential handling, no alert delivery beyond stub ledger,
-no Twelve Data credential requirement, no new env vars.
+no Twelve Data credential requirement, no new env vars. Phase 4 added a web UI
+on top of the Phase 2 API — no engine, service or schema change.
 
 ## Engine contract
 
@@ -186,3 +187,39 @@ policy snapshots, `config_hash`) and metric aggregates; uniqueness key
 `(user, version, instrument, direction, engine_version, range, config_hash)`
 makes identical replays idempotent. `backtest_trades` stores one row per
 simulated setup in `seq` order — aggregates only, never candle data.
+
+## Web UI (M6 Phase 4)
+
+Frontend only — `apps/web` consumes the Phase 2 API and adds no endpoint,
+migration or engine behaviour.
+
+| Route | Consumes |
+| --- | --- |
+| `/backtests` | `GET /api/backtests` (strategy filter, capped page size) |
+| `/backtests/new` | `POST /api/backtests`, `GET /api/strategies`, `GET /api/markets/instruments`, `GET /api/strategies/:id/versions/:versionId` |
+| `/backtests/:id` | `GET /api/backtests/:id`, `GET /api/backtests/:id/trades?limit=` |
+
+- **Inputs** — a published version (drafts are refused by the API and listed as
+  unselectable), an instrument from `GET /api/markets/instruments`, direction,
+  the range as local `datetime-local` inputs sent as UTC epoch-ms, the exit
+  policy (`stopLoss`, `takeProfit`, `maxHoldCandles`) and the cost/sizing
+  policy (`feePerSide`, `slippagePerSide`, `spread`, optional `riskPerTrade`).
+  The three timeframes are **not** an input: they come from the selected
+  version's configuration and are displayed read-only, as are the pinned
+  `signal_close` / `stop_first` rules.
+- **Client-side validation mirrors the service** (required selections,
+  `from < to`, no future bounds, ≤ 10-year span, `maxHoldCandles` 1–5000,
+  non-negative costs, optional positive risk) and the submitted body is the
+  parsed output of the shared `backtestRequestSchema`, so the payload that
+  leaves the browser is the payload the route accepts. A 400 is still rendered,
+  with per-field messages when the API supplies them.
+- **Results** — the run's policies, engine version and `config_hash`; every
+  metric of `BacktestMetrics` (setups detected, trades closed, wins, losses,
+  win rate, average R/expectancy, avg win/loss, net R, max drawdown, profit
+  factor, steps evaluated, currency only when `riskPerTrade` was supplied);
+  the engine's notes verbatim; truncation indicators for the anchor cap and the
+  500-trade storage bound; and the trade table with exit reason, exit price,
+  R and currency per trade. No metric is computed in the browser, and a null
+  metric renders as an em dash rather than zero.
+- **Replays** — `created: false` is labelled "identical run replayed", never as
+  a new result.
