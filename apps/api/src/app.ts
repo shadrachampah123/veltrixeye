@@ -17,6 +17,8 @@ import {
   EvaluationService,
   SetupService,
   ScoringService,
+  BacktestService,
+  AlertService,
   type ProviderRegistry,
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
@@ -25,6 +27,8 @@ import { userRoutes } from './routes/users.js';
 import { strategyRoutes } from './routes/strategies.js';
 import { marketDataRoutes } from './routes/market-data.js';
 import { setupRoutes } from './routes/setups.js';
+import { backtestRoutes } from './routes/backtests.js';
+import { alertRoutes } from './routes/alerts.js';
 
 export interface AppContext {
   pool: pg.Pool;
@@ -38,6 +42,8 @@ export interface AppContext {
   evaluation: EvaluationService;
   setups: SetupService;
   scoring: ScoringService;
+  backtests: BacktestService;
+  alerts: AlertService;
 }
 
 export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
@@ -48,6 +54,7 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   // M3: reads the shared candle store ONLY (never the ingestion fetch-through),
   // so evaluation never triggers a provider call.
   const evaluation = new EvaluationService(pool, strategies, candles);
+  const setups = new SetupService(pool, evaluation, candles);
   return {
     pool,
     users: new UserService(pool),
@@ -60,11 +67,15 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     evaluation,
     // M4: consumes the M3 evaluation service; writes setups + state events,
     // never scores, never providers.
-    setups: new SetupService(pool, evaluation, candles),
+    setups,
     // M5: consumes the M3 evaluation service to rebuild the scoring context;
     // writes append-only setup_scores + refreshes setups.quality_score,
     // never transitions setups, never providers.
     scoring: new ScoringService(pool, strategies, evaluation),
+    // M6 Phase 2: backtest service (pure engine + store-only reads + idempotent persistence)
+    backtests: new BacktestService(pool, strategies, candles),
+    // M6 Phase 2: alert service (eligible states, M5 gate, dedup, stub delivery)
+    alerts: new AlertService(pool, strategies),
   };
 }
 
@@ -159,6 +170,8 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await strategyRoutes(app, ctx, config);
   await marketDataRoutes(app, ctx, config);
   await setupRoutes(app, ctx, config);
+  await backtestRoutes(app, ctx, config);
+  await alertRoutes(app, ctx, config);
 
   return app;
 }
