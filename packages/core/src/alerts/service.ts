@@ -1,35 +1,49 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { createHash } from 'node:crypto';
 import type pg from 'pg';
 import {
   ALERT_TRIGGER_STATES,
+  MAX_ALERT_DELIVERIES,
   type AlertDetailDto,
   type AlertDto,
   type AlertDeliveryDto,
+  type AlertChannel,
   type AlertListQuery,
+  type AlertSkippedReason,
   type AlertTriggerState,
+  type SetupState,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
+import { isTerminalState } from '../setups/machine.js';
 import type { StrategyService } from '../strategies/strategies.js';
+import { NonStubSenderError, StubAlertSender, type AlertSender } from './sender.js';
 
 /**
- * AlertService (M6 Phase 2) — application boundary around the alert schema.
+ * AlertService (M6 Phases 2–3) — the application boundary around the alert
+ * schema. It is the ONLY writer of `alerts` / `alert_deliveries`.
  *
- * Guarantees:
- *  - owner-scoped: every method requires userId and checks alerts.user_id
- *    (masked 404 for foreign).
- *  - eligible states only: setup must be in confirmed or triggered.
- *  - M5 score required: setup_scores row at detection anchor must exist.
- *  - minQualityScore gate: score.total >= version's risk.minQualityScore,
- *    otherwise no alert (silence, not error).
- *  - dedup by (setup_id, trigger_state): at most two alerts per setup.
- *  - transactional: alert + stub delivery ledger in one transaction.
- *  - local/no-network: stub delivery only, deterministic payload hash.
- *  - safe repeated acknowledgement.
+ * Guarantees (pinned order, enforced by tests):
+ *  - owner-scoped: every method takes `userId` and checks the ownership chain
+ *    alerts.user_id → setups.strategy_version_id → strategies.user_id.
+ *    Foreign or unknown resources are masked as 404.
+ *  - eligible states only: the setup must be in `confirmed` or `triggered`,
+ *    i.e. `ALERT_TRIGGER_STATES`. Terminal setups (completed / invalidated /
+ *    expired) and pre-confirmation states are refused with 400.
+ *  - M5 score required: a `setup_scores` row at the setup's detection anchor
+ *    (`setup.as_of_ms`) must exist; otherwise 400.
+ *  - minQualityScore gate: `score.total >= version.config.risk.minQualityScore`
+ *    (default 0). Below the gate the call is silent — HTTP 200, no alert row,
+ *    no ledger row, `skippedReason: 'below_min_quality'`.
+ *  - dedup by `(setup_id, trigger_state)`: at most two alerts per setup
+ *    (`confirmed` + `triggered`). Replays return the existing alert and never
+ *    insert a second delivery ledger row.
+ *  - transactional: alert + stub delivery ledger row commit together.
+ *  - local/no-network: the only sender M6 accepts is the local stub
+ *    (`NonStubSenderError` otherwise) — zero external I/O.
+ *  - idempotent acknowledgement that preserves the first acknowledgedAt.
  */
 
+/** Setup states that may generate an alert (the dedup key's second half). */
 const ELIGIBLE_STATES = new Set<string>(ALERT_TRIGGER_STATES);
-const CONFIG_HASH_RE = /^[0-9a-f]{64}$/;
 
 interface SetupRow {
   id: string;
@@ -103,90 +117,113 @@ export interface GenerateAlertArgs {
 }
 
 export interface GenerateAlertResult {
+  /** The alert (newly created or the existing dedup winner); null on a gate skip. */
   alert: AlertDto | null;
+  /** The alert's stub ledger entry; null on a gate skip. */
   delivery: AlertDeliveryDto | null;
+  /** True only when THIS call inserted the alert row. */
   created: boolean;
-  skippedReason?: string;
+  /**
+   * True only when THIS call inserted the delivery ledger row. Replays are
+   * `false`, so callers can record `alert.delivery_recorded` exactly once per
+   * ledger row instead of on every retry.
+   */
+  deliveryCreated: boolean;
+  /** Present when the minQualityScore gate refused generation (silence). */
+  skippedReason?: AlertSkippedReason;
+  /** Gate context for audit metadata (present when skippedReason is set). */
+  gate?: { qualityScore: number; qualityGrade: string; minQualityScore: number };
 }
 
 export class AlertService {
+  private readonly sender: AlertSender;
+
   constructor(
     private readonly pool: pg.Pool,
     private readonly strategies: StrategyService,
-  ) {}
+    sender: AlertSender = new StubAlertSender(),
+  ) {
+    // M6 hard rule: the only delivery this milestone performs is the local
+    // stub ledger entry. A real channel would need an outbox/worker, provider
+    // credentials and a security review — refuse to boot with one wired.
+    if (sender.channel !== 'stub') throw new NonStubSenderError(String(sender.channel));
+    this.sender = sender;
+  }
+
+  /** The delivery channel in use — `stub` for every M6 deployment. */
+  get deliveryChannel(): AlertChannel {
+    return this.sender.channel;
+  }
 
   /**
    * Generate an alert from an owned setup.
    *
    * Steps (pinned order):
-   *  1. Setup exists, owned, in eligible state (confirmed/triggered) else 400/404.
-   *  2. M5 score exists at detection anchor else 400.
-   *  3. Score >= minQualityScore else no alert (silence).
-   *  4. Upsert onto (setup_id, trigger_state) idempotently.
-   *  5. Record exactly one stub delivery per generated alert (idempotent).
+   *  1. Setup exists, owned, in an eligible state (confirmed/triggered) else
+   *     404 (foreign/unknown) or 400 (terminal/ineligible).
+   *  2. M5 score exists at the detection anchor else 400.
+   *  3. `score.total >= risk.minQualityScore` else silence (200 + skippedReason).
+   *  4. Insert onto `(setup_id, trigger_state)` idempotently; the loser of a
+   *     race reads the winner's row.
+   *  5. If the alert has no ledger row yet, ask the (stub) sender to render it
+   *     and insert exactly one row; replays insert nothing.
    */
   async generateAlert(args: GenerateAlertArgs): Promise<GenerateAlertResult> {
-    // 1. Owned setup
+    // 1. Owned setup + eligible state
     const setup = await this.readOwnedSetup(args.userId, args.setupId);
     if (!setup) throw Errors.notFound('Setup not found');
+    assertEligibleState(setup.state);
 
-    if (!ELIGIBLE_STATES.has(setup.state)) {
-      throw Errors.invalidInput(`Setup is in state "${setup.state}" — only confirmed or triggered setups can generate alerts.`);
-    }
+    // Effective trigger state (validated logical progression)
+    const effectiveTrigger = resolveTriggerState(setup.state, args.triggerState);
 
-    // Determine effective trigger state
-    let effectiveTrigger: AlertTriggerState;
-    if (args.triggerState) {
-      if (!ELIGIBLE_STATES.has(args.triggerState)) {
-        throw Errors.invalidInput(`Invalid trigger state "${args.triggerState}" — only confirmed or triggered are allowed.`);
-      }
-      effectiveTrigger = args.triggerState;
-      // Enforce logical progression: can't generate triggered alert when setup is only confirmed.
-      if (effectiveTrigger === 'triggered' && setup.state !== 'triggered') {
-        throw Errors.invalidInput('Cannot generate a triggered alert for a setup that is not in triggered state.');
-      }
-      // Confirmed alert allowed when setup is confirmed or triggered (triggered implies confirmed was past)
-    } else {
-      effectiveTrigger = setup.state as AlertTriggerState;
-    }
-
-    // 2. M5 score at detection anchor
+    // 2. M5 score at the detection anchor
     const score = await this.readScoreAtAnchor(setup.id, Number(setup.as_of_ms));
     if (!score) {
-      throw Errors.invalidInput('Setup has no quality score at its detection anchor — score the setup before generating an alert.');
+      throw Errors.invalidInput(
+        'Setup has no quality score at its detection anchor — score the setup before generating an alert.',
+      );
     }
 
-    // 3. Load version config for minQualityScore
-    const version = await this.strategies.getVersion(args.userId, setup.strategy_id, setup.strategy_version_id);
+    // 3. Quality gate (owner-scoped version read; published or deprecated are
+    //    both readable by their owner — M4 detection semantics).
+    const version = await this.strategies.getVersion(
+      args.userId,
+      setup.strategy_id,
+      setup.strategy_version_id,
+    );
     const minQualityScore = version.config.risk?.minQualityScore ?? 0;
     if (score.total < minQualityScore) {
-      // Gate not met: silence, no row, no delivery
-      return { alert: null, delivery: null, created: false, skippedReason: 'below_min_quality' };
+      // Gate not met: silence, no row, no ledger entry, HTTP 200.
+      return {
+        alert: null,
+        delivery: null,
+        created: false,
+        deliveryCreated: false,
+        skippedReason: 'below_min_quality',
+        gate: {
+          qualityScore: score.total,
+          qualityGrade: score.grade,
+          minQualityScore,
+        },
+      };
     }
 
-    // Prepare title and body
-    const title = this.buildTitle({
+    const title = buildTitle({
       symbol: setup.symbol,
       direction: setup.direction,
       triggerState: effectiveTrigger,
       qualityScore: score.total,
       grade: score.grade,
     });
+    const body = buildBody({ setup, score, triggerState: effectiveTrigger, minQualityScore });
 
-    const body = this.buildBody({
-      setup,
-      score,
-      version,
-      triggerState: effectiveTrigger,
-      minQualityScore,
-    });
-
-    // 4 & 5. Transactional insert
+    // 4 + 5. Transactional alert + stub delivery ledger
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
 
-      const alertRes = await client.query<AlertRow>(
+      const inserted = await client.query<AlertRow>(
         `INSERT INTO alerts
            (user_id, setup_id, strategy_id, strategy_version_id, instrument_id, direction,
             trigger_state, quality_score, min_quality_score, title, body)
@@ -208,11 +245,11 @@ export class AlertService {
         ],
       );
 
-      let alertRow: AlertRow | null = alertRes.rows[0] ?? null;
-      let created = true;
+      let alertRow: AlertRow | null = inserted.rows[0] ?? null;
+      const created = alertRow !== null;
 
       if (!alertRow) {
-        // Existing alert: fetch it
+        // Dedup replay (or the loser of a concurrent race): read the winner.
         const existing = await client.query<AlertRow>(
           `SELECT a.*, i.asset_class, i.symbol, v.version_number
            FROM alerts a
@@ -226,44 +263,67 @@ export class AlertService {
           await client.query('ROLLBACK');
           throw Errors.internal('Alert conflict could not be resolved');
         }
-        created = false;
-      }
-
-      // For new alert, the payload hash should be over deterministic payload including alert id.
-      // Recompute with real alert id for accuracy, but keep idempotent via (alert_id, channel, payload_hash).
-      const finalPayloadHash = this.computePayloadHash({ title, body, alertId: alertRow.id });
-
-      // Insert stub delivery
-      const deliveryRes = await client.query<DeliveryRow>(
-        `INSERT INTO alert_deliveries (alert_id, channel, status, attempt, payload_hash)
-         VALUES ($1, 'stub', 'delivered', 1, $2)
-         ON CONFLICT (alert_id, channel, payload_hash) DO NOTHING
-         RETURNING *`,
-        [alertRow.id, finalPayloadHash],
-      );
-
-      let deliveryRow = deliveryRes.rows[0] ?? null;
-      if (!deliveryRow) {
-        const existingDelivery = await client.query<DeliveryRow>(
-          'SELECT * FROM alert_deliveries WHERE alert_id = $1 AND channel = $2 AND payload_hash = $3',
-          [alertRow.id, 'stub', finalPayloadHash],
-        );
-        deliveryRow = existingDelivery.rows[0] ?? null;
-      }
-
-      await client.query('COMMIT');
-
-      // Enrich alert row with joins if missing (for newly inserted case)
-      if (!alertRow.asset_class) {
+      } else if (!alertRow.asset_class) {
+        // Freshly inserted row: RETURNING cannot carry the joins.
         alertRow.asset_class = setup.asset_class;
         alertRow.symbol = setup.symbol;
         alertRow.version_number = setup.version_number;
       }
 
-      const alertDto = toAlertDto(alertRow);
-      const deliveryDto = deliveryRow ? toDeliveryDto(deliveryRow) : null;
+      // The ledger payload is rendered from the PERSISTED alert, so a replay
+      // (or any later change upstream) hashes to the original value and can
+      // never add a second ledger row for the same alert.
+      const persistedBody: Record<string, unknown> =
+        typeof alertRow.body === 'string'
+          ? (JSON.parse(alertRow.body) as Record<string, unknown>)
+          : (alertRow.body as Record<string, unknown>);
 
-      return { alert: alertDto, delivery: deliveryDto, created };
+      let deliveryRow = await this.readDeliveryRow(client, alertRow.id);
+      let deliveryCreated = false;
+
+      if (!deliveryRow) {
+        // No ledger row for this alert: render exactly one (also self-heals an
+        // alert whose ledger row is missing, which the transactional write
+        // path cannot normally produce).
+        const sent = await this.sender.send({
+          alertId: alertRow.id,
+          userId: args.userId,
+          setupId: setup.id,
+          triggerState: alertRow.trigger_state,
+          title: alertRow.title,
+          body: persistedBody,
+        });
+
+        const deliveryInsert = await client.query<DeliveryRow>(
+          `INSERT INTO alert_deliveries (alert_id, channel, status, attempt, error, payload_hash)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (alert_id, channel, payload_hash) DO NOTHING
+           RETURNING *`,
+          [
+            alertRow.id,
+            this.sender.channel,
+            sent.status,
+            sent.attempt,
+            sent.error ?? null,
+            sent.payloadHash,
+          ],
+        );
+        deliveryRow = deliveryInsert.rows[0] ?? null;
+        deliveryCreated = deliveryRow !== null;
+        if (!deliveryRow) {
+          // Concurrent twin inserted it first: read theirs.
+          deliveryRow = await this.readDeliveryRow(client, alertRow.id, sent.payloadHash);
+        }
+      }
+
+      await client.query('COMMIT');
+
+      return {
+        alert: toAlertDto(alertRow),
+        delivery: deliveryRow ? toDeliveryDto(deliveryRow) : null,
+        created,
+        deliveryCreated,
+      };
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       throw err;
@@ -309,22 +369,28 @@ export class AlertService {
     const alertRow = alertRes.rows[0];
     if (!alertRow) throw Errors.notFound('Alert not found');
 
-    const deliveriesRes = await this.pool.query<DeliveryRow>(
-      'SELECT * FROM alert_deliveries WHERE alert_id = $1 ORDER BY id ASC LIMIT 64',
-      [args.alertId],
+    const deliveries = await this.pool.query<DeliveryRow>(
+      'SELECT * FROM alert_deliveries WHERE alert_id = $1 ORDER BY id ASC LIMIT $2',
+      [args.alertId, MAX_ALERT_DELIVERIES],
     );
 
     return {
       alert: toAlertDto(alertRow),
-      deliveries: deliveriesRes.rows.map(toDeliveryDto),
+      deliveries: deliveries.rows.map(toDeliveryDto),
     };
   }
 
+  /**
+   * Acknowledge an owned alert. Idempotent: the first call moves
+   * `pending → acknowledged` and stamps `acknowledged_at`; repeats are
+   * accepted no-ops that return the SAME timestamp (the row is not written
+   * again). Foreign/unknown ids are masked as 404.
+   */
   async acknowledgeAlert(args: { userId: string; alertId: string }): Promise<AlertDetailDto> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const existing = await client.query<AlertRow>(
+      const locked = await client.query<AlertRow>(
         `SELECT a.*, i.asset_class, i.symbol, v.version_number
          FROM alerts a
          JOIN instruments i ON i.id = a.instrument_id
@@ -333,54 +399,49 @@ export class AlertService {
          FOR UPDATE`,
         [args.alertId, args.userId],
       );
-      const row = existing.rows[0];
+      const row = locked.rows[0];
       if (!row) {
         await client.query('ROLLBACK');
         throw Errors.notFound('Alert not found');
       }
 
-      // Idempotent ack: keep original acknowledged_at if already set
-      const updated = await client.query<AlertRow>(
-        `UPDATE alerts
-         SET status = 'acknowledged',
-             acknowledged_at = COALESCE(acknowledged_at, now())
-         WHERE id = $1
-         RETURNING *`,
-        [args.alertId],
-      );
-      const updatedRow = updated.rows[0];
-      if (!updatedRow) {
-        await client.query('ROLLBACK');
-        throw Errors.internal('Failed to acknowledge alert');
+      const alreadyAcknowledged = row.status === 'acknowledged' && row.acknowledged_at !== null;
+
+      let acknowledgedRow = row;
+      if (!alreadyAcknowledged) {
+        // Single state change; `COALESCE` keeps an existing (never overwritten)
+        // timestamp even if the column was set by an earlier partial write.
+        const updated = await client.query<AlertRow>(
+          `UPDATE alerts
+           SET status = 'acknowledged',
+               acknowledged_at = COALESCE(acknowledged_at, now())
+           WHERE id = $1 AND user_id = $2
+           RETURNING *`,
+          [args.alertId, args.userId],
+        );
+        const updatedRow = updated.rows[0];
+        if (!updatedRow) {
+          await client.query('ROLLBACK');
+          throw Errors.internal('Failed to acknowledge alert');
+        }
+        acknowledgedRow = {
+          ...row,
+          ...updatedRow,
+          asset_class: row.asset_class,
+          symbol: row.symbol,
+          version_number: row.version_number,
+        };
       }
 
-      // Re-join for DTO enrichment
-      const enriched = await client.query<AlertRow>(
-        `SELECT a.*, i.asset_class, i.symbol, v.version_number
-         FROM alerts a
-         JOIN instruments i ON i.id = a.instrument_id
-         JOIN strategy_versions v ON v.id = a.strategy_version_id
-         WHERE a.id = $1`,
-        [args.alertId],
-      );
-
       const deliveries = await client.query<DeliveryRow>(
-        'SELECT * FROM alert_deliveries WHERE alert_id = $1 ORDER BY id ASC LIMIT 64',
-        [args.alertId],
+        'SELECT * FROM alert_deliveries WHERE alert_id = $1 ORDER BY id ASC LIMIT $2',
+        [args.alertId, MAX_ALERT_DELIVERIES],
       );
 
       await client.query('COMMIT');
 
-      const finalRow = enriched.rows[0] ?? updatedRow;
-      // Ensure joined fields present
-      if (!finalRow.asset_class) {
-        finalRow.asset_class = row.asset_class;
-        finalRow.symbol = row.symbol;
-        finalRow.version_number = row.version_number;
-      }
-
       return {
-        alert: toAlertDto(finalRow),
+        alert: toAlertDto(acknowledgedRow),
         deliveries: deliveries.rows.map(toDeliveryDto),
       };
     } catch (err) {
@@ -389,6 +450,23 @@ export class AlertService {
     } finally {
       client.release();
     }
+  }
+
+  private async readDeliveryRow(
+    client: pg.PoolClient,
+    alertId: string,
+    payloadHash?: string,
+  ): Promise<DeliveryRow | null> {
+    const res = payloadHash
+      ? await client.query<DeliveryRow>(
+          'SELECT * FROM alert_deliveries WHERE alert_id = $1 AND channel = $2 AND payload_hash = $3',
+          [alertId, this.sender.channel, payloadHash],
+        )
+      : await client.query<DeliveryRow>(
+          'SELECT * FROM alert_deliveries WHERE alert_id = $1 AND channel = $2 ORDER BY id ASC LIMIT 1',
+          [alertId, this.sender.channel],
+        );
+    return res.rows[0] ?? null;
   }
 
   private async readOwnedSetup(userId: string, setupId: string): Promise<SetupRow | null> {
@@ -408,75 +486,94 @@ export class AlertService {
     const res = await this.pool.query<ScoreRow>(
       `SELECT * FROM setup_scores
        WHERE setup_id = $1 AND as_of_ms = $2
-       ORDER BY created_at DESC LIMIT 1`,
+       ORDER BY created_at DESC, id DESC LIMIT 1`,
       [setupId, asOfMs],
     );
     return res.rows[0] ?? null;
   }
-
-  private buildTitle(args: { symbol: string; direction: string; triggerState: string; qualityScore: number; grade: string }): string {
-    // Deterministic, ≤280 chars, human-readable
-    const base = `${args.symbol} ${args.direction} ${args.triggerState} (score ${args.qualityScore}/${args.grade})`;
-    return base.slice(0, 280);
-  }
-
-  private buildBody(args: {
-    setup: SetupRow;
-    score: ScoreRow;
-    version: { id: string; strategyId: string; versionNumber: number; config: any };
-    triggerState: string;
-    minQualityScore: number;
-  }): Record<string, unknown> {
-    // Structured payload — never raw candles, licensing-safe
-    return {
-      setupId: args.setup.id,
-      strategyId: args.setup.strategy_id,
-      strategyVersionId: args.setup.strategy_version_id,
-      versionNumber: args.setup.version_number,
-      instrument: { assetClass: args.setup.asset_class, symbol: args.setup.symbol },
-      direction: args.setup.direction,
-      triggerState: args.triggerState,
-      qualityScore: args.score.total,
-      qualityGrade: args.score.grade,
-      minQualityScore: args.minQualityScore,
-      entryPrice: args.setup.entry_price ? Number(args.setup.entry_price) : null,
-      stopLossPrice: args.setup.stop_loss_price ? Number(args.setup.stop_loss_price) : null,
-      tp1Price: args.setup.tp1_price ? Number(args.setup.tp1_price) : null,
-      tp2Price: args.setup.tp2_price ? Number(args.setup.tp2_price) : null,
-      tp3Price: args.setup.tp3_price ? Number(args.setup.tp3_price) : null,
-      scoreId: Number(args.score.id),
-      scoreEngineVersion: args.score.engine_version,
-      detectedAt: args.setup.detected_at.toISOString(),
-      asOfMs: Number(args.setup.as_of_ms),
-    };
-  }
-
-  private computePayloadHash(args: { title: string; body: Record<string, unknown>; alertId?: string; alertIdPlaceholder?: string }): string {
-    // Deterministic payload: sorted keys, JSON stringify, sha256
-    const payload = {
-      alertId: args.alertId ?? args.alertIdPlaceholder ?? 'unknown',
-      title: args.title,
-      body: args.body,
-    };
-    const canonical = canonicalize(payload);
-    const json = JSON.stringify(canonical);
-    const hash = createHash('sha256').update(json, 'utf8').digest('hex');
-    if (!CONFIG_HASH_RE.test(hash)) throw new Error('invalid payload hash format');
-    return hash;
-  }
 }
 
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (value !== null && typeof value === 'object') {
-    if (value instanceof Date) return value.toISOString();
-    const obj = value as Record<string, unknown>;
-    const keys = Object.keys(obj).sort();
-    const out: Record<string, unknown> = {};
-    for (const k of keys) out[k] = canonicalize(obj[k]);
-    return out;
+/**
+ * Refuse every state that is not `confirmed` / `triggered`. Terminal states
+ * (completed / invalidated / expired) get a dedicated message so callers can
+ * tell "this setup is over" apart from "this setup is not ready yet".
+ */
+function assertEligibleState(state: string): void {
+  if (ELIGIBLE_STATES.has(state)) return;
+  if (isTerminalState(state as SetupState)) {
+    throw Errors.invalidInput(
+      `Setup is in terminal state "${state}" — no alert can be generated for an invalidated, expired or completed setup.`,
+    );
   }
-  return value;
+  throw Errors.invalidInput(
+    `Setup is in state "${state}" — only confirmed or triggered setups can generate alerts.`,
+  );
+}
+
+/**
+ * Resolve the alert's triggering state. Omitted → the setup's current state
+ * (guaranteed eligible). `triggered` requires the setup to actually be
+ * triggered (no forward-looking alerts); `confirmed` stays allowed once the
+ * setup has progressed to `triggered`, because triggered implies confirmed.
+ */
+function resolveTriggerState(
+  setupState: string,
+  requested: AlertTriggerState | undefined,
+): AlertTriggerState {
+  if (!requested) return setupState as AlertTriggerState;
+  if (!ELIGIBLE_STATES.has(requested)) {
+    throw Errors.invalidInput(
+      `Invalid trigger state "${requested}" — only confirmed or triggered are allowed.`,
+    );
+  }
+  if (requested === 'triggered' && setupState !== 'triggered') {
+    throw Errors.invalidInput(
+      'Cannot generate a triggered alert for a setup that is not in triggered state.',
+    );
+  }
+  return requested;
+}
+
+/** Deterministic, licensing-safe, ≤ 280 chars (the 0012 CHECK). */
+function buildTitle(args: {
+  symbol: string;
+  direction: string;
+  triggerState: string;
+  qualityScore: number;
+  grade: string;
+}): string {
+  const base = `${args.symbol} ${args.direction} ${args.triggerState} (score ${args.qualityScore}/${args.grade})`;
+  return base.slice(0, 280);
+}
+
+/** Structured payload (levels, score reference, links) — never raw candles. */
+function buildBody(args: {
+  setup: SetupRow;
+  score: ScoreRow;
+  triggerState: string;
+  minQualityScore: number;
+}): Record<string, unknown> {
+  return {
+    setupId: args.setup.id,
+    strategyId: args.setup.strategy_id,
+    strategyVersionId: args.setup.strategy_version_id,
+    versionNumber: args.setup.version_number,
+    instrument: { assetClass: args.setup.asset_class, symbol: args.setup.symbol },
+    direction: args.setup.direction,
+    triggerState: args.triggerState,
+    qualityScore: args.score.total,
+    qualityGrade: args.score.grade,
+    minQualityScore: args.minQualityScore,
+    entryPrice: args.setup.entry_price ? Number(args.setup.entry_price) : null,
+    stopLossPrice: args.setup.stop_loss_price ? Number(args.setup.stop_loss_price) : null,
+    tp1Price: args.setup.tp1_price ? Number(args.setup.tp1_price) : null,
+    tp2Price: args.setup.tp2_price ? Number(args.setup.tp2_price) : null,
+    tp3Price: args.setup.tp3_price ? Number(args.setup.tp3_price) : null,
+    scoreId: Number(args.score.id),
+    scoreEngineVersion: args.score.engine_version,
+    detectedAt: args.setup.detected_at.toISOString(),
+    asOfMs: Number(args.setup.as_of_ms),
+  };
 }
 
 function toAlertDto(row: AlertRow): AlertDto {
@@ -495,7 +592,9 @@ function toAlertDto(row: AlertRow): AlertDto {
     qualityScore: row.quality_score,
     minQualityScore: row.min_quality_score,
     title: row.title,
-    body: (typeof row.body === 'string' ? JSON.parse(row.body as unknown as string) : row.body) as Record<string, unknown>,
+    body: (typeof row.body === 'string'
+      ? JSON.parse(row.body as unknown as string)
+      : row.body) as Record<string, unknown>,
     status: row.status as any,
     acknowledgedAt: row.acknowledged_at ? row.acknowledged_at.toISOString() : null,
     createdAt: row.created_at.toISOString(),

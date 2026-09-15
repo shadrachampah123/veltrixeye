@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   ALERT_CHANNELS,
   ALERT_DELIVERY_STATUSES,
+  ALERT_SKIPPED_REASONS,
   ALERT_STATUSES,
   ALERT_TRIGGER_STATES,
   DEFAULT_ALERTS_LIMIT,
@@ -14,7 +15,9 @@ import {
   alertDetailDtoSchema,
   alertDtoSchema,
   alertGenerateRequestSchema,
+  alertGenerateResponseSchema,
   alertListQuerySchema,
+  alertListResponseSchema,
 } from '../src/index.js';
 
 const CREATED = new Date(1_800_000_000_000).toISOString();
@@ -60,6 +63,7 @@ describe('m6 alert contracts', () => {
     assert.deepEqual([...ALERT_TRIGGER_STATES], ['confirmed', 'triggered']);
     assert.deepEqual([...ALERT_CHANNELS], ['stub', 'email', 'webhook', 'push']);
     assert.deepEqual([...ALERT_DELIVERY_STATUSES], ['delivered', 'failed']);
+    assert.deepEqual([...ALERT_SKIPPED_REASONS], ['below_min_quality']);
     assert.equal(DEFAULT_ALERTS_LIMIT, 50);
     assert.equal(MAX_ALERTS_LIMIT, 100);
     assert.equal(MAX_ALERT_DELIVERIES, 64);
@@ -114,6 +118,34 @@ describe('m6 alert contracts', () => {
     assert.equal(one.success, true);
     const many = Array.from({ length: MAX_ALERT_DELIVERIES + 1 }, (_, id) => validDelivery({ id: id + 1 }));
     assert.equal(alertDetailDtoSchema.safeParse({ alert: validAlert(), deliveries: many }).success, false);
+  });
+
+  test('generate response covers created, replayed and gate-skipped outcomes', () => {
+    const created = { alert: validAlert(), created: true, deliveries: [validDelivery()] };
+    assert.equal(alertGenerateResponseSchema.safeParse(created).success, true);
+    const replayed = { alert: validAlert(), created: false, deliveries: [validDelivery()] };
+    assert.equal(alertGenerateResponseSchema.safeParse(replayed).success, true);
+    const skipped = { alert: null, created: false, skippedReason: 'below_min_quality' };
+    assert.equal(alertGenerateResponseSchema.safeParse(skipped).success, true);
+    // Unknown keys, unknown reasons and a missing `created` are rejected.
+    assert.equal(alertGenerateResponseSchema.safeParse({ ...skipped, extra: 1 }).success, false);
+    assert.equal(
+      alertGenerateResponseSchema.safeParse({ alert: null, created: false, skippedReason: 'muted' }).success,
+      false,
+    );
+    assert.equal(alertGenerateResponseSchema.safeParse({ alert: validAlert() }).success, false);
+    assert.equal(
+      alertGenerateResponseSchema.safeParse({ alert: validAlert(), created: true, deliveries: 'none' }).success,
+      false,
+    );
+  });
+
+  test('list response caps the page at MAX_ALERTS_LIMIT and is strict', () => {
+    assert.equal(alertListResponseSchema.safeParse({ alerts: [validAlert()] }).success, true);
+    assert.equal(alertListResponseSchema.safeParse({ alerts: [] }).success, true);
+    assert.equal(alertListResponseSchema.safeParse({ alerts: [], total: 1 }).success, false);
+    const tooMany = Array.from({ length: MAX_ALERTS_LIMIT + 1 }, () => validAlert());
+    assert.equal(alertListResponseSchema.safeParse({ alerts: tooMany }).success, false);
   });
 
   test('list query defaults, coerces and bounds the limit', () => {

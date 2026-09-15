@@ -65,9 +65,19 @@ remaining items are listed at the bottom.
 - `POST …/versions/:versionId/evaluate`: **20/min per IP** (M3).
 - `POST …/versions/:versionId/detect`: **20/min per IP** (M4).
 - `POST /api/setups/:setupId/transitions`: **60/min per IP** (M4).
+- `POST /api/setups/:setupId/score`: **20/min per IP** (M5).
+- `POST /api/backtests`: **20/min per IP** (M6).
+- `POST /api/setups/:setupId/alerts`: **20/min per IP** (M6 — generation
+  writes an alert + a delivery-ledger row, so it gets the same ceiling as the
+  other write-side engine endpoints).
+- `POST /api/alerts/:id/acknowledge`: **60/min per IP** (M6 — idempotent
+  bookkeeping, deliberately higher than generation but still bounded).
 - All are per-IP limits configured in `apps/api/src/app.ts` (global) and
-  the route modules (per-route overrides); the auth, evaluate, and detect
-  limits each have a dedicated 429 regression test.
+  the route modules (per-route overrides); the auth, evaluate, detect, alert
+  generation and alert acknowledgement limits each have a dedicated 429
+  regression test (the alert tests also assert the 20-then-429 and 60-then-429
+  boundaries, and that a rate-limited request never writes a duplicate alert,
+  delivery or audit event).
 - 429 responses carry a structured body
   (`{error:{code:'rate_limited', message:'... Try again in Ns.'}}`).
 - **"Per IP" means an IP the caller cannot choose** — see the next section.
@@ -116,8 +126,59 @@ proxy list**. The list is therefore a security boundary:
 
 `audit_events` (append-only, trigger-guarded) records: registration,
 login, failed login, logout, session revocation, password change
-(success + failure), strategy create/update/publish/deprecate/delete.
+(success + failure), strategy create/update/publish/deprecate/delete,
+`market_data.backfill`, `strategy.evaluated`, `setup.detected`,
+`setup.transitioned`, `setup.scored`, `backtest.created`/`backtest.replayed`/
+`backtest.failed`, and the alert lifecycle — `alert.created`,
+`alert.replayed`, `alert.delivery_recorded`, `alert.skipped` and
+`alert.acknowledged` ([alerts.md](./alerts.md#6-audit-events)).
 Rows carry user id, action, IP, user agent, and metadata.
+
+Alert audit events are written to mirror exactly what happened: a dedup replay
+emits `alert.replayed` (never a second `alert.created`) and
+`alert.delivery_recorded` is emitted only when a ledger row was actually
+inserted, so the log cannot be misread as two deliveries. Generation is
+explicitly invoked (no scheduler), so every alert in the log has a matching
+user request.
+
+## Alert delivery is stub-only (M6)
+
+- **No external delivery exists in this milestone.** The only delivery
+  implementation is `StubAlertSender` (`channel: 'stub'`), which renders a
+  deterministic sha256 payload hash locally and is recorded in the append-only
+  `alert_deliveries` ledger. No email, webhook or push is sent; no vendor SDK,
+  no outbound HTTP client, no SMTP, and no new secret or provider credential is
+  introduced by alerts.
+- **The guard is enforced in code, not by convention.** `AlertService` throws
+  `NonStubSenderError` at construction for any sender whose channel is not
+  `stub`, so real delivery cannot be switched on by configuration, environment
+  variable or a one-line wiring change; it needs a reviewed change that also
+  relaxes the guard. Regression tests (API + core) assert both the refusal and
+  that a full generate → acknowledge flow performs **zero** network calls
+  (fetch/http/https/TLS/DNS sockets are spied on; the only sockets observed are
+  the local Postgres pool's, and the spy is proven live with a deliberate local
+  probe).
+- **Owner scoping and masked 404s are inherited, not re-implemented.** Alerts
+  belong to the caller through the existing chain
+  (`alerts.user_id` → `setups.strategy_version_id` → `strategies.user_id`).
+  Foreign or unknown setups, alerts and acknowledgements all return a plain
+  **404** with the same body as a genuinely missing resource, so alert
+  existence is never disclosed. A test asserts a cross-user attempt leaves the
+  victim's alert untouched (`pending`, no timestamp) and invisible in the
+  attacker's list.
+- **Generation is gated and cannot be coerced.** Only `confirmed`/`triggered`
+  setups with an existing M5 score at the detection anchor, passing the
+  version's `minQualityScore`, may generate; terminal setups are refused;
+  dedup by `(setup_id, trigger_state)` plus a unique ledger key mean repeated
+  or concurrent requests (verified with 8 parallel calls) produce exactly one
+  alert and one ledger row.
+- **Payloads are licensing-safe.** The alert body carries levels and score
+  references only — never raw candles, provider symbols or vendor payloads.
+- **Residual risk (accepted, documented).** Until a real channel is added, a
+  user cannot be notified out-of-band: alerts are visible only through the
+  authenticated API/UI. Real delivery must ship with an outbox + worker,
+  per-channel redaction, retry/backoff and delivery-rate limits
+  ([alerts.md](./alerts.md#9-future-channelprovider-architecture)).
 
 ## Data integrity as security
 
@@ -161,6 +222,9 @@ Rows carry user id, action, IP, user agent, and metadata.
   address is not published, so that hop cannot be pinned yet) — see
   [Client IP attribution](#client-ip-attribution-proxy-trust). Direct API
   traffic is attributed per real client address.
+- **Alert delivery is local-only in M6** (`stub` channel + ledger). Real
+  email/webhook/push needs an outbox + worker and provider credentials, and is
+  deliberately deferred — see [alerts.md](./alerts.md#9-future-channelprovider-architecture).
 - Production deployment hardening (TLS termination, WAF, secret manager,
   least-privilege DB roles, log redaction) is an operational task for
   deployment time — see [milestones.md](./milestones.md).

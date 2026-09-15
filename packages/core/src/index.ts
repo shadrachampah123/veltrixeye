@@ -97,8 +97,18 @@ export {
   CONFIG_HASH_RE as BACKTEST_CONFIG_HASH_RE,
 } from './backtest/canonical.js';
 
-// Setup alerts (M6 Phase 1: schema; Phase 2: service)
+// Setup alerts (M6 Phase 1: schema; Phase 2: service; Phase 3: stub sender)
 export { AlertService } from './alerts/service.js';
+export {
+  StubAlertSender,
+  NonStubSenderError,
+  alertPayloadHash,
+  canonicalize as canonicalizeAlertPayload,
+  ALERT_PAYLOAD_HASH_RE,
+  type AlertSender,
+  type AlertSendRequest,
+  type AlertSendResult,
+} from './alerts/sender.js';
 
 // Scoring (foundation re-exports)
 export { qualityGrade, QUALITY_GRADE_BANDS } from '@veltrixeye/contracts';
