@@ -110,6 +110,16 @@ function StrategyDetailContent() {
             <CardHeader
               title="Current version"
               subtitle={current ? `v${current.versionNumber} · published ${formatDate(current.publishedAt)}` : 'Not published yet'}
+              actions={
+                current ? (
+                  <Link
+                    href={`/strategies/${strategy.id}/versions/${current.id}`}
+                    className="text-xs text-signal-400 underline underline-offset-2"
+                  >
+                    Evaluate &amp; detect
+                  </Link>
+                ) : undefined
+              }
             />
             {current ? (
               <VersionConfigView version={current} />
@@ -169,15 +179,25 @@ function StrategyDetailContent() {
                     <td className="px-5 py-2.5 text-xs text-ink-400">{formatDate(v.createdAt)}</td>
                     <td className="px-5 py-2.5 text-xs text-ink-400">{formatDate(v.publishedAt)}</td>
                     <td className="px-5 py-2.5 text-right text-xs">
-                      {v.status === 'published' && v.isCurrent && (
-                        <button
-                          className="text-ink-400 hover:text-danger-450 disabled:opacity-50"
-                          disabled={busy}
-                          onClick={() => void act(() => api.deprecateVersion(strategy.id, v.id))}
-                        >
-                          Deprecate
-                        </button>
-                      )}
+                      <span className="inline-flex items-center gap-3">
+                        {v.status !== 'draft' && (
+                          <Link
+                            href={`/strategies/${strategy.id}/versions/${v.id}`}
+                            className="text-ink-300 hover:text-signal-400"
+                          >
+                            Evaluate &amp; detect
+                          </Link>
+                        )}
+                        {v.status === 'published' && v.isCurrent && (
+                          <button
+                            className="text-ink-400 hover:text-danger-450 disabled:opacity-50"
+                            disabled={busy}
+                            onClick={() => void act(() => api.deprecateVersion(strategy.id, v.id))}
+                          >
+                            Deprecate
+                          </button>
+                        )}
+                      </span>
                     </td>
                   </tr>
                 ))}
