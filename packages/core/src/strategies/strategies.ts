@@ -100,6 +100,19 @@ interface ConditionRow {
 }
 
 /**
+ * Request context for audit events written by the service layer.
+ *
+ * HTTP routes pass the acting request's client IP and user agent (derived
+ * from the pinned trust-proxy resolution, never client-chosen) so that
+ * strategy lifecycle events are attributable like every other audit event.
+ * Non-HTTP entrypoints (tests, future workers) may omit it.
+ */
+export interface StrategyAuditMeta {
+  ip?: string | null;
+  userAgent?: string | null;
+}
+
+/**
  * Strategy + StrategyVersion domain service.
  *
  * Guarantees (enforced here AND by database triggers):
@@ -112,6 +125,10 @@ interface ConditionRow {
  *    after publishing is deprecation
  *  - publish gate: validatePublishable must pass before a version is
  *    published
+ *  - reference-data protection: version configs may only reference
+ *    instruments that already exist in the shared platform universe —
+ *    user input never creates `instruments` rows or rewrites shared
+ *    display names (see writeVersionConfig)
  */
 export class StrategyService {
   constructor(
@@ -168,7 +185,11 @@ export class StrategyService {
     }
   }
 
-  async createStrategy(actorUserId: string, input: StrategyCreateInput): Promise<StrategyDetailDto> {
+  async createStrategy(
+    actorUserId: string,
+    input: StrategyCreateInput,
+    meta?: StrategyAuditMeta,
+  ): Promise<StrategyDetailDto> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -200,6 +221,8 @@ export class StrategyService {
         action: 'strategy.created',
         entityType: 'strategy',
         entityId: strategy.id,
+        ip: meta?.ip ?? null,
+        userAgent: meta?.userAgent ?? null,
         metadata: { name: strategy.name },
       });
 
@@ -215,7 +238,12 @@ export class StrategyService {
     }
   }
 
-  async updateStrategy(actorUserId: string, strategyId: string, input: StrategyUpdateInput): Promise<StrategyDetailDto> {
+  async updateStrategy(
+    actorUserId: string,
+    strategyId: string,
+    input: StrategyUpdateInput,
+    meta?: StrategyAuditMeta,
+  ): Promise<StrategyDetailDto> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -239,8 +267,22 @@ export class StrategyService {
         `UPDATE strategies SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`,
         values,
       );
+      const updated = res.rows[0];
+      if (!updated) throw Errors.notFound('Strategy not found');
       await client.query('COMMIT');
-      if (!res.rows[0]) throw Errors.notFound('Strategy not found');
+      await this.audit.log({
+        userId: actorUserId,
+        action: 'strategy.updated',
+        entityType: 'strategy',
+        entityId: strategy.id,
+        ip: meta?.ip ?? null,
+        userAgent: meta?.userAgent ?? null,
+        metadata: {
+          name: input.name !== undefined,
+          description: input.description !== undefined,
+          status: input.status ?? null,
+        },
+      });
       return this.getStrategy(actorUserId, strategyId);
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
@@ -257,7 +299,7 @@ export class StrategyService {
    * Delete a strategy. Blocked when the strategy has published/deprecated
    * versions — its history must remain traceable (archive it instead).
    */
-  async deleteStrategy(actorUserId: string, strategyId: string): Promise<void> {
+  async deleteStrategy(actorUserId: string, strategyId: string, meta?: StrategyAuditMeta): Promise<void> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -278,6 +320,8 @@ export class StrategyService {
         action: 'strategy.deleted',
         entityType: 'strategy',
         entityId: strategyId,
+        ip: meta?.ip ?? null,
+        userAgent: meta?.userAgent ?? null,
       });
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
@@ -295,6 +339,7 @@ export class StrategyService {
     actorUserId: string,
     strategyId: string,
     input: StrategyVersionCreateInput,
+    meta?: StrategyAuditMeta,
   ): Promise<StrategyVersionDetailDto> {
     const client = await this.pool.connect();
     try {
@@ -349,6 +394,8 @@ export class StrategyService {
         action: 'strategy.version_created',
         entityType: 'strategy_version',
         entityId: version.id,
+        ip: meta?.ip ?? null,
+        userAgent: meta?.userAgent ?? null,
         metadata: { strategyId, versionNumber: version.version_number, fromVersionId: input.fromVersionId ?? null },
       });
 
@@ -382,6 +429,7 @@ export class StrategyService {
     strategyId: string,
     versionId: string,
     input: StrategyVersionUpdateInput,
+    meta?: StrategyAuditMeta,
   ): Promise<StrategyVersionDetailDto> {
     const client = await this.pool.connect();
     try {
@@ -400,6 +448,8 @@ export class StrategyService {
         action: 'strategy.version_updated',
         entityType: 'strategy_version',
         entityId: version.id,
+        ip: meta?.ip ?? null,
+        userAgent: meta?.userAgent ?? null,
         metadata: { strategyId, versionNumber: version.version_number },
       });
       return this.readVersionDetail(client, version, false);
@@ -415,6 +465,7 @@ export class StrategyService {
     actorUserId: string,
     strategyId: string,
     versionId: string,
+    meta?: StrategyAuditMeta,
   ): Promise<StrategyVersionDetailDto> {
     const client = await this.pool.connect();
     try {
@@ -450,6 +501,8 @@ export class StrategyService {
         action: 'strategy.version_published',
         entityType: 'strategy_version',
         entityId: version.id,
+        ip: meta?.ip ?? null,
+        userAgent: meta?.userAgent ?? null,
         metadata: { strategyId, versionNumber: version.version_number },
       });
       return this.readVersionDetail(client, published, true);
@@ -465,6 +518,7 @@ export class StrategyService {
     actorUserId: string,
     strategyId: string,
     versionId: string,
+    meta?: StrategyAuditMeta,
   ): Promise<StrategyVersionDetailDto> {
     const client = await this.pool.connect();
     try {
@@ -488,6 +542,8 @@ export class StrategyService {
         action: 'strategy.version_deprecated',
         entityType: 'strategy_version',
         entityId: version.id,
+        ip: meta?.ip ?? null,
+        userAgent: meta?.userAgent ?? null,
         metadata: { strategyId, versionNumber: version.version_number },
       });
       const current = await this.findCurrentVersion(client, strategy.id);
@@ -804,21 +860,31 @@ async function writeVersionConfig(
     ]);
     if (config.marketScope.mode === 'instruments' && config.marketScope.instruments) {
       for (const inst of config.marketScope.instruments) {
+        // M7.2 hardening: `instruments` is PLATFORM-MANAGED reference data
+        // shared by every user (see migration 0002 — it grows only via
+        // migrations or an admin flow). A user's version config may only
+        // REFERENCE existing instruments, never create rows or rewrite
+        // shared display names. The previous upsert let any user mint new
+        // symbols (which then appeared in everyone's scope-"all"
+        // evaluations and market lists) and overwrite the display name of
+        // a platform instrument. Unknown instruments are rejected here.
+        // `displayName` in the input remains part of the version snapshot
+        // contract but no longer mutates the shared table.
         const res = await client.query<{ id: string }>(
-          `INSERT INTO instruments (asset_class, symbol, display_name)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (asset_class, symbol)
-           DO UPDATE SET display_name = COALESCE(EXCLUDED.display_name, instruments.display_name)
-           RETURNING id`,
-          [inst.assetClass, inst.symbol.toUpperCase(), inst.displayName ?? null],
+          'SELECT id FROM instruments WHERE asset_class = $1 AND symbol = $2',
+          [inst.assetClass, inst.symbol.toUpperCase()],
         );
         const instId = res.rows[0]?.id;
-        if (instId) {
-          await client.query('INSERT INTO strategy_market_scope_instruments (version_id, instrument_id) VALUES ($1, $2)', [
-            versionId,
-            instId,
-          ]);
+        if (!instId) {
+          throw Errors.invalidInput(
+            `Unknown instrument "${inst.assetClass}/${inst.symbol.toUpperCase()}" — it is not part of the platform instrument universe. ` +
+              'Choose an instrument from GET /api/markets/instruments.',
+          );
         }
+        await client.query('INSERT INTO strategy_market_scope_instruments (version_id, instrument_id) VALUES ($1, $2)', [
+          versionId,
+          instId,
+        ]);
       }
     }
   }

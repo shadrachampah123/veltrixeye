@@ -25,6 +25,7 @@ import {
   verifyPassword,
   UserService,
   SessionService,
+  MAX_SESSIONS_LISTED,
   StrategyService,
   AuditService,
   isDomainError,
@@ -225,6 +226,43 @@ describe('sessions', () => {
     assert.equal(current.current, true);
     assert.equal(current.userAgent, 'device-a');
   });
+
+  // M7.2: the session list is bounded so `GET /api/users/me` cannot grow
+  // without limit (a session is minted on every login and lives up to the TTL).
+  test('listForUser is capped at MAX_SESSIONS_LISTED, newest first', async () => {
+    const user = await users.create({ email: uniqueEmail(), passwordHash: await hashPassword(PASSWORD), name: 'C' });
+    const extra = MAX_SESSIONS_LISTED + 5;
+    let newest: string | null = null;
+    for (let i = 0; i < extra; i++) {
+      const s = await sessions.create(user.id, { userAgent: `cap-device-${i}` });
+      newest = s.token;
+    }
+
+    const list = await sessions.listForUser(user.id, newest);
+    assert.equal(list.length, MAX_SESSIONS_LISTED, 'list must be capped, not unbounded');
+    const ids = new Set(list.map((s) => s.id));
+    assert.equal(ids.size, MAX_SESSIONS_LISTED, 'no duplicates in the capped list');
+    const current = list.filter((s) => s.current);
+    assert.equal(current.length, 1);
+    assert.ok(current[0], 'current session present');
+    assert.ok(list[0], 'list non-empty');
+    assert.equal(current[0].id, list[0].id, 'newest session is first');
+  });
+
+  // M7.2: expired sessions are removed at boot (the API runs no scheduler by
+  // design). deleteExpired must remove ONLY expired rows.
+  test('deleteExpired removes only expired sessions', async () => {
+    const user = await users.create({ email: uniqueEmail(), passwordHash: await hashPassword(PASSWORD), name: 'X' });
+    const live = await sessions.create(user.id, { userAgent: 'live-device' });
+    const expired = await sessions.create(user.id, { userAgent: 'expired-device' });
+    await pool.query('UPDATE sessions SET expires_at = now() - interval \'1 hour\' WHERE id = $1', [expired.record.id]);
+
+    const removed = await sessions.deleteExpired();
+    assert.ok(removed >= 1, 'at least the seeded expired session was removed');
+
+    assert.ok(await sessions.findByToken(live.token), 'live session survives');
+    assert.equal(await sessions.findByToken(expired.token), null, 'expired session is gone');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -312,6 +350,55 @@ describe('strategies', () => {
     assert.equal(detail.versionCount, 1);
     assert.equal(first(detail.versions, 'version').status, 'draft');
     assert.equal(detail.currentVersion, null);
+  });
+
+  // M7.2: the shared `instruments` table is platform-managed reference data.
+  // A version config may only REFERENCE existing instruments; user input must
+  // not mint new rows or rewrite shared display names (the pre-M7.2 upsert
+  // allowed both, polluting every user's scope-"all" evaluations and lists).
+  test('a version config cannot reference an instrument outside the platform universe', async () => {
+    const owner = await makeUser();
+    const before = Number((await pool.query('SELECT count(*)::text AS n FROM instruments')).rows[0].n);
+
+    await assert.rejects(
+      async () =>
+        strategies.createStrategy(owner, {
+          name: 'Unknown Instrument',
+          version: {
+            marketScope: { mode: 'instruments', instruments: [{ assetClass: 'forex', symbol: 'ZZUNKNOWN' }] },
+          },
+        }),
+      (err: unknown) => isDomainError(err) && err.code === 'invalid_input',
+    );
+
+    assert.equal(
+      Number((await pool.query('SELECT count(*)::text AS n FROM instruments')).rows[0].n),
+      before,
+      'no new instrument row may be created',
+    );
+  });
+
+  test('a user-supplied displayName cannot rewrite a shared instrument', async () => {
+    const owner = await makeUser();
+    const dbBefore = (
+      await pool.query('SELECT display_name FROM instruments WHERE asset_class = $1 AND symbol = $2', ['forex', 'EURUSD'])
+    ).rows[0]?.display_name;
+
+    await strategies.createStrategy(owner, {
+      name: 'DisplayName Rewrite',
+      version: {
+        marketScope: {
+          mode: 'instruments',
+          instruments: [{ assetClass: 'forex', symbol: 'EURUSD', displayName: 'EVIL REWRITE' }],
+        },
+      },
+    });
+
+    const dbAfter = (
+      await pool.query('SELECT display_name FROM instruments WHERE asset_class = $1 AND symbol = $2', ['forex', 'EURUSD'])
+    ).rows[0]?.display_name;
+    assert.equal(dbAfter, dbBefore, 'shared display_name must be untouched');
+    assert.notEqual(dbAfter, 'EVIL REWRITE');
   });
 
   test('enforces unique strategy name per user (case-insensitive)', async () => {

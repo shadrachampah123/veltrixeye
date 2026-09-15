@@ -37,7 +37,13 @@ export async function userRoutes(app: FastifyInstance, ctx: AppContext, config: 
     return { user: ctx.users.toDto(updated) };
   });
 
-  app.post('/api/users/me/password', async (req, reply) => {
+  // Credential endpoint (verifies the current password): strictly limited
+  // per IP like login/register so an abuser holding one session cannot
+  // brute-force a password change. 5/min is far above any legitimate use.
+  app.post(
+    '/api/users/me/password',
+    { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } },
+    async (req, reply) => {
     const ok = await requireAuth(req, reply);
     if (!ok) return;
     const parsed = changePasswordSchema.safeParse(req.body);

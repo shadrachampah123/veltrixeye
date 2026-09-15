@@ -30,6 +30,16 @@ interface SessionRow {
 }
 
 /**
+ * Upper bound on how many active sessions `listForUser` returns (newest
+ * first). Sessions are created on every successful login and live up to the
+ * TTL (≤ 90 days), so without a cap a long-lived account could accumulate
+ * an unbounded list that bloats `GET /api/users/me` responses. 100 is far
+ * beyond any legitimate concurrent-device count; sessions beyond the cap
+ * still exist, are still valid, and are still revoked by password change.
+ */
+export const MAX_SESSIONS_LISTED = 100;
+
+/**
  * Server-side sessions.
  *
  * - The raw token is 256 bits of CSPRNG randomness; only its SHA-256 is
@@ -94,14 +104,23 @@ export class SessionService {
   }
 
   async listForUser(userId: string, currentToken: string | null): Promise<SessionDto[]> {
-    const res = await this.pool.query<SessionRow & { token_hash: string }>(
-      `SELECT s.*, s.token_hash
-       FROM sessions s
-       WHERE s.user_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now()
-       ORDER BY s.created_at DESC`,
-      [userId],
-    );
+    // The newest MAX_SESSIONS_LISTED active sessions — plus the CURRENT
+    // session whenever it would otherwise be cut off by the cap, so the
+    // caller can always see (and revoke) the device they are using. The
+    // current session is matched by token hash, never by client-supplied id.
     const currentHash = currentToken ? sha256(currentToken) : null;
+    const res = await this.pool.query<SessionRow & { token_hash: string; rn: string }>(
+      `WITH ranked AS (
+         SELECT s.*,
+                row_number() OVER (ORDER BY s.created_at DESC) AS rn
+         FROM sessions s
+         WHERE s.user_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now()
+       )
+       SELECT * FROM ranked
+       WHERE rn <= $2 OR token_hash = $3
+       ORDER BY rn`,
+      [userId, MAX_SESSIONS_LISTED, currentHash],
+    );
     return res.rows.map((row) => toDto(row, row.token_hash === currentHash));
   }
 

@@ -29,10 +29,21 @@ import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
 import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js';
-import { Errors } from '@veltrixeye/core';
+import { Errors, type StrategyAuditMeta } from '@veltrixeye/core';
+import type { FastifyRequest } from 'fastify';
 
 export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, config: AppConfig): Promise<void> {
   const requireAuth = createSessionAuth(config, ctx);
+
+  /**
+   * Audit context for the service-layer events this module triggers
+   * (strategy.created/updated/deleted, version lifecycle). `req.ip` is the
+   * pinned trust-proxy resolution — never client-chosen (see trust-proxy.ts).
+   */
+  const auditMeta = (req: FastifyRequest): StrategyAuditMeta => ({
+    ip: req.ip,
+    userAgent: req.headers['user-agent'] ?? null,
+  });
 
   // -- vocabulary/meta for the strategy editor (auth-gated) --
   app.get('/api/strategies/meta', async (req, reply) => {
@@ -83,7 +94,7 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
       return;
     }
     const { user } = req as AuthenticatedRequest;
-    const strategy = await ctx.strategies.createStrategy(user.id, parsed.data);
+    const strategy = await ctx.strategies.createStrategy(user.id, parsed.data, auditMeta(req));
     return reply.code(201).send({ strategy });
   });
 
@@ -108,7 +119,7 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
     const { user } = req as AuthenticatedRequest;
     const { strategyId } = req.params as { strategyId: string };
     if (!isUuid(strategyId)) throw Errors.notFound('Strategy not found');
-    const strategy = await ctx.strategies.updateStrategy(user.id, strategyId, parsed.data);
+    const strategy = await ctx.strategies.updateStrategy(user.id, strategyId, parsed.data, auditMeta(req));
     return { strategy };
   });
 
@@ -118,7 +129,7 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
     const { user } = req as AuthenticatedRequest;
     const { strategyId } = req.params as { strategyId: string };
     if (!isUuid(strategyId)) throw Errors.notFound('Strategy not found');
-    await ctx.strategies.deleteStrategy(user.id, strategyId);
+    await ctx.strategies.deleteStrategy(user.id, strategyId, auditMeta(req));
     return reply.code(204).send();
   });
 
@@ -134,7 +145,7 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
     const { user } = req as AuthenticatedRequest;
     const { strategyId } = req.params as { strategyId: string };
     if (!isUuid(strategyId)) throw Errors.notFound('Strategy not found');
-    const version = await ctx.strategies.createVersion(user.id, strategyId, parsed.data);
+    const version = await ctx.strategies.createVersion(user.id, strategyId, parsed.data, auditMeta(req));
     return reply.code(201).send({ version });
   });
 
@@ -159,7 +170,7 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
     const { user } = req as AuthenticatedRequest;
     const { strategyId, versionId } = req.params as { strategyId: string; versionId: string };
     if (!isUuid(strategyId) || !isUuid(versionId)) throw Errors.notFound('Version not found');
-    const version = await ctx.strategies.updateVersionConfig(user.id, strategyId, versionId, parsed.data);
+    const version = await ctx.strategies.updateVersionConfig(user.id, strategyId, versionId, parsed.data, auditMeta(req));
     return { version };
   });
 
@@ -169,7 +180,7 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
     const { user } = req as AuthenticatedRequest;
     const { strategyId, versionId } = req.params as { strategyId: string; versionId: string };
     if (!isUuid(strategyId) || !isUuid(versionId)) throw Errors.notFound('Version not found');
-    const version = await ctx.strategies.publishVersion(user.id, strategyId, versionId);
+    const version = await ctx.strategies.publishVersion(user.id, strategyId, versionId, auditMeta(req));
     return { version };
   });
 
@@ -179,7 +190,7 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
     const { user } = req as AuthenticatedRequest;
     const { strategyId, versionId } = req.params as { strategyId: string; versionId: string };
     if (!isUuid(strategyId) || !isUuid(versionId)) throw Errors.notFound('Version not found');
-    const version = await ctx.strategies.deprecateVersion(user.id, strategyId, versionId);
+    const version = await ctx.strategies.deprecateVersion(user.id, strategyId, versionId, auditMeta(req));
     return { version };
   });
 

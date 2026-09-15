@@ -23,6 +23,12 @@ remaining items are listed at the bottom.
   `Invalid email or password` 401 for both wrong-password and
   unknown-user, with **dummy argon2 verification** on the unknown-user
   path so response timing doesn't distinguish the two.
+- **Session hygiene (M7.2)**: expired sessions are removed at API boot
+  (`runStartupHousekeeping` — the platform runs no scheduler by design, so
+  boot is the cleanup point), bounding `sessions` growth; `GET
+  /api/users/me` returns at most `MAX_SESSIONS_LISTED` (100) newest
+  sessions plus the caller's current session whenever it would otherwise
+  be cut off by the cap.
 
 ## Input validation
 
@@ -60,6 +66,9 @@ remaining items are listed at the bottom.
 - Global: 300 req/min per IP.
 - `POST /api/auth/login`: **10/min per IP** (brute-force).
 - `POST /api/auth/register`: **5/hour per IP** (account spam).
+- `POST /api/users/me/password`: **5/min per IP** (M7.2 — a credential
+  endpoint: it verifies the current password, so it is limited like login
+  and register; 5/min is far above legitimate use).
 - `GET /api/market-data/candles`: **60/min per IP**.
 - `POST /api/market-data/backfill`: **5/min per IP**.
 - `POST …/versions/:versionId/evaluate`: **20/min per IP** (M3).
@@ -134,6 +143,13 @@ login, failed login, logout, session revocation, password change
 `alert.acknowledged` ([alerts.md](./alerts.md#6-audit-events)).
 Rows carry user id, action, IP, user agent, and metadata.
 
+Every row carries the acting request's IP and user agent (M7.2): the
+service-layer strategy lifecycle events (`strategy.created`,
+`strategy.updated`, `strategy.deleted`, `strategy.version_created`,
+`strategy.version_updated`, `strategy.version_published`,
+`strategy.version_deprecated`) now receive the request context from the
+HTTP layer, so no audit event is left without attribution.
+
 Alert audit events are written to mirror exactly what happened: a dedup replay
 emits `alert.replayed` (never a second `alert.created`) and
 `alert.delivery_recorded` is emitted only when a ledger row was actually
@@ -189,6 +205,14 @@ user request.
   output history is tamper-evident.
 - Ownership + cascade rules mean a user's delete cannot touch another
   user's data.
+- **Platform-managed reference data (M7.2)**: the shared `instruments`
+  table is global, read-only reference data. A strategy version may only
+  **reference** instruments that already exist; user input can neither
+  mint new rows nor rewrite a platform instrument's `display_name`.
+  Unknown symbols are rejected with a 400 at version write time. (The
+  pre-M7.2 upsert let any user create symbols that then appeared in every
+  other user's scope-`all` evaluations and market lists, and rename shared
+  instruments for everyone.)
 
 ## Secrets & environment
 

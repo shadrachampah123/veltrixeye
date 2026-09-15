@@ -1,5 +1,5 @@
 import { loadConfig, loadDotEnv } from './config.js';
-import { buildApp, createAppContext } from './app.js';
+import { buildApp, createAppContext, runStartupHousekeeping } from './app.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 import { createTwelveDataProvider } from '@veltrixeye/provider-twelve-data';
 
@@ -30,6 +30,16 @@ async function main(): Promise<void> {
   }
 
   const ctx = createAppContext(pool, config);
+
+  // M7.2 housekeeping: drop sessions past their TTL (no scheduler exists by
+  // design, so boot is the cleanup point). Never throws: a cleanup failure
+  // must not block boot — the queries are trivial DELETEs.
+  try {
+    const removed = await runStartupHousekeeping(ctx);
+    if (removed > 0) console.info(`[db] removed ${removed} expired session(s) at startup`);
+  } catch (err) {
+    console.warn('[api] expired-session cleanup failed (continuing):', (err as Error)?.message);
+  }
 
   // M2 primary market-data provider. The API boots without a key on purpose
   // (dev/test, or an unkeyed deploy); market-data reads/backfills answer 502

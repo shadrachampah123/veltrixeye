@@ -80,6 +80,18 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
 }
 
 /**
+ * One-shot startup housekeeping (M7.2): remove sessions that have passed
+ * their TTL. Sessions are created on every successful login and otherwise
+ * linger until their expiry — the platform runs no scheduler by design, so
+ * boot is the only place this cleanup can happen. Removing expired rows
+ * bounds `sessions` growth and keeps the per-user session list small.
+ * Returns the number of rows removed.
+ */
+export async function runStartupHousekeeping(ctx: AppContext): Promise<number> {
+  return ctx.sessions.deleteExpired();
+}
+
+/**
  * Build the Fastify app WITHOUT listening.
  * Tests use `app.inject()` against this factory.
  */
