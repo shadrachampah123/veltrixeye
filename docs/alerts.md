@@ -1,130 +1,211 @@
-# Setup Alerts (M6, Phases 1 & 2)
+# Setup Alerts (M6, Phases 1–3)
 
-M6 alerts notify an owner when one of their setups reaches an actionable
-state with sufficient quality. Like M4 detection and M5 scoring, alert
-generation is **invoked explicitly, never automatic**: there is no
-scheduler, scanner, queue, or background worker.
+M6 alerts notify an owner when one of their setups reaches an actionable state
+with sufficient quality. Like M4 detection and M5 scoring, alert generation is
+**invoked explicitly, never automatic**: there is no scheduler, scanner, queue,
+or background worker anywhere in this milestone.
 
-Phase 1 covers the versioned contracts (`@veltrixeye/contracts`) and the
-alert + delivery tables (`0012_alerts.sql`). Phase 2 adds `AlertService`
-and the HTTP surface (`/api/setups/:setupId/alerts`, `/api/alerts`).
-There is still no real delivery, no vendor SDKs, no email/webhook/push
-sending, no new env vars, no scheduler/worker/queue/cron/background.
+- **Phase 1** — versioned contracts (`@veltrixeye/contracts`) and the alert +
+  delivery tables (`0012_alerts.sql`).
+- **Phase 2** — `AlertService` and the HTTP surface
+  (`/api/setups/:setupId/alerts`, `/api/alerts`).
+- **Phase 3** — the `AlertSender` stub boundary, the pinned generation gates,
+  replay-safe ledgering, audit events, and the end-to-end lifecycle tests.
 
-## What Phase 1 does
+Delivery is **stub-only**: an append-only ledger row is written in the same
+transaction as the alert, and nothing is transmitted. No email, webhook, push,
+vendor SDK, new environment variable, credential, scheduler, worker, queue,
+cron or background job exists in M6.
 
-- Defines lifecycle: alert generated from one owned setup when (1) setup is
-  in eligible state (`confirmed` or `triggered`), (2) M5 score exists at
-  detection anchor, (3) score total ≥ version's `risk.minQualityScore`.
-- Deduplicates by `(setup_id, trigger_state)`: at most two alerts per setup.
-- Status `pending` → `acknowledged` | `suppressed`, with `acknowledged_at`.
-- Records delivery attempts in append-only `alert_deliveries` ledger with
-  `channel`, `status`, `attempt`, `error`, `payload_hash` (sha256).
+## 1. Contracts (`packages/contracts/src/alerts.ts`)
 
-## What Phase 2 adds
+- **Statuses**: `pending`, `acknowledged` (`suppressed` is a reserved value the
+  M6 service never writes).
+- **Trigger states** (= eligible setup states): `confirmed`, `triggered`.
+- **Channels**: `stub` (the only one written), plus reserved `email`,
+  `webhook`, `push` values so real delivery needs no migration later.
+- **Delivery statuses**: `delivered`, `failed` (the stub always writes
+  `delivered`).
+- **Skipped reason**: `below_min_quality` — the single silent outcome of a
+  valid generation request.
+- **DTOs**: `alertGenerateRequestSchema`, `alertGenerateResponseSchema`,
+  `alertListQuerySchema`, `alertListResponseSchema`, `alertDtoSchema`,
+  `alertDeliveryDtoSchema`, `alertDetailDtoSchema`,
+  `alertAcknowledgeRequestSchema`.
 
-`AlertService` (`packages/core/src/alerts/service.ts`) is the only writer
-of `alerts` / `alert_deliveries`:
+## 2. Generation rules (pinned order)
 
-### Generation (pinned order)
+`AlertService.generateAlert` (in `packages/core/src/alerts/service.ts`) is the
+only writer of `alerts` / `alert_deliveries`. It consumes the existing M4
+lifecycle state and the existing M5 score — it never re-evaluates conditions,
+never re-scores, and never transitions a setup.
 
-1. **Owner + eligible state**: setup must exist, belong to caller
-   (via `strategies.user_id`), and be in `confirmed` or `triggered`.
-   Other states → 400 `Setup is in state "..."`. Foreign → masked 404.
-2. **M5 score required**: `setup_scores` row at `setup.as_of_ms`
-   (detection anchor) must exist, else 400 `has no quality score`.
-3. **Quality gate**: load version config via `StrategyService.getVersion`
-   (owner-scoped) and compare `score.total` against
-   `config.risk.minQualityScore` (default 0). If below gate, return
-   `{alert:null, delivery:null, created:false, skippedReason:
-   'below_min_quality'}` — silence, no row, no delivery, HTTP 200 with
-   `skippedReason`. Not an error.
-4. **Trigger state**: caller may pass `triggerState` (`confirmed` |
-   `triggered`). If omitted, effective = setup's current state. If
-   `triggered` requested but setup is only `confirmed` → 400 logical
-   progression error. `confirmed` alert allowed when setup is `triggered`
-   (triggered implies confirmed past).
-5. **Deterministic content**: `title` ≤280 chars, e.g.
-   `EURUSD long confirmed (score 82/A)`. `body` structured payload
-   `{setupId, strategyId, strategyVersionId, versionNumber, instrument,
-   direction, triggerState, qualityScore, qualityGrade, minQualityScore,
-   entryPrice, stopLossPrice, tp1/2/3Price, scoreId, scoreEngineVersion,
-   detectedAt, asOfMs}` — never raw candles, licensing-safe.
-6. **Transactional idempotency**: `INSERT INTO alerts ... ON CONFLICT
-   (setup_id, trigger_state) DO NOTHING`. Winner inserts; losers re-select.
-   Exactly one `stub` delivery per generated alert:
-   `INSERT INTO alert_deliveries (alert_id, channel='stub',
-   status='delivered', attempt=1, payload_hash) ON CONFLICT (alert_id,
-   channel, payload_hash) DO NOTHING`. Concurrent identical submissions
-   collapse to one alert + one delivery; `created` flag tells caller.
-7. **Local/no-network**: no provider, no email/webhook SDK, no fetch.
-   Payload hash = `sha256(JSON.stringify(canonicalize({alertId,title,body})))`
-   where `canonicalize` sorts keys recursively, Date→ISO. Deterministic stub.
+1. **Ownership** — the setup must exist and belong to the caller through the
+   existing chain `setups.strategy_version_id → strategy_versions.strategy_id →
+   strategies.user_id`. Unknown *or* foreign ids are masked as **404** so
+   existence is never disclosed.
+2. **Eligible state** — only `confirmed` and `triggered` may generate. Any
+   other state is refused with **400**:
+   - terminal states (`completed`, `invalidated`, `expired`) →
+     `Setup is in terminal state "<state>" — no alert can be generated for an
+     invalidated, expired or completed setup.`
+   - pre-confirmation states (`developing`, `watching`, `almost_ready`) →
+     `Setup is in state "<state>" — only confirmed or triggered setups can
+     generate alerts.`
 
-### Listing & detail
+   The state gate runs **before** the score gate, so an ineligible setup is
+   refused for the real reason. It is then **re-checked under a row lock
+   inside the generation transaction** (`SELECT state FROM setups WHERE id =
+   $1 FOR SHARE`, immediately after `BEGIN`): that share lock conflicts with
+   the `FOR UPDATE` M4's `SetupService.transitionSetup` holds while changing
+   state, so a transition that lands while generation is in flight either
+   blocks until the alert commits or is seen by the re-check and refused —
+   an alert is never written for a setup that is terminal by commit time.
+3. **M5 score required** — a `setup_scores` row must exist at the setup's own
+   detection anchor (`setups.as_of_ms`). Missing → **400**
+   `Setup has no quality score at its detection anchor — score the setup before
+   generating an alert.` The alert's `scoreId` / `scoreEngineVersion` /
+   `qualityScore` / `qualityGrade` all come from that row.
+4. **`minQualityScore` gate** — the version's `risk.minQualityScore` (default
+   from the strategy config, `0` if absent) is compared against the stored
+   score total. `total >= gate` passes; `total < gate` is **silence**: HTTP
+   **200** with `{alert: null, created: false, skippedReason:
+   'below_min_quality'}`, no alert row, no ledger row. A below-gate setup is a
+   normal outcome, not an error.
+5. **Trigger state** — the caller may pass `triggerState` (`confirmed` /
+   `triggered`). Omitted → the setup's current state is used (already
+   eligible). `triggered` requires the setup to actually be `triggered`
+   (else **400**: no forward-looking alerts). `confirmed` remains valid once
+   the setup has progressed to `triggered`, because triggered implies
+   confirmed.
+6. **Deterministic content** — `title` = `<SYMBOL> <direction> <triggerState>
+   (score <total>/<grade>)`, capped at 280 chars; `body` is a structured
+   payload (`setupId`, `strategyId`, `strategyVersionId`, `versionNumber`,
+   instrument, direction, triggerState, qualityScore, qualityGrade,
+   minQualityScore, entry/SL/TP1–3 prices, `scoreId`,
+   `scoreEngineVersion`, `detectedAt`, `asOfMs`). **Never raw candles** —
+   licensing-safe by construction.
+7. **Deduplication** — `UNIQUE (setup_id, trigger_state)` (0012). A setup can
+   therefore produce at most two alerts: one `confirmed` and one `triggered`.
+   A replay returns the existing alert (`created: false`) with its **original**
+   `createdAt`, title and body; nothing is rewritten.
+8. **Transactionality** — the alert row and its stub ledger row commit in one
+   transaction. Concurrency is resolved by the database, not by
+   check-then-insert: the loser of the alert insert reads the winner's row, and
+   the ledger insert is idempotent on `(alert_id, channel, payload_hash)`.
 
-- `listAlerts({userId, strategyId?, status?, limit})` — owner-scoped,
-  newest first, joins `instruments` + `strategy_versions` for DTO enrichment.
-- `getAlert({userId, alertId})` — returns `{alert, deliveries}` (deliveries
-  up to 64, ordered by id). Masked 404 if not owned.
+## 3. Stub delivery ledger (zero external I/O)
 
-### Acknowledgement
+`AlertSender` (`packages/core/src/alerts/sender.ts`) is the single delivery
+boundary. M6 ships exactly one implementation:
 
-- `acknowledgeAlert({userId, alertId})` — `SELECT ... FOR UPDATE`,
-  `UPDATE alerts SET status='acknowledged',
-  acknowledged_at=COALESCE(acknowledged_at, now()) WHERE id=$1`.
-  Idempotent repeated ack preserves first `acknowledgedAt`. Returns detail
-  DTO. Owner-scoped, masked 404.
+- `StubAlertSender.channel === 'stub'`.
+- `send()` renders `sha256(JSON.stringify(canonicalize({alertId, title, body})))`
+  where `canonicalize` sorts keys recursively (arrays keep their order) and
+  normalizes `Date` → ISO. No clock, no randomness, no I/O.
+- It returns `{status: 'delivered', attempt: 1, payloadHash, error: null}`.
 
-### Invariants preserved
+`AlertService` writes exactly **one** `alert_deliveries` row per alert with
+that result, in the same transaction:
 
-- No real delivery: only `channel='stub'` inserted; `email`/`webhook`/`push`
-  reserved in schema but never written by service. No network I/O.
-- No `setups` / `setup_scores` / `setup_state_events` mutation.
-- Safe DTOs: no raw candles, no secrets.
-- Deterministic stub: same alert id + title + body → same payload hash.
+- The payload is rendered from the **persisted** alert (`title`/`body` read
+  back from `alerts`), so a replay — or any later upstream change — hashes to
+  the original value and can never mint a second ledger row.
+- A replay does not call the sender at all: the existing ledger row is
+  returned. The service also self-heals an alert that has no ledger row
+  (a state the transactional write path cannot produce) by writing exactly one
+  row, and reports `deliveryCreated: true` only when a row was actually
+  inserted, so audit events stay truthful.
+- `alert_deliveries` is append-only (`append_only_guard()` from 0007): rows are
+  never updated or deleted.
 
-## HTTP API (Phase 2)
+**Hard rule:** `AlertService` refuses any sender whose channel is not `stub`
+(`NonStubSenderError`) at construction time. Real email/webhook/push delivery
+needs an outbox + worker, provider credentials and its own security review —
+none of which exists in M6, and none of which can be switched on by
+misconfiguration.
 
-All routes session-authenticated, owner-scoped masked 404, Zod-validated,
-audited, licensing-safe.
+## 4. HTTP API
 
-- `POST /api/setups/:setupId/alerts`
-  Body: `{triggerState?: 'confirmed'|'triggered'}` (strict).
-  Rate limit 20/min. Returns `{alert, delivery, created, skippedReason?}`.
-  200 when `created=false` or skipped (gate), 201 when created. Errors:
-  400 state/gate/score/validation, 401 auth, 404 masked foreign setup,
-  429 rate limit.
-  Audit: `alert.generated` with `setupId, triggerState, qualityScore,
-  minQualityScore, created, skippedReason?`; `alert.delivery_recorded`
-  on delivery insert.
+All routes are session-authenticated, owner-scoped with masked 404s,
+Zod-validated (`strict()`), tiered rate limited, audited, and licensing-safe.
 
-- `GET /api/alerts?strategyId?&status?&limit?` — list owned alerts.
+| Route | Limit | Notes |
+| --- | --- | --- |
+| `POST /api/setups/:setupId/alerts` | 20/min | Body `{triggerState?: 'confirmed' \| 'triggered'}` (strict). **201** when created, **200** on replay, **200** with `skippedReason` when gated, **400** state/score/validation, **401**, **404** masked, **429**. |
+| `GET /api/alerts?strategyId?&status?&limit?` | global | Owner-scoped list, newest first (`limit` 1–100, default 50). |
+| `GET /api/alerts/:id` | global | `{alert, deliveries}` (deliveries ≤ 64, oldest first). Foreign/unknown/malformed id → 404. |
+| `POST /api/alerts/:id/acknowledge` | 60/min | Empty strict body. **200** idempotent; **404** masked; **429**. |
 
-- `GET /api/alerts/:id` — detail `{alert, deliveries}`.
+Generation response shape:
 
-- `POST /api/alerts/:id/acknowledge`
-  Rate limit 60/min (higher than generate). Idempotent. Returns detail.
-  Audit: `alert.acknowledged` with `alertId, setupId, triggerState`.
+```jsonc
+// 201 created
+{ "alert": { /* AlertDto */ }, "deliveries": [ { /* AlertDeliveryDto, channel: "stub" */ } ], "created": true }
+// 200 replay (same alert id + same ledger entry, never a second one)
+{ "alert": { /* identical row */ }, "deliveries": [ /* identical entry */ ], "created": false }
+// 200 gate skip (nothing written)
+{ "alert": null, "created": false, "skippedReason": "below_min_quality" }
+```
 
-Error mapping: 400 invalidInput (state, score missing, gate logic),
-401 unauthenticated, 404 masked foreign, 422 Zod, 429 rate limit.
+## 5. Acknowledgement
 
-Rate limits tiered: generate 20/min, acknowledge 60/min.
+`POST /api/alerts/:id/acknowledge` is **idempotent**:
 
-## What M6 does NOT do (still)
+- The row is read `SELECT … FOR UPDATE` under the caller's ownership check.
+- The first call performs exactly one `UPDATE` to `status = 'acknowledged'`
+  with `acknowledged_at = now()`.
+- Every repeat is accepted (`200`) and **writes nothing**: the original
+  `acknowledgedAt` is preserved and returned unchanged. There is no duplicate
+  state change, no extra ledger row, no re-delivery.
+- Acks are audited per accepted request (`alert.acknowledged`), which is how
+  the rate-limit/abuse signal stays visible.
 
-No UI (Phase 4), no real alert delivery/email/webhook/push, no vendor SDKs,
-no new secrets/env vars, no scheduler/worker/queue/cron/background job/
-polling, no AI, no billing, no second market-data provider, no Twelve Data
-credential requirement.
+## 6. Audit events
 
-## Storage (0012)
+| Action | When | Metadata (selected) |
+| --- | --- | --- |
+| `alert.created` | this call inserted the alert | `setupId`, `triggerState`, `qualityScore`, `qualityGrade`, `minQualityScore`, `channel` |
+| `alert.replayed` | dedup hit — the alert already existed | same, with `created: false` |
+| `alert.delivery_recorded` | a **new** ledger row was written | `alertId`, `setupId`, `channel`, `status`, `attempt`, `payloadHash` |
+| `alert.skipped` | `minQualityScore` gate refused generation | `reason`, `triggerState`, `qualityScore`, `qualityGrade`, `minQualityScore` |
+| `alert.acknowledged` | every accepted acknowledge request | `setupId`, `triggerState`, `status`, `acknowledgedAt` |
+
+A replay emits `alert.replayed` (never a second `alert.created`) and never a
+second `alert.delivery_recorded`, so the audit log cannot be read as "two
+deliveries happened".
+
+## 7. Storage (0012, unchanged)
 
 `alerts` stores owner, setup, strategy version, instrument, direction,
-triggering state, score snapshot, deterministic title (≤280), structured body
-(levels, score ref — never raw candles), mutable status. Uniqueness
-`(setup_id, trigger_state)` dedupes. `alert_deliveries` is append-only
-(`append_only_guard()` trigger reused); ledger rows never updated/deleted.
-Uniqueness `(alert_id, channel, payload_hash)` makes stub delivery idempotent.
-Both tables owner-scoped, cascade with setup.
+triggering state, the score snapshot, deterministic title (≤ 280) and the
+structured body (levels + score reference — never raw candles); `status` is
+mutable (`pending` → `acknowledged`). `UNIQUE (setup_id, trigger_state)`
+dedupes. `alert_deliveries` is the append-only ledger, unique on
+`(alert_id, channel, payload_hash)`. Both tables cascade with the setup and are
+owner-scoped through `alerts.user_id`.
+
+## 8. What M6 does NOT do (still)
+
+No UI/dashboard surface (Phase 4), no real alert delivery (email/webhook/push),
+no vendor SDKs, no new secrets or environment variables, no
+scheduler/worker/queue/cron/background job/polling/scanner, no AI, no billing,
+no trade execution (M8), no second market-data provider, and no Twelve Data
+credential requirement — alerts work with no provider registered at all.
+
+## 9. Future channel/provider architecture
+
+Real delivery is additive and deliberately deferred:
+
+1. Implement `AlertSender` for the channel (`channel: 'email' | 'webhook' |
+   'push'`), keeping `send()` a pure function of the persisted alert.
+2. Inject it where `AlertService` is constructed and relax the M6
+   `NonStubSenderError` guard in the same reviewed change.
+3. Move the send out of the request transaction into an outbox + worker
+   (the ledger already records `attempt`, `status`, `error`, `payload_hash`,
+   and the channel CHECK already accepts the new values — no migration).
+4. Add the provider credentials as platform secrets, plus the security review:
+   per-channel redaction, retry/backoff, and delivery-rate limits.
+
+Until then, the honest statement is: **M6 "delivery" is a local ledger entry,
+not a notification.**

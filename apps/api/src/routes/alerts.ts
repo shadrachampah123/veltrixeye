@@ -11,16 +11,22 @@ import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js
 import { Errors } from '@veltrixeye/core';
 
 /**
- * Alert API routes (M6 Phase 2).
+ * Alert API routes (M6 Phases 2–3).
  *
- * POST /api/setups/:setupId/alerts — generate alert from setup (setup-level action)
- * GET /api/alerts — list owned alerts
- * GET /api/alerts/:id — get alert + deliveries
- * POST /api/alerts/:id/acknowledge — acknowledge alert (idempotent)
+ * POST /api/setups/:setupId/alerts — generate an alert from an owned setup
+ * GET  /api/alerts                 — list owned alerts
+ * GET  /api/alerts/:id             — alert + its stub delivery ledger
+ * POST /api/alerts/:id/acknowledge — acknowledge (idempotent)
  *
  * All routes are session-authenticated, owner-scoped with masked 404s,
- * Zod-validated, tiered rate limits, audited, and return safe DTOs.
- * No real delivery is ever performed (stub only).
+ * Zod-validated, tiered rate limited (generate 20/min, acknowledge 60/min),
+ * audited, and return safe DTOs.
+ *
+ * No real delivery is ever performed: the only channel is the local `stub`
+ * sender (see `@veltrixeye/core` → `alerts/sender.ts`). Audit events mirror
+ * exactly what happened — `alert.created` only on insert, `alert.replayed`
+ * for a dedup replay, and `alert.delivery_recorded` only when a NEW ledger
+ * row was written, so a retry can never look like a second delivery.
  */
 
 export async function alertRoutes(app: FastifyInstance, ctx: AppContext, config: AppConfig): Promise<void> {
@@ -48,46 +54,8 @@ export async function alertRoutes(app: FastifyInstance, ctx: AppContext, config:
         triggerState: parsed.data.triggerState,
       });
 
-      if (result.alert) {
-        await ctx.audit.log({
-          userId: user.id,
-          action: result.created ? 'alert.generated' : 'alert.replayed',
-          entityType: 'alert',
-          entityId: result.alert.id,
-          ip: req.ip,
-          userAgent: req.headers['user-agent'] ?? null,
-          metadata: {
-            setupId,
-            triggerState: result.alert.triggerState,
-            qualityScore: result.alert.qualityScore,
-            minQualityScore: result.alert.minQualityScore,
-            created: result.created,
-            channel: 'stub',
-          },
-        });
-
-        // Delivery stub audit if conventions require
-        await ctx.audit.log({
-          userId: user.id,
-          action: 'alert.delivery_recorded',
-          entityType: 'alert_delivery',
-          entityId: result.delivery?.id ? String(result.delivery.id) : null,
-          ip: req.ip,
-          userAgent: req.headers['user-agent'] ?? null,
-          metadata: {
-            alertId: result.alert.id,
-            channel: 'stub',
-            status: 'delivered',
-          },
-        });
-
-        return reply.code(result.created ? 201 : 200).send({
-          alert: result.alert,
-          deliveries: result.delivery ? [result.delivery] : [],
-          created: result.created,
-        });
-      } else {
-        // Gate not met — explicit silence, not error
+      if (!result.alert) {
+        // minQualityScore gate: explicit, audited silence — not an error.
         await ctx.audit.log({
           userId: user.id,
           action: 'alert.skipped',
@@ -97,7 +65,10 @@ export async function alertRoutes(app: FastifyInstance, ctx: AppContext, config:
           userAgent: req.headers['user-agent'] ?? null,
           metadata: {
             reason: result.skippedReason,
-            triggerState: parsed.data.triggerState,
+            triggerState: parsed.data.triggerState ?? null,
+            qualityScore: result.gate?.qualityScore ?? null,
+            qualityGrade: result.gate?.qualityGrade ?? null,
+            minQualityScore: result.gate?.minQualityScore ?? null,
           },
         });
         return reply.code(200).send({
@@ -106,6 +77,50 @@ export async function alertRoutes(app: FastifyInstance, ctx: AppContext, config:
           skippedReason: result.skippedReason,
         });
       }
+
+      await ctx.audit.log({
+        userId: user.id,
+        action: result.created ? 'alert.created' : 'alert.replayed',
+        entityType: 'alert',
+        entityId: result.alert.id,
+        ip: req.ip,
+        userAgent: req.headers['user-agent'] ?? null,
+        metadata: {
+          setupId,
+          triggerState: result.alert.triggerState,
+          qualityScore: result.alert.qualityScore,
+          qualityGrade: result.alert.body.qualityGrade ?? null,
+          minQualityScore: result.alert.minQualityScore,
+          created: result.created,
+          channel: ctx.alerts.deliveryChannel,
+        },
+      });
+
+      if (result.deliveryCreated && result.delivery) {
+        // One ledger row, one audit event: replays do not re-emit this.
+        await ctx.audit.log({
+          userId: user.id,
+          action: 'alert.delivery_recorded',
+          entityType: 'alert_delivery',
+          entityId: String(result.delivery.id),
+          ip: req.ip,
+          userAgent: req.headers['user-agent'] ?? null,
+          metadata: {
+            alertId: result.alert.id,
+            setupId,
+            channel: result.delivery.channel,
+            status: result.delivery.status,
+            attempt: result.delivery.attempt,
+            payloadHash: result.delivery.payloadHash,
+          },
+        });
+      }
+
+      return reply.code(result.created ? 201 : 200).send({
+        alert: result.alert,
+        deliveries: result.delivery ? [result.delivery] : [],
+        created: result.created,
+      });
     },
   );
 
@@ -158,6 +173,8 @@ export async function alertRoutes(app: FastifyInstance, ctx: AppContext, config:
         ip: req.ip,
         userAgent: req.headers['user-agent'] ?? null,
         metadata: {
+          setupId: result.alert.setupId,
+          triggerState: result.alert.triggerState,
           status: result.alert.status,
           acknowledgedAt: result.alert.acknowledgedAt,
         },

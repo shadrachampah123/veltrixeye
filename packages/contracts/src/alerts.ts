@@ -18,15 +18,19 @@ import { detectionInstrumentSchema, setupDirectionSchema } from './detection.js'
  * can yield at most two alerts (`confirmed` + `triggered`) — retries and
  * double-clicks collapse onto the existing row.
  *
- * Delivery in M6 is a ledger with a STUB sender: every generated alert
- * records an `alert_deliveries` row (`channel: 'stub'`, `status:
- * 'delivered'`) WITHOUT any external I/O. No email, webhook or push is sent
- * in M6; the `AlertSender` interface plus the `email`/`webhook`/`push`
- * channel values exist so a later milestone can add real delivery behind the
- * same table without a migration.
+ * Delivery in M6 is a ledger with a STUB sender (`AlertSender` +
+ * `StubAlertSender` in `@veltrixeye/core`): every generated alert records
+ * exactly one `alert_deliveries` row (`channel: 'stub'`, `status:
+ * 'delivered'`, `attempt: 1`) WITHOUT any external I/O. No email, webhook or
+ * push is sent in M6; the interface plus the `email`/`webhook`/`push` channel
+ * values exist so a later milestone can add real delivery behind the same
+ * table without a migration (the M6 `AlertService` refuses a non-stub sender).
  *
- * Phase 1 ships these contracts and the 0012 migration only. Generation,
- * delivery ledgering, API routes and audit events land in Phase 3.
+ * Delivered: Phase 1 (these contracts + migration 0012), Phase 2
+ * (`AlertService`, HTTP routes), Phase 3 (the stub sender, the generation
+ * gates, replay-safe ledgering, audit events `alert.created` /
+ * `alert.replayed` / `alert.delivery_recorded` / `alert.skipped` /
+ * `alert.acknowledged`, and the end-to-end lifecycle tests).
  */
 
 /** Alert lifecycle states (`suppressed` is reserved for future mute rules — M6 never writes it). */
@@ -48,6 +52,14 @@ export type AlertChannel = (typeof ALERT_CHANNELS)[number];
 export const ALERT_DELIVERY_STATUSES = ['delivered', 'failed'] as const;
 export type AlertDeliveryStatus = (typeof ALERT_DELIVERY_STATUSES)[number];
 
+/**
+ * Why generation returned no alert even though the request was valid.
+ * M6 has exactly one silent outcome: the M5 total was below the version's
+ * `risk.minQualityScore` gate. Anything else is an error (400/404/429).
+ */
+export const ALERT_SKIPPED_REASONS = ['below_min_quality'] as const;
+export type AlertSkippedReason = (typeof ALERT_SKIPPED_REASONS)[number];
+
 /** Default/max page size for the alert list endpoint (Phase 3). */
 export const DEFAULT_ALERTS_LIMIT = 50;
 export const MAX_ALERTS_LIMIT = 100;
@@ -59,6 +71,7 @@ export const alertStatusSchema = z.enum(ALERT_STATUSES);
 export const alertTriggerStateSchema = z.enum(ALERT_TRIGGER_STATES);
 export const alertChannelSchema = z.enum(ALERT_CHANNELS);
 export const alertDeliveryStatusSchema = z.enum(ALERT_DELIVERY_STATUSES);
+export const alertSkippedReasonSchema = z.enum(ALERT_SKIPPED_REASONS);
 
 /**
  * POST /api/setups/:setupId/alerts body (Phase 3). Omit `triggerState` to
@@ -137,3 +150,28 @@ export const alertDetailDtoSchema = z
   })
   .strict();
 export type AlertDetailDto = z.infer<typeof alertDetailDtoSchema>;
+
+/**
+ * POST /api/setups/:setupId/alerts response (Phase 3).
+ *
+ * - `created: true` → 201, `alert` + its single stub `deliveries` entry.
+ * - `created: false` → 200, the existing dedup winner (`alert`) — a replay
+ *   returns the SAME alert id and the SAME ledger entry, never a second one.
+ * - `alert: null` → 200, the minQualityScore gate refused generation
+ *   (`skippedReason: 'below_min_quality'`); no row was written.
+ */
+export const alertGenerateResponseSchema = z
+  .object({
+    alert: alertDtoSchema.nullable(),
+    created: z.boolean(),
+    deliveries: z.array(alertDeliveryDtoSchema).max(MAX_ALERT_DELIVERIES).optional(),
+    skippedReason: alertSkippedReasonSchema.optional(),
+  })
+  .strict();
+export type AlertGenerateResponse = z.infer<typeof alertGenerateResponseSchema>;
+
+/** GET /api/alerts response (Phase 3): the caller's alerts, newest first. */
+export const alertListResponseSchema = z
+  .object({ alerts: z.array(alertDtoSchema).max(MAX_ALERTS_LIMIT) })
+  .strict();
+export type AlertListResponse = z.infer<typeof alertListResponseSchema>;

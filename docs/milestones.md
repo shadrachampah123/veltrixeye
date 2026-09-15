@@ -1,11 +1,13 @@
 # Milestone Boundaries
 
-This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5**.
-The boundaries below are deliberate and enforced: M1 shipped foundations
-and contracts; M2 added real historical market data; M3 added
-deterministic strategy evaluation; M4 added deterministic setup detection
-and lifecycle management; M5 adds deterministic setup quality scoring —
-and nothing that backtests, schedules, streams, or delivers alerts.
+This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5 and
+M6 Phases 1–3**. The boundaries below are deliberate and enforced: M1 shipped
+foundations and contracts; M2 added real historical market data; M3 added
+deterministic strategy evaluation; M4 added deterministic setup detection and
+lifecycle management; M5 added deterministic setup quality scoring; M6 Phases
+1–3 add the backtest engine/service and explicit setup alerts with a
+**stub-only** delivery ledger — and still nothing that schedules, streams,
+sends real notifications, or executes trades.
 
 ## M1 — delivered (Product Foundation & Architecture)
 
@@ -209,29 +211,114 @@ and nothing that backtests, schedules, streams, or delivers alerts.
 - **Automated tests** — 341 passing (contracts 45, core 138, provider 33,
   api 115, web 10) plus clean typecheck, lint and production build.
 
-## Explicitly NOT in M1+M2+M3+M4+M5 (by design, deferred)
+## M6 Phases 1–3 — delivered (Backtests + Setup Alerts, explicitly invoked)
 
-- A live **scanner** (detection stays explicitly invoked), setup
-  **realtime** updates, and **alert delivery** (M6).
+M6 has four planned phases. Phases 1–3 are delivered; Phase 4 (UI) is not
+started. Nothing in M6 runs automatically: there is **no scheduler, scanner,
+worker, queue, cron, polling loop or background job** anywhere in the API or
+core packages, and no real alert delivery of any kind.
+
+### Phase 1 — contracts + migrations (PR #10)
+
+- **Backtest contracts** — `packages/contracts/src/backtest.ts`: pinned engine
+  version `m6-backtest-1`, bounds, exit/cost policies, run/trade/metrics DTOs.
+- **Alert contracts** — `packages/contracts/src/alerts.ts`: statuses
+  (`pending`/`acknowledged`/`suppressed`), eligible trigger states
+  (`confirmed`/`triggered`), channels (`stub` + reserved
+  `email`/`webhook`/`push`), delivery statuses, the skipped reason
+  (`below_min_quality`), request/response/DTO schemas.
+- **Migrations 0011 (backtests) + 0012 (alerts)** — additive only; 0001–0010
+  untouched. `0012` adds `alerts` (dedup `UNIQUE (setup_id, trigger_state)`,
+  owner/strategy indexes, status + score CHECKs) and the append-only
+  `alert_deliveries` ledger (idempotency key
+  `(alert_id, channel, payload_hash)`, reusing `append_only_guard()`); no
+  migration changed in Phase 3.
+
+### Phase 2 — services + API (PR #11)
+
+- **Pure backtest engine** (`runBacktest`) with a canonical `config_hash`, plus
+  `BacktestService` (store-only, owner-scoped, idempotent, bounded) and
+  `POST/GET /api/backtests*` (20/min, audited, masked 404) —
+  see [backtesting.md](./backtesting.md).
+- **`AlertService`** (`packages/core/src/alerts/service.ts`) and the alert HTTP
+  surface — see [alerts.md](./alerts.md).
+
+### Phase 3 — stub delivery boundary + lifecycle correctness (this change)
+
+- **`AlertSender` + `StubAlertSender`** (`packages/core/src/alerts/sender.ts`):
+  the single delivery boundary, rendering a deterministic sha256 payload hash
+  locally. `AlertService` **refuses any non-`stub` sender at construction**
+  (`NonStubSenderError`), so real email/webhook/push delivery cannot be enabled
+  by configuration, environment variable or a one-line wiring change.
+- **Pinned generation gates** (order enforced and tested): ownership + masked
+  404 → eligible state (`confirmed`/`triggered`; terminal states get a
+  dedicated 400, pre-confirmation states get the state message) → required M5
+  score at the detection anchor (400) → `risk.minQualityScore` gate (silent
+  200 + `skippedReason: 'below_min_quality'`, no rows) → trigger-state
+  progression rule.
+- **Replay-safe ledgering**: the delivery payload is rendered from the
+  **persisted** alert, so a replay (or any later upstream change) can never
+  mint a second `alert_deliveries` row, and the sender is not even called on a
+  replay. A missing ledger row is repaired exactly once and reported via
+  `deliveryCreated`, so audit events stay truthful. Replay returns the
+  original alert, title, body and `createdAt`.
+- **Accurate audit events**: `alert.created`, `alert.replayed`,
+  `alert.delivery_recorded` (only on a real ledger insert), `alert.skipped`
+  (with score/grade/gate context) and `alert.acknowledged`.
+- **Idempotent acknowledgement**: one `UPDATE` on the first call; repeats are
+  accepted no-ops that preserve the original `acknowledgedAt`, with no extra
+  ledger or state rows.
+- **Tiered rate limits**: generation 20/min, acknowledgement 60/min, both with
+  boundary 429 tests; a 429 writes nothing.
+- **Zero external I/O** is proven, not asserted: API and core tests spy on
+  `fetch`/`http`/`https`/`tls`/`dns`/`net` and verify a full
+  generate → acknowledge flow touches only the local Postgres pool (the spy's
+  liveness is checked with a deliberate local probe).
+- **Docs** — [alerts.md](./alerts.md) rewritten for the Phase 3 semantics
+  (gates, stub-only delivery, acknowledgement, audit events, future channel
+  architecture) and [security.md](./security.md) extended with the alert rate
+  limits, audit events and the stub-only delivery guarantees.
+- **Automated tests** — 457 passing (contracts 68, core 187, provider 33,
+  api 159, web 10) plus clean typecheck, lint and production build. The alert
+  suite alone covers authentication, owner isolation, masked 404, eligible and
+  terminal states, the missing-score 400, the `minQualityScore` boundary, dedup,
+  8-way concurrent generation, ledger invariants, the defensive repair path,
+  acknowledgement idempotency, rate limits, audit accuracy, zero network I/O,
+  absence of stray DB writes, and non-collapse of distinct setups/triggers.
+
+## Explicitly NOT in M1+M2+M3+M4+M5+M6 (by design, deferred)
+
+- A live **scanner** (detection stays explicitly invoked) and setup
+  **realtime** updates.
 - **Realtime streaming / WebSockets**; session calendar and market-state
   feeds (provider honestly reports gaps).
-- **Backtester**.
-- **Alert delivery** (Telegram / email / push) and **TradingView
-  integration**.
+- **Real alert delivery** — email, webhook, push or Telegram. M6 records a
+  local stub ledger entry only ([alerts.md](./alerts.md#3-stub-delivery-ledger-zero-external-io));
+  a real channel needs an outbox + worker, provider credentials and its own
+  security review. **TradingView integration** is likewise not built.
+- **Alert UI** (M6 Phase 4) — M6 Phases 1–3 expose the API only; the
+  dashboard has no alerts surface yet.
+- **Automated trade execution** (M8) — alerts are suggestions, never orders.
+- **Billing / subscriptions** — the M1 `users.tier` column exists, but no
+  billing logic acts on it.
 - **AI** in the signal path — evaluation is deterministic rules; AI is
   never the core signal engine.
-- **Payments, billing, marketplace**.
+- **Marketplace** with paid plans or revenue sharing.
 - **Second provider implementation** (EODHD approved as fallback, not built).
 - **Raw-data export / redistribution** (needs an Enterprise/add-on license).
 - **Production deployment hardening** (TLS termination, WAF, secret
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M5 (later milestones, outline only)
+## After M6 Phases 1–3 (later work, outline only)
 
-1. Alert delivery (M6) — consumes stored setups and their quality scores
-   (the risk-config `minQualityScore` gate becomes meaningful there).
-2. Backtester, then a live scanner on top of the M4 detection service.
+1. **M6 Phase 4** — alert surfaces in the web app (list, detail, acknowledge)
+   on top of the existing API; no new backend delivery.
+2. **Real alert delivery** (channels + outbox/worker) with the security review
+   described in [alerts.md](./alerts.md#9-future-channelprovider-architecture).
+3. A **live scanner** on top of the M4 detection service (still explicitly
+   owned by the user, never a hidden cron), then **M8 trade execution** and
+   **billing** as their own milestones.
 
 Each of these is its own milestone. The M3 engine, M4 detector, M5 scoring
 engine, result DTOs, store, and provider abstraction are specifically
