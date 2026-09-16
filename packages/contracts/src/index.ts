@@ -15,3 +15,4 @@ export * from './auth.js';
 export * from './users.js';
 export * from './errors.js';
 export * from './billing.js';
+export * from './scanner.js';

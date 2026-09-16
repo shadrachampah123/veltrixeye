@@ -146,9 +146,9 @@ describe('m7.3 notification outbox schema', () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
     assert.equal(status.pending.length, 0);
     assert.equal(status.checksumsMatch, true);
-    assert.equal(status.expectedCount, 13, '0001…0013');
-    assert.equal(status.appliedCount, 13);
-    assert.equal(status.latestApplied, '0013_notification_outbox.sql');
+    assert.equal(status.expectedCount, 15, '0001…0015');
+    assert.equal(status.appliedCount, 15);
+    assert.equal(status.latestApplied, '0015_scanner_runs.sql');
   });
 
   test('the table carries every column the worker depends on', async () => {

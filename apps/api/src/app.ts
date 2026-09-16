@@ -21,6 +21,7 @@ import {
   BacktestService,
   AlertService,
   StubAlertSender,
+  ScannerService,
   // M7.3 delivery pipeline
   createNotificationProviderRegistry,
   createSmtpEmailProvider,
@@ -40,6 +41,7 @@ import { backtestRoutes } from './routes/backtests.js';
 import { alertRoutes } from './routes/alerts.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { billingRoutes } from './routes/billing.js';
+import { scannerRoutes } from './routes/scanner.js';
 
 export interface AppContext {
   pool: pg.Pool;
@@ -55,6 +57,7 @@ export interface AppContext {
   scoring: ScoringService;
   backtests: BacktestService;
   alerts: AlertService;
+  scanner: ScannerService;
   /** M7.3: channel → provider adapter registry (the only provider-aware object). */
   notificationProviders: NotificationProviderRegistry;
   /** M7.3: durable outbox — writes/reads `notification_deliveries`. */
@@ -94,6 +97,24 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     redact: (text) => redactSecrets(text, [config.notification.email.pass]),
   });
 
+  const ingestion = new IngestionService(pool, providerRegistry, candles);
+  const backtests = new BacktestService(pool, strategies, candles);
+  const alerts = new AlertService(pool, strategies, new StubAlertSender(), notifications);
+  const scoring = new ScoringService(pool, strategies, evaluation);
+
+  // M7.5 — live scanner (production market-data and scanner pipeline)
+  const scanner = new ScannerService(pool, providerRegistry, candles, ingestion, evaluation, setups, scoring, alerts, {
+    logger: {
+      info: (msg, meta) => {
+        if (config.NODE_ENV === 'production') {
+          console.info(`[scanner] ${msg}`, meta ? JSON.stringify(meta) : '');
+        }
+      },
+      warn: (msg, meta) => console.warn(`[scanner] ${msg}`, meta ? JSON.stringify(meta) : ''),
+      error: (msg, meta) => console.error(`[scanner] ${msg}`, meta ? JSON.stringify(meta) : ''),
+    },
+  });
+
   return {
     pool,
     users: new UserService(pool),
@@ -102,7 +123,7 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     audit,
     providerRegistry,
     candles,
-    ingestion: new IngestionService(pool, providerRegistry, candles),
+    ingestion,
     evaluation,
     // M4: consumes the M3 evaluation service; writes setups + state events,
     // never scores, never providers.
@@ -110,13 +131,15 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     // M5: consumes the M3 evaluation service to rebuild the scoring context;
     // writes append-only setup_scores + refreshes setups.quality_score,
     // never transitions setups, never providers.
-    scoring: new ScoringService(pool, strategies, evaluation),
+    scoring,
     // M6 Phase 2: backtest service (pure engine + store-only reads + idempotent persistence)
-    backtests: new BacktestService(pool, strategies, candles),
+    backtests,
     // M6 Phase 2 / M7.3: alert service (eligible states, M5 gate, dedup, stub
     // ledger) + the durable outbox hand-off. Alert generation still performs
     // NO external I/O: it enqueues a job, the worker delivers it.
-    alerts: new AlertService(pool, strategies, new StubAlertSender(), notifications),
+    alerts,
+    // M7.5: live scanner
+    scanner,
     notificationProviders,
     notifications,
     deliveryWorker,
@@ -147,6 +170,14 @@ export async function runStartupDeliveryRecovery(
   ctx: AppContext,
 ): Promise<{ recovered: number; deadLettered: number }> {
   return ctx.deliveryWorker.recoverStale();
+}
+
+/**
+ * One-shot scanner recovery (M7.5): mark stale running scanner runs as failed
+ * after a crash/restart. Cheap: one bounded UPDATE, no provider I/O.
+ */
+export async function runStartupScannerRecovery(ctx: AppContext): Promise<{ recovered: number }> {
+  return ctx.scanner.recoverStaleRuns();
 }
 
 /**
@@ -244,6 +275,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await alertRoutes(app, ctx, config);
   await notificationRoutes(app, ctx, config);
   await billingRoutes(app, ctx, config);
+  await scannerRoutes(app, ctx, config);
 
   return app;
 }

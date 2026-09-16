@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import type { Pool } from 'pg';
 import { type SubscriptionDto, type UserPlan } from '@veltrixeye/contracts';
 import { getEntitlements, type Entitlements } from './entitlements.js';
 
@@ -7,11 +7,11 @@ export interface BillingState {
   entitlements: Entitlements;
 }
 
-function toSubscriptionDto(row: any): SubscriptionDto {
+function toSubscriptionDto(row: { id: string; plan: string; status: string; current_period_end: Date | null; cancel_at_period_end: boolean }): SubscriptionDto {
   return {
     id: row.id,
     plan: row.plan as UserPlan,
-    status: row.status,
+    status: row.status as SubscriptionDto['status'],
     currentPeriodEnd: row.current_period_end ? row.current_period_end.toISOString() : null,
     cancelAtPeriodEnd: row.cancel_at_period_end,
   };

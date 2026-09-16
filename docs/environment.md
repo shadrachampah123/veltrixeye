@@ -58,6 +58,12 @@ git-ignored and never contain values you would commit.
 | `NOTIFICATION_WORKER_TOKEN` | secret, ≤256 chars | *(empty)* | Shared secret for `POST /api/internal/notifications/deliveries/*` (external cron). **Empty ⇒ those routes return 404.** |
 | `NOTIFICATION_RETENTION_DELIVERED_DAYS` | int 1–3650 | `30` | How long delivered rows are kept. |
 | `NOTIFICATION_RETENTION_FAILED_DAYS` | int 1–3650 | `120` | How long dead letters are kept (failure audit trail). |
+| `SCANNER_ENABLED` | `true` \| `false` | `false` | M7.5 live scanner. `false` (dev default) ⇔ scanner only runs when triggered via API; `true` starts an in-process ticker that calls `scanner.runOnce()` every `SCANNER_INTERVAL_MS`. Safe with concurrent triggers due to advisory locking. |
+| `SCANNER_INTERVAL_MS` | int 30000–3600000 | `300000` | Interval between scanner runs when `SCANNER_ENABLED=true` (5m default). |
+| `SCANNER_PROVIDER_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-request provider timeout for scanner fetches. |
+| `SCANNER_MAX_RETRIES` | int 0–10 | `3` | Retry attempts for transient provider failures. |
+| `SCANNER_RETRY_BASE_MS` | int 100–60000 | `1000` | Base backoff for retries. |
+| `SCANNER_RETRY_MAX_MS` | int 1000–120000 | `10000` | Max backoff cap. |
 
 Empty-string values (a platform dashboard often writes one for a skipped
 secret) are treated as "not set" for the numeric variables above, so they fall

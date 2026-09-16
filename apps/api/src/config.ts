@@ -183,6 +183,24 @@ const envSchema = z.object({
   /** Retention: how long terminal jobs are kept for auditing. */
   NOTIFICATION_RETENTION_DELIVERED_DAYS: intEnv(1, 3650, 30),
   NOTIFICATION_RETENTION_FAILED_DAYS: intEnv(1, 3650, 120),
+
+  /* ---------------------------------------------------------------------- */
+  /* M7.5 — live scanner (production market-data and scanner pipeline)       */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Run the live scanner inside the API process on an interval.
+   * The scanner processes real production market data through the full
+   * strategy pipeline and generates alerts. It uses advisory locking to
+   * prevent overlapping scans and respects subscription entitlements.
+   * Disabled by default in development (manual trigger via API).
+   */
+  SCANNER_ENABLED: boolEnv(false),
+  SCANNER_INTERVAL_MS: intEnv(30_000, 3_600_000, 300_000), // 5 minutes default
+  SCANNER_PROVIDER_TIMEOUT_MS: intEnv(1_000, 120_000, 15_000),
+  SCANNER_MAX_RETRIES: intEnv(0, 10, 3),
+  SCANNER_RETRY_BASE_MS: intEnv(100, 60_000, 1_000),
+  SCANNER_RETRY_MAX_MS: intEnv(1_000, 120_000, 10_000),
 });
 
 /** Email-channel configuration passed to the SMTP provider adapter. */
@@ -210,6 +228,15 @@ export interface NotificationConfig {
   retention: { deliveredRetentionDays: number; failedRetentionDays: number };
 }
 
+export interface ScannerConfig {
+  enabled: boolean;
+  intervalMs: number;
+  providerTimeoutMs: number;
+  maxRetries: number;
+  retryBaseMs: number;
+  retryMaxMs: number;
+}
+
 /**
  * Validated environment plus the derived values the app needs at boot.
  * `trustedProxies` is `TRUSTED_PROXY_CIDRS` parsed, validated and normalised
@@ -217,10 +244,12 @@ export interface NotificationConfig {
  * `trustProxy`, which is what makes `req.ip` non-client-controlled.
  * `notification` is the M7.3 delivery configuration (email credentials,
  * retry policy, worker invocation, retention).
+ * `scanner` is the M7.5 live scanner configuration.
  */
 export type AppConfig = z.infer<typeof envSchema> & {
   trustedProxies: string[];
   notification: NotificationConfig;
+  scanner: ScannerConfig;
 };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -280,6 +309,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         deliveredRetentionDays: values.NOTIFICATION_RETENTION_DELIVERED_DAYS,
         failedRetentionDays: values.NOTIFICATION_RETENTION_FAILED_DAYS,
       },
+    },
+    scanner: {
+      enabled: values.SCANNER_ENABLED,
+      intervalMs: values.SCANNER_INTERVAL_MS,
+      providerTimeoutMs: values.SCANNER_PROVIDER_TIMEOUT_MS,
+      maxRetries: values.SCANNER_MAX_RETRIES,
+      retryBaseMs: values.SCANNER_RETRY_BASE_MS,
+      retryMaxMs: values.SCANNER_RETRY_MAX_MS,
     },
   };
 }
