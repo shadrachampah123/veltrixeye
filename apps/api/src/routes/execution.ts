@@ -4,6 +4,7 @@ import {
   executionListQuerySchema,
   executionProfileCreateSchema,
   EXECUTION_ARCHITECTURE_VERSION,
+  RISK_ENGINE_VERSION,
   type ExecutionStatusDto,
 } from '@veltrixeye/contracts';
 import type { AppContext } from '../app.js';
@@ -86,6 +87,7 @@ export async function executionRoutes(app: FastifyInstance, ctx: AppContext, con
     const dto: ExecutionStatusDto = {
       automation,
       architectureVersion: EXECUTION_ARCHITECTURE_VERSION,
+      riskEngineVersion: RISK_ENGINE_VERSION,
       providers,
       profiles: profiles.length,
     };

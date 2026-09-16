@@ -146,11 +146,11 @@ describe('m7.3 notification outbox schema', () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
     assert.equal(status.pending.length, 0);
     assert.equal(status.checksumsMatch, true);
-    // M8.1 appended 0016 (execution architecture) after this suite was
-    // written; the notification outbox assertions below are unchanged.
-    assert.equal(status.expectedCount, 16, '0001…0016');
-    assert.equal(status.appliedCount, 16);
-    assert.equal(status.latestApplied, '0016_execution_architecture.sql');
+    // M8.2 appended 0017 (risk engine) after this suite was written; the
+    // notification outbox assertions below are unchanged.
+    assert.equal(status.expectedCount, 17, '0001…0017');
+    assert.equal(status.appliedCount, 17);
+    assert.equal(status.latestApplied, '0017_risk_engine.sql');
   });
 
   test('the table carries every column the worker depends on', async () => {

@@ -6,5 +6,5 @@ export const BRAND = {
   name: 'VeltrixEye',
   short: 'VX',
   tagline: 'Strategy scanner & alerts',
-  stage: 'M1 · Foundation',
+  stage: 'M8.2 · Risk engine',
 } as const;

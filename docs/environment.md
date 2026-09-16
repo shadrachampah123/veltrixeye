@@ -69,6 +69,10 @@ Empty-string values (a platform dashboard often writes one for a skipped
 secret) are treated as "not set" for the numeric variables above, so they fall
 back to the default instead of failing the boot with `NaN`.
 
+**M8.2 introduces no new environment variables.** The risk engine is
+entirely server-side configuration (platform ceilings + per-user policy
+rows). Future provider credentials stay out of the database.
+
 ### Client IP attribution (`TRUSTED_PROXY_CIDRS`)
 
 `req.ip` is not a raw socket value: Fastify walks the `X-Forwarded-For` chain

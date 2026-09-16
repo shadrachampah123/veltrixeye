@@ -3,9 +3,10 @@
 import * as React from 'react';
 import { AppShell, PageHeader } from '@/components/app-shell';
 import { RequireAuth } from '@/components/auth-context';
-import { api } from '@/lib/api';
+import { api, ApiError } from '@/lib/api';
 import { Card, CardHeader, Badge, Spinner } from '@/components/ui';
-import type { ExecutionStatusDto, ExecutionProfileDto } from '@veltrixeye/contracts';
+import { RiskPolicyPanel } from '@/components/risk-policy-panel';
+import type { ExecutionStatusDto, ExecutionProfileDto, RiskPolicyStatusDto } from '@veltrixeye/contracts';
 
 /**
  * Trading (M8.1) — execution READINESS only.
@@ -17,24 +18,34 @@ import type { ExecutionStatusDto, ExecutionProfileDto } from '@veltrixeye/contra
  *    "not ready" until the simulator ships);
  *  - lists the caller's execution profiles (paper only).
  *
- * Intentionally NOT here (per the M8.1 boundary): no "Enable Live Trading"
+ * Intentionally NOT here (per the M8.1/M8.2 boundary): no "Enable Live Trading"
  * button, no broker credential forms, no live trading dashboard, and no
- * control capable of submitting an order.
+ * control capable of submitting an order. M8.2 adds a read/bounded risk
+ * policy panel only.
  */
 function TradingContent() {
   const [status, setStatus] = React.useState<ExecutionStatusDto | null>(null);
   const [profiles, setProfiles] = React.useState<ExecutionProfileDto[] | null>(null);
+  const [risk, setRisk] = React.useState<RiskPolicyStatusDto | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
+  const [riskSaving, setRiskSaving] = React.useState(false);
+  const [riskError, setRiskError] = React.useState<string | null>(null);
+  const [riskNotice, setRiskNotice] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [s, p] = await Promise.all([api.getExecutionStatus(), api.listExecutionProfiles()]);
+        const [s, p, r] = await Promise.all([
+          api.getExecutionStatus(),
+          api.listExecutionProfiles(),
+          api.getRiskPolicy(),
+        ]);
         if (cancelled) return;
         setStatus(s);
         setProfiles(p.profiles);
+        setRisk(r);
         setError(null);
       } catch (e: any) {
         if (!cancelled) setError(e?.message ?? 'Failed to load execution status');
@@ -46,6 +57,21 @@ function TradingContent() {
       cancelled = true;
     };
   }, []);
+
+  const saveRisk = async (patch: { riskPctPerTrade: number; minRr: number; paperEquity: number }) => {
+    setRiskSaving(true);
+    setRiskError(null);
+    setRiskNotice(null);
+    try {
+      const next = await api.updateRiskPolicy(patch);
+      setRisk(next);
+      setRiskNotice('Risk settings saved. Platform safety limits still apply.');
+    } catch (e) {
+      setRiskError(e instanceof ApiError ? e.message : 'Failed to save risk settings');
+    } finally {
+      setRiskSaving(false);
+    }
+  };
 
   return (
     <AppShell>
@@ -182,6 +208,21 @@ function TradingContent() {
               </p>
             </div>
           </Card>
+
+          {risk && (
+            <div className="lg:col-span-2">
+              <RiskPolicyPanel
+                policy={risk.policy}
+                ceilings={risk.platformCeilings}
+                account={risk.account}
+                engineVersion={risk.engineVersion}
+                saving={riskSaving}
+                error={riskError}
+                notice={riskNotice}
+                onSave={(patch) => void saveRisk(patch)}
+              />
+            </div>
+          )}
         </div>
       )}
     </AppShell>

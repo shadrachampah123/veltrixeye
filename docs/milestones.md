@@ -1,7 +1,7 @@
 # Milestone Boundaries
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
-M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5 and M8.1**. The boundaries below
+M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1 and M8.2**. The boundaries below
 are deliberate and enforced: M1 shipped foundations and contracts; M2 added real historical
 market data; M3 added deterministic strategy evaluation; M4 added
 deterministic setup detection and lifecycle management; M5 added
@@ -481,7 +481,26 @@ Exness connectivity; no real, demo or simulated order can be placed.
 - Read/status API surface + `/trading` readiness page; no order-placement
   endpoint exists. Full design: [execution.md](./execution.md).
 
-## Explicitly NOT in M1–M8.1 (by design, deferred)
+## M8.2 — delivered (Risk Management Engine)
+
+Central server-side risk engine that produces the decision M8.1's
+`risk_decision` / `exposure_limits` gates consume. Full design:
+[risk.md](./risk.md).
+
+- Deterministic, fail-closed engine (`m8.2-risk-engine-1`): account risk,
+  trade-requirement checks, UTC session controls, strategy tighten-only
+  overrides, position sizing, RR (floor 1:2), daily/weekly/consecutive
+  loss limits, open-exposure limits, optional correlation groups.
+- Platform safety ceilings are immutable and CHECK-enforced; a user may
+  only request a value inside the envelope.
+- Server-issued decisions only — a client `{ approved: true }` is not a
+  risk approval.
+- Advisory-locked evaluation + reservations so concurrent twins cannot
+  both pass on stale exposure.
+- Read/bounded PATCH `/api/risk/policy` + decision history; Trading page
+  risk panel. **No order is executed.** Automation stays OFF.
+
+## Explicitly NOT in M1–M8.2 (by design, deferred)
 
 - Setup **realtime** updates (the scanner polls; no streaming).
 - **Realtime streaming / WebSockets**; session calendar and market-state
@@ -493,8 +512,9 @@ Exness connectivity; no real, demo or simulated order can be placed.
   per-strategy routing): deliberately not built in M7.3 — an alert goes to the
   owner's account email.
 - **Automated trade EXECUTION** — M8.1 built the execution architecture and
-  safety boundary; no order of any kind can be placed yet. Alerts remain
-  suggestions, never orders.
+  safety boundary; M8.2 built the risk engine that feeds those gates. No
+  order of any kind can be placed yet. Alerts remain suggestions, never
+  orders.
 - **Billing integration** — M7.4 built the subscription/entitlement
   foundation; no payment provider, checkout, portal or webhooks exist yet.
 - **AI** in the signal path — evaluation is deterministic rules; AI is
@@ -506,7 +526,7 @@ Exness connectivity; no real, demo or simulated order can be placed.
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M8.1 (later work, outline only)
+## After M8.2 (later work, outline only)
 
 1. **More channels + preferences** — a second `NotificationProvider` (push /
    webhook / SMS) behind the M7.3 registry, plus per-user notification

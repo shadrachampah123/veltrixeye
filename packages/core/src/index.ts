@@ -183,3 +183,6 @@ export * from './scanner/index.js';
 // Execution architecture (M8.1) — safety boundary only; no provider can trade
 export * from './execution/index.js';
 
+// Risk management engine (M8.2) — server-authoritative, fail-closed; does not execute
+export * from './risk/index.js';
+

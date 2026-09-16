@@ -22,6 +22,7 @@ import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 import {
   ExecutionProviderError,
   isExecutionProviderError,
+  RISK_ENGINE_VERSION,
   type ExecutionDecisionInput,
   type ExecutionProvider,
   type UserPlan,
@@ -46,6 +47,7 @@ import {
   isOrderTerminal,
   runMigrations,
   MIGRATIONS_DIR,
+  RiskEngineService,
   type ExecutionGateInput,
 } from '../src/index.js';
 
@@ -64,6 +66,7 @@ let automation: AutomationService;
 let profiles: ExecutionProfileService;
 let intake: ExecutionIntakeService;
 let queries: ExecutionQueryService;
+let risk: RiskEngineService;
 let registry: ReturnType<typeof createExecutionProviderRegistry>;
 
 const uniqueEmail = () => `exec_${randomBytes(6).toString('hex')}@example.com`;
@@ -83,8 +86,9 @@ before(async () => {
   registry.register(createPaperExecutionProvider());
   killSwitches = new KillSwitchService(pool);
   automation = new AutomationService(pool, killSwitches, audit);
+  risk = new RiskEngineService(pool, { killSwitches, audit });
   profiles = new ExecutionProfileService(pool, registry, audit);
-  intake = new ExecutionIntakeService(pool, { automation, killSwitches, providers: registry, audit });
+  intake = new ExecutionIntakeService(pool, { automation, killSwitches, providers: registry, audit, risk });
   queries = new ExecutionQueryService(pool);
 }, { timeout: 180_000 });
 
@@ -181,7 +185,11 @@ function passingGateInput(overrides: Partial<ExecutionGateInput> = {}): Executio
     },
     setup: { id: 'setup', direction: 'long', state: 'confirmed' },
     instrumentKnown: true,
-    riskDecision: { approved: true },
+    riskDecision: {
+      approved: true,
+      decisionId: '00000000-0000-4000-8000-000000000001',
+      engineVersion: RISK_ENGINE_VERSION,
+    },
     minRr: 2,
     exposureWithinLimits: true,
     providerHealth: { healthy: true },
@@ -372,7 +380,19 @@ describe('m8.1 safety gates (contract level)', () => {
       { name: 'missing risk decision', override: { riskDecision: null }, gate: 'risk_decision' },
       {
         name: 'rejected risk decision',
-        override: { riskDecision: { approved: false, reason: 'daily loss limit' } },
+        override: {
+          riskDecision: {
+            approved: false,
+            reason: 'daily loss limit',
+            decisionId: '00000000-0000-4000-8000-000000000002',
+            engineVersion: RISK_ENGINE_VERSION,
+          },
+        },
+        gate: 'risk_decision',
+      },
+      {
+        name: 'client boolean is not a server-issued risk decision',
+        override: { riskDecision: { approved: true } },
         gate: 'risk_decision',
       },
       { name: 'unknown symbol', override: { instrumentKnown: false }, gate: 'valid_symbol' },
@@ -607,7 +627,7 @@ describe('m8.1 execution intake', () => {
       decision: makeDecision(setup),
       meta: { ip: '10.0.0.1', userAgent: 'audit-test' },
     });
-    assert.equal(result.accepted, false, 'nothing may be accepted while the risk engine is absent');
+    assert.equal(result.accepted, false, 'nothing may be accepted while automation is OFF');
     assert.equal(result.replayed, false);
     assert.equal(result.request.status, 'rejected');
     assert.equal(result.gate.failedGate, 'entitlement', 'automation entitlement is off for every plan');
@@ -622,6 +642,14 @@ describe('m8.1 execution intake', () => {
       [user.id],
     );
     assert.ok(auditRows.rows.some((r) => r.action === 'execution.rejected'));
+
+    // Downstream gate refusal must release the in-flight risk reservation so
+    // a later evaluation is not permanently blocked.
+    const reserved = await pool.query<{ c: string }>(
+      `SELECT count(*)::text AS c FROM risk_reservations WHERE execution_profile_id = $1`,
+      [profile.id],
+    );
+    assert.equal(Number(reserved.rows[0]!.c), 0, 'gate rejection must release the risk reservation');
   });
 
   test('duplicate submissions collapse onto one row (idempotent replay)', async () => {

@@ -301,3 +301,19 @@ local stub ledger row. M7.3 added a durable outbox + worker that delivers
 - Production deployment hardening (TLS termination, WAF, secret manager,
   least-privilege DB roles, log redaction) is an operational task for
   deployment time — see [milestones.md](./milestones.md).
+
+## Risk engine (M8.2)
+
+- **Server-authoritative.** A client `{ approved: true }` is not a risk
+  decision. The execution gate requires a persisted `decisionId` and
+  `engineVersion` issued by `RiskEngineService`.
+- **Ceilings are unweakenable.** `PATCH /api/risk/policy` rejects values
+  outside `PLATFORM_RISK_CEILINGS`; database CHECKs make a 50% risk
+  setting unrepresentable. Owner-scoped reads (masked by session).
+- **No P&L injection.** Daily/weekly/consecutive loss counters live in
+  `risk_account_states` and have no public writer. Client-supplied P&L is
+  not an argument to `evaluate`.
+- **No secrets.** Risk tables have no credential columns; `[risk]` logs
+  carry ids, outcome and rejection code only. See [risk.md](./risk.md).
+- **No execution path.** There is still no order-placement endpoint.
+  Automation remains OFF.
