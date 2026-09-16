@@ -171,8 +171,15 @@ configuration.
 Optional `allowedSessions`. Named windows (`asia`, `london`,
 `new_york`, `sydney`) use the same **UTC** hours as the evaluation
 engine. Custom `{ kind: 'utc_hours', startHour, endHour }` windows are
-also UTC. A user timezone is never accepted. Outside the window ⇒
-`SESSION_NOT_ALLOWED`. `null` = all sessions allowed.
+also UTC. Overnight wraps (sydney 21:00–06:00, or `endHour < startHour`)
+are supported. A user timezone is never accepted.
+
+The authoritative clock is **`evaluatedAtMs`** (the server evaluation
+instant, injected as `nowMs` by the service). The setup's `asOfMs`
+detection anchor is **not** used for session membership: a setup
+detected during London and evaluated at 03:00 UTC is outside London
+hours. Invalid / non-positive evaluation clocks fail closed
+(`SESSION_NOT_ALLOWED`). `null` allowedSessions = all sessions allowed.
 
 ## Kill switch
 

@@ -3,6 +3,7 @@ import {
   DEFAULT_RISK_POLICY,
   PLATFORM_RISK_CEILINGS,
   RISK_ENGINE_VERSION,
+  RISK_RESERVATION_TTL_MS,
   platformCeilingsDto,
   riskSessionWindowSchema,
   type ExecutionDecisionInput,
@@ -39,7 +40,11 @@ export interface RiskEvaluateArgs {
   decision: ExecutionDecisionInput;
   spreadPips?: number | null;
   slippagePips?: number | null;
-  /** Injected clock (epoch ms). Defaults to Date.now — never used inside the pure engine. */
+  /**
+   * Injected clock (epoch ms). Defaults to Date.now.
+   * Drives session windows, loss-window rolls, reservation TTL, and the
+   * engine's `evaluatedAtMs`.
+   */
   nowMs?: number;
   /** When true, an approval inserts a reservation (intake holds it until gates settle). */
   reserveOnApprove?: boolean;
@@ -200,7 +205,8 @@ export class RiskEngineService {
 
       const account = await this.loadOrCreateAccountState(args.userId, args.executionProfileId, nowMs, client);
       const openPositions = await this.loadOpenPositions(args.userId, args.executionProfileId, client);
-      const reservations = await this.loadReservations(args.executionProfileId, client);
+      await this.reclaimExpiredReservations(args.executionProfileId, nowMs, client);
+      const reservations = await this.loadReservations(args.executionProfileId, nowMs, client);
       const spec = await this.loadInstrumentSpec(args.decision.assetClass, args.decision.symbol, client);
       const { groups, candidateGroupIds } = await this.loadCorrelation(
         args.decision.assetClass,
@@ -268,8 +274,8 @@ export class RiskEngineService {
       if (verdict.outcome === 'approved' && args.reserveOnApprove !== false && args.decision.action !== 'close_position') {
         await client.query(
           `INSERT INTO risk_reservations
-             (user_id, execution_profile_id, risk_decision_id, symbol, direction, monetary_risk)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
+             (user_id, execution_profile_id, risk_decision_id, symbol, direction, monetary_risk, expires_at)
+           VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7 / 1000.0))`,
           [
             args.userId,
             args.executionProfileId,
@@ -277,6 +283,7 @@ export class RiskEngineService {
             args.decision.symbol,
             args.decision.direction,
             verdict.monetaryRisk ? verdict.monetaryRisk.toFixed(10) : '0',
+            nowMs + RISK_RESERVATION_TTL_MS,
           ],
         );
       }
@@ -524,13 +531,35 @@ export class RiskEngineService {
     return out;
   }
 
+  /**
+   * Drop reservations whose TTL has elapsed. Must run under the same
+   * advisory lock as `evaluate` so a concurrent twin cannot observe a
+   * half-reclaimed set. Uses the injected clock, never wall-clock, so
+   * tests stay deterministic.
+   */
+  private async reclaimExpiredReservations(
+    executionProfileId: string,
+    nowMs: number,
+    q: RiskQueryable,
+  ): Promise<void> {
+    await q.query(
+      `DELETE FROM risk_reservations
+        WHERE execution_profile_id = $1
+          AND expires_at <= to_timestamp($2 / 1000.0)`,
+      [executionProfileId, nowMs],
+    );
+  }
+
   private async loadReservations(
     executionProfileId: string,
+    nowMs: number,
     q: RiskQueryable,
   ): Promise<Array<{ symbol: string; direction: 'long' | 'short'; monetaryRisk: DecT }>> {
     const res = await q.query<{ symbol: string; direction: 'long' | 'short'; monetary_risk: string }>(
-      `SELECT symbol, direction, monetary_risk FROM risk_reservations WHERE execution_profile_id = $1`,
-      [executionProfileId],
+      `SELECT symbol, direction, monetary_risk FROM risk_reservations
+        WHERE execution_profile_id = $1
+          AND expires_at > to_timestamp($2 / 1000.0)`,
+      [executionProfileId, nowMs],
     );
     return res.rows.map((r) => ({
       symbol: r.symbol,
@@ -750,7 +779,9 @@ export class RiskEngineService {
     );
     const reserved = await this.pool.query<{ n: string; risk: string }>(
       `SELECT count(*)::text AS n, coalesce(sum(monetary_risk), 0)::text AS risk
-         FROM risk_reservations WHERE execution_profile_id = $1`,
+         FROM risk_reservations
+        WHERE execution_profile_id = $1
+          AND expires_at > now()`,
       [executionProfileId],
     );
     const row = state.rows[0];

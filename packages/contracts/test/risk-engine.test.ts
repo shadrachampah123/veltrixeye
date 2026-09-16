@@ -6,6 +6,7 @@ import {
   PLATFORM_RISK_CEILINGS,
   RISK_ENGINE_VERSION,
   RISK_REJECTION_CODES,
+  RISK_RESERVATION_TTL_MS,
   isRiskRejectionCode,
   platformCeilingsDto,
   riskDecisionDtoSchema,
@@ -16,6 +17,10 @@ import {
 describe('m8.2 risk engine constants', () => {
   test('engine version is pinned', () => {
     assert.equal(RISK_ENGINE_VERSION, 'm8.2-risk-engine-1');
+  });
+
+  test('reservation TTL is a pinned safety constant (not an env var)', () => {
+    assert.equal(RISK_RESERVATION_TTL_MS, 60_000);
   });
 
   test('platform ceilings are the hard envelope (min RR 1:2, 1% per trade)', () => {

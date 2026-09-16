@@ -97,6 +97,16 @@ describe('m8.2 risk engine migration 0017', () => {
     );
   });
 
+  test('risk_reservations carry a crash-recovery expiry', async () => {
+    const cols = await pool.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'risk_reservations'`,
+    );
+    const names = cols.rows.map((r) => r.column_name);
+    assert.ok(names.includes('expires_at'));
+    assert.ok(!names.some((c) => /password|secret|api_key|token/i.test(c)));
+  });
+
   test('0016 execution tables are untouched (live still impossible)', async () => {
     const users = new UserService(pool);
     const user = await users.create({

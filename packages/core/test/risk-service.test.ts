@@ -332,6 +332,60 @@ describe('m8.2 risk evaluation (service)', () => {
   });
 });
 
+describe('m8.2 reservation TTL / crash recovery', () => {
+  test('a live reservation still blocks a twin; an expired one is reclaimed', async () => {
+    const user = await makeUser();
+    await risk.updatePolicy(user.id, { maxSimultaneousPositions: 1 });
+    const setupA = await makeSetup(user.id);
+    const setupB = await makeSetup(user.id);
+    const setupC = await makeSetup(user.id);
+    const profile = await profiles.createProfile(user.id, { mode: 'paper', providerSlug: 'paper' });
+
+    const first = await risk.evaluate({
+      userId: user.id,
+      executionProfileId: profile.id,
+      decision: makeDecision(setupA),
+      nowMs: ANCHOR,
+      reserveOnApprove: true,
+    });
+    assert.equal(first.outcome, 'approved');
+
+    const blocked = await risk.evaluate({
+      userId: user.id,
+      executionProfileId: profile.id,
+      decision: makeDecision(setupB),
+      nowMs: ANCHOR,
+      reserveOnApprove: true,
+    });
+    assert.equal(blocked.outcome, 'rejected');
+    assert.equal(blocked.rejectionCode, 'SIMULTANEOUS_POSITION_LIMIT');
+
+    // Simulate a crash: the reservation was never released and its TTL elapsed.
+    await pool.query('UPDATE risk_reservations SET expires_at = to_timestamp($1 / 1000.0) WHERE risk_decision_id = $2', [
+      ANCHOR - 1,
+      first.id,
+    ]);
+
+    const recovered = await risk.evaluate({
+      userId: user.id,
+      executionProfileId: profile.id,
+      decision: makeDecision(setupC),
+      nowMs: ANCHOR,
+      reserveOnApprove: true,
+    });
+    assert.equal(recovered.outcome, 'approved', 'stale reservation must not permanently consume the slot');
+
+    const leftover = await pool.query<{ c: string }>(
+      `SELECT count(*)::text AS c FROM risk_reservations
+        WHERE execution_profile_id = $1 AND expires_at > to_timestamp($2 / 1000.0)`,
+      [profile.id, ANCHOR],
+    );
+    assert.equal(Number(leftover.rows[0]!.c), 1, 'only the live recovered reservation remains');
+
+    await risk.releaseReservation(recovered.id);
+  });
+});
+
 describe('m8.2 concurrency', () => {
   test('two simultaneous approvals against maxSimultaneousPositions=1: only one passes', async () => {
     const user = await makeUser();

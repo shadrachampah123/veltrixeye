@@ -627,7 +627,7 @@ describe('m8.1 execution intake', () => {
       decision: makeDecision(setup),
       meta: { ip: '10.0.0.1', userAgent: 'audit-test' },
     });
-    assert.equal(result.accepted, false, 'nothing may be accepted while the risk engine is absent');
+    assert.equal(result.accepted, false, 'nothing may be accepted while automation is OFF');
     assert.equal(result.replayed, false);
     assert.equal(result.request.status, 'rejected');
     assert.equal(result.gate.failedGate, 'entitlement', 'automation entitlement is off for every plan');
@@ -642,6 +642,14 @@ describe('m8.1 execution intake', () => {
       [user.id],
     );
     assert.ok(auditRows.rows.some((r) => r.action === 'execution.rejected'));
+
+    // Downstream gate refusal must release the in-flight risk reservation so
+    // a later evaluation is not permanently blocked.
+    const reserved = await pool.query<{ c: string }>(
+      `SELECT count(*)::text AS c FROM risk_reservations WHERE execution_profile_id = $1`,
+      [profile.id],
+    );
+    assert.equal(Number(reserved.rows[0]!.c), 0, 'gate rejection must release the risk reservation');
   });
 
   test('duplicate submissions collapse onto one row (idempotent replay)', async () => {

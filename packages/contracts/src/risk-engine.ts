@@ -16,6 +16,20 @@ import { DEFAULT_MIN_RR } from './risk.js';
 /** Pinned engine version recorded on every risk decision. */
 export const RISK_ENGINE_VERSION = 'm8.2-risk-engine-1';
 
+/**
+ * How long an in-flight `risk_reservations` row remains authoritative.
+ *
+ * Intake is expected to release the row as soon as downstream gates refuse
+ * (they always do in M8.2). If a process crashes between `evaluate()` COMMIT
+ * and that release, the next evaluation on the same profile reclaims any row
+ * whose `expires_at` is ≤ the evaluation clock so a stale reservation cannot
+ * permanently consume simultaneous-position / exposure budget.
+ *
+ * 60s is far longer than gate evaluation and far shorter than a stuck crash.
+ * Not an environment variable — a pinned safety constant.
+ */
+export const RISK_RESERVATION_TTL_MS = 60_000;
+
 /* -------------------------------------------------------------------------- */
 /* Platform safety ceilings (immutable, server-controlled)                     */
 /* -------------------------------------------------------------------------- */

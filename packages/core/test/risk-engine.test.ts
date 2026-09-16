@@ -459,6 +459,66 @@ describe('m8.2 sessions (UTC, never a user timezone)', () => {
     assert.equal(sessionAllows(null, ANCHOR), true);
     assert.equal(sessionAllows([], ANCHOR), false);
   });
+
+  test('overnight sydney wrap is UTC (21:00–06:00) with no user timezone', () => {
+    const windows = [{ kind: 'named' as const, name: 'sydney' as const }];
+    assert.equal(sessionAllows(windows, Date.UTC(2024, 0, 2, 22, 0, 0)), true);
+    assert.equal(sessionAllows(windows, Date.UTC(2024, 0, 2, 3, 0, 0)), true);
+    assert.equal(sessionAllows(windows, Date.UTC(2024, 0, 2, 12, 0, 0)), false);
+  });
+
+  test('session restriction uses evaluatedAtMs, not the setup asOfMs', () => {
+    const london = policy({ allowedSessions: [{ kind: 'named', name: 'london' }] });
+    const inside = Date.UTC(2024, 0, 2, 12, 0, 0);
+    const outside = Date.UTC(2024, 0, 2, 3, 0, 0);
+
+    // Setup detected during London, evaluated at 03:00 UTC → refuse.
+    const detectedInside = evaluateRisk(
+      baseInput({
+        policy: london,
+        evaluatedAtMs: outside,
+        candidate: {
+          action: 'open_long',
+          symbol: 'EURUSD',
+          assetClass: 'forex',
+          direction: 'long',
+          entryPrice: 1.1,
+          stopLossPrice: 1.095,
+          takeProfitPrice: 1.11,
+          expectedRr: 2,
+          asOfMs: inside,
+        },
+      }),
+    );
+    assert.equal(detectedInside.outcome, 'rejected');
+    assert.equal(detectedInside.rejectionCode, 'SESSION_NOT_ALLOWED');
+
+    // Setup detected at 03:00 UTC, evaluated during London → allow.
+    const evaluatedInside = evaluateRisk(
+      baseInput({
+        policy: london,
+        evaluatedAtMs: inside,
+        candidate: {
+          action: 'open_long',
+          symbol: 'EURUSD',
+          assetClass: 'forex',
+          direction: 'long',
+          entryPrice: 1.1,
+          stopLossPrice: 1.095,
+          takeProfitPrice: 1.11,
+          expectedRr: 2,
+          asOfMs: outside,
+        },
+      }),
+    );
+    assert.equal(evaluatedInside.outcome, 'approved');
+  });
+
+  test('an invalid evaluation clock fails closed', () => {
+    const v = evaluateRisk(baseInput({ evaluatedAtMs: Number.NaN }));
+    assert.equal(v.outcome, 'rejected');
+    assert.equal(v.rejectionCode, 'SESSION_NOT_ALLOWED');
+  });
 });
 
 describe('m8.2 strategy override only tightens', () => {

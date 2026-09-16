@@ -282,7 +282,12 @@ function evaluateRiskInner(input: RiskEngineInput): RiskEngineVerdict {
 
   if (!input.account.equity.isPositive) violations.push('ZERO_OR_NEGATIVE_EQUITY');
 
-  if (!sessionAllows(tightened.allowedSessions, c.asOfMs)) {
+  // Session windows are evaluated against the server clock (`evaluatedAtMs`),
+  // not the setup's detection anchor. A London-detected setup evaluated at
+  // 03:00 UTC is outside London hours. Invalid clocks fail closed.
+  if (!Number.isFinite(input.evaluatedAtMs) || input.evaluatedAtMs <= 0) {
+    violations.push('SESSION_NOT_ALLOWED');
+  } else if (!sessionAllows(tightened.allowedSessions, input.evaluatedAtMs)) {
     violations.push('SESSION_NOT_ALLOWED');
   }
 

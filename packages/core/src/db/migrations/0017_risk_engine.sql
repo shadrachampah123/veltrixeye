@@ -244,6 +244,9 @@ CREATE TABLE risk_reservations (
   direction            text NOT NULL,
   monetary_risk        numeric(24, 10) NOT NULL,
   created_at           timestamptz NOT NULL DEFAULT now(),
+  -- Crash recovery: a reservation older than RISK_RESERVATION_TTL_MS is
+  -- reclaimed on the next locked evaluation and must not block exposure.
+  expires_at           timestamptz NOT NULL,
   UNIQUE (risk_decision_id),
   CHECK (direction IN ('long', 'short')),
   CHECK (monetary_risk >= 0),
@@ -251,6 +254,7 @@ CREATE TABLE risk_reservations (
 );
 
 CREATE INDEX risk_reservations_profile_idx ON risk_reservations (execution_profile_id);
+CREATE INDEX risk_reservations_expiry_idx ON risk_reservations (execution_profile_id, expires_at);
 
 COMMENT ON TABLE risk_policies IS
   'M8.2: server-owned per-user risk policy. CHECKs enforce platform ceilings; credentials are NEVER stored.';
@@ -263,4 +267,4 @@ COMMENT ON TABLE instrument_risk_specs IS
 COMMENT ON TABLE correlation_groups IS
   'M8.2: optional, configuration-driven correlation groups. The engine never invents correlation.';
 COMMENT ON TABLE risk_reservations IS
-  'M8.2: in-flight approved risk that has not yet become a position. Serializes concurrent evaluations.';
+  'M8.2: in-flight approved risk that has not yet become a position. Serializes concurrent evaluations. expires_at is a crash-recovery TTL; stale rows are reclaimed under the evaluation lock and do not count toward exposure.';
