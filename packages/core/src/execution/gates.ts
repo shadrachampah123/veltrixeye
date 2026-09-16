@@ -1,5 +1,6 @@
 import {
   EXECUTION_GATE_IDS,
+  RISK_ENGINE_VERSION,
   type ExecutionDecisionInput,
   type ExecutionGateId,
   type ExecutionMode,
@@ -42,8 +43,19 @@ export interface ExecutionGateInput {
   setup: { id: string; direction: 'long' | 'short'; state: string } | null;
   /** The platform knows the decision's instrument (universe membership). */
   instrumentKnown: boolean;
-  /** Gate 8 — the M8.2 risk engine's verdict. null ⇔ not produced ⇒ fail. */
-  riskDecision: { approved: boolean; reason?: string } | null;
+  /**
+   * Gate 8 — the M8.2 risk engine's verdict. null ⇔ not produced ⇒ fail.
+   *
+   * A client-provided `{ approved: true }` is NOT sufficient: the verdict
+   * must carry a server-issued `decisionId` and `engineVersion`. Missing
+   * either fails closed.
+   */
+  riskDecision: {
+    approved: boolean;
+    reason?: string;
+    decisionId?: string | null;
+    engineVersion?: string | null;
+  } | null;
   /** The version's configured minimum RR (null ⇒ platform default 1:2). */
   minRr: number | null;
   /** Gate 14 — exposure verdict. null ⇔ not evaluated yet ⇒ fail-closed. */
@@ -125,6 +137,12 @@ export function evaluateExecutionGates(input: ExecutionGateInput): ExecutionGate
       case 'risk_decision': {
         if (!input.riskDecision) {
           return fail(gate, 'no risk decision available (risk engine required before execution)');
+        }
+        if (!input.riskDecision.decisionId || !input.riskDecision.engineVersion) {
+          return fail(gate, 'risk decision is not server-issued (decisionId and engineVersion required)');
+        }
+        if (input.riskDecision.engineVersion !== RISK_ENGINE_VERSION) {
+          return fail(gate, 'risk decision engine version is not recognized');
         }
         if (!input.riskDecision.approved) {
           return fail(gate, input.riskDecision.reason ?? 'risk decision rejected the execution');

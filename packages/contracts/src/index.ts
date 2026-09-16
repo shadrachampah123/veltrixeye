@@ -2,6 +2,7 @@ export * from './timeframes.js';
 export * from './assets.js';
 export * from './conditions.js';
 export * from './risk.js';
+export * from './risk-engine.js';
 export * from './scoring.js';
 export * from './market-data.js';
 export * from './ingestion.js';

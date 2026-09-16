@@ -15,6 +15,7 @@ import type { AutomationService } from './automation.js';
 import type { KillSwitchService } from './kill-switch.js';
 import { evaluateExecutionGates, type ExecutionGateResult } from './gates.js';
 import type { ExecutionProviderRegistry } from './registry.js';
+import type { RiskEngineService } from '../risk/service.js';
 
 /**
  * M8.1 — execution decision intake (the ONLY door toward a future order).
@@ -29,9 +30,10 @@ import type { ExecutionProviderRegistry } from './registry.js';
  *    foreign setups are masked 404s, exactly like every other resource;
  *  - the decision must MATCH the stored setup (version, instrument,
  *    direction) — the execution layer never invents or reinterprets a trade;
- *  - all 15 safety gates run; in M8.1 gate `risk_decision` can never pass
- *    (no risk engine exists yet), so no intake can be ACCEPTED — the
- *    architecture is proven without a single executable path;
+ *  - all 15 safety gates run; M8.2 produces a real server-issued risk
+ *    decision, but automation stays OFF and the paper provider is not
+ *    ready, so no intake can be ACCEPTED — risk approval ≠ permission
+ *    to execute;
  *  - idempotency: UNIQUE (setup_id, execution_profile_id, action) + a UNIQUE
  *    sha256 identity key. Replays, retries and concurrent twins collapse onto
  *    the first row and return it (`replayed: true`), never a duplicate;
@@ -99,6 +101,7 @@ export class ExecutionIntakeService {
       killSwitches: KillSwitchService;
       providers: ExecutionProviderRegistry;
       audit: AuditService;
+      risk: RiskEngineService;
     },
     options?: { logger?: ExecutionLogger },
   ) {
@@ -205,6 +208,16 @@ export class ExecutionIntakeService {
     const provider = this.deps.providers.get(profile.provider_slug);
     const providerHealth = provider ? await provider.health() : null;
 
+    // M8.2: the risk engine is the ONLY source of a risk decision. The
+    // result is persisted under an advisory lock; a client boolean is never
+    // consulted. Risk approval still does not authorize execution.
+    const risk = await this.deps.risk.evaluate({
+      userId: args.userId,
+      executionProfileId: profile.id,
+      decision,
+      reserveOnApprove: true,
+    });
+
     const gate = evaluateExecutionGates({
       authenticated: true, // enforced by the API layer before this service runs
       authorized: true, // proven above via DB ownership joins
@@ -225,12 +238,14 @@ export class ExecutionIntakeService {
       // The setup join above resolved the instrument from the platform
       // universe (`instruments`), so the symbol is known by construction.
       instrumentKnown: true,
-      // M8.1: no risk engine exists, therefore no risk decision can exist —
-      // the gate fails closed and nothing can be accepted. M8.2 produces it.
-      riskDecision: null,
-      minRr: null,
-      // M8.1: no exposure engine — fail closed until M8.2 evaluates it.
-      exposureWithinLimits: null,
+      riskDecision: {
+        approved: risk.outcome === 'approved',
+        reason: risk.reason,
+        decisionId: risk.id,
+        engineVersion: risk.engineVersion,
+      },
+      minRr: risk.effectiveMinRr,
+      exposureWithinLimits: risk.exposureWithinLimits,
       providerHealth,
     });
 
@@ -268,6 +283,13 @@ export class ExecutionIntakeService {
     const request = await this.findByKey(idempotencyHash);
     if (!request) throw Errors.internal('Execution request could not be resolved after insert');
 
+    // Risk approval reserved exposure for this attempt. If the remaining
+    // gates refuse (they always do in M8.2 — automation is OFF), drop the
+    // reservation so it cannot block a later evaluation.
+    if (!accepted) {
+      await this.deps.risk.releaseReservation(risk.id);
+    }
+
     // 7. Append-only execution audit trail + platform audit log.
     await this.pool.query(
       `INSERT INTO execution_events
@@ -287,6 +309,9 @@ export class ExecutionIntakeService {
           action: decision.action,
           replayed: false,
           architectureVersion: EXECUTION_ARCHITECTURE_VERSION,
+          riskDecisionId: risk.id,
+          riskOutcome: risk.outcome,
+          riskRejectionCode: risk.rejectionCode,
         }),
         args.meta?.ip ?? null,
         args.meta?.userAgent ?? null,

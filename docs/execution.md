@@ -30,11 +30,12 @@ Validation → Risk Engine → Execution Decision → Execution Provider
 → Order → Position → Reconciliation
 ```
 
-In M8.1 the chain is proven through **Execution Decision**: the intake service
-accepts only server-validated decisions that cite a real, owned, eligible
-setup and agree with every fact the pipeline already persisted. The **Risk
-Engine → …** tail is contract-only: without a risk decision no intake can be
-accepted (fail-closed), and no provider can trade anyway.
+In M8.1 the chain is proven through **Execution Decision**. M8.2 fills the
+**Risk Engine** step: intake always calls the server-side risk engine and
+feeds the persisted verdict into the gates. A client-provided approval
+boolean is ignored. **Risk approval is still not permission to execute** —
+automation stays OFF and the paper provider reports not-ready, so no intake
+can be accepted. Full risk-engine design: [risk.md](./risk.md).
 
 ## Domain model
 
@@ -93,17 +94,22 @@ fail-closed (`packages/core/src/execution/gates.ts`):
 5. `profile_enabled` — profile exists, enabled, environment `paper` (M8.1)
 6. `kill_switch` — no active global/user/strategy/profile switch
 7. `valid_signal` — eligible setup state, matching direction, quality ≥ min
-8. `risk_decision` — approved by the risk engine (**cannot pass in M8.1**)
+8. `risk_decision` — approved by the M8.2 risk engine (must be a
+   **server-issued** decision with `decisionId` + `engineVersion`; a client
+   `{ approved: true }` fails closed)
 9. `valid_symbol` — platform market universe membership
 10. `valid_order_params` — positive prices, valid anchor (sizing lands in M8.2)
 11. `valid_stop_loss` — SL protects the entry per direction
 12. `valid_take_profit` — TP rewards the entry per direction
 13. `acceptable_rr` — expected RR ≥ version minimum and achievable from levels
-14. `exposure_limits` — exposure verdict (**cannot pass in M8.1**)
+14. `exposure_limits` — exposure verdict from the M8.2 risk engine
 15. `provider_healthy` — provider reports healthy (**paper reports not ready**)
 
-Unknown inputs fail closed: a missing decision, missing risk decision,
-unevaluated exposure or unknown provider health all refuse execution.
+Unknown inputs fail closed: a missing decision, a missing or
+non-server-issued risk decision, unevaluated exposure or unknown provider
+health all refuse execution. M8.2 produces a real risk decision; execution
+still cannot proceed because later gates (entitlement, automation, provider
+health) refuse.
 
 ## Kill switch
 
@@ -200,7 +206,9 @@ persisted, never logged.
 ## Boundaries (what M8.1 is NOT)
 
 Not implemented, by design — later M8 milestones: real/demo broker
-connectivity, Exness/MT5 integration, the paper simulator, the risk engine,
-position sizing, trailing stops, break-even, loss limits, correlated-exposure
-controls, session restrictions, reconciliation jobs, automated trade
-placement, and any UI beyond the read-only readiness page.
+connectivity, Exness/MT5 integration, the paper simulator (M8.3), trailing
+stops, break-even, reconciliation jobs, automated trade placement, and any
+UI beyond the readiness page + the M8.2 risk-settings panel. The risk
+engine, position sizing, loss limits, correlated-exposure controls and
+session restrictions shipped in M8.2 ([risk.md](./risk.md)) and still do
+not execute orders.

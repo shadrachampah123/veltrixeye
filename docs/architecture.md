@@ -87,10 +87,14 @@ talks to one origin. See [deployment.md](./deployment.md).
 ```
 providers → candles → analysis → strategy evaluation (per StrategyVersion)
           → setup detection → quality scoring → alerts
+          → risk engine → execution decision → execution provider
 
 alerts → durable outbox (notification_deliveries) → delivery worker
        → notification provider (email/SMTP) → delivered / retried / failed
 ```
+
+M8.2 ships the risk engine (see [risk.md](./risk.md)). It does not execute
+trades.
 
 M1 ships everything *up to* the first arrow: the strategy definition is
 stored in a complete, immutable, version-traceable form, and the

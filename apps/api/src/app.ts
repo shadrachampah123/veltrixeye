@@ -35,6 +35,7 @@ import {
   AutomationService,
   ExecutionIntakeService,
   ExecutionQueryService,
+  RiskEngineService,
   type ProviderRegistry,
   type NotificationProviderRegistry,
   type DeliveryRetryPolicy,
@@ -52,6 +53,7 @@ import { notificationRoutes } from './routes/notifications.js';
 import { billingRoutes } from './routes/billing.js';
 import { scannerRoutes } from './routes/scanner.js';
 import { executionRoutes } from './routes/execution.js';
+import { riskRoutes } from './routes/risk.js';
 
 export interface AppContext {
   pool: pg.Pool;
@@ -88,6 +90,7 @@ export interface AppContext {
     automation: AutomationService;
     intake: ExecutionIntakeService;
     queries: ExecutionQueryService;
+    risk: RiskEngineService;
   };
 }
 
@@ -132,6 +135,20 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   executionProviders.register(createPaperExecutionProvider());
   const killSwitches = new KillSwitchService(pool);
   const automation = new AutomationService(pool, killSwitches, audit);
+  const risk = new RiskEngineService(
+    pool,
+    { killSwitches, audit },
+    {
+      logger: {
+        info: (msg, meta) => {
+          if (config.NODE_ENV === 'production') {
+            console.info(`[risk] ${msg}`, meta ? JSON.stringify(meta) : '');
+          }
+        },
+        warn: (msg, meta) => console.warn(`[risk] ${msg}`, meta ? JSON.stringify(meta) : ''),
+      },
+    },
+  );
   const execution = {
     providers: executionProviders,
     killSwitches,
@@ -139,7 +156,7 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     automation,
     intake: new ExecutionIntakeService(
       pool,
-      { automation, killSwitches, providers: executionProviders, audit },
+      { automation, killSwitches, providers: executionProviders, audit, risk },
       {
         logger: {
           info: (msg, meta) => {
@@ -152,6 +169,7 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
       },
     ),
     queries: new ExecutionQueryService(pool),
+    risk,
   };
 
   // M7.5 — live scanner (production market-data and scanner pipeline)
@@ -331,6 +349,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await billingRoutes(app, ctx, config);
   await scannerRoutes(app, ctx, config);
   await executionRoutes(app, ctx, config);
+  await riskRoutes(app, ctx, config);
 
   return app;
 }

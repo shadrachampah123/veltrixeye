@@ -19,6 +19,10 @@ never destructive).
 0007_version_immutability.sql    trigger-based immutability guards
 0008_market_candles.sql          candles, ingestion_runs
 0009_setup_detection_keys.sql    setups.as_of_ms + detection idempotency key
+0016_execution_architecture.sql  execution profiles/requests/orders/positions,
+                                 kill switches, automation flag
+0017_risk_engine.sql             risk policies, instrument specs, account
+                                 state, risk decisions, reservations
 ```
 
 ## Entities

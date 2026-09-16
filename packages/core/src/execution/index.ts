@@ -1,7 +1,6 @@
 /**
  * M8.1 — automated trading execution architecture.
- *
- * Architecture + safety boundary ONLY: no provider registered here can
+ * M8.2 wires the risk engine into the intake gates; still no provider can
  * trade, no order is ever submitted, and automation stays OFF for every plan.
  */
 export {

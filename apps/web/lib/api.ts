@@ -54,6 +54,10 @@ import type {
   ExecutionOrderDto,
   ExecutionPositionDto,
   ExecutionAuditEventDto,
+  // M8.2 — risk policy (read + bounded update; no execution)
+  RiskPolicyStatusDto,
+  RiskDecisionDto,
+  RiskPolicyUpdateInput,
 } from '@veltrixeye/contracts';
 import {
   MAX_ALERTS_LIMIT,
@@ -458,6 +462,21 @@ export const api = {
   /** GET /api/execution/events — owner-scoped execution audit trail. */
   listExecutionEvents: (params: { limit?: number } = {}) =>
     request<{ events: ExecutionAuditEventDto[] }>(`/execution/events${toQueryString({ limit: params.limit })}`),
+
+  // -------------------------------------------------------------------------
+  // M8.2 — risk policy (read + bounded update; no order submission)
+  // -------------------------------------------------------------------------
+
+  /** GET /api/risk/policy — owner-scoped policy + platform ceilings. */
+  getRiskPolicy: () => request<RiskPolicyStatusDto>('/risk/policy'),
+
+  /** PATCH /api/risk/policy — user settings, rejected if they exceed ceilings. */
+  updateRiskPolicy: (input: RiskPolicyUpdateInput) =>
+    request<RiskPolicyStatusDto>('/risk/policy', { method: 'PATCH', body: JSON.stringify(input) }),
+
+  /** GET /api/risk/decisions — owner-scoped risk-decision audit trail. */
+  listRiskDecisions: (params: { limit?: number } = {}) =>
+    request<{ decisions: RiskDecisionDto[] }>(`/risk/decisions${toQueryString({ limit: params.limit })}`),
 };
 
 /** Summary row shape from the API list endpoint. */

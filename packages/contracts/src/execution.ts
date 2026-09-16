@@ -497,6 +497,8 @@ export const executionStatusDtoSchema = z
   .object({
     automation: automationStatusDtoSchema,
     architectureVersion: z.string(),
+    /** M8.2 risk-engine version. Present even though execution cannot proceed. */
+    riskEngineVersion: z.string(),
     providers: z.array(
       z
         .object({
