@@ -1,5 +1,11 @@
 import { loadConfig, loadDotEnv } from './config.js';
-import { buildApp, createAppContext, runStartupHousekeeping, runStartupDeliveryRecovery } from './app.js';
+import {
+  buildApp,
+  createAppContext,
+  runStartupHousekeeping,
+  runStartupDeliveryRecovery,
+  runStartupScannerRecovery,
+} from './app.js';
 import { startDeliveryWorkerTicker, consoleDeliveryLogger } from './delivery-worker.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 import { createTwelveDataProvider } from '@veltrixeye/provider-twelve-data';
@@ -94,6 +100,16 @@ async function main(): Promise<void> {
     console.warn('[api] delivery recovery failed (continuing):', (err as Error)?.message);
   }
 
+  // M7.5 — scanner recovery: mark stale running scanner runs as failed after restart.
+  try {
+    const scannerRecovery = await runStartupScannerRecovery(ctx);
+    if (scannerRecovery.recovered > 0) {
+      console.info(`[api] scanner recovery: ${scannerRecovery.recovered} stale run(s) marked failed`);
+    }
+  } catch (err) {
+    console.warn('[api] scanner recovery failed (continuing):', (err as Error)?.message);
+  }
+
   const app = await buildApp(config, ctx);
 
   await app.listen({ port: config.PORT, host: config.HOST });
@@ -118,8 +134,32 @@ async function main(): Promise<void> {
     );
   }
 
+  // M7.5 — live scanner ticker (optional, disabled by default in dev).
+  let scannerTicker: NodeJS.Timeout | null = null;
+  if (config.scanner.enabled) {
+    console.info(`[api] live scanner enabled (every ${config.scanner.intervalMs}ms)`);
+    const runScanner = async () => {
+      try {
+        const result = await ctx.scanner.runOnce({});
+        if (!result.skipped) {
+          console.info(
+            `[scanner] run ${result.run.id} ${result.run.status}: ${result.run.setupsDetected} setups, ${result.run.alertsCreated} alerts`,
+          );
+        }
+      } catch (err) {
+        console.warn('[scanner] run failed:', (err as Error)?.message);
+      }
+    };
+    // Initial delay to let the server settle
+    setTimeout(() => void runScanner(), 10_000);
+    scannerTicker = setInterval(() => void runScanner(), config.scanner.intervalMs);
+  } else {
+    console.info('[api] live scanner is disabled — enable with SCANNER_ENABLED=true or trigger via POST /api/scanner/trigger');
+  }
+
   const shutdown = async (signal: string) => {
         console.info(`[api] ${signal} received, shutting down`);
+    if (scannerTicker) clearInterval(scannerTicker);
     await workerTicker?.stop().catch(() => {});
     await app.close();
     await pool.end();

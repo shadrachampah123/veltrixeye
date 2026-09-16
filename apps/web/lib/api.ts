@@ -42,6 +42,11 @@ import type {
   SetupTransitionRequest,
   SetupTransitionResponseDto,
   BillingStateDto,
+  // M7.5 — live scanner
+  ScannerHealthDto,
+  ScannerRunDto,
+  ScannerTriggerRequestInput,
+  ScannerTriggerResponse,
 } from '@veltrixeye/contracts';
 import {
   MAX_ALERTS_LIMIT,
@@ -396,6 +401,29 @@ export const api = {
     request<AlertGenerateResponse>(`/setups/${encodeURIComponent(setupId)}/alerts`, {
       method: 'POST',
       body: JSON.stringify(triggerState ? { triggerState } : {}),
+    }),
+
+  // -------------------------------------------------------------------------
+  // Scanner (M7.5 — live scanner / production market flow)
+  // -------------------------------------------------------------------------
+
+  /** GET /api/scanner/health — real production scanner health/status. */
+  getScannerHealth: () => request<ScannerHealthDto>('/scanner/health'),
+
+  /** GET /api/scanner/runs — recent scanner runs. */
+  listScannerRuns: (params: { status?: string; limit?: number } = {}) =>
+    request<{ runs: ScannerRunDto[] }>(
+      `/scanner/runs${toQueryString({
+        status: params.status,
+        limit: params.limit,
+      })}`,
+    ),
+
+  /** POST /api/scanner/trigger — manual scan trigger. */
+  triggerScanner: (input: ScannerTriggerRequestInput = {}) =>
+    request<ScannerTriggerResponse>('/scanner/trigger', {
+      method: 'POST',
+      body: JSON.stringify(input),
     }),
 };
 

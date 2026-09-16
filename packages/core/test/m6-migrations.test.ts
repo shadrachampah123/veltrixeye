@@ -163,10 +163,11 @@ describe('m6 migrations: chain and backtest tables (0011)', () => {
     assert.equal(status.pending.length, 0);
     assert.ok(status.appliedCount >= 12);
     // The chain is additive: M7.3 appended 0013 (the notification outbox)
-    // without touching 0001-0012, so the head moved on while every earlier
-    // migration — and this suite's 0011/0012 assertions — still hold.
-    assert.equal(status.expectedCount, 13);
-    assert.equal(status.latestApplied, '0013_notification_outbox.sql');
+    // and M7.5 appended 0015 (scanner runs) without touching 0001-0012, so the
+    // head moved on while every earlier migration — and this suite's 0011/0012
+    // assertions — still hold.
+    assert.equal(status.expectedCount, 15);
+    assert.equal(status.latestApplied, '0015_scanner_runs.sql');
     assert.equal(status.checksumsMatch, true);
     const second = await runMigrations(pool, MIGRATIONS_DIR);
     assert.equal(second.applied.length, 0);
