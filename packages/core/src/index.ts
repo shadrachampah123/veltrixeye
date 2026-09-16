@@ -180,3 +180,6 @@ export * from './billing/index.js';
 // Live scanner (M7.5) — production market-data and scanner pipeline
 export * from './scanner/index.js';
 
+// Execution architecture (M8.1) — safety boundary only; no provider can trade
+export * from './execution/index.js';
+

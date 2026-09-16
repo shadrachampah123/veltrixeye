@@ -16,6 +16,7 @@ const NAV = [
   { href: '/backtests', label: 'Backtests', icon: '◫' },
   { href: '/markets', label: 'Markets', icon: '◈' },
   { href: '/scanner', label: 'Live Scanner', icon: '◐' },
+  { href: '/trading', label: 'Trading', icon: '⚡' },
   { href: '/settings', label: 'Settings', icon: '⚙' },
 ];
 

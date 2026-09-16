@@ -47,6 +47,13 @@ import type {
   ScannerRunDto,
   ScannerTriggerRequestInput,
   ScannerTriggerResponse,
+  // M8.1 — execution architecture (read/status surface only)
+  AutomationStatusDto,
+  ExecutionStatusDto,
+  ExecutionProfileDto,
+  ExecutionOrderDto,
+  ExecutionPositionDto,
+  ExecutionAuditEventDto,
 } from '@veltrixeye/contracts';
 import {
   MAX_ALERTS_LIMIT,
@@ -425,6 +432,32 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(input),
     }),
+
+  // -------------------------------------------------------------------------
+  // M8.1 — execution architecture (read/status surface only; no order
+  // submission exists or is exposed)
+  // -------------------------------------------------------------------------
+
+  /** GET /api/execution/automation — server-authoritative automation state. */
+  getAutomationStatus: () => request<AutomationStatusDto>('/execution/automation'),
+
+  /** GET /api/execution/status — execution readiness snapshot. */
+  getExecutionStatus: () => request<ExecutionStatusDto>('/execution/status'),
+
+  /** GET /api/execution/profiles — the caller's execution profiles. */
+  listExecutionProfiles: () => request<{ profiles: ExecutionProfileDto[] }>('/execution/profiles'),
+
+  /** GET /api/execution/orders — owner-scoped orders (empty in M8.1). */
+  listExecutionOrders: (params: { limit?: number } = {}) =>
+    request<{ orders: ExecutionOrderDto[] }>(`/execution/orders${toQueryString({ limit: params.limit })}`),
+
+  /** GET /api/execution/positions — owner-scoped positions (empty in M8.1). */
+  listExecutionPositions: (params: { limit?: number } = {}) =>
+    request<{ positions: ExecutionPositionDto[] }>(`/execution/positions${toQueryString({ limit: params.limit })}`),
+
+  /** GET /api/execution/events — owner-scoped execution audit trail. */
+  listExecutionEvents: (params: { limit?: number } = {}) =>
+    request<{ events: ExecutionAuditEventDto[] }>(`/execution/events${toQueryString({ limit: params.limit })}`),
 };
 
 /** Summary row shape from the API list endpoint. */

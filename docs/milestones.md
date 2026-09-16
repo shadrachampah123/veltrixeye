@@ -1,8 +1,8 @@
 # Milestone Boundaries
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
-M6 Phases 1–4, M7.1, M7.2 and M7.3**. The boundaries below are deliberate and
-enforced: M1 shipped foundations and contracts; M2 added real historical
+M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5 and M8.1**. The boundaries below
+are deliberate and enforced: M1 shipped foundations and contracts; M2 added real historical
 market data; M3 added deterministic strategy evaluation; M4 added
 deterministic setup detection and lifecycle management; M5 added
 deterministic setup quality scoring; M6 Phases 1–3 add the backtest
@@ -437,10 +437,53 @@ delivers it. Full design: [notification-delivery.md](./notification-delivery.md)
   one job per alert, replay, no in-request delivery, zero I/O, owner scoping,
   token protection, run/maintenance endpoints, credential hygiene).
 
-## Explicitly NOT in M1+M2+M3+M4+M5+M6+M7 (by design, deferred)
+## M7.4 — delivered (Subscription / Entitlement Foundation)
 
-- A live **scanner** (detection stays explicitly invoked) and setup
-  **realtime** updates.
+- `subscriptions` table (migration 0014) with plan/status/period and provider
+  id columns; unique per user; backfilled from the M1 `users.plan` column.
+- Server-authoritative `getEntitlements(plan, status)`: Free/Pro/Premium
+  limits (strategies, backtests/month, alerts/month, saved setups) plus
+  `canAccessScanner`, advanced-strategy/alert placeholders and
+  `canAccessAutomation` (false for every plan).
+- Atomic limit enforcement (`SELECT … FOR UPDATE` on the subscription row)
+  for strategies, setups and alerts; route-level backtest limit.
+- `GET /api/billing/me` read-only surface; **no mutation path exists** — a
+  client cannot change plan, status or limits. Billing provider integration
+  is a later milestone.
+
+## M7.5 — delivered (Live Scanner / Production Market Flow)
+
+Production scanner over real Twelve Data market data through the full
+pipeline (normalization → validation/freshness → M4 detection → M5 scoring →
+quality-gated alerts → notification outbox). Advisory locking, cursors,
+four-layer dedup, stale-data policy, restart recovery, entitlement-gated API
+and the `/scanner` UI. Full design: [scanner.md](./scanner.md).
+
+## M8.1 — delivered (Automated Trading Execution Architecture)
+
+Execution **architecture and safety boundary only** — no broker, MT5 or
+Exness connectivity; no real, demo or simulated order can be placed.
+
+- Domain model: execution profiles, idempotent execution requests, order and
+  position schemas, append-only execution audit trail, kill switches,
+  explicit automation switch (`users.automation_enabled`, default OFF).
+- Live execution impossible by construction (service refusal + DB CHECK);
+  no credentials modeled anywhere.
+- Provider abstraction (`ExecutionProvider`) with normalized failure
+  taxonomy; exactly one provider registered (paper), which reports not-ready
+  and refuses every trading operation (simulator deferred to M8.3).
+- Pinned order state machine with absorbing terminals; invalid transitions
+  rejected.
+- 15 ordered safety gates, fail-closed; in M8.1 the risk-decision and
+  exposure gates can never pass, so no intake can be accepted.
+- Idempotency from stable derived identity (user + setup + profile +
+  action), enforced by unique constraints.
+- Read/status API surface + `/trading` readiness page; no order-placement
+  endpoint exists. Full design: [execution.md](./execution.md).
+
+## Explicitly NOT in M1–M8.1 (by design, deferred)
+
+- Setup **realtime** updates (the scanner polls; no streaming).
 - **Realtime streaming / WebSockets**; session calendar and market-state
   feeds (provider honestly reports gaps).
 - **Channels other than email** (webhook, push, SMS/Telegram): M7.3 built the
@@ -449,9 +492,11 @@ delivers it. Full design: [notification-delivery.md](./notification-delivery.md)
 - **User notification preferences** (per-channel opt-in, quiet hours,
   per-strategy routing): deliberately not built in M7.3 — an alert goes to the
   owner's account email.
-- **Automated trade execution** (M8) — alerts are suggestions, never orders.
-- **Billing / subscriptions** — the M1 `users.tier` column exists, but no
-  billing logic acts on it.
+- **Automated trade EXECUTION** — M8.1 built the execution architecture and
+  safety boundary; no order of any kind can be placed yet. Alerts remain
+  suggestions, never orders.
+- **Billing integration** — M7.4 built the subscription/entitlement
+  foundation; no payment provider, checkout, portal or webhooks exist yet.
 - **AI** in the signal path — evaluation is deterministic rules; AI is
   never the core signal engine.
 - **Marketplace** with paid plans or revenue sharing.
@@ -461,14 +506,16 @@ delivers it. Full design: [notification-delivery.md](./notification-delivery.md)
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M7.3 (later work, outline only)
+## After M8.1 (later work, outline only)
 
 1. **More channels + preferences** — a second `NotificationProvider` (push /
    webhook / SMS) behind the M7.3 registry, plus per-user notification
    preferences and per-strategy routing.
-2. A **live scanner** on top of the M4 detection service (still explicitly
-   owned by the user, never a hidden cron), then **M8 trade execution** and
-   **billing** as their own milestones.
+2. **M8.2+ trade execution** — the risk engine, position sizing and exposure
+   limits that feed the M8.1 gates, then the paper execution simulator
+   (M8.3) behind the M8.1 provider boundary, then broker/demo connectivity
+   (e.g. an MT5/Exness bridge) — each its own milestone. **Billing**
+   (provider, webhooks, checkout/portal) lands alongside or after.
 
 Each of these is its own milestone. The M3 engine, M4 detector, M5 scoring
 engine, result DTOs, store, and provider abstraction are specifically
