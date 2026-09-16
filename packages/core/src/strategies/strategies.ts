@@ -20,6 +20,7 @@ import {
 import { Errors } from '../errors.js';
 import type { AuditService } from '../audit.js';
 import { validatePublishable } from './validation.js';
+import { getEntitlements } from '../billing/entitlements.js';
 
 interface StrategyRow {
   id: string;
@@ -193,6 +194,23 @@ export class StrategyService {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+
+      // M7.4 Atomic entitlement enforcement
+      const entitlementRes = await client.query(`
+        SELECT plan, status FROM subscriptions WHERE user_id = $1 FOR UPDATE
+      `, [actorUserId]);
+      
+      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active' };
+      const entitlements = getEntitlements(subRow.plan as UserPlan, subRow.status);
+      const maxStrategies = entitlements.maxStrategies;
+      
+      const countRes = await client.query('SELECT count(*)::int AS c FROM strategies WHERE user_id = $1', [actorUserId]);
+      const currentCount = countRes.rows[0].c;
+      
+      if (currentCount >= maxStrategies) {
+        throw Errors.forbidden(`Strategy limit reached. Your plan allows up to ${maxStrategies} strategies.`);
+      }
+
       const res = await client.query<StrategyRow>(
         `INSERT INTO strategies (user_id, name, description)
          VALUES ($1, $2, $3)

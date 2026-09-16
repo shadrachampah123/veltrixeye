@@ -27,6 +27,7 @@ export class UserService {
     const email = data.email.trim().toLowerCase();
     const client = await this.pool.connect();
     try {
+      await client.query('BEGIN');
       const res = await client.query<UserRow>(
         `INSERT INTO users (email, password_hash, name)
          VALUES ($1, $2, $3)
@@ -34,9 +35,20 @@ export class UserService {
         [email, data.passwordHash, data.name],
       );
       const row = res.rows[0];
-      if (!row) throw Errors.internal('Failed to create user');
+      if (!row) {
+        await client.query('ROLLBACK');
+        throw Errors.internal('Failed to create user');
+      }
+      
+      await client.query(
+        `INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'free', 'active')`,
+        [row.id]
+      );
+      
+      await client.query('COMMIT');
       return toDto(row);
     } catch (err) {
+      await client.query('ROLLBACK');
       if (isUniqueViolation(err)) {
         throw Errors.conflict('An account with this email already exists');
       }

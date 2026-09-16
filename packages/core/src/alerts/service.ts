@@ -18,6 +18,8 @@ import {
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
 import { isTerminalState } from '../setups/machine.js';
+import { getEntitlements } from '../billing/entitlements.js';
+import type { UserPlan } from '@veltrixeye/contracts';
 import type { StrategyService } from '../strategies/strategies.js';
 import { toNotificationDto, type NotificationOutbox } from '../notifications/outbox.js';
 import { notificationIdempotencyKey, notificationPayloadHash, renderAlertNotification } from '../notifications/render.js';
@@ -303,6 +305,22 @@ export class AlertService {
       }
       assertEligibleState(guardedRow.state);
 
+      // M7.4 Atomic entitlement enforcement
+      const entitlementRes = await client.query(`
+        SELECT plan, status FROM subscriptions WHERE user_id = $1 FOR UPDATE
+      `, [args.userId]);
+      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active' };
+      const entitlements = getEntitlements(subRow.plan as UserPlan, subRow.status);
+      const maxAlerts = entitlements.maxAlertsPerMonth;
+      
+      const countRes = await client.query(
+        "SELECT count(*)::int AS c FROM alerts WHERE user_id = $1 AND created_at >= date_trunc('month', now())",
+        [args.userId]
+      );
+      if (countRes.rows[0].c >= maxAlerts) {
+        throw Errors.forbidden(`Alert limit reached. Your plan allows up to ${maxAlerts} alerts per month.`);
+      }
+
       const inserted = await client.query<AlertRow>(
         `INSERT INTO alerts
            (user_id, setup_id, strategy_id, strategy_version_id, instrument_id, direction,
@@ -453,6 +471,15 @@ export class AlertService {
     } finally {
       client.release();
     }
+  }
+
+  async countAlertsThisMonth(userId: string): Promise<number> {
+    const res = await this.pool.query(
+      `SELECT count(*)::int AS c FROM setup_alerts 
+       WHERE user_id = $1 AND created_at >= date_trunc('month', now())`,
+      [userId]
+    );
+    return res.rows[0].c;
   }
 
   async listAlerts(args: { userId: string } & AlertListQuery): Promise<{ alerts: AlertDto[] }> {

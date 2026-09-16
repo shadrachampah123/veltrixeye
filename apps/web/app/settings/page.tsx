@@ -6,11 +6,12 @@ import { RequireAuth, useAuth } from '@/components/auth-context';
 import { api, ApiError } from '@/lib/api';
 import { Alert, Badge, Button, Card, CardHeader, Field, Input, Spinner } from '@/components/ui';
 import { formatDateTime } from '@/lib/formats';
-import type { SessionDto } from '@veltrixeye/contracts';
+import type { SessionDto, BillingStateDto } from '@veltrixeye/contracts';
 
 function SettingsContent() {
   const { user, refresh } = useAuth();
   const [sessions, setSessions] = React.useState<SessionDto[] | null>(null);
+  const [billing, setBilling] = React.useState<BillingStateDto | null>(null);
   const [name, setName] = React.useState(user?.name ?? '');
   const [profileMsg, setProfileMsg] = React.useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
   const [cur, setCur] = React.useState('');
@@ -25,9 +26,17 @@ function SettingsContent() {
       .catch(() => setSessions([]));
   }, []);
 
+  const loadBilling = React.useCallback(() => {
+    api
+      .getBillingState()
+      .then((b) => setBilling(b))
+      .catch(() => setBilling(null));
+  }, []);
+
   React.useEffect(() => {
     loadSessions();
-  }, [loadSessions]);
+    loadBilling();
+  }, [loadSessions, loadBilling]);
 
   if (!user) return <Spinner />;
 
@@ -111,8 +120,45 @@ function SettingsContent() {
           </Card>
         </div>
 
-        <Card>
-          <CardHeader title="Active sessions" subtitle="Where you are signed in" />
+        <div className="space-y-5">
+          <Card>
+            <CardHeader title="Subscription & Plan" subtitle="Commercial entitlement status" />
+            <div className="px-5 py-4 space-y-4">
+              {billing === null ? (
+                <Spinner />
+              ) : (
+                <>
+                  <div className="flex items-center gap-3">
+                    <span className="font-medium capitalize">{billing.subscription.plan} plan</span>
+                    <Badge tone={billing.subscription.status === 'active' ? 'success' : 'neutral'}>
+                      {billing.subscription.status}
+                    </Badge>
+                  </div>
+                  {billing.subscription.currentPeriodEnd && (
+                    <p className="text-sm text-ink-400">
+                      Period ends: {formatDateTime(billing.subscription.currentPeriodEnd)}
+                    </p>
+                  )}
+                  <div className="mt-4 pt-4 border-t border-ink-750">
+                    <h4 className="text-sm font-semibold mb-2">Plan Entitlements & Limits</h4>
+                    <ul className="text-sm space-y-2 text-ink-300">
+                      <li>Max strategies: {billing.entitlements.maxStrategies}</li>
+                      <li>Backtests per month: {billing.entitlements.maxBacktestsPerMonth}</li>
+                      <li>Alerts per month: {billing.entitlements.maxAlertsPerMonth}</li>
+                      <li>Max saved setups: {billing.entitlements.maxSavedSetups}</li>
+                      <li>Advanced strategies: {billing.entitlements.canAccessAdvancedStrategies ? 'Yes' : 'No'}</li>
+                      <li>Advanced alerts: {billing.entitlements.canAccessAdvancedAlerts ? 'Yes' : 'No'}</li>
+                      <li>Scanner access: {billing.entitlements.canAccessScanner ? 'Yes' : 'No'}</li>
+                      <li>Automation access (M8): {billing.entitlements.canAccessAutomation ? 'Yes' : 'No'}</li>
+                    </ul>
+                  </div>
+                </>
+              )}
+            </div>
+          </Card>
+
+          <Card>
+            <CardHeader title="Active sessions" subtitle="Where you are signed in" />
           <div className="divide-y divide-ink-750">
             {sessions === null ? (
               <div className="px-5 py-6">

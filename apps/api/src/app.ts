@@ -39,6 +39,7 @@ import { setupRoutes } from './routes/setups.js';
 import { backtestRoutes } from './routes/backtests.js';
 import { alertRoutes } from './routes/alerts.js';
 import { notificationRoutes } from './routes/notifications.js';
+import { billingRoutes } from './routes/billing.js';
 
 export interface AppContext {
   pool: pg.Pool;
@@ -242,6 +243,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await backtestRoutes(app, ctx, config);
   await alertRoutes(app, ctx, config);
   await notificationRoutes(app, ctx, config);
+  await billingRoutes(app, ctx, config);
 
   return app;
 }

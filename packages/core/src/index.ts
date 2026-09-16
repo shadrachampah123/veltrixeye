@@ -173,3 +173,7 @@ export {
   M5_FAILING_DIRECTION_CAP,
   type M5ComponentName,
 } from './scoring/engine.js';
+
+// Billing / Entitlements
+export * from './billing/index.js';
+

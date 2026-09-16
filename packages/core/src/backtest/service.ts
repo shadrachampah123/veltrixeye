@@ -18,6 +18,8 @@ import type { StrategyService } from '../strategies/strategies.js';
 import type { CandleStore } from '../market-data/candles.js';
 import { requiredWindows } from '../strategies/evaluation/service.js';
 import { runBacktest } from './engine.js';
+import { getEntitlements } from '../billing/entitlements.js';
+import type { UserPlan } from '@veltrixeye/contracts';
 import { computeConfigHash, isValidConfigHash } from './canonical.js';
 
 /**
@@ -251,6 +253,23 @@ export class BacktestService {
     try {
       await client.query('BEGIN');
 
+      // M7.4 Atomic entitlement enforcement
+      const entitlementRes = await client.query(`
+        SELECT plan, status FROM subscriptions WHERE user_id = $1 FOR UPDATE
+      `, [args.userId]);
+      
+      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active' };
+      const entitlements = getEntitlements(subRow.plan as UserPlan, subRow.status);
+      const maxBacktests = entitlements.maxBacktestsPerMonth;
+      
+      const countRes = await client.query(
+        "SELECT count(*)::int AS c FROM backtest_runs WHERE user_id = $1 AND created_at >= date_trunc('month', now())",
+        [args.userId]
+      );
+      if (countRes.rows[0].c >= maxBacktests) {
+        throw Errors.forbidden(`Backtest limit reached. Your plan allows up to ${maxBacktests} backtests per month.`);
+      }
+
       // Attempt insert run.
       const runRes = await client.query<BacktestRunRow>(
         `INSERT INTO backtest_runs
@@ -360,6 +379,15 @@ export class BacktestService {
     } finally {
       client.release();
     }
+  }
+
+  async countBacktestsThisMonth(userId: string): Promise<number> {
+    const res = await this.pool.query(
+      `SELECT count(*)::int AS c FROM backtest_runs 
+       WHERE user_id = $1 AND created_at >= date_trunc('month', now())`,
+      [userId]
+    );
+    return res.rows[0].c;
   }
 
   async listBacktests(args: { userId: string } & BacktestListQuery): Promise<{ runs: BacktestRunDto[] }> {

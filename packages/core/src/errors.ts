@@ -17,6 +17,7 @@ export class DomainError extends Error {
 export const Errors = {
   invalidInput: (message: string) => new DomainError(ERROR_CODES.INVALID_INPUT, message),
   unauthorized: (message = 'Authentication required') => new DomainError(ERROR_CODES.UNAUTHORIZED, message),
+  forbidden: (message = 'Permission denied') => new DomainError(ERROR_CODES.FORBIDDEN, message),
   notFound: (message = 'Resource not found') => new DomainError(ERROR_CODES.NOT_FOUND, message),
   conflict: (message: string) => new DomainError(ERROR_CODES.CONFLICT, message),
   immutable: (message: string) => new DomainError(ERROR_CODES.IMMUTABLE, message),
