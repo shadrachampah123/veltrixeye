@@ -2,6 +2,7 @@
 import type pg from 'pg';
 import {
   ALERT_TRIGGER_STATES,
+  DEFAULT_NOTIFICATION_CHANNEL,
   MAX_ALERT_DELIVERIES,
   type AlertDetailDto,
   type AlertDto,
@@ -10,16 +11,23 @@ import {
   type AlertListQuery,
   type AlertSkippedReason,
   type AlertTriggerState,
+  type NotificationChannel,
+  type NotificationDto,
   type SetupState,
+  type StrategyTimeframes,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
 import { isTerminalState } from '../setups/machine.js';
 import type { StrategyService } from '../strategies/strategies.js';
+import { toNotificationDto, type NotificationOutbox } from '../notifications/outbox.js';
+import { notificationIdempotencyKey, notificationPayloadHash, renderAlertNotification } from '../notifications/render.js';
 import { NonStubSenderError, StubAlertSender, type AlertSender } from './sender.js';
 
 /**
- * AlertService (M6 Phases 2–3) — the application boundary around the alert
- * schema. It is the ONLY writer of `alerts` / `alert_deliveries`.
+ * AlertService (M6 Phases 2–3, extended by M7.3) — the application boundary
+ * around the alert schema. It is the ONLY writer of `alerts` /
+ * `alert_deliveries`, and the only place that enqueues a `notification_deliveries`
+ * outbox job.
  *
  * Guarantees (pinned order, enforced by tests):
  *  - owner-scoped: every method takes `userId` and checks the ownership chain
@@ -36,10 +44,23 @@ import { NonStubSenderError, StubAlertSender, type AlertSender } from './sender.
  *  - dedup by `(setup_id, trigger_state)`: at most two alerts per setup
  *    (`confirmed` + `triggered`). Replays return the existing alert and never
  *    insert a second delivery ledger row.
- *  - transactional: alert + stub delivery ledger row commit together.
+ *  - transactional: alert + stub delivery ledger row + outbox job commit
+ *    together (M7.3).
  *  - local/no-network: the only sender M6 accepts is the local stub
- *    (`NonStubSenderError` otherwise) — zero external I/O.
+ *    (`NonStubSenderError` otherwise) — zero external I/O. M7.3 keeps that
+ *    property: generation writes a durable job, it never calls a provider.
  *  - idempotent acknowledgement that preserves the first acknowledgedAt.
+ *
+ * M7.3 addition — the outbox hand-off:
+ *  - the job is written in the SAME transaction as the alert, so an alert can
+ *    never exist without exactly one delivery job per channel (and a job can
+ *    never exist without an alert: the FK forbids it);
+ *  - at most one job per (alert, channel) — enforced by a UNIQUE index, so a
+ *    replayed request, a concurrent twin or a retried HTTP call collapse;
+ *  - the payload is rendered from the PERSISTED alert (`title`/`body` read
+ *    back) plus the published version's timeframe, so the delivered content is
+ *    server-generated and cannot be influenced by the caller;
+ *  - the service still performs no I/O: delivery happens later, in the worker.
  */
 
 /** Setup states that may generate an alert (the dedup key's second half). */
@@ -121,6 +142,14 @@ export interface GenerateAlertResult {
   alert: AlertDto | null;
   /** The alert's stub ledger entry; null on a gate skip. */
   delivery: AlertDeliveryDto | null;
+  /**
+   * M7.3: the durable outbox job for this alert (never delivered from the
+   * request path). `null` when no outbox is wired (M6-only construction) or on
+   * a gate skip.
+   */
+  notification: NotificationDto | null;
+  /** True only when THIS call inserted the outbox job (replays → false). */
+  notificationCreated: boolean;
   /** True only when THIS call inserted the alert row. */
   created: boolean;
   /**
@@ -137,22 +166,35 @@ export interface GenerateAlertResult {
 
 export class AlertService {
   private readonly sender: AlertSender;
+  private readonly outbox: NotificationOutbox | null;
 
   constructor(
     private readonly pool: pg.Pool,
     private readonly strategies: StrategyService,
     sender: AlertSender = new StubAlertSender(),
+    /**
+     * M7.3 outbox. Optional on purpose: the M6 constructor signature
+     * (`pool, strategies, sender`) stays valid and, without an outbox, alert
+     * generation behaves exactly as it did in M6/M7.2 (stub ledger only).
+     */
+    outbox: NotificationOutbox | null = null,
   ) {
-    // M6 hard rule: the only delivery this milestone performs is the local
-    // stub ledger entry. A real channel would need an outbox/worker, provider
-    // credentials and a security review — refuse to boot with one wired.
+    // M6 hard rule, unchanged: the only delivery performed IN the request is
+    // the local stub ledger entry. A real channel is delivered by the worker
+    // from the outbox — refuse to boot with a non-stub sender wired.
     if (sender.channel !== 'stub') throw new NonStubSenderError(String(sender.channel));
     this.sender = sender;
+    this.outbox = outbox;
   }
 
-  /** The delivery channel in use — `stub` for every M6 deployment. */
+  /** The delivery channel in use — `stub` for every M6/M7 deployment. */
   get deliveryChannel(): AlertChannel {
     return this.sender.channel;
+  }
+
+  /** The channel alerts are queued for on the outbox (`null` when unwired). */
+  get notificationChannel(): NotificationChannel | null {
+    return this.outbox ? DEFAULT_NOTIFICATION_CHANNEL : null;
   }
 
   /**
@@ -202,6 +244,8 @@ export class AlertService {
       return {
         alert: null,
         delivery: null,
+        notification: null,
+        notificationCreated: false,
         created: false,
         deliveryCreated: false,
         skippedReason: 'below_min_quality',
@@ -352,11 +396,54 @@ export class AlertService {
         }
       }
 
+      // 6. M7.3: enqueue exactly ONE durable delivery job for this alert, in
+      //    this transaction. No provider is contacted here — the worker does
+      //    that later, safely, with retries.
+      let notificationRow: NotificationDto | null = null;
+      let notificationCreated = false;
+      if (this.outbox) {
+        const rendered = renderAlertNotification({
+          // Authoritative: the persisted alert row (DB-constrained columns).
+          alertId: alertRow.id,
+          setupId: setup.id,
+          strategyId: setup.strategy_id,
+          strategyVersionId: setup.strategy_version_id,
+          versionNumber: setup.version_number,
+          direction: alertRow.direction,
+          triggerState: alertRow.trigger_state,
+          qualityScore: alertRow.quality_score,
+          minQualityScore: alertRow.min_quality_score,
+          createdAt: alertRow.created_at.toISOString(),
+          // Supplementary: levels / grade / detection time, null-tolerant.
+          body: persistedBody,
+          symbol: setup.symbol,
+          assetClass: setup.asset_class,
+          timeframe: resolveTimeframe(version.config.timeframes),
+        });
+        const enqueued = await this.outbox.enqueue(client, {
+          alertId: alertRow.id,
+          userId: args.userId,
+          channel: DEFAULT_NOTIFICATION_CHANNEL,
+          template: rendered.template,
+          payload: rendered,
+          payloadHash: notificationPayloadHash(rendered),
+          idempotencyKey: notificationIdempotencyKey({
+            template: rendered.template,
+            channel: DEFAULT_NOTIFICATION_CHANNEL,
+            alertId: alertRow.id,
+          }),
+        });
+        notificationRow = toNotificationDto(enqueued.row);
+        notificationCreated = enqueued.created;
+      }
+
       await client.query('COMMIT');
 
       return {
         alert: toAlertDto(alertRow),
         delivery: deliveryRow ? toDeliveryDto(deliveryRow) : null,
+        notification: notificationRow,
+        notificationCreated,
         created,
         deliveryCreated,
       };
@@ -527,6 +614,16 @@ export class AlertService {
     );
     return res.rows[0] ?? null;
   }
+}
+
+/**
+ * M7.3: the timeframe shown in a delivered alert. It comes from the published
+ * version config (never from request input) and is nullable by design — an
+ * alert created before the timeframe assignment existed still delivers.
+ */
+function resolveTimeframe(timeframes: StrategyTimeframes | null | undefined): string | null {
+  const setup = timeframes?.setup;
+  return typeof setup === 'string' && setup.length > 0 ? setup : null;
 }
 
 /**

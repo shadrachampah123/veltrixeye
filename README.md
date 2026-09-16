@@ -1,13 +1,13 @@
 # VeltrixEye
 
-> **Milestones M1-M6 — Foundation, Market Data, Evaluation, Setup Detection, Quality Scoring, Backtests & Alerts**
+> **Milestones M1–M7.3 — Foundation, Market Data, Evaluation, Setup Detection, Quality Scoring, Backtests, Alerts & Alert Delivery**
 > A general-purpose SaaS platform where traders define **their own** deterministic trading strategies, scan markets against them, and receive explained, scored alerts.
 
 ## Status
 
-This repository currently contains **M1–M6**: application foundation, domain model, database schema with migrations, authentication, strategy versioning, market/instrument abstractions, security baseline, UI shell — plus the first real market-data provider (Twelve Data, historical), a global shared candle store with fetch-through reads and audited backfills, retention enforcement, a coverage ledger, the Markets UI, the deterministic strategy-evaluation engine (M3), the setup-detection + lifecycle layer (M4), the deterministic setup quality-scoring engine (M5, version `m5-quality-score-1`, see [docs/setup-scoring.md](docs/setup-scoring.md)), and M6: the deterministic backtest engine/service/API (version `m6-backtest-1`, see [docs/backtesting.md](docs/backtesting.md)), explicitly-invoked setup alerts with a **stub-only** delivery ledger (see [docs/alerts.md](docs/alerts.md)), and the Phase 4 backtest + alert surfaces in the web app (`/backtests`, `/alerts`).
+This repository currently contains **M1–M7.3**: application foundation, domain model, database schema with migrations, authentication, strategy versioning, market/instrument abstractions, security baseline, UI shell — plus the first real market-data provider (Twelve Data, historical), a global shared candle store with fetch-through reads and audited backfills, retention enforcement, a coverage ledger, the Markets UI, the deterministic strategy-evaluation engine (M3), the setup-detection + lifecycle layer (M4), the deterministic setup quality-scoring engine (M5, version `m5-quality-score-1`, see [docs/setup-scoring.md](docs/setup-scoring.md)), and M6: the deterministic backtest engine/service/API (version `m6-backtest-1`, see [docs/backtesting.md](docs/backtesting.md)), explicitly-invoked setup alerts with a stub delivery ledger (see [docs/alerts.md](docs/alerts.md)), the Phase 4 backtest + alert surfaces in the web app (`/backtests`, `/alerts`), M7.1's core browser trading workflow, M7.2's commercial/security hardening, and M7.3's alert **delivery** infrastructure — durable outbox, worker, email provider adapter, retries, idempotency and observability (see [docs/notification-delivery.md](docs/notification-delivery.md)).
 
-**Not yet implemented** (by design, later milestones): real alert delivery (email/webhook/push — M6 records a local stub ledger entry only), a live scanner, trade execution, billing. See [docs/milestones.md](docs/milestones.md).
+**Not yet implemented** (by design, later milestones): channels other than email (webhook/push — M7.3 built the outbox/worker/provider boundary they plug into and ships the email adapter), user notification preferences, a live scanner, trade execution, billing. See [docs/milestones.md](docs/milestones.md).
 
 ## Stack
 
@@ -137,6 +137,7 @@ Start here:
 - [Provider abstraction](docs/provider-abstraction.md)
 - [How to add a market-data provider](docs/how-to-add-provider.md)
 - [Future strategy-engine contract](docs/strategy-engine-contract.md)
+- [Alert notification delivery (M7.3)](docs/notification-delivery.md)
 - [Security model](docs/security.md)
 - [Environment configuration](docs/environment.md)
 - [Milestone boundaries](docs/milestones.md)

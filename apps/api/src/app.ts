@@ -7,6 +7,7 @@ import type { AppConfig } from './config.js';
 import { isProduction } from './config.js';
 import { errorHandler } from './errors.js';
 import {
+  redactSecrets,
   UserService,
   SessionService,
   StrategyService,
@@ -19,7 +20,15 @@ import {
   ScoringService,
   BacktestService,
   AlertService,
+  StubAlertSender,
+  // M7.3 delivery pipeline
+  createNotificationProviderRegistry,
+  createSmtpEmailProvider,
+  NotificationOutbox,
+  DeliveryWorker,
   type ProviderRegistry,
+  type NotificationProviderRegistry,
+  type DeliveryRetryPolicy,
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
 import { authRoutes } from './routes/auth.js';
@@ -29,6 +38,7 @@ import { marketDataRoutes } from './routes/market-data.js';
 import { setupRoutes } from './routes/setups.js';
 import { backtestRoutes } from './routes/backtests.js';
 import { alertRoutes } from './routes/alerts.js';
+import { notificationRoutes } from './routes/notifications.js';
 
 export interface AppContext {
   pool: pg.Pool;
@@ -44,6 +54,14 @@ export interface AppContext {
   scoring: ScoringService;
   backtests: BacktestService;
   alerts: AlertService;
+  /** M7.3: channel → provider adapter registry (the only provider-aware object). */
+  notificationProviders: NotificationProviderRegistry;
+  /** M7.3: durable outbox — writes/reads `notification_deliveries`. */
+  notifications: NotificationOutbox;
+  /** M7.3: the delivery worker (run in-process, by cron, or manually). */
+  deliveryWorker: DeliveryWorker;
+  /** M7.3: the retry/lease policy derived from the environment. */
+  deliveryPolicy: DeliveryRetryPolicy;
 }
 
 export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
@@ -55,6 +73,26 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   // so evaluation never triggers a provider call.
   const evaluation = new EvaluationService(pool, strategies, candles);
   const setups = new SetupService(pool, evaluation, candles);
+
+  // M7.3 — notification delivery. The registry is the ONLY place a channel is
+  // bound to an adapter; an unconfigured email adapter is still registered
+  // when its credentials exist, and simply omitted when they do not, so the
+  // worker records `unavailable` instead of faking a delivery.
+  const notificationProviders = createNotificationProviderRegistry();
+  const emailProvider = createSmtpEmailProvider(config.notification.email);
+  if (emailProvider.configured) notificationProviders.register(emailProvider);
+
+  const notifications = new NotificationOutbox(pool, {
+    maxAttempts: config.notification.retry.maxAttempts,
+  });
+  const deliveryWorker = new DeliveryWorker(pool, notificationProviders, config.notification.retry, {
+    retention: config.notification.retention,
+    // Defence in depth: adapters redact their own secrets, and the worker also
+    // scrubs the credentials THIS deployment configured out of any provider
+    // error before it is stored in `last_error` or written to a log line.
+    redact: (text) => redactSecrets(text, [config.notification.email.pass]),
+  });
+
   return {
     pool,
     users: new UserService(pool),
@@ -74,8 +112,14 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     scoring: new ScoringService(pool, strategies, evaluation),
     // M6 Phase 2: backtest service (pure engine + store-only reads + idempotent persistence)
     backtests: new BacktestService(pool, strategies, candles),
-    // M6 Phase 2: alert service (eligible states, M5 gate, dedup, stub delivery)
-    alerts: new AlertService(pool, strategies),
+    // M6 Phase 2 / M7.3: alert service (eligible states, M5 gate, dedup, stub
+    // ledger) + the durable outbox hand-off. Alert generation still performs
+    // NO external I/O: it enqueues a job, the worker delivers it.
+    alerts: new AlertService(pool, strategies, new StubAlertSender(), notifications),
+    notificationProviders,
+    notifications,
+    deliveryWorker,
+    deliveryPolicy: config.notification.retry,
   };
 }
 
@@ -89,6 +133,19 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
  */
 export async function runStartupHousekeeping(ctx: AppContext): Promise<number> {
   return ctx.sessions.deleteExpired();
+}
+
+/**
+ * One-shot delivery recovery (M7.3): return outbox jobs that a previous
+ * process claimed but never finished — a crash, a deploy or an instance that
+ * was stopped mid-delivery — to `pending` (or dead-letter them when their
+ * retry budget is gone). Two bounded UPDATEs, no provider I/O, never throws:
+ * a recovery failure must not block boot (the next worker run retries it).
+ */
+export async function runStartupDeliveryRecovery(
+  ctx: AppContext,
+): Promise<{ recovered: number; deadLettered: number }> {
+  return ctx.deliveryWorker.recoverStale();
 }
 
 /**
@@ -184,6 +241,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await setupRoutes(app, ctx, config);
   await backtestRoutes(app, ctx, config);
   await alertRoutes(app, ctx, config);
+  await notificationRoutes(app, ctx, config);
 
   return app;
 }

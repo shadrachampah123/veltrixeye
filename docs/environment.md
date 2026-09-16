@@ -40,6 +40,28 @@ git-ignored and never contain values you would commit.
 | `TWELVE_DATA_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-request upstream timeout. |
 | `TWELVE_DATA_MAX_RPM` | int 1–10000 | `50` | Client-side upstream cap (keep under plan credits/min). |
 | `TWELVE_DATA_CRYPTO_EXCHANGE` | string 1–32 | `Binance` | Pinned crypto venue (defines the stored series — don't change casually). |
+| `SMTP_HOST` | string | *(empty = email delivery unavailable)* | M7.3 email channel. Empty (with `NOTIFICATION_FROM`) ⇔ the SMTP adapter reports unconfigured and jobs are recorded `unavailable`, never `delivered`. |
+| `SMTP_PORT` | int 1–65535 | `587` | 587 = submission + STARTTLS (required), 465 = implicit TLS. |
+| `SMTP_SECURE` | `auto` \| `always` \| `never` | `auto` | `auto` = implicit TLS on port 465 only; STARTTLS is mandatory otherwise. |
+| `SMTP_USER` | string | *(empty = no AUTH)* | SMTP username (often the vendor's API key). |
+| `SMTP_PASS` | secret, ≤512 chars | *(empty)* | SMTP password / API secret. **Server-side only** — never logged, never returned by a route, redacted out of provider errors. |
+| `NOTIFICATION_FROM` | ≤320 chars | *(empty)* | From address, e.g. `VeltrixEye Alerts <alerts@example.com>`. |
+| `NOTIFICATION_PROVIDER_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-attempt provider budget. |
+| `NOTIFICATION_MAX_ATTEMPTS` | int 1–10 | `5` | Send attempts per job before it is dead-lettered. |
+| `NOTIFICATION_BACKOFF_BASE_MS` | int 1000–600000 | `30000` | Attempt *n* waits `base · 2^(n-1)` ms. |
+| `NOTIFICATION_BACKOFF_MAX_MS` | int 1000–21600000 | `3600000` | Backoff cap. |
+| `NOTIFICATION_BACKOFF_JITTER_MS` | int 0–60000 | `5000` | Deterministic per-job jitter that spreads retry bursts. |
+| `NOTIFICATION_LEASE_MS` | int 5000–3600000 | `120000` | How long a claim may stay `processing` before another run recovers it. |
+| `NOTIFICATION_WORKER_ENABLED` | `true` \| `false` | `true` | Run the delivery worker on an interval inside the API process. |
+| `NOTIFICATION_WORKER_INTERVAL_MS` | int 5000–3600000 | `60000` | Interval between batches. |
+| `NOTIFICATION_WORKER_BATCH_SIZE` | int 1–200 | `25` | Jobs claimed per batch. |
+| `NOTIFICATION_WORKER_TOKEN` | secret, ≤256 chars | *(empty)* | Shared secret for `POST /api/internal/notifications/deliveries/*` (external cron). **Empty ⇒ those routes return 404.** |
+| `NOTIFICATION_RETENTION_DELIVERED_DAYS` | int 1–3650 | `30` | How long delivered rows are kept. |
+| `NOTIFICATION_RETENTION_FAILED_DAYS` | int 1–3650 | `120` | How long dead letters are kept (failure audit trail). |
+
+Empty-string values (a platform dashboard often writes one for a skipped
+secret) are treated as "not set" for the numeric variables above, so they fall
+back to the default instead of failing the boot with `NaN`.
 
 ### Client IP attribution (`TRUSTED_PROXY_CIDRS`)
 
@@ -135,11 +157,16 @@ See [deployment.md](./deployment.md) for the full production runbook.
 
 ## Secrets policy
 
-- The service needs **two** secrets: the `DATABASE_URL` credentials and
+- The service needs up to **four** secrets: the `DATABASE_URL` credentials,
   the `TWELVE_DATA_API_KEY` provider key (server-side only — it travels in
   upstream query strings by vendor design, so it must never reach logs or
-  browsers). Session tokens are server-side (random per session, stored
-  hashed) — no JWT secret is required.
+  browsers), and — once delivery is switched on — `SMTP_PASS` and
+  `NOTIFICATION_WORKER_TOKEN`. Session tokens are server-side (random per
+  session, stored hashed) — no JWT secret is required.
+- Delivery credentials never leave the API process: they are read at boot, held
+  by the SMTP adapter, redacted out of provider error text before that text is
+  stored or logged, and they are absent from `describe()`, from every HTTP
+  response and from the worker's log lines.
 - **No secrets in source control, none in the frontend.** Never commit
   `.env` / `.env.local`.
 - **No invented production credentials.** Real values are injected by the

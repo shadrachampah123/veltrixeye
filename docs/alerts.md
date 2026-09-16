@@ -1,4 +1,9 @@
-# Setup Alerts (M6, Phases 1–4)
+# Setup Alerts (M6, Phases 1–4 + M7.3 delivery)
+
+> **M7.3 added real delivery next to this ledger.** Generation still writes the
+> stub ledger row described below and still performs no external I/O; it now
+> also enqueues **one** durable outbox job, which a worker delivers outside the
+> request. See [notification-delivery.md](./notification-delivery.md).
 
 M6 alerts notify an owner when one of their setups reaches an actionable state
 with sufficient quality. Like M4 detection and M5 scoring, alert generation is
@@ -220,27 +225,46 @@ migration, service or delivery channel of its own.
   notification is sent. There is no notification-provider configuration
   anywhere in the UI, because none exists in M6.
 
-## 9. What M6 does NOT do (still)
+## 9. What M6 does NOT do (still — partly delivered by M7.3)
 
-No real alert delivery (email/webhook/push),
-no vendor SDKs, no new secrets or environment variables, no
-scheduler/worker/queue/cron/background job/polling/scanner, no AI, no billing,
-no trade execution (M8), no second market-data provider, and no Twelve Data
-credential requirement — alerts work with no provider registered at all.
+M6 itself shipped **no** real alert delivery, no vendor SDKs, no new secrets,
+no scheduler/worker/queue/cron/background job/polling/scanner, no AI, no
+billing, no trade execution (M8), no second market-data provider.
 
-## 10. Future channel/provider architecture
+M7.3 delivers the *infrastructure* for real delivery (outbox + worker + email
+adapter + configuration via environment variables), and leaves the M6
+request-path guarantees intact. Still not implemented: user notification
+preferences, a template editor, an in-app inbox, and any channel other than
+email.
 
-Real delivery is additive and deliberately deferred:
+## 10. Channel/provider architecture (M7.3: delivered for email)
 
-1. Implement `AlertSender` for the channel (`channel: 'email' | 'webhook' |
-   'push'`), keeping `send()` a pure function of the persisted alert.
-2. Inject it where `AlertService` is constructed and relax the M6
-   `NonStubSenderError` guard in the same reviewed change.
-3. Move the send out of the request transaction into an outbox + worker
-   (the ledger already records `attempt`, `status`, `error`, `payload_hash`,
-   and the channel CHECK already accepts the new values — no migration).
-4. Add the provider credentials as platform secrets, plus the security review:
-   per-channel redaction, retry/backoff, and delivery-rate limits.
+The plan below is now implemented for the **email** channel:
 
-Until then, the honest statement is: **M6 "delivery" is a local ledger entry,
-not a notification.**
+1. ✅ **Provider adapter** — `NotificationProvider`
+   (`packages/core/src/notifications/provider.ts`) with `channel`, `name`,
+   `configured`, `describe()` and `send()`. The `email` adapter is SMTP-based
+   (`notifications/email.ts`); the strategy engine and the alert service never
+   import a provider — they resolve one through a registry.
+2. ✅ **Out of the request transaction** — `AlertService` writes a durable
+   `notification_deliveries` row (migration 0013) inside the alert transaction,
+   and nothing else. `AlertSender`/`StubAlertSender` and the
+   `NonStubSenderError` guard are untouched: the request path still delivers
+   nothing.
+3. ✅ **Worker** — `DeliveryWorker.runOnce()` claims with
+   `FOR UPDATE SKIP LOCKED`, applies bounded exponential backoff, distinguishes
+   transient/permanent/timeout/configuration failures and dead-letters
+   exhausted jobs. It is invoked by an in-process ticker and/or by the
+   token-protected internal endpoint (external cron).
+4. ✅ **Credentials + security review** — SMTP settings are environment-only,
+   redacted out of stored/logged provider errors, and delivery is honest: an
+   unconfigured provider records `unavailable`, never `delivered`.
+
+Details, schema, retry table and operations:
+[notification-delivery.md](./notification-delivery.md).
+
+**Current honest statement:** the ledger row (`alert_deliveries`) is the local
+record the UI shows; the outbox row (`notification_deliveries`) is the real
+delivery job. When SMTP is configured the alert is emailed to the owner's
+account address; when it is not, the job is recorded `unavailable` and no
+notification is sent.

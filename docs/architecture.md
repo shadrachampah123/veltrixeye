@@ -21,8 +21,9 @@ packages/
                strategies, conditions, timeframes, risk, scoring, and the
                MarketDataProvider interface. Single source of truth.
   core/        Domain services on top of Postgres: migrations, users,
-               sessions, strategies/versions, audit, provider registry.
-               No HTTP knowledge.
+               sessions, strategies/versions, audit, provider registry,
+               and the notification delivery pipeline (outbox + worker +
+               provider adapters). No HTTP knowledge.
 apps/
   api/         Fastify 5 HTTP layer: auth, users, strategies, market-data
                routes, security middleware, error mapping.
@@ -86,6 +87,9 @@ talks to one origin. See [deployment.md](./deployment.md).
 ```
 providers → candles → analysis → strategy evaluation (per StrategyVersion)
           → setup detection → quality scoring → alerts
+
+alerts → durable outbox (notification_deliveries) → delivery worker
+       → notification provider (email/SMTP) → delivered / retried / failed
 ```
 
 M1 ships everything *up to* the first arrow: the strategy definition is
@@ -106,3 +110,4 @@ into. See [engine-contract.md](./engine-contract.md).
 | Immutability enforced at 3 layers (service + DB triggers + append-only guards) | Version history is the product's audit trail; it must not be mutable by accident. |
 | Normalized instruments, provider symbols quarantined | Strategies reference `instruments.id` / `(asset_class, symbol)`, never provider tickers. See [provider-abstraction.md](./provider-abstraction.md). |
 | Embedded Postgres for dev/test only | Real Postgres 18 in `.test/` / `.dev/`; the app only ever sees a `DATABASE_URL`. |
+| Delivery is an outbox, not a request side effect | A provider outage or slow SMTP server can never fail alert generation: the request writes a durable job, a worker delivers it later with bounded retries. See [notification-delivery.md](./notification-delivery.md). |

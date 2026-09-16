@@ -81,6 +81,9 @@ remaining items are listed at the bottom.
   other write-side engine endpoints).
 - `POST /api/alerts/:id/acknowledge`: **60/min per IP** (M6 — idempotent
   bookkeeping, deliberately higher than generation but still bounded).
+- `POST /api/internal/notifications/deliveries/run` and
+  `…/maintenance`: **30/min per IP** (M7.3 — administrative, additionally
+  gated by a shared secret; see below).
 - All are per-IP limits configured in `apps/api/src/app.ts` (global) and
   the route modules (per-route overrides); the auth, evaluate, detect, alert
   generation and alert acknowledgement limits each have a dedicated 429
@@ -159,6 +162,11 @@ user request.
 
 ## Alert delivery is stub-only (M6)
 
+*(M7.3 note: the request path is unchanged — generation still writes only the
+local stub ledger row. M7.3 added a durable outbox + worker that delivers
+**outside** the request; see
+[Alert notification delivery (M7.3)](#alert-notification-delivery-m73) below.)
+
 - **No external delivery exists in this milestone.** The only delivery
   implementation is `StubAlertSender` (`channel: 'stub'`), which renders a
   deterministic sha256 payload hash locally and is recorded in the append-only
@@ -195,6 +203,47 @@ user request.
   authenticated API/UI. Real delivery must ship with an outbox + worker,
   per-channel redaction, retry/backoff and delivery-rate limits
   ([alerts.md](./alerts.md#10-future-channelprovider-architecture)).
+
+## Alert notification delivery (M7.3)
+
+- **The request path still performs no external I/O.** Generating an alert
+  writes the alert, its stub ledger row and **one** durable outbox job in a
+  single transaction; delivery happens later, in the worker. Regression tests
+  assert zero network calls during generation even with SMTP configured.
+- **Administrative routes are invisible until configured.**
+  `POST /api/internal/notifications/deliveries/{run,maintenance}` require the
+  `x-veltrixeye-worker-token` header; when `NOTIFICATION_WORKER_TOKEN` is unset
+  they return **404** (not 401), so an unconfigured deployment advertises no
+  administrative surface. The token is compared in constant time over SHA-256
+  digests, and the routes are additionally rate limited (30/min per IP).
+- **The worker endpoints accept no content.** Their bodies accept only
+  `batchSize` / retention days; ids, recipients, channels and payloads are
+  rejected with 400. A caller can say "process a batch", never "send this".
+- **Owner scoping of notification records.** `GET
+  /api/alerts/:alertId/notifications` is session-authenticated and owner-scoped;
+  foreign, unknown and malformed ids are masked **404**s. The DTO exposes
+  status, attempts, failure category, provider and timestamps only — never the
+  recipient, the rendered payload, the provider error or an upstream id.
+- **Credentials stay server-side and out of logs.** SMTP settings are read from
+  the API environment and held by the adapter; `describe()` (the boot log)
+  publishes host/port/from/auth-mode only. Provider errors are redacted before
+  they are stored in `last_error` or written to a log line, and the deployment
+  also hands the worker a scrubber for the credentials it configured. Worker log
+  lines carry job id, alert id, user id, channel, attempt, status, provider,
+  response code and failure category — no recipient, no payload, no secret.
+- **No fake delivery.** With no configured provider a job is recorded
+  `unavailable` (never `delivered`), and it is terminal, so a misconfigured
+  deployment cannot spin on retries. `unavailable` jobs are re-queued
+  automatically — bounded by the batch size — once a configured provider exists.
+- **Duplicates are prevented at four levels**: `UNIQUE (alert_id, channel)`,
+  `UNIQUE (idempotency_key)`, `FOR UPDATE SKIP LOCKED` claiming, and a stable
+  per-job `Message-ID` so a receiver can collapse a retry after a timeout.
+- **Bounded retries.** `attempts <= max_attempts` is a `CHECK` constraint, the
+  claim requires `attempts < max_attempts`, and staleness recovery dead-letters
+  a job whose lease expired repeatedly — an infinite loop is not expressible.
+- **Retention deletes only finished work**: aged `delivered` (30 d) and
+  `failed` (120 d) rows; `pending`, `processing` and `unavailable` rows are
+  never deleted.
 
 ## Data integrity as security
 
