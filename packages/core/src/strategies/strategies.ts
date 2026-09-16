@@ -16,6 +16,7 @@ import {
   type StrategyVersionCreateInput,
   type StrategyFilter,
   type SessionFilter,
+  type UserPlan,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
 import type { AuditService } from '../audit.js';

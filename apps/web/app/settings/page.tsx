@@ -199,7 +199,8 @@ function SettingsContent() {
               ))
             )}
           </div>
-        </Card>
+          </Card>
+        </div>
       </div>
     </AppShell>
   );
