@@ -159,7 +159,7 @@ function SettingsContent() {
 
           <Card>
             <CardHeader title="Active sessions" subtitle="Where you are signed in" />
-          <div className="divide-y divide-ink-750">
+            <div className="divide-y divide-ink-750">
             {sessions === null ? (
               <div className="px-5 py-6">
                 <Spinner />
