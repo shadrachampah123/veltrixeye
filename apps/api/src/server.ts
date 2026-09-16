@@ -1,5 +1,6 @@
 import { loadConfig, loadDotEnv } from './config.js';
-import { buildApp, createAppContext, runStartupHousekeeping } from './app.js';
+import { buildApp, createAppContext, runStartupHousekeeping, runStartupDeliveryRecovery } from './app.js';
+import { startDeliveryWorkerTicker, consoleDeliveryLogger } from './delivery-worker.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 import { createTwelveDataProvider } from '@veltrixeye/provider-twelve-data';
 
@@ -61,12 +62,65 @@ async function main(): Promise<void> {
     console.warn('[api] TWELVE_DATA_API_KEY is not set — market-data ingestion is unavailable (502)');
   }
 
+  // M7.3 — notification delivery. Log the channel state WITHOUT credentials:
+  // `describe()` is the provider's operator-safe view (host/port/from only,
+  // never the SMTP password). Unconfigured is a normal state, not an error:
+  // outbox jobs are still created and the worker records them `unavailable`
+  // rather than pretending they were delivered.
+  const email = ctx.notificationProviders.list()[0];
+  if (email?.configured) {
+    const emailProvider = ctx.notificationProviders.get('email');
+    console.info(
+      `[api] notification channel "email" configured: ${JSON.stringify(emailProvider?.describe() ?? {})}`,
+    );
+  } else {
+    console.warn(
+      '[api] email delivery is NOT configured (SMTP_HOST / NOTIFICATION_FROM missing) — ' +
+        'alert notifications are queued and recorded as "unavailable", never as delivered. ' +
+        'Set the SMTP_* / NOTIFICATION_FROM environment variables to enable delivery.',
+    );
+  }
+
+  // Recover jobs a previous process claimed but never finished (crash, deploy,
+  // scale-down). Cheap: two bounded UPDATEs, no provider I/O. Never throws.
+  try {
+    const recovery = await runStartupDeliveryRecovery(ctx);
+    if (recovery.recovered > 0 || recovery.deadLettered > 0) {
+      console.info(
+        `[api] delivery recovery: ${recovery.recovered} job(s) re-queued, ${recovery.deadLettered} dead-lettered`,
+      );
+    }
+  } catch (err) {
+    console.warn('[api] delivery recovery failed (continuing):', (err as Error)?.message);
+  }
+
   const app = await buildApp(config, ctx);
 
   await app.listen({ port: config.PORT, host: config.HOST });
 
+  // Drain the outbox on an interval. An external scheduler can do the same
+  // through the token-protected internal endpoint; both are safe together.
+  let workerTicker: Awaited<ReturnType<typeof startDeliveryWorkerTicker>> | null = null;
+  if (config.notification.worker.enabled) {
+    workerTicker = startDeliveryWorkerTicker(ctx.deliveryWorker, {
+      intervalMs: config.notification.worker.intervalMs,
+      batchSize: config.notification.worker.batchSize,
+      logger: consoleDeliveryLogger('[notifications]'),
+    });
+    console.info(
+      `[api] notification worker enabled (every ${config.notification.worker.intervalMs}ms, ` +
+        `batch ${config.notification.worker.batchSize})`,
+    );
+  } else {
+    console.warn(
+      '[api] notification worker is disabled — the outbox drains only when the internal ' +
+        'endpoint is called by an external scheduler (NOTIFICATION_WORKER_TOKEN).',
+    );
+  }
+
   const shutdown = async (signal: string) => {
         console.info(`[api] ${signal} received, shutting down`);
+    await workerTicker?.stop().catch(() => {});
     await app.close();
     await pool.end();
     process.exit(0);

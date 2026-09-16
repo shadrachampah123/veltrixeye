@@ -255,6 +255,10 @@ disagree. The failing `schema` block is included in the response.
 | `SESSION_TTL_DAYS` | no (default 30) | 1–90 |
 | `LOG_LEVEL` | no (default `info`) | `info` in production |
 | `TRUSTED_PROXY_CIDRS` | no (default = Cloudflare ranges + Render-internal) | Proxies allowed to speak for the client in `X-Forwarded-For` — this decides `req.ip`, the key for every rate limit. **Leave unset on Render**; the default is already the pinned production list. See [Scaling and rate limiting](#scaling-and-rate-limiting) |
+| `SMTP_HOST` / `NOTIFICATION_FROM` | for email delivery (M7.3) | Empty = email delivery unavailable: outbox jobs are created and recorded `unavailable`, never `delivered`. Set them plus `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` to switch delivery on |
+| `SMTP_PASS` | for email delivery | SMTP password / vendor API secret (`sync: false` in `render.yaml`). Server-side only — never logged, never returned by a route |
+| `NOTIFICATION_WORKER_TOKEN` | for scheduled draining | Shared secret for `POST /api/internal/notifications/deliveries/*`. **Empty = those routes return 404.** Set it if an external scheduler (Render Cron Job) should drain the outbox while the instance is asleep |
+| `NOTIFICATION_WORKER_ENABLED` | no (default `true`) | `false` disables the in-process ticker; the outbox then drains only through the internal endpoint |
 
 Missing or malformed values make the API **fail at boot** with an itemized
 error (`loadConfig` zod validation) instead of misbehaving at runtime.
@@ -270,6 +274,7 @@ The web app's only deployment variable is `API_INTERNAL_BASE` (Step 4).
 | Rate limiting | `apps/api/src/app.ts`, route modules | 300/min global, 10/min login, 5/h register, 20/min evaluate, 20/min detect, 60/min setup transitions — per instance (see below) |
 | Client IP attribution | `apps/api/src/trust-proxy.ts`, `config.ts` | `req.ip` — the rate-limit key and the IP in `audit_events` / `sessions` — is resolved through Render's Cloudflare-fronted chain, so `X-Forwarded-For` is never caller-controlled (see below) |
 | Audit logging | `packages/core/src/audit.ts` | register/login/failure/logout/password-change/strategy actions recorded in `audit_events` |
+| Alert delivery (M7.3) | `packages/core/src/notifications/*`, `apps/api/src/delivery-worker.ts` | durable outbox (`notification_deliveries`) drained by the in-process worker and/or a token-protected internal endpoint; provider credentials server-side only |
 | Security headers | Fastify helmet | CSP deny-all, `nosniff`, `X-Frame-Options: DENY`, HSTS in production, no CORS headers, `X-Powered-By` hidden |
 | Transport | Render/Vercel TLS | HTTPS end to end; `DATABASE_SSL_MODE` covers API→database |
 | Secrets | platform env vars | nothing in the repo, nothing in the image (`.dockerignore` excludes `.env*`) |
@@ -323,10 +328,33 @@ production-grade always-on API, change `plan: free` to `plan: starter` in
 `render.yaml` (or in the dashboard) — the blueprint, health check and
 migrations are unaffected.
 
+### Alert delivery operations (M7.3)
+
+- **Enabling email** — set `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`,
+  `SMTP_USER`, `SMTP_PASS` and `NOTIFICATION_FROM` on the service and redeploy.
+  Until then the API logs a warning on every boot and every job is recorded
+  `unavailable`; nothing is ever recorded as delivered without a provider.
+- **Draining the outbox** — the in-process ticker runs every
+  `NOTIFICATION_WORKER_INTERVAL_MS` (60 s) while the instance is awake. On a
+  free instance (which sleeps), point a **Render Cron Job** at
+  `POST /api/internal/notifications/deliveries/run` with the
+  `x-veltrixeye-worker-token` header every minute or two; it is safe to run
+  alongside the ticker, because jobs are claimed with `FOR UPDATE SKIP LOCKED`.
+- **Housekeeping** —
+  `POST /api/internal/notifications/deliveries/maintenance` (same token)
+  recovers stale work, applies retention (delivered 30 d, failed 120 d) and
+  returns the queue depth per status. Schedule it hourly or daily.
+- **Watching** — `depth.pending` growing or `depth.failed` non-zero means
+  deliveries are stuck or being rejected; the row's `failure_category`,
+  `provider_response_code` and redacted `last_error` say which. See
+  [notification-delivery.md](./notification-delivery.md).
+
 ### Operations
 
 - **Logs**: Render streams the Fastify logger (`LOG_LEVEL=info`); request logs
-  go to the platform, not to a file.
+  go to the platform, not to a file. Delivery lines are prefixed
+  `[notifications]` and carry ids, statuses and failure categories only — never
+  a recipient or a credential.
 - **Rollback**: Render keeps previous deploys — roll back the service, and if
   the rollback's build needs a schema the database does not have, migrations
   refuse rather than guess (drift protection).

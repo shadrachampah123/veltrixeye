@@ -1,7 +1,7 @@
 # Milestone Boundaries
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
-M6 Phases 1–4, and M7.1 + M7.2**. The boundaries below are deliberate and
+M6 Phases 1–4, M7.1, M7.2 and M7.3**. The boundaries below are deliberate and
 enforced: M1 shipped foundations and contracts; M2 added real historical
 market data; M3 added deterministic strategy evaluation; M4 added
 deterministic setup detection and lifecycle management; M5 added
@@ -370,16 +370,85 @@ delivery) was re-verified and already met the bar, so it is unchanged.
   current-inclusive session list) plus core service-level regressions for
   the instrument guard and the session cap/cleanup.
 
-## Explicitly NOT in M1+M2+M3+M4+M5+M6 (by design, deferred)
+## M7.3 — delivered (Alert Delivery Infrastructure)
+
+M7.3 makes alert delivery reliable, observable, retryable and extensible
+**without** coupling the strategy engine (or the alert service) to any external
+notification provider. Alert generation still performs zero external I/O: it
+writes a durable outbox row in the same transaction as the alert, and a worker
+delivers it. Full design: [notification-delivery.md](./notification-delivery.md).
+
+- **Durable outbox** — migration `0013_notification_outbox.sql` adds
+  `notification_deliveries`: one job per `(alert_id, channel)` (UNIQUE) plus a
+  UNIQUE `idempotency_key`, with `attempts <= max_attempts` as a CHECK, the
+  rendered payload stored verbatim, the recipient snapshotted from
+  `users.email`, provider receipt columns, `failure_category`, `last_error`,
+  `next_attempt_at` and a `locked_at`/`locked_by` lease.
+- **Idempotent by construction** — a replayed generation request, a retried
+  HTTP call, a concurrent twin, a crashed worker and a second worker process all
+  collapse onto the one row (`ON CONFLICT DO NOTHING` +
+  `FOR UPDATE SKIP LOCKED` claiming + a stable per-job `Message-ID` so a
+  receiver can suppress a duplicate caused by a provider timeout).
+- **Worker** — `DeliveryWorker.runOnce()` (bounded batch): recover stale →
+  re-queue `unavailable` jobs whose provider is now configured → claim → send →
+  record. Exponential backoff with deterministic per-job jitter, a bounded
+  attempt budget, transient vs permanent vs timeout vs configuration
+  classification, dead-lettering on exhaustion, and lease-based crash recovery
+  (also run once at API boot).
+- **Invocation that fits the platform** — an in-process ticker
+  (`NOTIFICATION_WORKER_ENABLED`, default on, overlap-guarded, `unref`'d) AND a
+  token-protected `POST /api/internal/notifications/deliveries/run` for an
+  external scheduler (Render Cron Job). Both are safe to run at the same time;
+  nothing depends on a process that may be asleep.
+- **Provider abstraction** — `NotificationProvider` +
+  `NotificationProviderRegistry`; the only adapter in this milestone is
+  **email / SMTP** (`nodemailer`, no transitive dependencies), configured
+  entirely through `SMTP_*` / `NOTIFICATION_FROM`. Unconfigured ⇒ jobs are
+  recorded `unavailable`, never `delivered` — no fake success, no silent drop.
+- **Security** — internal worker routes return **404** when no
+  `NOTIFICATION_WORKER_TOKEN` is set, otherwise compare it in constant time
+  (SHA-256 + `timingSafeEqual`) and accept only `batchSize` / retention days
+  (ids, recipients, channels and payloads are 400s). Owner-scoped
+  `GET /api/alerts/:alertId/notifications` returns status/attempts/category
+  only — never a recipient, payload or provider error. Credentials stay
+  server-side, are absent from `describe()`/logs, and are redacted out of
+  stored provider errors.
+- **Observability + cleanup** — every attempt is recorded on the row
+  (attempt, status, provider, response code, failure category, redacted
+  error, timestamps); structured worker log lines carry ids and categories
+  only; `…/maintenance` recovers stale work, applies retention (delivered 30 d,
+  failed 120 d — never pending/processing/unavailable) and reports queue depth.
+- **Unchanged M6/M7.1/M7.2 behaviour** — `AlertSender`/`StubAlertSender`, the
+  `NonStubSenderError` guard, the stub ledger row, the generation gates, dedup,
+  acknowledgement idempotency, the generate response schema and the web copy
+  are all untouched; every pre-existing test still passes (two assertions in
+  `packages/core/test/m6-migrations.test.ts` were updated for the longer
+  migration chain: `expectedCount` 12 → 13, `latestApplied` → `0013`).
+- **Tests** — **690 passing** (contracts 73, core 229, provider 33, api 188,
+  web 167) vs 630 before the milestone (+5 contracts, +38 core, +17 api);
+  clean typecheck, lint and production build. New suites:
+  `packages/contracts/test/notifications.test.ts`,
+  `packages/core/test/notification-outbox.test.ts` (29 tests: enqueue
+  idempotency, transactional enqueue, SKIP LOCKED claiming, delivery,
+  backoff, budget exhaustion, permanent failure, timeout de-duplication, stale
+  recovery, concurrent workers, unavailable/re-queue, retention, rendering,
+  redaction), `packages/core/test/m7-notification-migrations.test.ts`
+  (9 schema tests) and `apps/api/test/notifications.test.ts` (17 HTTP tests:
+  one job per alert, replay, no in-request delivery, zero I/O, owner scoping,
+  token protection, run/maintenance endpoints, credential hygiene).
+
+## Explicitly NOT in M1+M2+M3+M4+M5+M6+M7 (by design, deferred)
 
 - A live **scanner** (detection stays explicitly invoked) and setup
   **realtime** updates.
 - **Realtime streaming / WebSockets**; session calendar and market-state
   feeds (provider honestly reports gaps).
-- **Real alert delivery** — email, webhook, push or Telegram. M6 records a
-  local stub ledger entry only ([alerts.md](./alerts.md#3-stub-delivery-ledger-zero-external-io));
-  a real channel needs an outbox + worker, provider credentials and its own
-  security review. **TradingView integration** is likewise not built.
+- **Channels other than email** (webhook, push, SMS/Telegram): M7.3 built the
+  outbox, the worker and the provider boundary they plug into, and shipped the
+  email adapter only. **TradingView integration** is likewise not built.
+- **User notification preferences** (per-channel opt-in, quiet hours,
+  per-strategy routing): deliberately not built in M7.3 — an alert goes to the
+  owner's account email.
 - **Automated trade execution** (M8) — alerts are suggestions, never orders.
 - **Billing / subscriptions** — the M1 `users.tier` column exists, but no
   billing logic acts on it.
@@ -392,12 +461,11 @@ delivery) was re-verified and already met the bar, so it is unchanged.
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M6 (later work, outline only)
+## After M7.3 (later work, outline only)
 
-1. **Real alert delivery** (channels + outbox/worker) with the security review
-   described in [alerts.md](./alerts.md#10-future-channelprovider-architecture).
-   The Phase 4 UI already labels delivery as stub-only, so enabling a real
-   channel is a backend change plus a copy change, not a UI rebuild.
+1. **More channels + preferences** — a second `NotificationProvider` (push /
+   webhook / SMS) behind the M7.3 registry, plus per-user notification
+   preferences and per-strategy routing.
 2. A **live scanner** on top of the M4 detection service (still explicitly
    owned by the user, never a hidden cron), then **M8 trade execution** and
    **billing** as their own milestones.

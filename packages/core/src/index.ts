@@ -110,6 +110,56 @@ export {
   type AlertSendResult,
 } from './alerts/sender.js';
 
+// Notification delivery pipeline (M7.3: outbox + worker + provider adapters)
+export {
+  NotificationOutbox,
+  toNotificationDto,
+  type Queryable,
+  type NotificationJobRow,
+  type EnqueueAlertNotificationArgs,
+  type EnqueueResult,
+  type AttemptResult,
+  type CleanupPolicy,
+  type OutboxDepth,
+} from './notifications/outbox.js';
+export {
+  NotificationProviderRegistry,
+  createNotificationProviderRegistry,
+  type NotificationProvider,
+  type NotificationOutcome,
+  type NotificationSendRequest,
+  type NotificationSendResult,
+  type RegisteredNotificationProviderInfo,
+} from './notifications/provider.js';
+export {
+  renderAlertNotification,
+  notificationPayloadHash,
+  notificationIdempotencyKey,
+  formatPrice as formatNotificationPrice,
+  NOTIFICATION_HASH_RE,
+  type RenderAlertNotificationArgs,
+} from './notifications/render.js';
+export {
+  DeliveryWorker,
+  backoffDelayMs,
+  DEFAULT_DELIVERY_RETRY_POLICY,
+  type DeliveryRetryPolicy,
+  type DeliveryWorkerLogger,
+  type DeliveryWorkerOptions,
+  type WorkerRunResult,
+  type WorkerMaintenanceResult,
+} from './notifications/worker.js';
+export {
+  createSmtpEmailProvider,
+  isSmtpConfigured,
+  classifySmtpError,
+  buildMessageId,
+  SMTP_PROVIDER_NAME,
+  type SmtpEmailConfig,
+  type SmtpEmailProvider,
+} from './notifications/email.js';
+export { redactSecrets, describeError, REDACTED, MAX_ERROR_CHARS } from './notifications/redact.js';
+
 // Scoring (foundation re-exports)
 export { qualityGrade, QUALITY_GRADE_BANDS } from '@veltrixeye/contracts';
 

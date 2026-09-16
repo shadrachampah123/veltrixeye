@@ -17,10 +17,12 @@
   "dependencies": {
     "@veltrixeye/contracts": "*",
     "argon2": "^0.41.1",
+    "nodemailer": "^9.1.1",
     "pg": "^8.13.1",
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@types/nodemailer": "^8.0.2",
     "@types/pg": "^8.11.10"
   }
 }

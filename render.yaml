@@ -44,6 +44,35 @@ services:
         value: '10'
       - key: LOG_LEVEL
         value: info
+      # --- M7.3 alert notification delivery ---
+      # Leave SMTP_HOST and NOTIFICATION_FROM empty to run WITHOUT email
+      # delivery: outbox jobs are still created and the worker records them
+      # "unavailable" (never "delivered"). Fill them in (plus SMTP_USER /
+      # SMTP_PASS) to switch delivery on — no code change, no redeploy of the
+      # web app. See docs/notification-delivery.md.
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: '587'
+      - key: SMTP_SECURE
+        value: auto
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: NOTIFICATION_FROM
+        sync: false
+      # Shared secret for POST /api/internal/notifications/deliveries/* so an
+      # external scheduler can drain the outbox while the instance is asleep.
+      # Empty = those routes return 404 (no administrative surface).
+      - key: NOTIFICATION_WORKER_TOKEN
+        sync: false
+      - key: NOTIFICATION_WORKER_ENABLED
+        value: 'true'
+      - key: NOTIFICATION_WORKER_INTERVAL_MS
+        value: '60000'
+      - key: NOTIFICATION_WORKER_BATCH_SIZE
+        value: '25'
     # Only rebuild the API when something it actually ships changed; the web
     # app deploys independently on Vercel.
     buildFilter:
