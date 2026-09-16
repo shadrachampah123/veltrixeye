@@ -41,6 +41,7 @@ import type {
   SetupScoreResponseDto,
   SetupTransitionRequest,
   SetupTransitionResponseDto,
+  BillingStateDto,
 } from '@veltrixeye/contracts';
 import {
   MAX_ALERTS_LIMIT,
@@ -202,6 +203,7 @@ export const api = {
   login: (input: LoginInput) => request<{ user: UserDto }>('/auth/login', { method: 'POST', body: JSON.stringify(input) }),
   logout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
   me: () => request<{ user: UserDto; sessions: SessionDto[] }>('/users/me'),
+  getBillingState: () => request<BillingStateDto>('/billing/me'),
 
   // profile
   updateProfile: (input: UpdateProfileInput) =>

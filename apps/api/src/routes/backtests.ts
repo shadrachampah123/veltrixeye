@@ -12,7 +12,7 @@ import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
 import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js';
-import { Errors } from '@veltrixeye/core';
+import { Errors, getBillingState } from '@veltrixeye/core';
 
 /**
  * Backtest API routes (M6 Phase 2).
@@ -68,6 +68,14 @@ export async function backtestRoutes(app: FastifyInstance, ctx: AppContext, conf
         return;
       }
       const data = parsed.data;
+      
+      const billingState = await getBillingState(ctx.pool, user.id);
+      const currentMonthCount = await ctx.backtests.countBacktestsThisMonth(user.id);
+      
+      if (currentMonthCount >= billingState.entitlements.maxBacktestsPerMonth) {
+        throw Errors.forbidden(`Backtest limit reached. Your plan allows up to ${billingState.entitlements.maxBacktestsPerMonth} backtests per month.`);
+      }
+      
       try {
         const result = await ctx.backtests.createBacktest({
           userId: user.id,

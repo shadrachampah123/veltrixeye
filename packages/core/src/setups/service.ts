@@ -17,6 +17,8 @@ import type { EvaluationService } from '../strategies/evaluation/service.js';
 import type { CandleStore } from '../market-data/candles.js';
 import { assertTransition } from './machine.js';
 import { detectionLevels } from './levels.js';
+import { getEntitlements } from '../billing/entitlements.js';
+import type { UserPlan } from '@veltrixeye/contracts';
 
 /**
  * Setup detection + lifecycle service (M4).
@@ -126,6 +128,14 @@ export class SetupService {
   }
 
   /** List the acting user's setups (newest first), with optional filters. */
+  async countSetups(userId: string): Promise<number> {
+    const res = await this.pool.query(
+      'SELECT count(*)::int AS c FROM strategy_setups WHERE user_id = $1',
+      [userId]
+    );
+    return res.rows[0].c;
+  }
+
   async listSetups(args: { userId: string } & SetupListQuery): Promise<{ setups: SetupDto[] }> {
     const values: unknown[] = [args.userId];
     const where = ['st.user_id = $1'];
@@ -263,6 +273,25 @@ export class SetupService {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+
+      // M7.4 Atomic entitlement enforcement
+      const entitlementRes = await client.query(`
+        SELECT plan, status FROM subscriptions WHERE user_id = $1 FOR UPDATE
+      `, [args.userId]);
+      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active' };
+      const entitlements = getEntitlements(subRow.plan as UserPlan, subRow.status);
+      const maxSetups = entitlements.maxSavedSetups;
+      
+      const countRes = await client.query(`
+        SELECT count(*)::int AS c FROM setups st
+        JOIN strategy_versions v ON st.strategy_version_id = v.id
+        JOIN strategies s ON v.strategy_id = s.id
+        WHERE s.user_id = $1
+      `, [args.userId]);
+      if (countRes.rows[0].c >= maxSetups) {
+        throw Errors.forbidden(`Saved setups limit reached. Your plan allows up to ${maxSetups} saved setups.`);
+      }
+
       const inserted = await client.query<SetupRow>(
         `INSERT INTO setups (strategy_version_id, instrument_id, state, direction, detected_at, as_of_ms,
                              entry_price, stop_loss_price, tp1_price, tp2_price, tp3_price, metadata)

@@ -8,7 +8,7 @@ import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
 import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js';
-import { Errors } from '@veltrixeye/core';
+import { Errors, getBillingState } from '@veltrixeye/core';
 
 /**
  * Alert API routes (M6 Phases 2–3).

@@ -6,6 +6,7 @@
 export const ERROR_CODES = {
   INVALID_INPUT: 'invalid_input',
   UNAUTHORIZED: 'unauthorized',
+  FORBIDDEN: 'forbidden',
   NOT_FOUND: 'not_found',
   CONFLICT: 'conflict',
   IMMUTABLE: 'immutable',

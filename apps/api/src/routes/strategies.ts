@@ -29,7 +29,7 @@ import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
 import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js';
-import { Errors, type StrategyAuditMeta } from '@veltrixeye/core';
+import { Errors, type StrategyAuditMeta, getBillingState } from '@veltrixeye/core';
 import type { FastifyRequest } from 'fastify';
 
 export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, config: AppConfig): Promise<void> {
@@ -94,6 +94,7 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
       return;
     }
     const { user } = req as AuthenticatedRequest;
+    
     const strategy = await ctx.strategies.createStrategy(user.id, parsed.data, auditMeta(req));
     return reply.code(201).send({ strategy });
   });
@@ -267,6 +268,7 @@ export async function strategyRoutes(app: FastifyInstance, ctx: AppContext, conf
         sendZodError(reply, parsed.error, 'body');
         return;
       }
+      
       const result = await ctx.setups.detect({
         userId: user.id,
         strategyId,
