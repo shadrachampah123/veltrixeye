@@ -27,9 +27,18 @@ import {
   createSmtpEmailProvider,
   NotificationOutbox,
   DeliveryWorker,
+  // M8.1 execution architecture (safety boundary only — no provider can trade)
+  createExecutionProviderRegistry,
+  createPaperExecutionProvider,
+  KillSwitchService,
+  ExecutionProfileService,
+  AutomationService,
+  ExecutionIntakeService,
+  ExecutionQueryService,
   type ProviderRegistry,
   type NotificationProviderRegistry,
   type DeliveryRetryPolicy,
+  type ExecutionProviderRegistry,
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
 import { authRoutes } from './routes/auth.js';
@@ -42,6 +51,7 @@ import { alertRoutes } from './routes/alerts.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { billingRoutes } from './routes/billing.js';
 import { scannerRoutes } from './routes/scanner.js';
+import { executionRoutes } from './routes/execution.js';
 
 export interface AppContext {
   pool: pg.Pool;
@@ -66,6 +76,19 @@ export interface AppContext {
   deliveryWorker: DeliveryWorker;
   /** M7.3: the retry/lease policy derived from the environment. */
   deliveryPolicy: DeliveryRetryPolicy;
+  /**
+   * M8.1: execution architecture bundle. Safety boundary only — the single
+   * registered provider (paper) reports not-ready and refuses every trading
+   * operation, and no route exposes order submission.
+   */
+  execution: {
+    providers: ExecutionProviderRegistry;
+    killSwitches: KillSwitchService;
+    profiles: ExecutionProfileService;
+    automation: AutomationService;
+    intake: ExecutionIntakeService;
+    queries: ExecutionQueryService;
+  };
 }
 
 export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
@@ -101,6 +124,35 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   const backtests = new BacktestService(pool, strategies, candles);
   const alerts = new AlertService(pool, strategies, new StubAlertSender(), notifications);
   const scoring = new ScoringService(pool, strategies, evaluation);
+
+  // M8.1 — execution architecture (safety boundary only). Exactly one
+  // provider registers (paper), it reports not-ready, and every trading
+  // operation on it throws: no broker connectivity exists anywhere.
+  const executionProviders = createExecutionProviderRegistry();
+  executionProviders.register(createPaperExecutionProvider());
+  const killSwitches = new KillSwitchService(pool);
+  const automation = new AutomationService(pool, killSwitches, audit);
+  const execution = {
+    providers: executionProviders,
+    killSwitches,
+    profiles: new ExecutionProfileService(pool, executionProviders, audit),
+    automation,
+    intake: new ExecutionIntakeService(
+      pool,
+      { automation, killSwitches, providers: executionProviders, audit },
+      {
+        logger: {
+          info: (msg, meta) => {
+            if (config.NODE_ENV === 'production') {
+              console.info(`[execution] ${msg}`, meta ? JSON.stringify(meta) : '');
+            }
+          },
+          warn: (msg, meta) => console.warn(`[execution] ${msg}`, meta ? JSON.stringify(meta) : ''),
+        },
+      },
+    ),
+    queries: new ExecutionQueryService(pool),
+  };
 
   // M7.5 — live scanner (production market-data and scanner pipeline)
   const scanner = new ScannerService(pool, providerRegistry, candles, ingestion, evaluation, setups, scoring, alerts, {
@@ -144,6 +196,8 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     notifications,
     deliveryWorker,
     deliveryPolicy: config.notification.retry,
+    // M8.1: execution architecture (safety boundary; no provider can trade)
+    execution,
   };
 }
 
@@ -276,6 +330,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await notificationRoutes(app, ctx, config);
   await billingRoutes(app, ctx, config);
   await scannerRoutes(app, ctx, config);
+  await executionRoutes(app, ctx, config);
 
   return app;
 }
