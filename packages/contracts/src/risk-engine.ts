@@ -234,6 +234,13 @@ export const riskPolicyDtoSchema = z
     correlationRequired: z.boolean(),
     maxCorrelationGroupExposurePct: z.number(),
     paperEquity: z.number(),
+    /**
+     * M8.6 — automatic circuit breaker (read-only for users): a daily/weekly/
+     * consecutive-loss rejection additionally TRIPS the user kill switch.
+     * Platform-controlled (DB default true); the user update schema never
+     * exposes it, so a subscription or API call cannot disarm a safety control.
+     */
+    circuitBreakerEnabled: z.boolean(),
     createdAt: z.string(),
     updatedAt: z.string(),
   })

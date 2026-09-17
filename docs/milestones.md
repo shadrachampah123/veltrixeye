@@ -1,7 +1,8 @@
 # Milestone Boundaries
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
-M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2 and M8.3**. The boundaries below
+M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2, M8.3, M8.4, M8.5
+and M8.6**. The boundaries below
 are deliberate and enforced: M1 shipped foundations and contracts; M2 added real historical
 market data; M3 added deterministic strategy evaluation; M4 added
 deterministic setup detection and lifecycle management; M5 added
@@ -567,10 +568,11 @@ reconciliation. Full design: [execution.md](./execution.md).
 - **Operational broker/demo connectivity** — M8.4 provides the MT5 provider
   and disabled transport boundary only. A validated bridge and approved
   external secret-management integration remain future work.
-- **Live reconciliation against a broker (M8.5)** — M8.3 ships only the
-  foundation (expected-vs-actual comparison, finding codes, fail-closed
-  reporting); scheduled reconciliation jobs, drift repair and broker-side
-  state import are M8.5.
+- **Live reconciliation against a broker** — M8.5 delivered the
+  provider-neutral machinery (runs, findings, snapshots, local resolution,
+  uncertain-outcome preservation) against the providers that exist (paper);
+  *broker-side* import and repair still await an operational transport, and
+  **destructive corrective actions remain gated OFF by design**.
 - **Billing integration** — M7.4 built the subscription/entitlement
   foundation; no payment provider, checkout, portal or webhooks exist yet.
 - **AI** in the signal path — evaluation is deterministic rules; AI is
@@ -582,24 +584,14 @@ reconciliation. Full design: [execution.md](./execution.md).
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M8.4 (later work, outline only)
+## After M8.4 (historical outline)
 
-1. **More channels + preferences** — a second `NotificationProvider` (push /
-   webhook / SMS) behind the M7.3 registry, plus per-user notification
-   preferences and per-strategy routing.
-2. **Operational broker transport** — validate a concrete MT5 bridge and an
-   approved external secret manager on demo infrastructure. M8.4 deliberately
-   ships neither and makes no connectivity claim.
-3. **M8.5 — full reconciliation** — scheduled reconciliation jobs against
-   the broker, drift detection and repair policy, and broker-state import on
-   top of the M8.3 foundation.
-4. **Billing** (provider, webhooks, checkout/portal) lands alongside or
-   after.
-
-Each of these is its own milestone. The M3 engine, M4 detector, M5 scoring
-engine, result DTOs, store, and provider abstraction are specifically
-shaped so each is additive — no rewrite of the schema, contracts, or UI is
-required.
+M8.4 once closed the section with this outline: reconciliation (M8.5), safety
+controls (M8.6), then channels/billing. Both M8 milestones were delivered as
+described below; the superseded forward-looking list now lives in
+[After M8.6](#after-m86-later-work-outline-only). Each milestone is additive —
+no rewrite of the schema, contracts, or UI — and M8.6 continues that property:
+safety controls were added alongside the existing gates, never inside them.
 
 ## M8.4 — delivered (Broker / MT5 Integration Boundary)
 
@@ -630,3 +622,99 @@ an example MT5 broker/server, not a separate engine.
 **M8.4 does not enable live trading.** M8.5 adds full reconciliation, M8.6
 strengthens kill-switch/safety controls, and M8.7 is the earliest milestone
 that may consider controlled live automation after all validation is complete.
+
+## M8.5 — delivered (Order & Position Reconciliation)
+
+Provider-neutral reconciliation of platform execution state against an
+execution provider's actual order/position state. Full surface:
+`packages/contracts/src/reconciliation.ts`,
+`packages/core/src/execution/reconciliation*.ts`,
+`/api/execution/reconciliation/*` and the Trading-page panel.
+
+- Runs are **idempotent and concurrency-safe** (per-user/profile advisory
+  locks), carry the pinned `m8.5-reconciliation-1` version and a persisted
+  expected-vs-provider snapshot; matching is by **stable identifiers only** —
+  never a guess, and ambiguous matches become findings instead of merges.
+- Classifies mismatches with stable machine-readable codes (missing-order/
+  position either way, status, quantity, direction, price, stale state,
+  uncertain outcome, provider unavailable, tenant mismatch) and surfaces
+  `synchronized` / `mismatch_detected` / `uncertain` / `provider_unavailable`
+  / `manual_resolution_required` summaries.
+- **Fail-closed recovery policy:** uncertain broker outcomes are never
+  auto-rejected or blind-retried; M8.4's durable `execution_provider_intents`
+  are reconciled, not discarded. Composition dispatches the owner-scoped paper
+  snapshot provider for paper profiles; the disabled MT5 transport honestly
+  reports `provider_unavailable`.
+- Findings support **local resolution bookkeeping only** (`acknowledge` /
+  `mark_resolved` / `ignore` with an audit note). Destructive correction —
+  cancel/resubmit/close at the provider — is explicitly gated OFF.
+- Migration `0020_order_position_reconciliation.sql` (additive):
+  `reconciliation_runs`, `reconciliation_findings`, `reconciliation_snapshots`
+  with tenant FKs, CHECK-enumerated statuses/codes, and indexes. **No
+  credentials, no live path; automation stays OFF.**
+
+## M8.6 — delivered (Kill-Switch & Safety Controls)
+
+Strengthens the emergency-stop machinery M8.1 introduced into a full,
+user-operable safety-control surface. Design: [execution.md](./execution.md)
+§ “Safety controls (M8.6)”.
+
+- **Provenance + history:** `kill_switches` records `source`
+  (`operator | user | circuit_breaker`), the acting user and the activation
+  moment; a new **append-only `kill_switch_events` ledger** records every
+  change attempt — including redundant calls (`changed = false`) — with
+  scope, target, resolved owner, actor, reason and source. A trigger stamps
+  missing activation times, so even raw operator SQL keeps history honest.
+- **User-facing kill-switch API:** arm/clear the account, any owned strategy,
+  or any owned execution-profile switch with a REQUIRED reason
+  (`/api/execution/safety/kill-switch/activate|clear`), an owner-scoped
+  status read model, and switch history. Stopping never requires an
+  entitlement; cross-tenant targets are masked 404s. The **global scope is
+  never user-mutable** — service and schema both refuse it.
+- **Deployment-level global switch:** `EXECUTION_GLOBAL_KILL_SWITCH=true`
+  pins the platform-wide stop ON regardless of database state — every account
+  fails gate 6 (automation) and the paper `kill_switch` gate, status/automation
+  read models name the environment as the reason, and no API can clear the
+  pin. It can only stop; it grants nothing.
+- **Emergency stop:** one atomic call (advisory-locked) arms the user switch,
+  forces `automation_enabled` OFF (the safe direction — always allowed) and
+  disables every execution profile; mirrored into `audit_events` (ip
+  attribution) and `execution_events`. Position exits and other
+  risk-reducing actions deliberately remain available — a stop must never
+  strand exposure.
+- **Automatic loss-limit circuit breaker:** when the M8.2 risk engine rejects
+  on a daily/weekly/consecutive-loss breach, the user kill switch is TRIPPED
+  durably (source `circuit_breaker`) instead of the refusal being
+  per-decision-only; explicit, reason-carrying clearing is required and the
+  trip is idempotent (no reason overwrite, no event spam). The trip can never
+  crash the risk call, and the breaker cannot be disarmed by user policy
+  input (`risk_policies.circuit_breaker_enabled` is platform-owned).
+- **Automation asymmetry hardened:** turning automation OFF is a safety
+  control and is always allowed; turning it ON additionally refuses (409)
+  while any kill switch is armed — the switch outranks any plan claim, and
+  the entitlement guarantee (`canAccessAutomation: false` on every plan) is
+  untouched.
+- Migration `0021_safety_controls.sql` (additive; no prior constraint
+  altered). Trading-page panel with arm/clear + confirmed EMERGENCY STOP +
+  append-only history; UI can only ever add stops.
+- **M8.6 changes no execution capability**: live execution remains impossible
+  (0016 CHECK intact), no broker connectivity, no credentials, alerts remain
+  suggestions.
+
+## After M8.6 (later work, outline only)
+
+1. **More channels + preferences** — a second `NotificationProvider` (push /
+   webhook / SMS) behind the M7.3 registry, plus per-user notification
+   preferences and per-strategy routing.
+2. **Operational broker transport** — validate a concrete MT5 bridge and an
+   approved external secret manager on demo infrastructure. M8.4 deliberately
+   ships neither and makes no connectivity claim. M8.5/M8.6 prepare
+   reconciliation and safety plumbing for it; the transport itself is
+   gated on external validation.
+3. **M8.7 — controlled live automation (maybe)** — only after transport
+   validation, secret management, broker/account authorization and
+   operational review are ALL complete. Until then `canAccessAutomation`
+   remains false for every plan, and the M8.6 brakes (kill switches,
+   circuit breakers, environment pin) apply to every path that exists.
+4. **Billing** (provider, webhooks, checkout/portal) lands alongside or
+   after.

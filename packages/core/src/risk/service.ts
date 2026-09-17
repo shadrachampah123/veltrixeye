@@ -4,6 +4,7 @@ import {
   PLATFORM_RISK_CEILINGS,
   RISK_ENGINE_VERSION,
   RISK_RESERVATION_TTL_MS,
+  isCircuitBreakerCode,
   platformCeilingsDto,
   riskSessionWindowSchema,
   type ExecutionDecisionInput,
@@ -289,6 +290,50 @@ export class RiskEngineService {
       }
 
       await client.query('COMMIT');
+      // M8.6 — automatic circuit breaker. A loss-limit rejection is more than
+      // "not this trade": it DURABLY trips the user's kill switch (until an
+      // explicit, audited clear). The trip runs OUTSIDE the decision
+      // transaction so a ledger hiccup can never corrupt or block the
+      // persisted verdict; and because rejections repeat while the breach
+      // holds, an idempotent trip is guaranteed to land on the next decision
+      // (eventual, never silent). It can never GRANT anything — worst case is
+      // one extra refused decision.
+      if (
+        verdict.outcome === 'rejected'
+        && policy.circuitBreakerEnabled
+        && verdict.violations.some((v) => isCircuitBreakerCode(v))
+      ) {
+        const code = verdict.violations.find((v) => isCircuitBreakerCode(v)) ?? 'LOSS_LIMIT';
+        try {
+          const trip = await this.deps.killSwitches.tripCircuitBreaker(
+            args.userId,
+            `Risk circuit breaker: ${code} limit reached — trading is stopped until this switch is cleared`,
+          );
+          if (trip.changed) {
+            this.logger.warn('risk circuit breaker tripped', {
+              userId: args.userId,
+              code,
+              decisionId: persisted.id,
+              engineVersion: RISK_ENGINE_VERSION,
+            });
+            await this.deps.audit.log({
+              userId: args.userId,
+              action: 'safety.circuit_breaker_tripped',
+              entityType: 'kill_switch',
+              entityId: args.userId,
+              metadata: { code, riskDecisionId: persisted.id, scope: 'user' },
+            });
+          }
+        } catch (err) {
+          // Fail-CLOSED bias: a failed trip never crashes the risk call, and
+          // the rejection itself already refused the trade. Loud + auditable.
+          this.logger.warn('risk circuit breaker trip failed', {
+            userId: args.userId,
+            code,
+            error: (err as Error)?.message ?? 'unknown',
+          });
+        }
+      }
       this.recordMetrics(verdict);
       this.logger.info(verdict.outcome === 'approved' ? 'risk approved' : 'risk rejected', {
         decisionId: persisted.id,
@@ -824,6 +869,7 @@ interface PolicyRow {
   correlation_required: boolean;
   max_correlation_group_exposure_pct: string;
   paper_equity: string;
+  circuit_breaker_enabled: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -878,6 +924,8 @@ function policyFromRow(row: PolicyRow): RiskPolicyDto {
     correlationRequired: row.correlation_required,
     maxCorrelationGroupExposurePct: Number(row.max_correlation_group_exposure_pct),
     paperEquity: Number(row.paper_equity),
+    // M8.6 — platform-controlled; absent column (pre-0021 row cache) reads ON.
+    circuitBreakerEnabled: row.circuit_breaker_enabled !== false,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
   };

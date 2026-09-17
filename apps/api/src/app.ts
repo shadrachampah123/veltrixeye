@@ -35,6 +35,7 @@ import {
   PaperExecutionService,
   CandleStoreMarketPriceSource,
   KillSwitchService,
+  SafetyControlsService,
   ExecutionProfileService,
   AutomationService,
   ExecutionIntakeService,
@@ -59,7 +60,12 @@ import { alertRoutes } from './routes/alerts.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { billingRoutes } from './routes/billing.js';
 import { scannerRoutes } from './routes/scanner.js';
-import { executionRoutes, paperExecutionRoutes, reconciliationRoutes } from './routes/execution.js';
+import {
+  executionRoutes,
+  paperExecutionRoutes,
+  reconciliationRoutes,
+  safetyRoutes,
+} from './routes/execution.js';
 import { riskRoutes } from './routes/risk.js';
 
 export interface AppContext {
@@ -109,6 +115,13 @@ export interface AppContext {
      * OFF; mismatches produce findings for manual resolution.
      */
     reconciliation: ReconciliationService;
+    /**
+     * M8.6: safety controls — kill-switch status/history for every scope the
+     * account owns, the emergency stop (arm switch + automation OFF + profiles
+     * disabled, one transaction), and the loss-limit circuit-breaker wiring.
+     * Stopping is always allowed; nothing here can arm execution.
+     */
+    safety: SafetyControlsService;
   };
 }
 
@@ -151,7 +164,11 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   // there is no broker connectivity anywhere, and the provider refuses every
   // order that does not carry a server-issued authorization.
   const executionProviders = createExecutionProviderRegistry();
-  const killSwitches = new KillSwitchService(pool);
+  // M8.6: the deployment-level global kill switch (EXECUTION_GLOBAL_KILL_SWITCH)
+  // pins the platform stop ON regardless of DB state; no API can clear it.
+  const killSwitches = new KillSwitchService(pool, {
+    globalForced: config.EXECUTION_GLOBAL_KILL_SWITCH,
+  });
   const automation = new AutomationService(pool, killSwitches, audit);
   const risk = new RiskEngineService(
     pool,
@@ -231,6 +248,7 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
         },
       },
     )),
+    safety: new SafetyControlsService(pool, { killSwitches, automation, audit }),
     reconciliation: new ReconciliationService(
       pool,
       {
@@ -433,6 +451,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await executionRoutes(app, ctx, config);
   await paperExecutionRoutes(app, ctx, config);
   await reconciliationRoutes(app, ctx, config);
+  await safetyRoutes(app, ctx, config);
   await riskRoutes(app, ctx, config);
 
   return app;

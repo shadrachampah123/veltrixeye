@@ -71,6 +71,13 @@ import type {
   ReconciliationRunDto,
   ReconciliationStatusDto,
   ReconciliationTriggerResponse,
+  // M8.6 — kill-switch & safety controls
+  KillSwitchStatusDto,
+  KillSwitchEventDto,
+  KillSwitchMutationResultDto,
+  EmergencyStopResultDto,
+  KillSwitchActivateInput,
+  KillSwitchClearInput,
 } from '@veltrixeye/contracts';
 import {
   MAX_ALERTS_LIMIT,
@@ -621,6 +628,43 @@ export const api = {
       `/execution/reconciliation/findings/${encodeURIComponent(findingId)}/resolve`,
       { method: 'POST', body: JSON.stringify(input) },
     ),
+
+  // -------------------------------------------------------------------------
+  // M8.6 — kill-switch & safety controls.
+  // These calls can ONLY make the platform more stopped: arm/disarm your own
+  // switches and emergency-stop. No live-trading control, no resume
+  // shortcut, no global mutation.
+  // -------------------------------------------------------------------------
+
+  /** GET /api/execution/safety — owner-scoped switch status. */
+  getSafetyStatus: () => request<KillSwitchStatusDto>('/execution/safety'),
+
+  /** GET /api/execution/safety/events — append-only switch history. */
+  listSafetyEvents: (params: { limit?: number } = {}) =>
+    request<{ events: KillSwitchEventDto[] }>(
+      `/execution/safety/events${toQueryString({ limit: params.limit })}`,
+    ),
+
+  /** POST /api/execution/safety/kill-switch/activate — arm a switch (reason required). */
+  activateSafetyKillSwitch: (input: KillSwitchActivateInput) =>
+    request<KillSwitchMutationResultDto>('/execution/safety/kill-switch/activate', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  /** POST /api/execution/safety/kill-switch/clear — disarm a switch you own. */
+  clearSafetyKillSwitch: (input: KillSwitchClearInput) =>
+    request<KillSwitchMutationResultDto>('/execution/safety/kill-switch/clear', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  /** POST /api/execution/safety/emergency-stop — panic button (always available). */
+  emergencyStop: (reason?: string) =>
+    request<EmergencyStopResultDto>('/execution/safety/emergency-stop', {
+      method: 'POST',
+      body: JSON.stringify(reason ? { reason } : {}),
+    }),
 };
 
 /** Summary row shape from the API list endpoint. */

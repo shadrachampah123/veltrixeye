@@ -32,7 +32,13 @@ export {
   type MT5OrderSnapshot,
   type MT5PositionSnapshot,
 } from './mt5.js';
-export { KillSwitchService } from './kill-switch.js';
+export {
+  KillSwitchService,
+  type KillSwitchRow,
+  type KillSwitchState,
+} from './kill-switch.js';
+/* M8.6 — safety controls (emergency stop, provenance, circuit-breaker wiring) */
+export { SafetyControlsService } from './safety.js';
 export { ExecutionProfileService, toProfileDto, type ExecutionProfileRow } from './profiles.js';
 export { AutomationService, type AutomationStatus } from './automation.js';
 export { evaluateExecutionGates, type ExecutionGateInput, type ExecutionGateResult } from './gates.js';

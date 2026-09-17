@@ -139,6 +139,17 @@ Computed from `risk_account_states` (server-owned):
 Windows roll inside the locked transaction. There is no HTTP path to
 write P&L; `recordRealizedPl` exists for tests and a future executor.
 
+**M8.6 — durable circuit breaker.** When a persisted rejection carries
+`DAILY_LOSS_LIMIT`, `WEEKLY_LOSS_LIMIT` or `CONSECUTIVE_LOSS_LIMIT` and the
+platform-owned `risk_policies.circuit_breaker_enabled` is set, the account's
+M8.1 kill switch is TRIPPED (source `circuit_breaker`) through the same
+audited path as a manual stop. A breach no longer merely refuses one decision
+— it stops the account until a user explicitly clears the switch with a
+reason. The breaker trips idempotently (an already-armed switch is never
+re-overwritten) and its internal write runs after the decision commits so a
+breaker fault can never crash or alter a risk verdict. See
+[execution.md § Safety controls (M8.6)](./execution.md#safety-controls-m86).
+
 ## Exposure controls
 
 Against open `execution_positions` **plus** in-flight
@@ -185,7 +196,11 @@ hours. Invalid / non-positive evaluation clocks fail closed
 
 The engine independently rejects (`KILL_SWITCH_ACTIVE`) when any
 applicable M8.1 kill switch is active. The execution gate still checks
-kill switches as well. Neither path can be silently bypassed.
+kill switches as well. Neither path can be silently bypassed. From M8.6 the
+switch is also a user-operable control (`/api/execution/safety/*`) and is the
+target of the loss-limit circuit breaker above; `KILL_SWITCH_ACTIVE` is
+deliberately NOT itself a breaker code (the breaker must not loop on its own
+refusals).
 
 ## Concurrency
 

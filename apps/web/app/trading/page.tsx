@@ -7,6 +7,7 @@ import { api, ApiError } from '@/lib/api';
 import { Card, CardHeader, Badge, Spinner, Button } from '@/components/ui';
 import { RiskPolicyPanel } from '@/components/risk-policy-panel';
 import { PaperExecutionPanel } from '@/components/paper-execution-panel';
+import { SafetyPanel } from '@/components/safety-panel';
 import type {
   ExecutionStatusDto,
   ExecutionProfileDto,
@@ -19,6 +20,8 @@ import type {
   ReconciliationRunDto,
   ReconciliationStatusDto,
   RiskPolicyStatusDto,
+  KillSwitchStatusDto,
+  KillSwitchEventDto,
 } from '@veltrixeye/contracts';
 
 /**
@@ -32,7 +35,13 @@ import type {
  *  - lists the caller's execution profiles (paper only);
  *  - M8.3 adds the paper-execution panel: simulate a server-issued decision,
  *    see simulated orders/positions/fills, entry/exit prices, open and closed
- *    simulated P&L and the reconciliation trail.
+ *    simulated P&L and the reconciliation trail;
+ *  - M8.6 replaces the static safety readout with the interactive Safety
+ *    controls panel: arm/clear kill switches (user/strategy/profile), see the
+ *    automatic loss-limit circuit breaker, and the EMERGENCY STOP (arm switch
+ *    + automation OFF + profiles disabled in one call). Stopping is always
+ *    allowed; nothing in this panel can arm execution or touch the platform-
+ *    wide global switch.
  *
  * Intentionally NOT here (per the M8.1/M8.2/M8.3 boundary): no "Enable Live
  * Trading" button, no broker credential forms, no live/demo-account
@@ -59,11 +68,23 @@ function TradingContent() {
   const [reconBusy, setReconBusy] = React.useState(false);
   const [reconError, setReconError] = React.useState<string | null>(null);
   const [reconNotice, setReconNotice] = React.useState<string | null>(null);
+  // M8.6 — safety controls (kill switches + emergency stop)
+  const [safety, setSafety] = React.useState<KillSwitchStatusDto | null>(null);
+  const [safetyEvents, setSafetyEvents] = React.useState<KillSwitchEventDto[]>([]);
+  const [safetyBusy, setSafetyBusy] = React.useState(false);
+  const [safetyError, setSafetyError] = React.useState<string | null>(null);
+  const [safetyNotice, setSafetyNotice] = React.useState<string | null>(null);
   const [paperSetupId, setPaperSetupId] = React.useState('');
   const [paperProfileId, setPaperProfileId] = React.useState('');
   const [paperBusy, setPaperBusy] = React.useState(false);
   const [paperError, setPaperError] = React.useState<string | null>(null);
   const [paperNotice, setPaperNotice] = React.useState<string | null>(null);
+
+  const loadSafety = React.useCallback(async () => {
+    const [st, ev] = await Promise.all([api.getSafetyStatus(), api.listSafetyEvents({ limit: 25 })]);
+    setSafety(st);
+    setSafetyEvents(ev.events);
+  }, []);
 
   const loadReconciliation = React.useCallback(async () => {
     const [rs, rr, rf] = await Promise.all([
@@ -115,6 +136,11 @@ function TradingContent() {
         } catch {
           // Surface still renders without reconciliation data.
         }
+        try {
+          await loadSafety();
+        } catch {
+          // Safety panel renders with defaults when the status call fails.
+        }
       } catch (e: any) {
         if (!cancelled) setError(e?.message ?? 'Failed to load execution status');
       } finally {
@@ -153,6 +179,9 @@ function TradingContent() {
       setPaperError(e instanceof ApiError ? e.message : 'Paper simulation failed');
     } finally {
       setPaperBusy(false);
+      // M8.6: a loss-limit rejection may have tripped the circuit breaker —
+      // refresh the authoritative safety picture after every paper action.
+      void loadSafety().catch(() => undefined);
     }
   };
 
@@ -176,6 +205,39 @@ function TradingContent() {
     runPaper(
       () => api.closePaperPosition(positionId),
       'Simulated position closed at the server price.',
+    );
+
+  const runSafety = async (action: () => Promise<unknown>, notice: string, errorText: string) => {
+    setSafetyBusy(true);
+    setSafetyError(null);
+    setSafetyNotice(null);
+    try {
+      await action();
+      await loadSafety();
+      // Automation status badges live in `status` — refresh them too.
+      const [s] = await Promise.all([api.getExecutionStatus()]);
+      setStatus(s);
+      setSafetyNotice(notice);
+    } catch (e) {
+      setSafetyError(e instanceof ApiError ? e.message : errorText);
+      // Surface whatever authoritative state the server still reports.
+      await loadSafety().catch(() => undefined);
+    } finally {
+      setSafetyBusy(false);
+    }
+  };
+
+  const activateSwitch = (input: { scope: 'user' | 'strategy' | 'execution_profile'; targetId?: string; reason: string }) =>
+    runSafety(() => api.activateSafetyKillSwitch(input), 'Kill switch armed — new execution is refused.', 'Failed to arm the kill switch');
+
+  const clearSwitch = (input: { scope: 'user' | 'strategy' | 'execution_profile'; targetId?: string; reason: string }) =>
+    runSafety(() => api.clearSafetyKillSwitch(input), 'Kill switch cleared with an audited reason.', 'Failed to clear the kill switch');
+
+  const emergencyStop = (reason: string) =>
+    runSafety(
+      () => api.emergencyStop(reason),
+      'Emergency stop applied: switch armed, automation OFF, profiles disabled. Position exits remain available.',
+      'Emergency stop failed',
     );
 
   const runReconcile = async (profileId: string) => {
@@ -253,31 +315,18 @@ function TradingContent() {
             </div>
           </Card>
 
-          {/* Safety state */}
-          <Card>
-            <CardHeader
-              title="Safety"
-              subtitle="Emergency stop state — an active switch refuses all new execution"
-            />
-            <div className="space-y-3 px-5 pb-5 text-sm">
-              <div className="flex items-center justify-between">
-                <span className="text-ink-300">Global kill switch</span>
-                <Badge tone={status?.automation.globalKillSwitch ? 'danger' : 'success'}>
-                  {status?.automation.globalKillSwitch ? 'ACTIVE' : 'clear'}
-                </Badge>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-ink-300">Account kill switch</span>
-                <Badge tone={status?.automation.userKillSwitch ? 'danger' : 'success'}>
-                  {status?.automation.userKillSwitch ? 'ACTIVE' : 'clear'}
-                </Badge>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-ink-300">Execution readiness</span>
-                <Badge tone="neutral">not active (foundation milestone)</Badge>
-              </div>
-            </div>
-          </Card>
+          {/* M8.6 — Safety controls: kill switches, circuit breakers, emergency stop */}
+          <SafetyPanel
+            status={safety}
+            events={safetyEvents}
+            busy={safetyBusy}
+            error={safetyError}
+            notice={safetyNotice}
+            onActivate={activateSwitch}
+            onClear={clearSwitch}
+            onEmergencyStop={emergencyStop}
+            onRefresh={loadSafety}
+          />
 
           {/* Providers */}
           <Card>

@@ -10,6 +10,10 @@ import {
   reconciliationListQuerySchema,
   reconciliationRunTriggerSchema,
   reconciliationFindingResolveSchema,
+  killSwitchActivateSchema,
+  killSwitchClearSchema,
+  killSwitchEventListQuerySchema,
+  emergencyStopSchema,
   EXECUTION_ARCHITECTURE_VERSION,
   RISK_ENGINE_VERSION,
   type ExecutionStatusDto,
@@ -499,6 +503,106 @@ export async function reconciliationRoutes(
         return;
       }
       return ctx.execution.reconciliation.resolveFinding(user.id, findingId, parsed.data, {
+        ip: req.ip,
+        userAgent: req.headers['user-agent'] ?? null,
+      });
+    },
+  );
+}
+
+/**
+ * M8.6 — safety-controls routes (kill switches + emergency stop).
+ *
+ * | Route | Auth | Notes |
+ * |---|---|---|
+ * | GET  /api/execution/safety                        | session | Owner-scoped switch state (global/user/strategy/profile), circuit-breaker + automation summary. |
+ * | GET  /api/execution/safety/events                 | session | Append-only switch history for THIS account's switches. |
+ * | POST /api/execution/safety/kill-switch/activate   | session | Arm a user/strategy/profile switch (reason required). Always allowed — stopping is not a feature. |
+ * | POST /api/execution/safety/kill-switch/clear      | session | Disarm a switch the caller owns (reason required, audited). |
+ * | POST /api/execution/safety/emergency-stop         | session | Panic button: user switch armed + automation OFF + all profiles disabled, one transaction. |
+ *
+ * Deliberately ABSENT: any global-scope mutation (platform operator territory
+ * only — and when `EXECUTION_GLOBAL_KILL_SWITCH=true` even the operator API
+ * cannot un-pin it), any "resume trading" shortcut, and anything that could
+ * arm execution. These routes only ever make the platform MORE stopped.
+ */
+export async function safetyRoutes(
+  app: FastifyInstance,
+  ctx: AppContext,
+  config: AppConfig,
+): Promise<void> {
+  const requireAuth = createSessionAuth(config, ctx);
+
+  app.get('/api/execution/safety', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    return ctx.execution.safety.getStatus(user.id);
+  });
+
+  app.get('/api/execution/safety/events', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const parsed = killSwitchEventListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'query');
+      return;
+    }
+    return ctx.execution.safety.history(user.id, parsed.data.limit);
+  });
+
+  app.post(
+    '/api/execution/safety/kill-switch/activate',
+    { config: { rateLimit: { max: 15, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const parsed = killSwitchActivateSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendZodError(reply, parsed.error, 'body');
+        return;
+      }
+      return ctx.execution.safety.activate(user.id, parsed.data, {
+        ip: req.ip,
+        userAgent: req.headers['user-agent'] ?? null,
+      });
+    },
+  );
+
+  app.post(
+    '/api/execution/safety/kill-switch/clear',
+    { config: { rateLimit: { max: 15, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const parsed = killSwitchClearSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendZodError(reply, parsed.error, 'body');
+        return;
+      }
+      return ctx.execution.safety.clear(user.id, parsed.data, {
+        ip: req.ip,
+        userAgent: req.headers['user-agent'] ?? null,
+      });
+    },
+  );
+
+  app.post(
+    '/api/execution/safety/emergency-stop',
+    { config: { rateLimit: { max: 6, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const parsed = emergencyStopSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendZodError(reply, parsed.error, 'body');
+        return;
+      }
+      return ctx.execution.safety.emergencyStop(user.id, parsed.data.reason, {
         ip: req.ip,
         userAgent: req.headers['user-agent'] ?? null,
       });

@@ -1,4 +1,4 @@
-# Automated Trading Execution Architecture (M8.1–M8.4)
+# Automated Trading Execution Architecture (M8.1–M8.6)
 
 M8.1 builds the **execution architecture and safety boundary only**. It is a
 foundation milestone:
@@ -126,8 +126,14 @@ health) refuse.
 - `execution_profile` — per-profile disable
 
 An active switch anywhere in scope makes gate 6 fail: **no new execution may
-be accepted**. M8.1 ships the contract, the read helpers, the setter (used by
-operators/tests) and status surfacing in `/api/execution/automation`; no UI.
+be accepted** (the same refusal applies to user-initiated paper simulations at
+the paper gate). M8.1 shipped the contract, read helpers, the operator setter
+and status surfacing in `/api/execution/automation`. **M8.6 turned this into a
+full safety-control surface**: per-switch provenance (`source`,
+`actor_user_id`, `activated_at`), an append-only `kill_switch_events` history
+ledger, a user API for own-scope arm/clear, an emergency stop, a
+deployment-pinned global switch, and automatic loss-limit circuit breakers.
+See “Safety controls (M8.6)” below.
 
 ## Provider abstraction
 
@@ -374,11 +380,130 @@ in M8.4** notice. It has no credential or live-trading control.
 Lifecycle changes are audited with non-secret provider/profile/status facts.
 Neither API responses nor audit metadata contains secret values.
 
-## Roadmap after M8.4
+## Safety controls (M8.6)
 
-M8.5 builds full order/position reconciliation and resolution of uncertain
-broker outcomes. M8.6 strengthens kill-switch and safety controls. M8.7 may
-consider controlled live automation only after all required safety gates,
-transport validation, secret management, broker/account authorization, and
-operational validation are complete. Until then `canAccessAutomation` remains
-false for every plan and live execution remains impossible.
+**M8.6 changes no execution capability.** It strengthens the brakes: the
+kill-switch contract becomes an operable, auditable safety system for accounts
+and for the platform, and the risk engine's loss limits gain a durable stop.
+Every control here can only make the platform MORE stopped.
+
+### Ledgers and provenance
+
+- `kill_switches` gains `source` (`operator | user | circuit_breaker`,
+  CHECK-enforced), `actor_user_id`, and `activated_at`; a DB trigger stamps a
+  missing activation time even for raw operator writes, so an ACTIVE row always
+  answers “when did this arm?”.
+- `kill_switch_events` is **append-only** (guard trigger): one row per change
+  ATTEMPT from the API — including redundant activate/clear calls recorded with
+  `changed = false` — carrying scope, target, the resolved owner user id, the
+  actor, reason, source and metadata (`safetyVersion`). Only the tenant that
+  owns the affected switch can read their events.
+- State-row semantics are unchanged and additive-only: a clear never deletes;
+  a redundant arm never overwrites the original stop reason/source (the first
+  trip's provenance stands; the attempt itself lands in the event ledger).
+
+### User-facing API (session-authenticated, owner-scoped)
+
+| Route | Purpose |
+|---|---|
+| `GET  /api/execution/safety` | Full switch state: global (read-only), account, per-strategy and per-profile entries, breaker summary, automation summary, `globalForcedByEnvironment`. |
+| `GET  /api/execution/safety/events` | Owner-scoped append-only switch history. |
+| `POST /api/execution/safety/kill-switch/activate` | Arm `user` / `strategy` / `execution_profile` (reason 3–400 chars required; markup-hostile characters refused). |
+| `POST /api/execution/safety/kill-switch/clear` | Disarm a switch the caller owns, with a required audited reason. |
+| `POST /api/execution/safety/emergency-stop` | The panic button (see below). |
+
+Hard properties: `global` is **not a user-mutable scope** — the zod enum
+excludes it and the service re-refuses it (`403`); `user` scope ignores
+`targetId` at the schema level so a client can never aim at another account;
+strategy/profile targets are ownership-re-proven and answered with **masked
+404s** (identical to “does not exist”); mutation bodies are strict —
+`{ approved: true }`, prices or credential-shaped fields are `400`. Arming
+requires **no entitlement** (stopping is not a feature); reads and writes
+never leave the tenant boundary.
+
+### Emergency stop
+
+`POST /api/execution/safety/emergency-stop` runs ONE transaction (advisory
+locked per user, so a double-tap cannot split state):
+
+1. arm the user kill switch (source `user`),
+2. force `users.automation_enabled` OFF — the safe direction, always allowed,
+   never entitlement-gated,
+3. disable every `execution_profiles` row of the account.
+
+It mirrors into `kill_switch_events`, `execution_events`
+(`event='emergency_stop'`) and `audit_events` (ip + user-agent). The switch is
+armed FIRST because it is the strongest brake; a re-tap is a recorded no-op.
+**There is no reverse “panic release”** — resuming is always an explicit
+per-scope `clear` with a reason.
+
+### Loss-limit circuit breaker
+
+The M8.2 engine already refused a decision while a daily/weekly/consecutive-
+loss limit was breached. M8.6 makes that refusal DURABLE: when a persisted
+rejection carries one of `DAILY_LOSS_LIMIT`, `WEEKLY_LOSS_LIMIT` or
+`CONSECUTIVE_LOSS_LIMIT` (and `risk_policies.circuit_breaker_enabled`, a
+platform-owned DB default that NO user policy input can change), the service
+trips the account kill switch with source `circuit_breaker` and a reason
+naming the code.
+
+- Idempotent: while the switch is armed the trip is a no-op — no event spam,
+  no reason overwrite — so a breaker cannot loop on its own `KILL_SWITCH_ACTIVE`
+  rejections.
+- The trip runs AFTER the decision transaction commits (inside the same call),
+  so a ledger fault can never corrupt or crash the persisted verdict; in that
+  fault case the durable trip lands on the NEXT rejection — rejections repeat
+  while the breach holds, so the stop is eventual but never silent.
+- While tripped, automation status shows `user_kill_switch_active`, the
+  circuit-breaker summary names it, and only an explicit clear (audited) can
+  release it. If the loss window still breaches afterwards, the next rejection
+  trips again — by design: “still in breach” cannot be cleared by wanting
+  harder.
+
+### Deployment-pinned global switch
+
+`EXECUTION_GLOBAL_KILL_SWITCH=true` (strict boolean, default `false`) pins the
+global switch ON inside `KillSwitchService`, independently of the table:
+`isGlobalActive()`/`anyActive()` report true for EVERY user, so gate 6 and the
+paper `kill_switch` gate refuse, and `/api/execution/automation` gains the
+reason `global_kill_switch_forced_by_environment`. No API or profile row can
+clear the pin — releasing it means editing the deployment environment.
+`GET /api/execution/safety` reports `globalForcedByEnvironment` honestly.
+The variable grants nothing; live execution remains impossible regardless.
+
+### What stays deliberately unaffected
+
+Gate 6's refusal covers NEW entries only. **Position exits (paper
+`evaluate`/`close`) and reconciliation runs never consult the kill switch** —
+risk reduction must remain available during an incident, and reconciliation is
+read-only. The automated path stays impossible for an independent reason: no
+plan grants the automation entitlement, and the emergency controls only ever
+push it further OFF.
+
+### Tests (M8.6)
+
+- contracts (`safety.test.ts`): pinned vocabularies, mutation strictness
+  (global unparseable, user-target refusal, reason rules, no smuggling
+  fields), DTO strictness, breaker-code list excluding `KILL_SWITCH_ACTIVE`.
+- core (`safety-controls.test.ts`): migration CHECKs + append-only guard +
+  activation-stamp trigger, activate/clear/idempotency/ownership masking,
+  environment pin vs gate 6 + automation statuses, breaker trip persistence,
+  idempotency and non-crash behavior, automation ON/OFF asymmetry, emergency
+  stop atomicity incl. concurrent double-tap, tenant isolation of reads, and
+  the exit-path exemption.
+- api (`safety.test.ts`): auth on all five routes, no global-mutation route,
+  strict-400s, arm/clear/emergency round-trips observed through every read
+  model, ip-attributed audits, cross-tenant masked 404s (arm AND clear),
+  breaker field read-only over PATCH, and a live second app with the pin ON.
+- web (`safety-ui.test.ts`): panel renders every scope display-only for
+  global, no live/credential affordance anywhere, emergency confirm step, and
+  the exact five client routes with identifier+reason bodies only.
+
+## Roadmap after M8.6
+
+M8.5 (reconciliation) and M8.6 (kill-switch & safety controls) are delivered.
+M8.7 may consider controlled live automation only after all required safety
+gates, transport validation, secret management, broker/account
+authorization, and operational validation are complete. Until then
+`canAccessAutomation` remains false for every plan and live execution remains
+impossible — and the M8.6 brakes apply to every path that exists.
