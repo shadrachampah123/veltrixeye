@@ -84,6 +84,12 @@ remaining items are listed at the bottom.
 - `POST /api/internal/notifications/deliveries/run` and
   `…/maintenance`: **30/min per IP** (M7.3 — administrative, additionally
   gated by a shared secret; see below).
+- `POST /api/execution/safety/kill-switch/activate` and `…/clear`: **15/min
+  per IP**; `POST /api/execution/safety/emergency-stop`: **6/min per IP**
+  (M8.6). These are fail-safe controls: the limits exist to bound abuse loops,
+  never to make stopping harder than acting — arming and emergency stop are
+  idempotent, and reads (`GET /api/execution/safety*`) are unlimited beyond
+  the global cap.
 - All are per-IP limits configured in `apps/api/src/app.ts` (global) and
   the route modules (per-route overrides); the auth, evaluate, detect, alert
   generation and alert acknowledgement limits each have a dedicated 429
@@ -159,6 +165,41 @@ emits `alert.replayed` (never a second `alert.created`) and
 inserted, so the log cannot be misread as two deliveries. Generation is
 explicitly invoked (no scheduler), so every alert in the log has a matching
 user request.
+
+## Emergency stop hierarchy (M8.6)
+
+The M8.6 safety controls form one-way brakes: **every safety endpoint can make
+the platform stop MORE, and none can make it run MORE.**
+
+- Kill-switch `activate`/`clear`/`emergency-stop` refuse `scope=global` at
+  the schema level (the user-facing enum omits it) and again in the service
+  (`403`); the global switch is operator/environment territory only. Clearing
+  requires a reason — an unexplained disarm is not possible through this API.
+- `EXECUTION_GLOBAL_KILL_SWITCH=true` cannot be overridden from inside the
+  app: `KillSwitchService` ORs the environment pin into every read, so no DB
+  row or request can un-activate it, and `GET /api/execution/safety` reports
+  `globalForcedByEnvironment` honestly.
+- The loss-limit circuit breaker writes through the SAME audited path
+  (`kill_switches` + `kill_switch_events` + `audit_events`, source
+  `circuit_breaker`); `risk_policies.circuit_breaker_enabled` is
+  platform-owned — user policy PATCHes cannot disable the breaker.
+- Switch history is owner-scoped; cross-tenant arm/clear attempts observe a
+  masked `404` identical to “nonexistent”. `audit_events` metadata for safety
+  actions carries scope/target/reason — no secrets, ever.
+- Deliberate asymmetry inherited from M8.1 and kept: position exits and
+  reconciliation are NOT kill-switch-blocked (risk reduction stays available
+  during an incident); only NEW entry is refused. Turning automation OFF is
+  always allowed; turning it ON additionally refuses (409) while any switch is
+  armed.
+
+## Audit log additions
+
+Safety actions emit `safety.kill_switch_activated`,
+`safety.kill_switch_cleared`, `safety.emergency_stop` and
+`safety.circuit_breaker_tripped` to `audit_events` (append-only, trigger-
+guarded, ip + user-agent) — the emergency stop additionally mirrors a
+`execution_events` row so the execution ledger alone answers “when did this
+account stop?”. `kill_switch_events` is append-only by its own guard trigger.
 
 ## Alert delivery is stub-only (M6)
 

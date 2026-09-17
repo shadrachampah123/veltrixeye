@@ -1,11 +1,12 @@
 # VeltrixEye
 
-> **Milestones M1–M8.2 — Foundation through Risk Management Engine**
+> **Milestones M1–M8.6 — Foundation through Risk Management, Paper Execution,
+> Broker Boundary, Reconciliation and Safety Controls**
 > A general-purpose SaaS platform where traders define **their own** deterministic trading strategies, scan markets against them, and receive explained, scored alerts.
 
 ## Status
 
-This repository currently contains **M1–M8.2**: application foundation through the M8.2 **risk management engine** (see [docs/risk.md](docs/risk.md)). M8.1 shipped the execution architecture and safety boundary ([docs/execution.md](docs/execution.md)); M8.2 produces the server-authoritative risk decision those gates consume. **No real, demo or paper orders are executed. Automation stays OFF. No broker is connected.**
+This repository currently contains **M1–M8.6**: application foundation through the M8 execution program — the **risk management engine** (M8.2, [docs/risk.md](docs/risk.md)), the execution architecture and 18-gate safety boundary (M8.1, [docs/execution.md](docs/execution.md)), the internal paper execution simulator (M8.3), the provider-neutral MT5/broker boundary with a deliberately disabled transport (M8.4), order/position reconciliation (M8.5), and strengthened kill-switch & safety controls with append-only switch history, emergency stop, durable loss-limit circuit breakers and the `EXECUTION_GLOBAL_KILL_SWITCH` environment pin (M8.6). **No real or demo broker orders are executed. Automation stays OFF for every plan. No broker is connected.**
 
 **Not yet implemented** (by design, later milestones): channels other than email (webhook/push — M7.3 built the outbox/worker/provider boundary they plug into and ships the email adapter), user notification preferences, a live scanner, trade execution, billing. See [docs/milestones.md](docs/milestones.md).
 
@@ -138,8 +139,12 @@ Start here:
 - [How to add a market-data provider](docs/how-to-add-provider.md)
 - [Future strategy-engine contract](docs/strategy-engine-contract.md)
 - [Alert notification delivery (M7.3)](docs/notification-delivery.md)
-- [Execution architecture (M8.1)](docs/execution.md)
+- [Execution architecture (M8.1–M8.6)](docs/execution.md)
 - [Risk management engine (M8.2)](docs/risk.md)
+- [Paper execution simulator (M8.3)](docs/execution.md#paper-execution-simulator-m83)
+- [MT5/broker boundary (M8.4)](docs/execution.md#broker--mt5-integration-boundary-m84)
+- [Order/position reconciliation (M8.5)](docs/milestones.md#m85--delivered-order--position-reconciliation)
+- [Safety controls (M8.6)](docs/execution.md#safety-controls-m86)
 - [Security model](docs/security.md)
 - [Environment configuration](docs/environment.md)
 - [Milestone boundaries](docs/milestones.md)

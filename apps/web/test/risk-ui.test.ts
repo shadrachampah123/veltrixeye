@@ -37,6 +37,8 @@ const policy: RiskPolicyDto = {
   correlationRequired: false,
   maxCorrelationGroupExposurePct: 2,
   paperEquity: 10_000,
+  // M8.6 — platform-controlled circuit breaker (read-only in the DTO).
+  circuitBreakerEnabled: true,
   createdAt: '2024-01-01T00:00:00.000Z',
   updatedAt: '2024-01-01T00:00:00.000Z',
 };

@@ -73,6 +73,14 @@ services:
         value: '60000'
       - key: NOTIFICATION_WORKER_BATCH_SIZE
         value: '25'
+      # --- M8.6 deployment-level global kill switch ---
+      # 'true' pins the platform-wide emergency stop ON for every account
+      # regardless of database state (new execution + paper simulation
+      # refused); it can then only be released by editing this value and
+      # redeploying — no API or DB row can clear it. Default 'false'.
+      # It never enables anything: live execution stays impossible.
+      - key: EXECUTION_GLOBAL_KILL_SWITCH
+        value: 'false'
     # Only rebuild the API when something it actually ships changed; the web
     # app deploys independently on Vercel.
     buildFilter:

@@ -201,6 +201,21 @@ const envSchema = z.object({
   SCANNER_MAX_RETRIES: intEnv(0, 10, 3),
   SCANNER_RETRY_BASE_MS: intEnv(100, 60_000, 1_000),
   SCANNER_RETRY_MAX_MS: intEnv(1_000, 120_000, 10_000),
+
+  /* ---------------------------------------------------------------------- */
+  /* M8.6 — kill-switch & safety controls                                      */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Deployment-level global kill switch. `true` pins the PLATFORM-wide switch
+   * ON for every account regardless of database state — the operator's last-
+   * resort brake (usable even when normal tooling/DB access is degraded).
+   * It can only be cleared by changing the deployment environment; no API
+   * route or profile row can un-pin it. Fail-closed default: absent/false.
+   * Live execution is impossible in this platform either way — this stops
+   * paper simulation and any future intake, nothing more.
+   */
+  EXECUTION_GLOBAL_KILL_SWITCH: boolEnv(false),
 });
 
 /** Email-channel configuration passed to the SMTP provider adapter. */

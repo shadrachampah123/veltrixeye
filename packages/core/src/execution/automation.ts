@@ -41,6 +41,9 @@ export class AutomationService {
     if (!entitlements.canAccessAutomation) reasons.push('entitlement_not_granted');
     if (!automationEnabled) reasons.push('automation_switch_off');
     if (globalKillSwitch) reasons.push('global_kill_switch_active');
+    if (globalKillSwitch && this.killSwitches.isGlobalForced()) {
+      reasons.push('global_kill_switch_forced_by_environment');
+    }
     if (userKillSwitch) reasons.push('user_kill_switch_active');
 
     return {
@@ -58,8 +61,18 @@ export class AutomationService {
   }
 
   /**
-   * The ONLY mutation path for the automation switch. Entitlement-gated:
-   * in M8.1 this always throws 403 because no plan carries the entitlement.
+   * The ONLY mutation path for the automation switch.
+   *
+   * M8.6 strengthens its safety asymmetry:
+   *  - Turning automation ON remains entitlement-gated (in this platform no
+   *    plan grants it, so an ON attempt always 403s), AND is additionally
+   *    refused (409) while any kill switch is active: emergency stop means
+   *    "automation cannot be re-armed", not "automation blocks the stop".
+   *  - Turning automation OFF is a safety control, never a feature — it is
+   *    always allowed without an entitlement (also for `emergency-stop`, and
+   *    for a user de-arming themselves after a breaker trip). The flag can
+   *    only go off; gates still re-check entitlement at execution time, so
+   *    this path can never arm execution.
    */
   async setAutomationEnabled(
     userId: string,
@@ -67,10 +80,24 @@ export class AutomationService {
     meta?: { ip?: string | null; userAgent?: string | null },
   ): Promise<AutomationStatusDto> {
     const { entitlements } = await this.readState(userId);
-    if (!entitlements.canAccessAutomation) {
-      throw Errors.forbidden(
-        'Automation is not available on your subscription plan — the switch cannot be changed',
-      );
+    if (enabled) {
+      // M8.6 ordering: an armed switch outranks any plan claim. Checking it
+      // FIRST means the emergency stop is enforced identically for every
+      // account and this path can only ever REFUSE more, never grant.
+      const [globalKill, userKill] = await Promise.all([
+        this.killSwitches.isGlobalActive(),
+        this.killSwitches.isUserActive(userId),
+      ]);
+      if (globalKill || userKill) {
+        throw Errors.conflict(
+          'A kill switch is active — it must be cleared (with a reason) before automation can be re-armed',
+        );
+      }
+      if (!entitlements.canAccessAutomation) {
+        throw Errors.forbidden(
+          'Automation is not available on your subscription plan — the switch cannot be changed',
+        );
+      }
     }
     await this.pool.query('UPDATE users SET automation_enabled = $2 WHERE id = $1', [
       userId,

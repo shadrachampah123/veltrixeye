@@ -64,14 +64,18 @@ git-ignored and never contain values you would commit.
 | `SCANNER_MAX_RETRIES` | int 0–10 | `3` | Retry attempts for transient provider failures. |
 | `SCANNER_RETRY_BASE_MS` | int 100–60000 | `1000` | Base backoff for retries. |
 | `SCANNER_RETRY_MAX_MS` | int 1000–120000 | `10000` | Max backoff cap. |
+| `EXECUTION_GLOBAL_KILL_SWITCH` | `true` \| `false` (strict) | `false` | M8.6 deployment-level global kill switch. `true` pins the platform-wide emergency stop ON for EVERY account regardless of database state: new execution (automation gates and paper simulation) is refused, `GET /api/execution/automation` reports `global_kill_switch_forced_by_environment`, and no API can clear the pin — only changing this value and redeploying. It GRANTS nothing; live execution remains impossible either way. |
 
 Empty-string values (a platform dashboard often writes one for a skipped
 secret) are treated as "not set" for the numeric variables above, so they fall
 back to the default instead of failing the boot with `NaN`.
 
-**M8.2 introduces no new environment variables.** The risk engine is
-entirely server-side configuration (platform ceilings + per-user policy
-rows). Future provider credentials stay out of the database.
+**M8.2 introduces no new environment variables** for the risk engine (it is
+entirely server-side configuration: platform ceilings + per-user policy
+rows). Future provider credentials stay out of the database. **M8.6 adds
+exactly one variable** — `EXECUTION_GLOBAL_KILL_SWITCH` above — and it is a
+stop, not a feature flag: leaving it unset/false is the normal state, and the
+only way it changes behavior is by making MORE refuse.
 
 ### Client IP attribution (`TRUSTED_PROXY_CIDRS`)
 
