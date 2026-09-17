@@ -71,11 +71,13 @@ describe('m8.1 execution constants', () => {
     assert.equal(isTerminalOrderStatus('filled'), true);
   });
 
-  test('the safety gate list is pinned, ordered and complete (15 gates)', () => {
-    assert.equal(EXECUTION_GATE_IDS.length, 15);
+  test('the safety gate list is pinned, ordered and complete (18 gates)', () => {
+    assert.equal(EXECUTION_GATE_IDS.length, 18);
     assert.equal(EXECUTION_GATE_IDS[0], 'authenticated');
     assert.equal(EXECUTION_GATE_IDS[1], 'authorized');
-    assert.equal(EXECUTION_GATE_IDS[EXECUTION_GATE_IDS.length - 1], 'provider_healthy');
+    assert.equal(EXECUTION_GATE_IDS[EXECUTION_GATE_IDS.length - 1], 'account_authorized');
+    assert.ok(EXECUTION_GATE_IDS.includes('environment_safety'));
+    assert.ok(EXECUTION_GATE_IDS.includes('broker_authorized'));
     assert.ok(EXECUTION_GATE_IDS.includes('kill_switch'));
     assert.ok(EXECUTION_GATE_IDS.includes('automation_on'));
   });
@@ -90,6 +92,13 @@ describe('m8.1 execution constants', () => {
       'timeout',
       'unavailable',
       'rejected',
+      'connection',
+      'invalid_symbol',
+      'invalid_volume',
+      'invalid_price',
+      'invalid_protection',
+      'duplicate',
+      'uncertain',
       'unknown',
     ]);
   });

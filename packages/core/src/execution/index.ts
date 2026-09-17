@@ -17,6 +17,21 @@ export {
   createPaperExecutionProvider,
   type PaperSimulatorPort,
 } from './paper.js';
+export {
+  createMT5ExecutionProvider,
+  normalizeMT5Error,
+  normalizeMT5Order,
+  DisabledMT5Transport,
+  type MT5Transport,
+  type MT5TransportHealth,
+  type MT5TransportError,
+  type MT5ProviderConfig,
+  type MT5AccountSnapshot,
+  type MT5SymbolSnapshot,
+  type MT5OrderRequest,
+  type MT5OrderSnapshot,
+  type MT5PositionSnapshot,
+} from './mt5.js';
 export { KillSwitchService } from './kill-switch.js';
 export { ExecutionProfileService, toProfileDto, type ExecutionProfileRow } from './profiles.js';
 export { AutomationService, type AutomationStatus } from './automation.js';

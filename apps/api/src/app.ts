@@ -30,6 +30,8 @@ import {
   // M8.1 execution architecture (safety boundary only — no provider can trade)
   createExecutionProviderRegistry,
   createPaperExecutionProvider,
+  createMT5ExecutionProvider,
+  DisabledMT5Transport,
   PaperExecutionService,
   CandleStoreMarketPriceSource,
   KillSwitchService,
@@ -167,6 +169,17 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     },
   });
   executionProviders.register(paperProvider);
+  // M8.4: MT5 is a registered, honest integration boundary. The deployed
+  // transport is deliberately disabled/unconfigured: no endpoint, SDK,
+  // credential, terminal, or network path exists and live is hard-stopped.
+  executionProviders.register(createMT5ExecutionProvider(new DisabledMT5Transport(), {
+    enabled: false,
+    environment: 'demo',
+    broker: null,
+    server: null,
+    accountRef: null,
+    symbols: new Map(),
+  }));
   const execution = {
     providers: executionProviders,
     killSwitches,

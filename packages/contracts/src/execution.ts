@@ -112,6 +112,13 @@ export const EXECUTION_FAILURE_CATEGORIES = [
   'timeout',
   'unavailable',
   'rejected',
+  'connection',
+  'invalid_symbol',
+  'invalid_volume',
+  'invalid_price',
+  'invalid_protection',
+  'duplicate',
+  'uncertain',
   'unknown',
 ] as const;
 export type ExecutionFailureCategory = (typeof EXECUTION_FAILURE_CATEGORIES)[number];
@@ -123,11 +130,16 @@ export type ExecutionFailureCategory = (typeof EXECUTION_FAILURE_CATEGORIES)[num
  */
 export class ExecutionProviderError extends Error {
   readonly category: ExecutionFailureCategory;
+  /** True when the venue may have accepted a mutation but confirmation was lost. */
+  readonly uncertain: boolean;
+  readonly retryable: boolean;
 
-  constructor(category: ExecutionFailureCategory, message: string, options?: { cause?: unknown }) {
+  constructor(category: ExecutionFailureCategory, message: string, options?: { cause?: unknown; uncertain?: boolean; retryable?: boolean }) {
     super(message, options);
     this.name = 'ExecutionProviderError';
     this.category = category;
+    this.uncertain = options?.uncertain ?? category === 'uncertain';
+    this.retryable = options?.retryable ?? false;
   }
 }
 
@@ -141,6 +153,38 @@ export function isExecutionProviderError(err: unknown): err is ExecutionProvider
 
 /** The id of the built-in (future) paper provider. No broker ids exist yet. */
 export const PAPER_EXECUTION_PROVIDER_ID = 'paper';
+export const MT5_EXECUTION_PROVIDER_ID = 'mt5';
+
+export const PROVIDER_HEALTH_STATES = ['healthy', 'degraded', 'unavailable', 'disabled'] as const;
+export type ProviderHealthState = (typeof PROVIDER_HEALTH_STATES)[number];
+
+export interface ExecutionAccountInfo {
+  accountRef: string;
+  broker: string;
+  server: string;
+  environment: ExecutionMode;
+  currency: string | null;
+  balance: number | null;
+  equity: number | null;
+  marginFree: number | null;
+}
+
+export interface ExecutionMarketQuote { bid: number; ask: number; spread: number; timestampMs: number; }
+
+export interface ExecutionInstrumentMetadata {
+  assetClass: AssetClass;
+  canonicalSymbol: string;
+  providerSymbol: string;
+  contractSize: number;
+  minVolume: number;
+  maxVolume: number;
+  volumeStep: number;
+  priceDigits: number;
+  tickSize: number;
+  orderTypes: readonly OrderType[];
+  tradingStatus: 'open' | 'closed' | 'disabled' | 'unknown';
+  quote: ExecutionMarketQuote | null;
+}
 
 export interface ExecutionProviderCapabilities {
   /** Environments this provider can serve. */
@@ -206,8 +250,14 @@ export interface ExecutionProviderPositionState {
 }
 
 export interface ExecutionProviderHealth {
+  configured: boolean;
+  authenticated: boolean;
+  connected: boolean;
+  available: boolean;
   healthy: boolean;
+  state: ProviderHealthState;
   reason?: string;
+  checkedAt: string;
   detail?: Record<string, unknown>;
 }
 
@@ -230,6 +280,9 @@ export interface ExecutionProvider {
   /** Operator-safe view: NEVER includes credentials or secrets. */
   describe(): Record<string, unknown>;
   health(): Promise<ExecutionProviderHealth>;
+  getAccountInfo(): Promise<ExecutionAccountInfo | null>;
+  getInstrument(canonicalSymbol: string): Promise<ExecutionInstrumentMetadata | null>;
+  listInstruments(): Promise<ExecutionInstrumentMetadata[]>;
 
   submitOrder(request: ExecutionSubmitOrderRequest): Promise<ExecutionSubmitOrderOutcome>;
   cancelOrder(providerOrderId: string): Promise<void>;
@@ -239,6 +292,7 @@ export interface ExecutionProvider {
   ): Promise<void>;
   getOrder(providerOrderId: string): Promise<ExecutionProviderOrderState | null>;
   listOrders(): Promise<ExecutionProviderOrderState[]>;
+  getPosition(providerPositionId: string): Promise<ExecutionProviderPositionState | null>;
   listPositions(): Promise<ExecutionProviderPositionState[]>;
   closePosition(providerPositionId: string): Promise<void>;
 }
@@ -276,6 +330,9 @@ export const EXECUTION_GATE_IDS = [
   'acceptable_rr',
   'exposure_limits',
   'provider_healthy',
+  'environment_safety',
+  'broker_authorized',
+  'account_authorized',
 ] as const;
 export type ExecutionGateId = (typeof EXECUTION_GATE_IDS)[number];
 
@@ -378,6 +435,16 @@ export type ExecutionDecisionInput = z.infer<typeof executionDecisionSchema>;
 const uuidSchema = z.string().uuid();
 const isoDateTimeSchema = z.string();
 
+export const BROKER_CONNECTION_STATUSES = ['unconfigured', 'disabled', 'unavailable', 'connected', 'degraded'] as const;
+export type BrokerConnectionStatus = (typeof BROKER_CONNECTION_STATUSES)[number];
+
+export const brokerSymbolMappingSchema = z.object({
+  assetClass: z.enum(ASSET_CLASSES),
+  canonicalSymbol: instrumentSymbolSchema,
+  brokerSymbol: z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/),
+}).strict();
+export type BrokerSymbolMappingInput = z.infer<typeof brokerSymbolMappingSchema>;
+
 export const executionProfileDtoSchema = z
   .object({
     id: uuidSchema,
@@ -386,6 +453,9 @@ export const executionProfileDtoSchema = z
     providerSlug: z.string().min(1).max(64),
     /** Platform-side reference only. NEVER a credential. */
     accountRef: z.string().max(128).nullable(),
+    brokerServer: z.string().max(128).nullable(),
+    connectionStatus: z.enum(BROKER_CONNECTION_STATUSES),
+    symbolMappings: z.array(brokerSymbolMappingSchema),
     enabled: z.boolean(),
     createdAt: isoDateTimeSchema,
     updatedAt: isoDateTimeSchema,
@@ -398,10 +468,23 @@ export const executionProfileCreateSchema = z
   .object({
     mode: z.enum(EXECUTION_MODES),
     providerSlug: z.string().trim().min(1).max(64),
-    accountRef: z.string().trim().max(128).optional(),
+    accountRef: z.string().trim().min(1).max(128).optional(),
+    brokerServer: z.string().trim().min(1).max(128).optional(),
+    symbolMappings: z.array(brokerSymbolMappingSchema).max(100).optional(),
   })
   .strict();
 export type ExecutionProfileCreateInput = z.infer<typeof executionProfileCreateSchema>;
+export const brokerProfilePatchSchema = z.object({
+  enabled: z.boolean().optional(),
+  brokerServer: z.string().trim().min(1).max(128).optional(),
+  accountRef: z.string().trim().min(1).max(128).optional(),
+  symbolMappings: z.array(brokerSymbolMappingSchema).max(100).optional(),
+  environment: z.enum(EXECUTION_MODES).optional(),
+}).strict().refine((v) => Object.keys(v).length > 0, 'At least one field is required');
+export type BrokerProfilePatchInput = z.infer<typeof brokerProfilePatchSchema>;
+
+export const brokerProfileParamsSchema = z.object({ id: uuidSchema }).strict();
+
 
 export const executionOrderDtoSchema = z
   .object({
@@ -516,7 +599,11 @@ export const executionStatusDtoSchema = z
           id: z.string(),
           name: z.string(),
           configured: z.boolean(),
+          authenticated: z.boolean(),
+          connected: z.boolean(),
+          available: z.boolean(),
           healthy: z.boolean(),
+          state: z.enum(PROVIDER_HEALTH_STATES),
           reason: z.string().nullable(),
         })
         .strict(),

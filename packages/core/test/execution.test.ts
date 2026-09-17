@@ -196,6 +196,9 @@ function passingGateInput(overrides: Partial<ExecutionGateInput> = {}): Executio
     minRr: 2,
     exposureWithinLimits: true,
     providerHealth: { healthy: true },
+    environmentSafe: true,
+    brokerAuthorized: true,
+    accountAuthorized: true,
     ...overrides,
   };
 }
@@ -314,11 +317,11 @@ describe('m8.1 database constraints', () => {
 });
 
 describe('m8.1 safety gates (contract level)', () => {
-  test('all 15 gates passing yields acceptance', () => {
+  test('all 18 gates passing yields acceptance', () => {
     const result = evaluateExecutionGates(passingGateInput());
     assert.equal(result.passed, true);
     assert.equal(result.failedGate, null);
-    assert.equal(result.evaluated.length, 15);
+    assert.equal(result.evaluated.length, 18);
   });
 
   test('each gate fails closed in order', () => {
@@ -429,6 +432,9 @@ describe('m8.1 safety gates (contract level)', () => {
         override: { providerHealth: { healthy: false } },
         gate: 'provider_healthy',
       },
+      { name: 'unsafe environment', override: { environmentSafe: false }, gate: 'environment_safety' },
+      { name: 'broker not authorized', override: { brokerAuthorized: false }, gate: 'broker_authorized' },
+      { name: 'account not authorized', override: { accountAuthorized: false }, gate: 'account_authorized' },
     ];
 
     for (const c of cases) {
@@ -477,7 +483,7 @@ describe('m8.1 execution profiles', () => {
     const user = await makeUser();
     await assert.rejects(
       async () => profiles.createProfile(user.id, { mode: 'demo', providerSlug: 'paper' }),
-      (err: any) => err.code === 'forbidden',
+      (err: any) => err.code === 'invalid_input',
     );
     await assert.rejects(
       async () => profiles.createProfile(user.id, { mode: 'live', providerSlug: 'paper' }),
@@ -936,7 +942,10 @@ describe('m8.1 provider boundary', () => {
         capabilities: { modes: ['paper'], orderTypes: ['market'] },
         configured: true,
         describe: () => ({ category }),
-        health: async () => ({ healthy: false, reason: category }),
+        health: async () => ({ configured: true, authenticated: true, connected: true, available: false, healthy: false, state: 'degraded', reason: category, checkedAt: new Date(0).toISOString() }),
+        getAccountInfo: async () => null,
+        getInstrument: async () => null,
+        listInstruments: async () => [],
         submitOrder: async () => {
           throw new ExecutionProviderError(category, `simulated ${category}`);
         },
@@ -944,6 +953,7 @@ describe('m8.1 provider boundary', () => {
         modifyOrder: async () => {},
         getOrder: async () => null,
         listOrders: async () => [],
+        getPosition: async () => null,
         listPositions: async () => [],
         closePosition: async () => {},
       };

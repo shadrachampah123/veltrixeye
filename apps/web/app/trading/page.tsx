@@ -239,7 +239,7 @@ function TradingContent() {
           <Card>
             <CardHeader
               title="Execution providers"
-              subtitle="Registered server-side; no broker connectivity exists in this milestone"
+              subtitle="Provider-neutral registry — paper is internal; MT5 is an unavailable integration boundary"
             />
             <div className="space-y-3 px-5 pb-5 text-sm">
               {status && status.providers.length === 0 && (
@@ -256,8 +256,9 @@ function TradingContent() {
                 </div>
               ))}
               <p className="text-xs text-ink-400">
-                Paper execution simulation, demo and broker connectivity arrive in later
-                milestones. No real or demo orders can be placed from this platform today.
+                MT5/Exness-compatible configuration is modeled without a broker transport.
+                Connection status is never inferred from configuration. No real or broker-demo
+                order can be placed from this platform today.
               </p>
             </div>
           </Card>
@@ -265,8 +266,8 @@ function TradingContent() {
           {/* Profiles */}
           <Card>
             <CardHeader
-              title="Execution profiles"
-              subtitle="Account configuration — paper only in this milestone"
+              title="Execution & broker profiles"
+              subtitle="Paper simulation and disabled MT5 demo connection metadata"
             />
             <div className="space-y-3 px-5 pb-5 text-sm">
               {profiles !== null && profiles.length === 0 && (
@@ -276,15 +277,18 @@ function TradingContent() {
                 <div key={profile.id} className="flex items-center justify-between">
                   <span className="capitalize">
                     {profile.mode} <span className="text-xs text-ink-400">via {profile.providerSlug}</span>
+                    {profile.brokerServer ? <span className="block text-xs text-ink-400">{profile.brokerServer} · {profile.accountRef} · {profile.connectionStatus}</span> : null}
+                    {profile.symbolMappings.length > 0 ? <span className="block text-xs text-ink-400">{profile.symbolMappings.length} explicit symbol mapping(s)</span> : null}
                   </span>
                   <Badge tone={profile.enabled ? 'success' : 'neutral'}>
                     {profile.enabled ? 'enabled' : 'disabled'}
                   </Badge>
                 </div>
               ))}
-              <p className="text-xs text-ink-400">
-                Live profiles are impossible in this platform version; credentials are never
-                stored — provider connectivity is configured server-side only.
+              <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+                <strong>Live trading unavailable in M8.4.</strong> Broker profiles contain only
+                non-secret references and explicit symbol mappings. Credentials are not accepted
+                or stored, and the MT5 transport is disabled.
               </p>
             </div>
           </Card>
@@ -298,7 +302,7 @@ function TradingContent() {
               reconciliations={paperReconciliations}
               setupId={paperSetupId}
               onSetupIdChange={setPaperSetupId}
-              profileOptions={(profiles ?? []).map((profile) => ({
+              profileOptions={(profiles ?? []).filter((profile) => profile.providerSlug === 'paper').map((profile) => ({
                 id: profile.id,
                 label: `${profile.mode} · ${profile.providerSlug}`,
               }))}

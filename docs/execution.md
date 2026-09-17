@@ -1,9 +1,9 @@
-# Automated Trading Execution Architecture (M8.1)
+# Automated Trading Execution Architecture (M8.1–M8.4)
 
 M8.1 builds the **execution architecture and safety boundary only**. It is a
 foundation milestone:
 
-- **NO broker, MT5 or Exness connectivity exists anywhere in this repository.**
+- **M8.4 adds an MT5 broker adapter and transport interface, but the deployed transport is explicitly disabled/unconfigured. No broker connectivity is operational.**
 - **NO order can reach a broker, demo account or external venue.** M8.3 adds
   the internal **paper simulator** (see below): it creates *simulated* orders
   and positions only, priced from the platform's own candle store. The single
@@ -86,7 +86,7 @@ Covered by sequential-replay and 8-way concurrent tests.
 
 ## Safety gates
 
-Every future execution must pass ALL 15 gates, evaluated in pinned order,
+Every future execution must pass ALL 18 gates, evaluated in pinned order,
 fail-closed (`packages/core/src/execution/gates.ts`):
 
 1. `authenticated` — valid session
@@ -105,7 +105,10 @@ fail-closed (`packages/core/src/execution/gates.ts`):
 12. `valid_take_profit` — TP rewards the entry per direction
 13. `acceptable_rr` — expected RR ≥ version minimum and achievable from levels
 14. `exposure_limits` — exposure verdict from the M8.2 risk engine
-15. `provider_healthy` — provider reports healthy (**paper reports not ready**)
+15. `provider_healthy` — provider reports healthy
+16. `environment_safety` — the milestone safety policy authorizes the environment; `live` never passes
+17. `broker_authorized` — broker is resolved and authorized server-side
+18. `account_authorized` — account ownership/authorization is resolved server-side
 
 Unknown inputs fail closed: a missing decision, a missing or
 non-server-issued risk decision, unevaluated exposure or unknown provider
@@ -139,9 +142,7 @@ All failures normalize into `ExecutionProviderError` with one of:
 `rate_limited`, `timeout`, `unavailable`, `rejected`, `unknown`. Raw provider
 payloads never propagate; secrets never exist to leak.
 
-**Registered providers in M8.1: `paper` only.** Its boundary is in place for
-the M8.3 simulator; today every trading operation throws
-`ExecutionProviderError('unavailable')`.
+**Registered providers in M8.4: `paper` and `mt5`.** Paper remains the internal M8.3 simulator. MT5 uses `DisabledMT5Transport`, reports `configured: false`, `available: false`, `healthy: false`, and never performs network I/O.
 
 ## Paper execution simulator (M8.3)
 
@@ -199,7 +200,7 @@ Paper endpoints (session-authenticated, owner-scoped):
 | `POST /api/execution/automation` | entitlement-gated switch (403 for every plan in M8.1) |
 | `GET /api/execution/status` | readiness snapshot: automation, provider health, profile count |
 | `GET /api/execution/profiles` | owner-scoped profiles |
-| `POST /api/execution/profiles` | create a **paper** profile (demo/live refused, provider validated) |
+| `POST /api/execution/profiles` | create paper or disabled MT5 demo metadata (live refused; provider validated) |
 | `GET /api/execution/orders` | owner-scoped orders (empty until a provider can trade) |
 | `GET /api/execution/positions` | owner-scoped positions (empty) |
 | `GET /api/execution/events` | owner-scoped execution audit trail |
@@ -245,7 +246,7 @@ persisted, never logged.
   RR achievability, strictness, pinned gate/status/taxonomy constants, stable
   idempotency identity, error normalization.
 - core (`execution.test.ts`): state machine (valid/invalid/terminal), DB
-  constraints (live impossible, unique intents, order CHECKs), all 15 gates
+  constraints (live impossible, unique intents, order CHECKs), all 18 gates
   fail-closed, profile/automation/kill-switch services, intake validation,
   ownership masking, entitlement refusal, sequential + concurrent idempotency,
   owner-scoped read models, append-only trail, paper boundary, failure
@@ -268,9 +269,10 @@ persisted, never logged.
 
 ## Boundaries (what M8.1/M8.2/M8.3 are NOT)
 
-Not implemented, by design — later M8 milestones: **broker/demo connectivity
-and MT5/Exness integration (M8.4)**, **live reconciliation jobs against a
-broker (M8.5)**, trailing stops, break-even, automated trade placement
+Not implemented, by design — later M8 milestones: **an operational broker
+transport or broker-demo connectivity** (M8.4 provides only the disabled MT5
+boundary), **live reconciliation jobs against a broker (M8.5)**, trailing
+stops, break-even, automated trade placement
 (permanently OFF in this milestone set), and any UI beyond the readiness page,
 the M8.2 risk-settings panel and the M8.3 paper-execution panel. The M8.3
 simulator is internal and deterministic: it never contacts a broker, never
@@ -278,3 +280,105 @@ stores a credential and cannot place a live order. The risk engine, position
 sizing, loss limits, correlated-exposure controls and session restrictions
 shipped in M8.2 ([risk.md](./risk.md)) remain mandatory and still do not
 authorise real execution.
+
+## Broker / MT5 integration boundary (M8.4)
+
+**M8.4 does not enable live trading.** It adds an interchangeable broker
+boundary while preserving paper simulation as the only executable provider.
+The deployed composition registers `paper` and `mt5`; MT5 is backed by
+`DisabledMT5Transport`. It has no URL, terminal SDK, socket, credential, or
+network implementation, and it never fabricates a successful connection.
+Exness is supported only as a possible MT5 broker/server configuration value;
+there is no Exness-specific execution engine and connectivity has not been
+validated.
+
+```
+Strategy signal → M8.2 Risk Engine → Execution Decision → ExecutionProvider
+                                                        ├─ paper (internal)
+                                                        └─ MT5Provider → MT5Transport → future terminal/bridge
+```
+
+### Normalized provider operations
+
+`ExecutionProvider` exposes normalized health, account information, instrument
+metadata, submit/cancel/modify/get/list orders, get/list positions and close
+position. MT5 transport records (login/server, bid/ask, tickets, volume,
+prices, SL/TP, retcode/message and timestamps) are translated at the adapter;
+raw broker structures do not enter strategy, risk, UI, or database logic.
+Failures normalize to safe categories including authentication, connection,
+timeout, invalid symbol/volume/price/protection, market closed, insufficient
+funds, rejection, duplicate and uncertain.
+
+Health has independent `configured`, `authenticated`, `connected`, `available`,
+`healthy` and state fields. Configuration alone never means healthy. The
+shipped MT5 provider reports false for configured/available/healthy.
+
+### Demo, paper, and live are distinct
+
+- **Paper** is the internal deterministic M8.3 simulator.
+- **Broker demo** is an external MT5 demo account. M8.4 may store disabled,
+  non-secret profile metadata but cannot connect because no safe transport is
+  configured.
+- **Live** means real money and is prohibited by service validation, the
+  original database `environment <> 'live'` constraint, the 18-gate safety
+  checklist, the MT5 provider hard-stop, disabled automation, and absent
+  transport. A profile value can never activate it.
+
+### Profiles, mappings, and constraints
+
+Migration `0019_broker_mt5_boundary.sql` adds public `broker_server` and
+normalized `connection_status` fields, explicit `execution_symbol_mappings`,
+and `execution_provider_intents` for idempotent/uncertain outcomes ahead of
+M8.5. Profiles hold a non-secret opaque account reference only. There is no
+password, token, API key, investor-password, endpoint, or secret-reference
+column because this repository has no production-grade broker secret manager.
+A future transport must integrate one before it can be configured.
+
+Canonical-to-broker symbols are explicit per profile (for example, a broker
+*might* map `XAUUSD` to `XAUUSDm`; this is never assumed). Orders cannot
+supply an override. Metadata validates asset class, contract size, min/max
+volume, volume step, digits, tick size, supported order types and trading
+status. Quantity is rejected rather than rounded upward. Broker quote checks
+reject missing, non-positive, crossed/contradictory, or stale bid/ask data.
+The M8.2 Risk Engine remains authoritative; broker constraints only add a
+stricter execution check.
+
+### Idempotency and uncertainty
+
+The stable platform `clientOrderId` is translated to the MT5 request. Before
+submission, the adapter performs a client-id lookup. A retry that finds an
+existing broker order returns its normalized state without resubmitting. If a
+transport reports that the response was lost after submission, the adapter
+raises an `uncertain` `ExecutionProviderError`; it is not treated as rejection
+and is not retried. The durable provider-intent table can retain `uncertain`
+for M8.5 reconciliation. M8.4 exposes no broker order submission route, so
+this logic is adapter-contract tested only.
+
+### Safe management API and UI
+
+Authenticated routes are limited to provider/profile management:
+
+- `GET /api/execution/providers`
+- `GET /api/execution/providers/:provider/status`
+- `GET|POST /api/execution/broker-profiles`
+- `PATCH /api/execution/broker-profiles/:id`
+- `POST /api/execution/broker-profiles/:id/test`
+
+All profile operations are owner-scoped. Strict schemas reject credential
+fields. The test route only reads normalized provider health and returns
+`orderPlaced: false`. It cannot place an order. The Trading UI shows provider,
+environment, public broker/server, opaque account reference, connection state,
+enabled state, and mapping count, with a permanent **Live trading unavailable
+in M8.4** notice. It has no credential or live-trading control.
+
+Lifecycle changes are audited with non-secret provider/profile/status facts.
+Neither API responses nor audit metadata contains secret values.
+
+## Roadmap after M8.4
+
+M8.5 builds full order/position reconciliation and resolution of uncertain
+broker outcomes. M8.6 strengthens kill-switch and safety controls. M8.7 may
+consider controlled live automation only after all required safety gates,
+transport validation, secret management, broker/account authorization, and
+operational validation are complete. Until then `canAccessAutomation` remains
+false for every plan and live execution remains impossible.

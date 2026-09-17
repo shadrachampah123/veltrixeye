@@ -60,8 +60,13 @@ export interface ExecutionGateInput {
   minRr: number | null;
   /** Gate 14 — exposure verdict. null ⇔ not evaluated yet ⇒ fail-closed. */
   exposureWithinLimits: boolean | null;
-  /** Gate 15 — provider health. null ⇔ unknown ⇒ fail-closed. */
+  /** Provider health. null ⇔ unknown ⇒ fail-closed. */
   providerHealth: { healthy: boolean } | null;
+  /** M8.4 defense-in-depth. Paper is safe; live is always false. */
+  environmentSafe: boolean;
+  /** Broker/account authorization are server-resolved, never client claims. */
+  brokerAuthorized: boolean;
+  accountAuthorized: boolean;
 }
 
 export interface ExecutionGateResult {
@@ -212,6 +217,17 @@ export function evaluateExecutionGates(input: ExecutionGateInput): ExecutionGate
         if (!input.providerHealth.healthy) {
           return fail(gate, 'execution provider is not healthy');
         }
+        break;
+      case 'environment_safety':
+        if (!input.environmentSafe || input.profile?.environment === 'live') {
+          return fail(gate, 'execution environment is not authorized by the M8.4 safety boundary');
+        }
+        break;
+      case 'broker_authorized':
+        if (!input.brokerAuthorized) return fail(gate, 'broker is not server-authorized');
+        break;
+      case 'account_authorized':
+        if (!input.accountAuthorized) return fail(gate, 'broker account is not server-authorized');
         break;
     }
     evaluated.push(gate);
