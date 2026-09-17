@@ -7,6 +7,9 @@ import {
   brokerProfileParamsSchema,
   paperPositionActionSchema,
   paperSimulateSchema,
+  reconciliationListQuerySchema,
+  reconciliationRunTriggerSchema,
+  reconciliationFindingResolveSchema,
   EXECUTION_ARCHITECTURE_VERSION,
   RISK_ENGINE_VERSION,
   type ExecutionStatusDto,
@@ -386,6 +389,119 @@ export async function paperExecutionRoutes(
         return;
       }
       return ctx.execution.paper.reconcile({ userId: user.id });
+    },
+  );
+}
+
+/**
+ * M8.5 — Provider-neutral reconciliation API.
+ *
+ * Every endpoint is owner-scoped, session-authenticated, and READ-only with
+ * respect to provider state. The only write is bookkeeping: triggering a run
+ * (which records a snapshot + findings) and resolving a finding locally
+ * (updates resolution_state only — no cancel/resubmit/close).
+ *
+ * Destructive corrective actions are explicitly GATED OFF and will remain so
+ * until a future milestone introduces an operator-approved repair flow.
+ */
+export async function reconciliationRoutes(
+  app: FastifyInstance,
+  ctx: AppContext,
+  config: AppConfig,
+): Promise<void> {
+  const requireAuth = createSessionAuth(config, ctx);
+
+  // GET /api/execution/reconciliation/status — aggregate status
+  app.get('/api/execution/reconciliation/status', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    return ctx.execution.reconciliation.getStatus(user.id);
+  });
+
+  // GET /api/execution/reconciliation/runs — list runs
+  app.get('/api/execution/reconciliation/runs', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const parsed = reconciliationListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'query');
+      return;
+    }
+    return ctx.execution.reconciliation.listRuns(user.id, parsed.data);
+  });
+
+  // GET /api/execution/reconciliation/runs/:id — run detail
+  app.get('/api/execution/reconciliation/runs/:id', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const runId = (req.params as { id?: string }).id ?? '';
+    return ctx.execution.reconciliation.getRunDetail(user.id, runId);
+  });
+
+  // GET /api/execution/reconciliation/findings — list findings
+  app.get('/api/execution/reconciliation/findings', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const parsed = reconciliationListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'query');
+      return;
+    }
+    const state = (req.query as { state?: string }).state;
+    return ctx.execution.reconciliation.listFindings(user.id, {
+      limit: parsed.data.limit,
+      executionProfileId: parsed.data.executionProfileId,
+      state:
+        state === 'open' || state === 'acknowledged' || state === 'resolved' || state === 'ignored'
+          ? state
+          : undefined,
+    });
+  });
+
+  // POST /api/execution/reconciliation/runs — trigger a run (idempotent)
+  app.post(
+    '/api/execution/reconciliation/runs',
+    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const parsed = reconciliationRunTriggerSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendZodError(reply, parsed.error, 'body');
+        return;
+      }
+      return ctx.execution.reconciliation.triggerRun({
+        userId: user.id,
+        executionProfileId: parsed.data.executionProfileId,
+        trigger: parsed.data.trigger,
+        meta: { ip: req.ip, userAgent: req.headers['user-agent'] ?? null },
+      });
+    },
+  );
+
+  // POST /api/execution/reconciliation/findings/:id/resolve — local resolution only
+  app.post(
+    '/api/execution/reconciliation/findings/:id/resolve',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const findingId = (req.params as { id?: string }).id ?? '';
+      const parsed = reconciliationFindingResolveSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendZodError(reply, parsed.error, 'body');
+        return;
+      }
+      return ctx.execution.reconciliation.resolveFinding(user.id, findingId, parsed.data, {
+        ip: req.ip,
+        userAgent: req.headers['user-agent'] ?? null,
+      });
     },
   );
 }

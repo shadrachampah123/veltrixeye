@@ -103,3 +103,13 @@ export {
   type ReconciliationPositionState,
   type ReconciliationResult,
 } from './reconciliation.js';
+
+/* M8.5 — provider-neutral order & position reconciliation */
+export {
+  ReconciliationService,
+  PaperReconciliationSnapshotProvider,
+  ProviderReconciliationSnapshotProvider,
+  type ReconciliationServiceDeps,
+  type ReconciliationSnapshotProvider,
+  type TriggerRunOptions,
+} from './reconciliation-service.js';

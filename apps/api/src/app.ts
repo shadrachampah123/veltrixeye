@@ -39,6 +39,9 @@ import {
   AutomationService,
   ExecutionIntakeService,
   ExecutionQueryService,
+  ReconciliationService,
+  PaperReconciliationSnapshotProvider,
+  ProviderReconciliationSnapshotProvider,
   RiskEngineService,
   type ProviderRegistry,
   type NotificationProviderRegistry,
@@ -56,7 +59,7 @@ import { alertRoutes } from './routes/alerts.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { billingRoutes } from './routes/billing.js';
 import { scannerRoutes } from './routes/scanner.js';
-import { executionRoutes, paperExecutionRoutes } from './routes/execution.js';
+import { executionRoutes, paperExecutionRoutes, reconciliationRoutes } from './routes/execution.js';
 import { riskRoutes } from './routes/risk.js';
 
 export interface AppContext {
@@ -100,6 +103,12 @@ export interface AppContext {
      * no external trading call — every order it writes is simulated.
      */
     paper: PaperExecutionService;
+    /**
+     * M8.5: provider-neutral order & position reconciliation. Fail-closed,
+     * idempotent, concurrency-safe. Destructive corrective actions are gated
+     * OFF; mismatches produce findings for manual resolution.
+     */
+    reconciliation: ReconciliationService;
   };
 }
 
@@ -222,6 +231,27 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
         },
       },
     )),
+    reconciliation: new ReconciliationService(
+      pool,
+      {
+        getProvider: (id) => executionProviders.get(id),
+        snapshots: {
+          // M8.5: composition root dispatches to the owner-scoped paper
+          // snapshot provider for paper profiles, and the generic provider
+          // adapter for anything else (which in M8.5 returns unavailable
+          // for the disabled MT5 transport — fail-closed).
+          async getSnapshot(args) {
+            if (args.providerId === 'paper') {
+              return new PaperReconciliationSnapshotProvider(pool).getSnapshot(args);
+            }
+            return new ProviderReconciliationSnapshotProvider((id) =>
+              executionProviders.get(id),
+            ).getSnapshot(args);
+          },
+        },
+        audit,
+      },
+    ),
   };
 
   // M7.5 — live scanner (production market-data and scanner pipeline)
@@ -402,6 +432,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await scannerRoutes(app, ctx, config);
   await executionRoutes(app, ctx, config);
   await paperExecutionRoutes(app, ctx, config);
+  await reconciliationRoutes(app, ctx, config);
   await riskRoutes(app, ctx, config);
 
   return app;

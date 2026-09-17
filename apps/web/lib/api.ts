@@ -66,6 +66,11 @@ import type {
   PaperSimulationResultDto,
   PaperStatusDto,
   ReconciliationDto,
+  ReconciliationFindingDto,
+  ReconciliationRunDetailDto,
+  ReconciliationRunDto,
+  ReconciliationStatusDto,
+  ReconciliationTriggerResponse,
 } from '@veltrixeye/contracts';
 import {
   MAX_ALERTS_LIMIT,
@@ -547,6 +552,74 @@ export const api = {
     request<{ ok: boolean; findings: string[]; reconciliations: ReconciliationDto[] }>(
       '/execution/paper/reconcile',
       { method: 'POST', body: JSON.stringify({}) },
+    ),
+
+  // -------------------------------------------------------------------------
+  // M8.5 — provider-neutral reconciliation
+  //
+  // Read-only with respect to provider state. Triggering a run records a
+  // snapshot + findings; resolving a finding updates bookkeeping only — no
+  // cancel/resubmit/close. Automation remains OFF.
+  // -------------------------------------------------------------------------
+
+  /** GET /api/execution/reconciliation/status — aggregate reconciliation status. */
+  getReconciliationStatus: () =>
+    request<ReconciliationStatusDto>('/execution/reconciliation/status'),
+
+  /** GET /api/execution/reconciliation/runs — owner-scoped runs. */
+  listReconciliationRuns: (
+    params: { limit?: number; executionProfileId?: string } = {},
+  ) =>
+    request<{ runs: ReconciliationRunDto[] }>(
+      `/execution/reconciliation/runs${toQueryString({
+        limit: clampLimit(params.limit, 200),
+        executionProfileId: params.executionProfileId,
+      })}`,
+    ),
+
+  /** GET /api/execution/reconciliation/runs/:id — one run with findings. */
+  getReconciliationRun: (runId: string) =>
+    request<ReconciliationRunDetailDto>(
+      `/execution/reconciliation/runs/${encodeURIComponent(runId)}`,
+    ),
+
+  /** GET /api/execution/reconciliation/findings — owner-scoped findings. */
+  listReconciliationFindings: (
+    params: {
+      limit?: number;
+      executionProfileId?: string;
+      state?: 'open' | 'acknowledged' | 'resolved' | 'ignored';
+    } = {},
+  ) =>
+    request<{ findings: ReconciliationFindingDto[] }>(
+      `/execution/reconciliation/findings${toQueryString({
+        limit: clampLimit(params.limit, 200),
+        executionProfileId: params.executionProfileId,
+        state: params.state,
+      })}`,
+    ),
+
+  /** POST /api/execution/reconciliation/runs — trigger an idempotent run. */
+  triggerReconciliationRun: (input: {
+    executionProfileId: string;
+    trigger?: 'manual' | 'startup' | 'scheduled' | 'post_submit';
+  }) =>
+    request<ReconciliationTriggerResponse>('/execution/reconciliation/runs', {
+      method: 'POST',
+      body: JSON.stringify({
+        executionProfileId: input.executionProfileId,
+        trigger: input.trigger ?? 'manual',
+      }),
+    }),
+
+  /** POST /api/execution/reconciliation/findings/:id/resolve — local resolution only. */
+  resolveReconciliationFinding: (
+    findingId: string,
+    input: { action: 'acknowledge' | 'mark_resolved' | 'ignore'; note?: string },
+  ) =>
+    request<ReconciliationFindingDto>(
+      `/execution/reconciliation/findings/${encodeURIComponent(findingId)}/resolve`,
+      { method: 'POST', body: JSON.stringify(input) },
     ),
 };
 
