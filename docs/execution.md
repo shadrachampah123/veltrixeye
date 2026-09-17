@@ -450,9 +450,10 @@ naming the code.
 - Idempotent: while the switch is armed the trip is a no-op — no event spam,
   no reason overwrite — so a breaker cannot loop on its own `KILL_SWITCH_ACTIVE`
   rejections.
-- The trip runs AFTER the decision transaction commits and its failure can
-  never crash or alter the verdict (the rejection itself already refused the
-  trade; the durable trip lands on the next decision).
+- The trip runs AFTER the decision transaction commits (inside the same call),
+  so a ledger fault can never corrupt or crash the persisted verdict; in that
+  fault case the durable trip lands on the NEXT rejection — rejections repeat
+  while the breach holds, so the stop is eventual but never silent.
 - While tripped, automation status shows `user_kill_switch_active`, the
   circuit-breaker summary names it, and only an explicit clear (audited) can
   release it. If the loss window still breaches afterwards, the next rejection
