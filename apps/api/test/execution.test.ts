@@ -200,7 +200,7 @@ describe('M8.1 execution API — profiles', () => {
       headers: { cookie, 'x-forwarded-for': freshIp() },
       payload: { mode: 'demo', providerSlug: 'paper' },
     });
-    assert.equal(demo.statusCode, 403);
+    assert.equal(demo.statusCode, 400);
 
     const live = await app.inject({
       method: 'POST',
@@ -323,11 +323,14 @@ describe('M8.1 execution API — execution status', () => {
     assert.ok(Array.isArray(body.providers));
     const paper = body.providers.find((p: { id: string }) => p.id === 'paper');
     assert.ok(paper, 'the paper boundary provider is registered');
-    // M8.3: the ONLY registered provider is the internal paper simulator, so
-    // it reports ready — and there is still no broker/live provider at all.
     assert.equal(paper.healthy, true);
     assert.equal(paper.configured, true);
-    assert.equal(body.providers.length, 1, 'paper is the only provider that exists');
+    const mt5 = body.providers.find((p: { id: string }) => p.id === 'mt5');
+    assert.ok(mt5, 'the disabled MT5 integration boundary is registered');
+    assert.equal(mt5.healthy, false);
+    assert.equal(mt5.available, false);
+    assert.equal(mt5.configured, false);
+    assert.equal(body.providers.length, 2);
     // No secret material anywhere in the response.
     const serialized = JSON.stringify(body).toLowerCase();
     for (const needle of ['password', 'api_key', 'apikey', 'secret', 'token']) {
@@ -371,5 +374,56 @@ describe('M8.1 execution API — no order-placement surface', () => {
       });
       assert.equal(res.statusCode, 404, `POST ${url} must not exist`);
     }
+  });
+});
+
+describe('M8.4 broker management API', () => {
+  const demoPayload = {
+    mode: 'demo', providerSlug: 'mt5', accountRef: 'demo-account-ref', brokerServer: 'ExampleBroker-Demo',
+    symbolMappings: [{ assetClass: 'commodity', canonicalSymbol: 'XAUUSD', brokerSymbol: 'XAUUSDm' }],
+  };
+
+  test('provider inventory reports MT5 unavailable and live disabled', async () => {
+    const { cookie } = await registerUser();
+    const res = await app.inject({ method: 'GET', url: '/api/execution/providers', headers: { cookie } });
+    assert.equal(res.statusCode, 200);
+    const body = res.json();
+    const mt5 = body.providers.find((p: { id: string }) => p.id === 'mt5');
+    assert.equal(mt5.health.configured, false); assert.equal(mt5.health.available, false); assert.equal(mt5.health.healthy, false);
+    assert.equal(body.liveExecutionAvailable, false);
+  });
+
+  test('creates disabled demo metadata, rejects secrets and cannot enable it', async () => {
+    const { cookie } = await registerUser();
+    const created = await app.inject({ method: 'POST', url: '/api/execution/broker-profiles', headers: { cookie, 'x-forwarded-for': freshIp() }, payload: demoPayload });
+    assert.equal(created.statusCode, 201, created.body);
+    const profile = created.json().profile;
+    assert.equal(profile.environment, 'demo'); assert.equal(profile.enabled, false); assert.equal(profile.connectionStatus, 'disabled');
+    assert.equal(profile.symbolMappings[0].brokerSymbol, 'XAUUSDm');
+    const secret = await app.inject({ method: 'POST', url: '/api/execution/broker-profiles', headers: { cookie, 'x-forwarded-for': freshIp() }, payload: { ...demoPayload, password: 'must-not-be-stored' } });
+    assert.equal(secret.statusCode, 400);
+    const enable = await app.inject({ method: 'PATCH', url: `/api/execution/broker-profiles/${profile.id}`, headers: { cookie, 'x-forwarded-for': freshIp() }, payload: { enabled: true } });
+    assert.equal(enable.statusCode, 403);
+  });
+
+  test('live profile and live patch are rejected', async () => {
+    const { cookie } = await registerUser();
+    const live = await app.inject({ method: 'POST', url: '/api/execution/broker-profiles', headers: { cookie, 'x-forwarded-for': freshIp() }, payload: { ...demoPayload, mode: 'live' } });
+    assert.equal(live.statusCode, 403);
+    const created = await app.inject({ method: 'POST', url: '/api/execution/broker-profiles', headers: { cookie, 'x-forwarded-for': freshIp() }, payload: demoPayload });
+    const patch = await app.inject({ method: 'PATCH', url: `/api/execution/broker-profiles/${created.json().profile.id}`, headers: { cookie, 'x-forwarded-for': freshIp() }, payload: { environment: 'live' } });
+    assert.equal(patch.statusCode, 403);
+  });
+
+  test('profile reads/tests are tenant isolated and connection test places no order', async () => {
+    const a = await registerUser(); const b = await registerUser();
+    const created = await app.inject({ method: 'POST', url: '/api/execution/broker-profiles', headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() }, payload: demoPayload });
+    const id = created.json().profile.id;
+    const list = await app.inject({ method: 'GET', url: '/api/execution/broker-profiles', headers: { cookie: b.cookie } });
+    assert.equal(list.json().profiles.length, 0);
+    const foreignTest = await app.inject({ method: 'POST', url: `/api/execution/broker-profiles/${id}/test`, headers: { cookie: b.cookie, 'x-forwarded-for': freshIp() } });
+    assert.equal(foreignTest.statusCode, 404);
+    const ownTest = await app.inject({ method: 'POST', url: `/api/execution/broker-profiles/${id}/test`, headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() } });
+    assert.equal(ownTest.statusCode, 200); assert.equal(ownTest.json().orderPlaced, false); assert.equal(ownTest.json().health.available, false);
   });
 });

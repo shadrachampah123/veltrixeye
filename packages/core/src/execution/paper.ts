@@ -85,13 +85,41 @@ export function createPaperExecutionProvider(options?: {
     },
 
     async health(): Promise<ExecutionProviderHealth> {
+      const checkedAt = new Date(options?.now?.() ?? Date.now()).toISOString();
       if (!simulator) {
-        return { healthy: false, reason: 'paper_simulator_not_bound' };
+        return {
+          configured: false,
+          authenticated: true,
+          connected: false,
+          available: false,
+          healthy: false,
+          state: 'unavailable',
+          reason: 'paper_simulator_not_bound',
+          checkedAt,
+        };
       }
       return {
+        configured: true,
+        authenticated: true,
+        connected: true,
+        available: true,
         healthy: true,
+        state: 'healthy',
+        checkedAt,
         detail: { internal: true, simulatorVersion: PAPER_SIMULATOR_VERSION },
       };
+    },
+
+    async getAccountInfo() {
+      return null;
+    },
+
+    async getInstrument() {
+      return null;
+    },
+
+    async listInstruments() {
+      return [];
     },
 
     async submitOrder(request: ExecutionSubmitOrderRequest): Promise<ExecutionSubmitOrderOutcome> {
@@ -134,6 +162,13 @@ export function createPaperExecutionProvider(options?: {
       // The provider-neutral list cannot express an owner, so it reports
       // nothing rather than leaking every tenant's rows.
       return [];
+    },
+
+    async getPosition(): Promise<ExecutionProviderPositionState | null> {
+      throw new ExecutionProviderError(
+        'unavailable',
+        'paper position reads are owner-scoped and served by GET /api/execution/paper/positions',
+      );
     },
 
     async listPositions(): Promise<ExecutionProviderPositionState[]> {

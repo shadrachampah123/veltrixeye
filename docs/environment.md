@@ -182,3 +182,12 @@ See [deployment.md](./deployment.md) for the full production runbook.
 - **No invented production credentials.** Real values are injected by the
   operator at deploy time; the code contains no stand-in production
   values. See [security.md](./security.md).
+
+## M8.4 MT5 boundary
+
+M8.4 adds **no MT5 environment variables**. The registered MT5 provider uses
+an unconfigured/disabled transport and has no network endpoint or credential.
+Do not add broker passwords to `.env`, the database, or client configuration.
+A later operational transport requires an approved external secret-management
+boundary and explicit validation; configuration must never imply health or
+enable live execution.

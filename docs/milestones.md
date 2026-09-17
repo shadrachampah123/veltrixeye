@@ -564,9 +564,9 @@ reconciliation. Full design: [execution.md](./execution.md).
   gates, and M8.3 the internal paper simulator that exercises the whole
   chain. **No broker is contacted and no real or demo order can be placed**;
   automation stays OFF and alerts remain suggestions, never orders.
-- **Broker/demo connectivity (M8.4)** — an MT5/Exness bridge, credential
-  handling via server-side secret management, and the provider
-  implementation behind the existing `ExecutionProvider` boundary.
+- **Operational broker/demo connectivity** — M8.4 provides the MT5 provider
+  and disabled transport boundary only. A validated bridge and approved
+  external secret-management integration remain future work.
 - **Live reconciliation against a broker (M8.5)** — M8.3 ships only the
   foundation (expected-vs-actual comparison, finding codes, fail-closed
   reporting); scheduled reconciliation jobs, drift repair and broker-side
@@ -582,16 +582,14 @@ reconciliation. Full design: [execution.md](./execution.md).
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M8.3 (later work, outline only)
+## After M8.4 (later work, outline only)
 
 1. **More channels + preferences** — a second `NotificationProvider` (push /
    webhook / SMS) behind the M7.3 registry, plus per-user notification
    preferences and per-strategy routing.
-2. **M8.4 — broker/demo connectivity** — an MT5/Exness-style bridge behind
-   the existing `ExecutionProvider` boundary, with credentials held only in
-   server-side secret management (never persisted, never logged). Live
-   execution stays impossible until this lands **and** the automation
-   entitlement is granted.
+2. **Operational broker transport** — validate a concrete MT5 bridge and an
+   approved external secret manager on demo infrastructure. M8.4 deliberately
+   ships neither and makes no connectivity claim.
 3. **M8.5 — full reconciliation** — scheduled reconciliation jobs against
    the broker, drift detection and repair policy, and broker-state import on
    top of the M8.3 foundation.
@@ -602,3 +600,33 @@ Each of these is its own milestone. The M3 engine, M4 detector, M5 scoring
 engine, result DTOs, store, and provider abstraction are specifically
 shaped so each is additive — no rewrite of the schema, contracts, or UI is
 required.
+
+## M8.4 — delivered (Broker / MT5 Integration Boundary)
+
+Provider-neutral broker contracts now cover normalized health, account and
+instrument metadata, orders and positions. `MT5Provider` depends only on
+`MT5Transport`; no hosting topology or vendor protocol is invented. Exness is
+an example MT5 broker/server, not a separate engine.
+
+- Production composition uses `DisabledMT5Transport`: MT5 reports unconfigured,
+  unavailable and unhealthy. No real transport or broker connectivity is
+  operational, and no successful response is fabricated.
+- Paper and broker demo remain separate. Disabled demo metadata profiles and
+  explicit canonical-to-broker symbol mappings are owner-scoped; no plaintext
+  credentials or secret references are stored because a production broker
+  secret manager does not yet exist.
+- Broker constraints and quote freshness are additional fail-closed checks;
+  risk-safe volume is never increased to satisfy a broker minimum.
+- Stable client ids, pre-submit lookup, normalized errors, and explicit
+  uncertain/lost-response handling prepare M8.5 reconciliation without blind
+  retries.
+- Safe authenticated provider/profile status and connection-test routes plus
+  minimal Trading UI were added. There is no broker order route or live button.
+- Defense in depth now pins 18 execution gates, ending with environment,
+  broker, and account authorization. The original live-profile DB prohibition,
+  provider hard-stop, automation OFF state, and `canAccessAutomation: false`
+  all remain intact.
+
+**M8.4 does not enable live trading.** M8.5 adds full reconciliation, M8.6
+strengthens kill-switch/safety controls, and M8.7 is the earliest milestone
+that may consider controlled live automation after all validation is complete.

@@ -247,6 +247,9 @@ export class ExecutionIntakeService {
       minRr: risk.effectiveMinRr,
       exposureWithinLimits: risk.exposureWithinLimits,
       providerHealth,
+      environmentSafe: profile.environment === 'paper',
+      brokerAuthorized: profile.provider_slug === 'paper',
+      accountAuthorized: profile.provider_slug === 'paper',
     });
 
     const accepted = gate.passed;

@@ -1723,6 +1723,9 @@ export class PaperExecutionService {
       minRr: null,
       exposureWithinLimits: null,
       providerHealth: provider && health ? { healthy: health.healthy } : null,
+      environmentSafe: true,
+      brokerAuthorized: true,
+      accountAuthorized: true,
     });
     return result.failedGate;
   }

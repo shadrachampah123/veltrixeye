@@ -1929,13 +1929,13 @@ describe('M8.3 reconciliation', () => {
 });
 
 describe('M8.3 migration 0018', () => {
-  test('applies additively as the 18th migration', async () => {
+  test('remains applied when later additive migrations exist', async () => {
     const status = await pool.query<{ n: string }>(
       `SELECT count(*)::text AS n FROM schema_migrations`,
     );
-    assert.equal(Number(status.rows[0]!.n), 18);
+    assert.ok(Number(status.rows[0]!.n) >= 18);
     const applied = await pool.query<{ name: string }>(
-      `SELECT name FROM schema_migrations ORDER BY name DESC LIMIT 1`,
+      `SELECT name FROM schema_migrations WHERE name = '0018_paper_execution.sql'`,
     );
     assert.equal(applied.rows[0]!.name, '0018_paper_execution.sql');
   });

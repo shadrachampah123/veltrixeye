@@ -3,6 +3,8 @@ import {
   automationToggleSchema,
   executionListQuerySchema,
   executionProfileCreateSchema,
+  brokerProfilePatchSchema,
+  brokerProfileParamsSchema,
   paperPositionActionSchema,
   paperSimulateSchema,
   EXECUTION_ARCHITECTURE_VERSION,
@@ -75,12 +77,19 @@ export async function executionRoutes(app: FastifyInstance, ctx: AppContext, con
     const providers: ExecutionStatusDto['providers'] = [];
     for (const info of ctx.execution.providers.list()) {
       const provider = ctx.execution.providers.get(info.id);
-      const health = provider ? await provider.health() : { healthy: false, reason: 'provider_missing' };
+      const health = provider ? await provider.health() : {
+        configured: false, authenticated: false, connected: false, available: false,
+        healthy: false, state: 'unavailable' as const, reason: 'provider_missing', checkedAt: new Date().toISOString(),
+      };
       providers.push({
         id: info.id,
         name: info.name,
-        configured: info.configured,
+        configured: health.configured,
+        authenticated: health.authenticated,
+        connected: health.connected,
+        available: health.available,
         healthy: health.healthy,
+        state: health.state,
         reason: health.reason ?? null,
       });
     }
@@ -94,6 +103,27 @@ export async function executionRoutes(app: FastifyInstance, ctx: AppContext, con
       profiles: profiles.length,
     };
     return dto;
+  });
+
+  // M8.4 provider inventory/status. Safe metadata only; describe() is written
+  // by adapters and never contains credentials.
+  app.get('/api/execution/providers', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const providers = await Promise.all(ctx.execution.providers.list().map(async (info) => {
+      const provider = ctx.execution.providers.get(info.id)!;
+      return { id: info.id, name: info.name, capabilities: info.capabilities, description: provider.describe(), health: await provider.health() };
+    }));
+    return { providers, liveExecutionAvailable: false };
+  });
+
+  app.get('/api/execution/providers/:provider/status', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const providerId = (req.params as { provider?: string }).provider ?? '';
+    const provider = ctx.execution.providers.get(providerId);
+    if (!provider) return reply.code(404).send({ error: { code: 'not_found', message: 'Execution provider not found' } });
+    return { id: provider.id, name: provider.name, capabilities: provider.capabilities, description: provider.describe(), health: await provider.health(), liveExecutionAvailable: false };
   });
 
   // GET /api/execution/profiles — owner-scoped list
@@ -125,7 +155,39 @@ export async function executionRoutes(app: FastifyInstance, ctx: AppContext, con
     },
   );
 
-  // GET /api/execution/orders — owner-scoped (empty until a provider can trade)
+  // M8.4 broker-profile aliases keep broker management distinct from order APIs.
+  app.get('/api/execution/broker-profiles', async (req, reply) => {
+    const ok = await requireAuth(req, reply); if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const result = await ctx.execution.profiles.listForUser(user.id);
+    return { profiles: result.profiles.filter((p) => p.providerSlug !== 'paper') };
+  });
+  app.post('/api/execution/broker-profiles', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (req, reply) => {
+    const ok = await requireAuth(req, reply); if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const parsed = executionProfileCreateSchema.safeParse(req.body ?? {});
+    if (!parsed.success) { sendZodError(reply, parsed.error, 'body'); return; }
+    const profile = await ctx.execution.profiles.createProfile(user.id, parsed.data, { ip: req.ip, userAgent: req.headers['user-agent'] ?? null });
+    return reply.code(201).send({ profile });
+  });
+  app.patch('/api/execution/broker-profiles/:id', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (req, reply) => {
+    const ok = await requireAuth(req, reply); if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const params = brokerProfileParamsSchema.safeParse(req.params);
+    const body = brokerProfilePatchSchema.safeParse(req.body ?? {});
+    if (!params.success) { sendZodError(reply, params.error, 'params'); return; }
+    if (!body.success) { sendZodError(reply, body.error, 'body'); return; }
+    return { profile: await ctx.execution.profiles.updateBrokerProfile(user.id, params.data.id, body.data, { ip: req.ip, userAgent: req.headers['user-agent'] ?? null }) };
+  });
+  app.post('/api/execution/broker-profiles/:id/test', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (req, reply) => {
+    const ok = await requireAuth(req, reply); if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const params = brokerProfileParamsSchema.safeParse(req.params);
+    if (!params.success) { sendZodError(reply, params.error, 'params'); return; }
+    return ctx.execution.profiles.testBrokerProfile(user.id, params.data.id, { ip: req.ip, userAgent: req.headers['user-agent'] ?? null });
+  });
+
+  // GET /api/execution/orders — owner-scoped
   app.get('/api/execution/orders', async (req, reply) => {
     const ok = await requireAuth(req, reply);
     if (!ok) return;
