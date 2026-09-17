@@ -4,7 +4,7 @@ import * as React from 'react';
 import { AppShell, PageHeader } from '@/components/app-shell';
 import { RequireAuth } from '@/components/auth-context';
 import { api, ApiError } from '@/lib/api';
-import { Card, CardHeader, Badge, Spinner } from '@/components/ui';
+import { Card, CardHeader, Badge, Spinner, Button } from '@/components/ui';
 import { RiskPolicyPanel } from '@/components/risk-policy-panel';
 import { PaperExecutionPanel } from '@/components/paper-execution-panel';
 import type {
@@ -15,6 +15,9 @@ import type {
   PaperPositionDto,
   PaperStatusDto,
   ReconciliationDto,
+  ReconciliationFindingDto,
+  ReconciliationRunDto,
+  ReconciliationStatusDto,
   RiskPolicyStatusDto,
 } from '@veltrixeye/contracts';
 
@@ -50,11 +53,28 @@ function TradingContent() {
   const [paperPositions, setPaperPositions] = React.useState<PaperPositionDto[]>([]);
   const [paperFills, setPaperFills] = React.useState<PaperFillDto[]>([]);
   const [paperReconciliations, setPaperReconciliations] = React.useState<ReconciliationDto[]>([]);
+  const [reconStatus, setReconStatus] = React.useState<ReconciliationStatusDto | null>(null);
+  const [reconRuns, setReconRuns] = React.useState<ReconciliationRunDto[]>([]);
+  const [reconFindings, setReconFindings] = React.useState<ReconciliationFindingDto[]>([]);
+  const [reconBusy, setReconBusy] = React.useState(false);
+  const [reconError, setReconError] = React.useState<string | null>(null);
+  const [reconNotice, setReconNotice] = React.useState<string | null>(null);
   const [paperSetupId, setPaperSetupId] = React.useState('');
   const [paperProfileId, setPaperProfileId] = React.useState('');
   const [paperBusy, setPaperBusy] = React.useState(false);
   const [paperError, setPaperError] = React.useState<string | null>(null);
   const [paperNotice, setPaperNotice] = React.useState<string | null>(null);
+
+  const loadReconciliation = React.useCallback(async () => {
+    const [rs, rr, rf] = await Promise.all([
+      api.getReconciliationStatus(),
+      api.listReconciliationRuns({ limit: 10 }),
+      api.listReconciliationFindings({ limit: 25, state: 'open' }),
+    ]);
+    setReconStatus(rs);
+    setReconRuns(rr.runs);
+    setReconFindings(rf.findings);
+  }, []);
 
   const loadPaper = React.useCallback(async () => {
     const [ps, po, pp, pf, pr] = await Promise.all([
@@ -89,6 +109,11 @@ function TradingContent() {
           await loadPaper();
         } catch {
           // The readiness surface still renders when the paper panel cannot load.
+        }
+        try {
+          await loadReconciliation();
+        } catch {
+          // Surface still renders without reconciliation data.
         }
       } catch (e: any) {
         if (!cancelled) setError(e?.message ?? 'Failed to load execution status');
@@ -152,6 +177,25 @@ function TradingContent() {
       () => api.closePaperPosition(positionId),
       'Simulated position closed at the server price.',
     );
+
+  const runReconcile = async (profileId: string) => {
+    if (!profileId) {
+      setReconError('Select a paper execution profile first.');
+      return;
+    }
+    setReconBusy(true);
+    setReconError(null);
+    setReconNotice(null);
+    try {
+      await api.triggerReconciliationRun({ executionProfileId: profileId, trigger: 'manual' });
+      await loadReconciliation();
+      setReconNotice('Reconciliation run complete. No corrective actions were taken.');
+    } catch (e) {
+      setReconError(e instanceof Error ? e.message : 'Reconciliation failed');
+    } finally {
+      setReconBusy(false);
+    }
+  };
 
   return (
     <AppShell>
@@ -290,6 +334,115 @@ function TradingContent() {
                 non-secret references and explicit symbol mappings. Credentials are not accepted
                 or stored, and the MT5 transport is disabled.
               </p>
+            </div>
+          </Card>
+
+          {/* M8.5 Reconciliation status */}
+          <Card>
+            <CardHeader
+              title="Order & position reconciliation (M8.5)"
+              subtitle="Provider-neutral comparison between internal state and provider state. Fail-closed; no automatic repair."
+              actions={
+                <Badge
+                  tone={
+                    reconStatus?.healthState === 'synchronized'
+                      ? 'success'
+                      : reconStatus?.healthState === 'provider_unavailable'
+                        ? 'neutral'
+                        : reconStatus?.healthState === 'uncertain'
+                          ? 'warning'
+                          : 'danger'
+                  }
+                >
+                  {reconStatus?.healthState ?? 'initializing'}
+                </Badge>
+              }
+            />
+            <div className="space-y-3 px-5 pb-5 text-sm">
+              <div className="grid gap-2 sm:grid-cols-4">
+                <div>
+                  <div className="text-xs text-ink-400">Open findings</div>
+                  <div className="text-lg">{reconStatus?.openFindings ?? 0}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-ink-400">Total runs</div>
+                  <div className="text-lg">{reconStatus?.totalRuns ?? 0}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-ink-400">Last run</div>
+                  <div className="text-sm">
+                    {reconStatus?.lastRun
+                      ? new Date(reconStatus.lastRun.startedAt).toLocaleString()
+                      : '—'}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-ink-400">Corrective actions</div>
+                  <div className="text-lg">disabled</div>
+                </div>
+              </div>
+              <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+                <strong>Safety gates active.</strong> Reconciliation never creates, cancels or
+                closes orders automatically. Uncertain outcomes remain uncertain until an
+                operator acknowledges them; provider unavailability fails closed.
+              </p>
+              <div className="flex flex-wrap items-end gap-2">
+                <Button
+                  onClick={() => void runReconcile(paperProfileId)}
+                  disabled={reconBusy || !paperProfileId}
+                >
+                  Run reconciliation
+                </Button>
+              </div>
+              {reconError && <p className="text-xs text-red-400">{reconError}</p>}
+              {reconNotice && <p className="text-xs text-emerald-400">{reconNotice}</p>}
+
+              {reconFindings.length > 0 && (
+                <div>
+                  <div className="mb-1 text-xs uppercase tracking-wide text-ink-400">
+                    Findings requiring attention
+                  </div>
+                  <ul className="space-y-1 text-xs">
+                    {reconFindings.slice(0, 10).map((f) => (
+                      <li key={f.id} className="flex items-start justify-between gap-2">
+                        <span className="text-red-400">{f.code}</span>
+                        <span className="text-ink-400">
+                          {f.scope}
+                          {f.resolutionState !== 'open' ? ` · ${f.resolutionState}` : ''}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {reconRuns.length > 0 && (
+                <div>
+                  <div className="mb-1 text-xs uppercase tracking-wide text-ink-400">
+                    Recent runs
+                  </div>
+                  <ul className="space-y-1 text-xs">
+                    {reconRuns.slice(0, 5).map((r) => (
+                      <li key={r.id} className="flex items-center justify-between gap-2">
+                        <span className="text-ink-300">{r.providerId} · {r.trigger}</span>
+                        <span
+                          className={
+                            r.healthState === 'synchronized'
+                              ? 'text-emerald-400'
+                              : r.healthState === 'uncertain'
+                                ? 'text-amber-400'
+                                : r.healthState === 'provider_unavailable'
+                                  ? 'text-ink-400'
+                                  : 'text-red-400'
+                          }
+                        >
+                          {r.healthState} · {r.summary.findingsOpen} open
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
           </Card>
 
