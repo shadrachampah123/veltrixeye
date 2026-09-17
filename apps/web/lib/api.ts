@@ -58,6 +58,14 @@ import type {
   RiskPolicyStatusDto,
   RiskDecisionDto,
   RiskPolicyUpdateInput,
+
+  PaperFillDto,
+  PaperOrderDto,
+  PaperPositionDto,
+  PaperPositionOutcomeDto,
+  PaperSimulationResultDto,
+  PaperStatusDto,
+  ReconciliationDto,
 } from '@veltrixeye/contracts';
 import {
   MAX_ALERTS_LIMIT,
@@ -477,6 +485,69 @@ export const api = {
   /** GET /api/risk/decisions — owner-scoped risk-decision audit trail. */
   listRiskDecisions: (params: { limit?: number } = {}) =>
     request<{ decisions: RiskDecisionDto[] }>(`/risk/decisions${toQueryString({ limit: params.limit })}`),
+
+  // -------------------------------------------------------------------------
+  // M8.3 — paper execution simulator (INTERNAL simulation only)
+  //
+  // These calls can only ever produce simulated orders/positions against the
+  // platform's own candle store. There is no broker, demo account or live
+  // endpoint on this client, and none of them accepts a price, size, approval
+  // or P&L — identifiers only.
+  // -------------------------------------------------------------------------
+
+  /** GET /api/execution/paper/status — simulator readiness + simulated P&L. */
+  getPaperStatus: () => request<PaperStatusDto>('/execution/paper/status'),
+
+  /**
+   * POST /api/execution/paper/simulate — simulate execution of the server's
+   * decision for one owned setup. Body carries identifiers only.
+   */
+  simulatePaperExecution: (input: { setupId: string; executionProfileId: string; riskDecisionId?: string }) =>
+    request<PaperSimulationResultDto>('/execution/paper/simulate', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  /** GET /api/execution/paper/orders — owner-scoped simulated orders. */
+  listPaperOrders: (params: { limit?: number } = {}) =>
+    request<{ orders: PaperOrderDto[] }>(`/execution/paper/orders${toQueryString({ limit: params.limit })}`),
+
+  /** GET /api/execution/paper/positions — owner-scoped simulated positions. */
+  listPaperPositions: (params: { limit?: number } = {}) =>
+    request<{ positions: PaperPositionDto[] }>(
+      `/execution/paper/positions${toQueryString({ limit: params.limit })}`,
+    ),
+
+  /** GET /api/execution/paper/fills — the append-only simulated fill ledger. */
+  listPaperFills: (params: { limit?: number } = {}) =>
+    request<{ fills: PaperFillDto[] }>(`/execution/paper/fills${toQueryString({ limit: params.limit })}`),
+
+  /** GET /api/execution/paper/reconciliations — reconciliation trail. */
+  listPaperReconciliations: (params: { limit?: number } = {}) =>
+    request<{ reconciliations: ReconciliationDto[] }>(
+      `/execution/paper/reconciliations${toQueryString({ limit: params.limit })}`,
+    ),
+
+  /** POST /api/execution/paper/evaluate — apply SL/TP to open simulated positions. */
+  evaluatePaperPositions: () =>
+    request<{ evaluated: number; closed: number; outcomes: PaperPositionOutcomeDto[] }>(
+      '/execution/paper/evaluate',
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+
+  /** POST /api/execution/paper/positions/:id/close — close at the server price. */
+  closePaperPosition: (positionId: string) =>
+    request<PaperPositionOutcomeDto>(`/execution/paper/positions/${positionId}/close`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+
+  /** POST /api/execution/paper/reconcile — run the read-only consistency sweep. */
+  reconcilePaperExecution: () =>
+    request<{ ok: boolean; findings: string[]; reconciliations: ReconciliationDto[] }>(
+      '/execution/paper/reconcile',
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
 };
 
 /** Summary row shape from the API list endpoint. */

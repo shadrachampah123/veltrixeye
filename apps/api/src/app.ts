@@ -30,6 +30,8 @@ import {
   // M8.1 execution architecture (safety boundary only — no provider can trade)
   createExecutionProviderRegistry,
   createPaperExecutionProvider,
+  PaperExecutionService,
+  CandleStoreMarketPriceSource,
   KillSwitchService,
   ExecutionProfileService,
   AutomationService,
@@ -52,7 +54,7 @@ import { alertRoutes } from './routes/alerts.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { billingRoutes } from './routes/billing.js';
 import { scannerRoutes } from './routes/scanner.js';
-import { executionRoutes } from './routes/execution.js';
+import { executionRoutes, paperExecutionRoutes } from './routes/execution.js';
 import { riskRoutes } from './routes/risk.js';
 
 export interface AppContext {
@@ -91,6 +93,11 @@ export interface AppContext {
     intake: ExecutionIntakeService;
     queries: ExecutionQueryService;
     risk: RiskEngineService;
+    /**
+     * M8.3: internal deterministic paper simulator. No broker, no credential,
+     * no external trading call — every order it writes is simulated.
+     */
+    paper: PaperExecutionService;
   };
 }
 
@@ -128,11 +135,11 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   const alerts = new AlertService(pool, strategies, new StubAlertSender(), notifications);
   const scoring = new ScoringService(pool, strategies, evaluation);
 
-  // M8.1 — execution architecture (safety boundary only). Exactly one
-  // provider registers (paper), it reports not-ready, and every trading
-  // operation on it throws: no broker connectivity exists anywhere.
+  // M8.1/M8.3 — execution architecture + the internal paper simulator.
+  // Exactly ONE provider registers (paper), bound to the in-process simulator:
+  // there is no broker connectivity anywhere, and the provider refuses every
+  // order that does not carry a server-issued authorization.
   const executionProviders = createExecutionProviderRegistry();
-  executionProviders.register(createPaperExecutionProvider());
   const killSwitches = new KillSwitchService(pool);
   const automation = new AutomationService(pool, killSwitches, audit);
   const risk = new RiskEngineService(
@@ -149,6 +156,17 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
       },
     },
   );
+  // M8.3 — the paper simulator is created BEFORE the provider so the provider
+  // can be bound to it; the service resolves the provider lazily (below) so
+  // there is no construction cycle.
+  const paperMarket = new CandleStoreMarketPriceSource(pool);
+  let paperService: PaperExecutionService;
+  const paperProvider = createPaperExecutionProvider({
+    simulator: {
+      submitAuthorizedOrder: (args) => paperService.submitAuthorizedOrder(args),
+    },
+  });
+  executionProviders.register(paperProvider);
   const execution = {
     providers: executionProviders,
     killSwitches,
@@ -170,6 +188,27 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     ),
     queries: new ExecutionQueryService(pool),
     risk,
+    paper: (paperService = new PaperExecutionService(
+      pool,
+      {
+        market: paperMarket,
+        risk,
+        killSwitches,
+        automation,
+        audit,
+        provider: () => executionProviders.get(paperProvider.id),
+      },
+      {
+        logger: {
+          info: (msg, meta) => {
+            if (config.NODE_ENV === 'production') {
+              console.info(`[paper] ${msg}`, meta ? JSON.stringify(meta) : '');
+            }
+          },
+          warn: (msg, meta) => console.warn(`[paper] ${msg}`, meta ? JSON.stringify(meta) : ''),
+        },
+      },
+    )),
   };
 
   // M7.5 — live scanner (production market-data and scanner pipeline)
@@ -349,6 +388,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await billingRoutes(app, ctx, config);
   await scannerRoutes(app, ctx, config);
   await executionRoutes(app, ctx, config);
+  await paperExecutionRoutes(app, ctx, config);
   await riskRoutes(app, ctx, config);
 
   return app;

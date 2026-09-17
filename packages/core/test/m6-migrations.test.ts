@@ -164,11 +164,15 @@ describe('m6 migrations: chain and backtest tables (0011)', () => {
     assert.ok(status.appliedCount >= 12);
     // The chain is additive: M7.3 appended 0013 (the notification outbox),
     // M7.5 appended 0015 (scanner runs), M8.1 appended 0016 (execution
-    // architecture) and M8.2 appended 0017 (risk engine) without touching
-    // 0001-0012, so the head moved on while every earlier migration — and
-    // this suite's 0011/0012 assertions — still hold.
-    assert.equal(status.expectedCount, 17);
-    assert.equal(status.latestApplied, '0017_risk_engine.sql');
+    // architecture), M8.2 appended 0017 (risk engine) and M8.3 appended 0018
+    // (paper execution) without touching 0001-0012, so the head moved on while
+    // every earlier migration — and this suite's 0011/0012 assertions — still
+    // hold. The head is therefore asserted as a floor, not a frozen number.
+    assert.ok(status.expectedCount >= 12);
+    assert.equal(status.appliedCount, status.expectedCount);
+    assert.ok(
+      status.latestApplied !== null && status.latestApplied >= '0012_backtests.sql',
+    );
     assert.equal(status.checksumsMatch, true);
     const second = await runMigrations(pool, MIGRATIONS_DIR);
     assert.equal(second.applied.length, 0);

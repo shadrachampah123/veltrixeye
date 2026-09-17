@@ -4,10 +4,12 @@ M8.1 builds the **execution architecture and safety boundary only**. It is a
 foundation milestone:
 
 - **NO broker, MT5 or Exness connectivity exists anywhere in this repository.**
-- **NO order — real, demo or simulated — can be placed.** The single registered
-  provider (`paper`) reports `configured: false`, answers unhealthy with a
-  reason, and throws a normalized `unavailable` error on every trading
-  operation.
+- **NO order can reach a broker, demo account or external venue.** M8.3 adds
+  the internal **paper simulator** (see below): it creates *simulated* orders
+  and positions only, priced from the platform's own candle store. The single
+  registered provider is still the platform's own `paper` adapter, and broker
+  operations (`cancel`, `modify`, `getOrder`, `closePosition`) still throw a
+  normalized `unavailable` error.
 - **Live execution is impossible by construction**: the service layer refuses
   it, and migration `0016` carries `CHECK (environment <> 'live')`.
 - **No credentials are modeled**: execution profiles store a provider slug and
@@ -141,6 +143,54 @@ payloads never propagate; secrets never exist to leak.
 the M8.3 simulator; today every trading operation throws
 `ExecutionProviderError('unavailable')`.
 
+## Paper execution simulator (M8.3)
+
+M8.3 fills the **Execution Provider → Order → Position → SL/TP → P&L →
+Reconciliation** part of the chain **internally**. It is a deterministic
+simulator, not a broker integration:
+
+- **Inputs are server-issued only.** A simulation request carries identifiers
+  (`setupId`, `executionProfileId`, optional `riskDecisionId`) and nothing
+  else. The server rebuilds the decision from the owned setup, calls the M8.2
+  risk engine, and only then can an order exist. A client `{ approved: true }`,
+  price, quantity or P&L field is a 400.
+- **Market data is the platform's own.** `CandleStoreMarketPriceSource` reads
+  the same `candles` table the scanner uses. Prices must exist, be positive
+  and be fresh (per-instrument `STALE_THRESHOLDS_MS`); stale, future,
+  missing or non-positive prices refuse the simulation. There is no second
+  market-data provider and no external quote.
+- **Deterministic fills.** Market orders fill at the reference price with
+  adverse slippage; stops fill at the stop with adverse slippage; take
+  profits fill at the level; explicit closes fill at the current reference
+  price. All arithmetic is the M8.2 `Dec` (bigint, 10 dp) — never a float.
+- **State machine + ledger.** `execution_orders`/`execution_positions` are
+  transitioned through the M8.1 states; fills are appended to
+  `execution_fills` (exactly-once per `(order_id, sequence)`, unique
+  idempotency key, append-only trigger). Repeated submissions replay the
+  existing result instead of creating a duplicate.
+- **SL/TP from candles.** `detectExit` walks the candles after entry in
+  chronological order. A candle that touches both levels resolves to the
+  **stop** (conservative) and records a `paper_sl_tp_conflict` event.
+- **Reconciliation foundation (M8.5).** Each fill/close writes an
+  `execution_reconciliations` record comparing expected vs stored state.
+  Inconsistencies are *reported* and the write fails closed — nothing is
+  silently corrected.
+- **P&L is simulated.** Realized/unrealized P&L, fees and slippage are
+  simulated values. Paper results are **not** broker fills and are not a
+  guarantee of future performance.
+
+Paper endpoints (session-authenticated, owner-scoped):
+
+| Route | Purpose |
+|---|---|
+| `GET /api/execution/paper/status` | simulator readiness + simulated P&L summary |
+| `POST /api/execution/paper/simulate` | simulate the server's decision for one owned setup |
+| `GET /api/execution/paper/orders` \| `/positions` \| `/fills` | owner-scoped read models |
+| `POST /api/execution/paper/positions/:id/close` | close a simulated position at the server price |
+| `POST /api/execution/paper/evaluate` | apply SL/TP to open simulated positions |
+| `GET /api/execution/paper/reconciliations` | reconciliation trail |
+| `POST /api/execution/paper/reconcile` | read-only consistency sweep |
+
 ## API surface (M8.1)
 
 | Route | Purpose |
@@ -154,9 +204,12 @@ the M8.3 simulator; today every trading operation throws
 | `GET /api/execution/positions` | owner-scoped positions (empty) |
 | `GET /api/execution/events` | owner-scoped execution audit trail |
 
-**Deliberately absent**: order submission/modification/cancellation, direct
-provider invocation, client-authored execution decisions. Decisions will only
-ever be produced server-side by the strategy → risk pipeline (M8.2+).
+**Deliberately absent**: order submission/modification/cancellation to a
+broker, direct provider invocation, client-authored execution decisions,
+broker credentials, demo-account connection and MT5/Exness configuration.
+The paper routes above are the only order-creating surface, and they are
+simulations. Decisions are only ever produced server-side by the
+strategy → risk pipeline (M8.2+).
 
 ## Audit trail
 
@@ -202,13 +255,26 @@ persisted, never logged.
   unknown-provider refusal, credential-field rejection, cross-user isolation,
   and proof that no order-placement surface exists (all candidate submission
   endpoints 404).
+- M8.3 paper execution (`packages/core/test/paper-execution.test.ts` and
+  `apps/api/test/paper-execution.test.ts`): pure fill/P&L/exit arithmetic and
+  gate ordering, valid long/short simulations, SL/TP exits, fees/slippage,
+  risk-decision forgery/citation/invalid-engine-version refusal, kill-switch
+  and automation-OFF blocking, idempotent replay and duplicate-fill no-ops,
+  stale/missing market data, deterministic fill/order/close failure paths,
+  reconciliation mismatch detection (never an auto-correction), tenant
+  isolation, the append-only fill ledger and the migration CHECKs, plus an
+  API-level assertion that no paper response carries credential material or
+  a broker order id.
 
-## Boundaries (what M8.1 is NOT)
+## Boundaries (what M8.1/M8.2/M8.3 are NOT)
 
-Not implemented, by design — later M8 milestones: real/demo broker
-connectivity, Exness/MT5 integration, the paper simulator (M8.3), trailing
-stops, break-even, reconciliation jobs, automated trade placement, and any
-UI beyond the readiness page + the M8.2 risk-settings panel. The risk
-engine, position sizing, loss limits, correlated-exposure controls and
-session restrictions shipped in M8.2 ([risk.md](./risk.md)) and still do
-not execute orders.
+Not implemented, by design — later M8 milestones: **broker/demo connectivity
+and MT5/Exness integration (M8.4)**, **live reconciliation jobs against a
+broker (M8.5)**, trailing stops, break-even, automated trade placement
+(permanently OFF in this milestone set), and any UI beyond the readiness page,
+the M8.2 risk-settings panel and the M8.3 paper-execution panel. The M8.3
+simulator is internal and deterministic: it never contacts a broker, never
+stores a credential and cannot place a live order. The risk engine, position
+sizing, loss limits, correlated-exposure controls and session restrictions
+shipped in M8.2 ([risk.md](./risk.md)) remain mandatory and still do not
+authorise real execution.

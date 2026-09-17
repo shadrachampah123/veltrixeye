@@ -313,7 +313,7 @@ describe('M8.1 execution API — orders, positions, events', () => {
 });
 
 describe('M8.1 execution API — execution status', () => {
-  test('status reports automation OFF, paper provider not ready, no secrets', async () => {
+  test('status reports automation OFF, internal paper simulator ready, no secrets', async () => {
     const { cookie } = await registerUser();
     const res = await app.inject({ method: 'GET', url: '/api/execution/status', headers: { cookie } });
     assert.equal(res.statusCode, 200);
@@ -323,8 +323,11 @@ describe('M8.1 execution API — execution status', () => {
     assert.ok(Array.isArray(body.providers));
     const paper = body.providers.find((p: { id: string }) => p.id === 'paper');
     assert.ok(paper, 'the paper boundary provider is registered');
-    assert.equal(paper.healthy, false, 'paper honestly reports not-ready in M8.1');
-    assert.equal(paper.configured, false);
+    // M8.3: the ONLY registered provider is the internal paper simulator, so
+    // it reports ready — and there is still no broker/live provider at all.
+    assert.equal(paper.healthy, true);
+    assert.equal(paper.configured, true);
+    assert.equal(body.providers.length, 1, 'paper is the only provider that exists');
     // No secret material anywhere in the response.
     const serialized = JSON.stringify(body).toLowerCase();
     for (const needle of ['password', 'api_key', 'apikey', 'secret', 'token']) {
