@@ -201,6 +201,33 @@ Unknown, missing or uncomputable inputs reject. There is no default
 position size, no assumed correlation, no assumed session, no assumed
 spread. A missing risk decision still fails the M8.1 gate.
 
+## Consumption by the paper simulator (M8.3)
+
+M8.3 makes the risk engine a **mandatory, server-side** step of the paper
+execution path ([execution.md](./execution.md)):
+
+- A simulation request carries identifiers only. The server derives the
+  strategy/setup/profile context itself and calls `RiskEngineService`
+  **before** any order can exist; a client-supplied approval, price, size,
+  risk amount or P&L field is rejected as invalid input.
+- The engine's verdict is persisted and its `decisionId` +
+  `engineVersion` are cited by the created order. The simulator revalidates
+  that citation (the decision row must exist, belong to the same user and
+  setup, be `approved`, carry `RISK_ENGINE_VERSION`, and be within
+  `PAPER_RISK_DECISION_MAX_AGE_MS`). A forged or stale citation fails
+  closed.
+- The approved size is re-checked against the instrument risk spec and the
+  platform ceiling, and the SL/TP legs are re-validated against the fill
+  price's direction and the policy RR floor **at fill price** — approval is
+  a precondition, never a substitute for validation.
+- Kill-switch state, execution-profile state and the M8.1 automation switch
+  are re-read at execution time; the automated path stays OFF for every
+  plan, so the simulator is only reachable through an explicit user action.
+- When a simulated position closes, its realized P&L is fed back into the
+  account snapshot (`recordRealizedPl`) so daily/weekly/consecutive-loss
+  limits see paper results. Paper equity is a simulation parameter, not a
+  broker balance.
+
 ## Rejection codes
 
 Pinned in `RISK_REJECTION_CODES`. When several checks fail, the public
@@ -228,11 +255,15 @@ and policy version only.
 | `GET /api/risk/decisions` | Owner-scoped decision history |
 
 There is **no** endpoint that accepts a client risk approval or places
-an order.
+an order. The only order-creating surface is the M8.3 paper simulator
+(`/api/execution/paper/*`), which produces **simulations** and always
+calls this engine first.
 
 The Trading page shows a risk panel that labels **User Risk Setting**
-separately from **Platform Safety Limit**. No live-trading button, no
-broker credential form, no order ticket.
+separately from **Platform Safety Limit**, plus the M8.3 paper-execution
+panel (simulate / evaluate / close *simulated* positions, simulated P&L,
+reconciliation trail). No live-trading button, no broker credential form,
+no broker/demo-account connection, no order ticket.
 
 ## Environment variables
 
@@ -240,10 +271,17 @@ M8.2 introduces **none**.
 
 ## Current limitations
 
-- No real, demo or paper orders are executed.
-- Automation remains OFF for every plan.
-- Paper provider is not ready (simulator is M8.3).
+- **No real or demo order is executed and no broker is contacted.** M8.3
+  executes *simulated* paper orders internally (deterministic fills from
+  the platform's own candle store) — these are simulations, not broker
+  fills, and are not a guarantee of future performance.
+- Automation remains OFF for every plan (`canAccessAutomation` is false on
+  all tiers and `users.automation_enabled` defaults to `false`).
+- The paper provider reports ready **for simulation only**; broker
+  connectivity is M8.4 (MT5/Exness bridge) and live reconciliation against
+  a broker is M8.5.
 - Correlation groups are a mechanism only — none are seeded.
 - Paper equity is a simulation parameter, not a broker balance.
 - Spread/slippage are enforced only when the policy configures a
-  maximum (missing input then fails closed).
+  maximum (missing input then fails closed); the M8.3 simulator uses its
+  own deterministic cost model (`PAPER_COST_MODEL_NONE` by default).

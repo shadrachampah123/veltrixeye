@@ -6,7 +6,17 @@ import { RequireAuth } from '@/components/auth-context';
 import { api, ApiError } from '@/lib/api';
 import { Card, CardHeader, Badge, Spinner } from '@/components/ui';
 import { RiskPolicyPanel } from '@/components/risk-policy-panel';
-import type { ExecutionStatusDto, ExecutionProfileDto, RiskPolicyStatusDto } from '@veltrixeye/contracts';
+import { PaperExecutionPanel } from '@/components/paper-execution-panel';
+import type {
+  ExecutionStatusDto,
+  ExecutionProfileDto,
+  PaperFillDto,
+  PaperOrderDto,
+  PaperPositionDto,
+  PaperStatusDto,
+  ReconciliationDto,
+  RiskPolicyStatusDto,
+} from '@veltrixeye/contracts';
 
 /**
  * Trading (M8.1) — execution READINESS only.
@@ -14,14 +24,17 @@ import type { ExecutionStatusDto, ExecutionProfileDto, RiskPolicyStatusDto } fro
  * Deliberately minimal and read-only:
  *  - shows the server-authoritative automation state (OFF by default and for
  *    every plan in M8.1) and why;
- *  - shows registered execution providers and their honest health (paper is
- *    "not ready" until the simulator ships);
- *  - lists the caller's execution profiles (paper only).
+ *  - shows registered execution providers and their honest health (M8.3: the
+ *    internal paper SIMULATOR is ready; there is still no broker);
+ *  - lists the caller's execution profiles (paper only);
+ *  - M8.3 adds the paper-execution panel: simulate a server-issued decision,
+ *    see simulated orders/positions/fills, entry/exit prices, open and closed
+ *    simulated P&L and the reconciliation trail.
  *
- * Intentionally NOT here (per the M8.1/M8.2 boundary): no "Enable Live Trading"
- * button, no broker credential forms, no live trading dashboard, and no
- * control capable of submitting an order. M8.2 adds a read/bounded risk
- * policy panel only.
+ * Intentionally NOT here (per the M8.1/M8.2/M8.3 boundary): no "Enable Live
+ * Trading" button, no broker credential forms, no live/demo-account
+ * connection, no MT5/Exness configuration and no control capable of placing a
+ * real order. Every paper action is a request to the INTERNAL simulator.
  */
 function TradingContent() {
   const [status, setStatus] = React.useState<ExecutionStatusDto | null>(null);
@@ -32,6 +45,31 @@ function TradingContent() {
   const [riskSaving, setRiskSaving] = React.useState(false);
   const [riskError, setRiskError] = React.useState<string | null>(null);
   const [riskNotice, setRiskNotice] = React.useState<string | null>(null);
+  const [paperStatus, setPaperStatus] = React.useState<PaperStatusDto | null>(null);
+  const [paperOrders, setPaperOrders] = React.useState<PaperOrderDto[]>([]);
+  const [paperPositions, setPaperPositions] = React.useState<PaperPositionDto[]>([]);
+  const [paperFills, setPaperFills] = React.useState<PaperFillDto[]>([]);
+  const [paperReconciliations, setPaperReconciliations] = React.useState<ReconciliationDto[]>([]);
+  const [paperSetupId, setPaperSetupId] = React.useState('');
+  const [paperProfileId, setPaperProfileId] = React.useState('');
+  const [paperBusy, setPaperBusy] = React.useState(false);
+  const [paperError, setPaperError] = React.useState<string | null>(null);
+  const [paperNotice, setPaperNotice] = React.useState<string | null>(null);
+
+  const loadPaper = React.useCallback(async () => {
+    const [ps, po, pp, pf, pr] = await Promise.all([
+      api.getPaperStatus(),
+      api.listPaperOrders({ limit: 25 }),
+      api.listPaperPositions({ limit: 25 }),
+      api.listPaperFills({ limit: 25 }),
+      api.listPaperReconciliations({ limit: 25 }),
+    ]);
+    setPaperStatus(ps);
+    setPaperOrders(po.orders);
+    setPaperPositions(pp.positions);
+    setPaperFills(pf.fills);
+    setPaperReconciliations(pr.reconciliations);
+  }, []);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -47,6 +85,11 @@ function TradingContent() {
         setProfiles(p.profiles);
         setRisk(r);
         setError(null);
+        try {
+          await loadPaper();
+        } catch {
+          // The readiness surface still renders when the paper panel cannot load.
+        }
       } catch (e: any) {
         if (!cancelled) setError(e?.message ?? 'Failed to load execution status');
       } finally {
@@ -72,6 +115,43 @@ function TradingContent() {
       setRiskSaving(false);
     }
   };
+
+  const runPaper = async (action: () => Promise<unknown>, notice: string) => {
+    setPaperBusy(true);
+    setPaperError(null);
+    setPaperNotice(null);
+    try {
+      await action();
+      await loadPaper();
+      setPaperNotice(notice);
+    } catch (e) {
+      setPaperError(e instanceof ApiError ? e.message : 'Paper simulation failed');
+    } finally {
+      setPaperBusy(false);
+    }
+  };
+
+  const simulate = () =>
+    runPaper(
+      () =>
+        api.simulatePaperExecution({
+          setupId: paperSetupId.trim(),
+          executionProfileId: paperProfileId,
+        }),
+      'Simulation complete. Results are simulated, not broker fills.',
+    );
+
+  const evaluate = () =>
+    runPaper(
+      () => api.evaluatePaperPositions(),
+      'Open simulated positions evaluated against server market data.',
+    );
+
+  const closePaperPosition = (positionId: string) =>
+    runPaper(
+      () => api.closePaperPosition(positionId),
+      'Simulated position closed at the server price.',
+    );
 
   return (
     <AppShell>
@@ -208,6 +288,30 @@ function TradingContent() {
               </p>
             </div>
           </Card>
+
+          <div className="lg:col-span-2">
+            <PaperExecutionPanel
+              status={paperStatus}
+              orders={paperOrders}
+              positions={paperPositions}
+              fills={paperFills}
+              reconciliations={paperReconciliations}
+              setupId={paperSetupId}
+              onSetupIdChange={setPaperSetupId}
+              profileOptions={(profiles ?? []).map((profile) => ({
+                id: profile.id,
+                label: `${profile.mode} · ${profile.providerSlug}`,
+              }))}
+              selectedProfileId={paperProfileId}
+              onProfileChange={setPaperProfileId}
+              onSimulate={() => void simulate()}
+              onEvaluate={() => void evaluate()}
+              onClosePosition={(id) => void closePaperPosition(id)}
+              busy={paperBusy}
+              error={paperError}
+              notice={paperNotice}
+            />
+          </div>
 
           {risk && (
             <div className="lg:col-span-2">

@@ -1,7 +1,7 @@
 # Milestone Boundaries
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
-M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1 and M8.2**. The boundaries below
+M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2 and M8.3**. The boundaries below
 are deliberate and enforced: M1 shipped foundations and contracts; M2 added real historical
 market data; M3 added deterministic strategy evaluation; M4 added
 deterministic setup detection and lifecycle management; M5 added
@@ -11,8 +11,10 @@ ledger; M6 Phase 4 adds the backtest and alert surfaces in the web app; M7.1
 adds the core browser trading workflow (evaluate → detect → score →
 transition → alert → acknowledge); M7.2 hardens the whole surface for
 commercial readiness (reference-data protection, audit attribution,
-credential-endpoint limiting, session hygiene). Still, nothing that
-schedules, streams, sends real notifications, or executes trades.
+credential-endpoint limiting, session hygiene). M8.3 adds an **internal,
+deterministic paper execution simulator** — simulated fills and positions
+only, no broker, no demo account, no live execution. Still, nothing that
+schedules, streams, sends real notifications, or executes a real trade.
 
 ## M1 — delivered (Product Foundation & Architecture)
 
@@ -470,8 +472,9 @@ Exness connectivity; no real, demo or simulated order can be placed.
 - Live execution impossible by construction (service refusal + DB CHECK);
   no credentials modeled anywhere.
 - Provider abstraction (`ExecutionProvider`) with normalized failure
-  taxonomy; exactly one provider registered (paper), which reports not-ready
-  and refuses every trading operation (simulator deferred to M8.3).
+  taxonomy; exactly one provider registered (paper), which in M8.1 reports
+  not-ready and refuses every trading operation (the internal simulator
+  shipped later, in M8.3, behind the same boundary).
 - Pinned order state machine with absorbing terminals; invalid transitions
   rejected.
 - 15 ordered safety gates, fail-closed; in M8.1 the risk-decision and
@@ -500,7 +503,52 @@ Central server-side risk engine that produces the decision M8.1's
 - Read/bounded PATCH `/api/risk/policy` + decision history; Trading page
   risk panel. **No order is executed.** Automation stays OFF.
 
-## Explicitly NOT in M1–M8.2 (by design, deferred)
+## M8.3 — delivered (Paper / Demo Execution Simulator)
+
+An **internal, deterministic execution simulator**. Signals now travel the
+whole pipeline inside the platform: strategy signal → risk engine →
+execution decision → paper order → fill → position → SL/TP → P&L →
+reconciliation. Full design: [execution.md](./execution.md).
+
+- **No broker, MT5, Exness or external trading API is contacted anywhere.**
+  No credential is stored or accepted, and no live order can be created:
+  the simulator's only market data is the platform's own `candles` table.
+- Server-issued inputs only: a simulation request carries identifiers, and
+  the server rebuilds the decision and calls the M8.2 risk engine before an
+  order can exist. A client `{ approved: true }` (or price/size/P&L/state)
+  is a 400.
+- Deterministic fills on the M8.2 `Dec` bigint arithmetic: market BUY/SELL,
+  long/short, full fills, adverse slippage, optional deterministic costs,
+  SL exits, TP exits and explicit closes; first-touch SL/TP detection with a
+  conservative stop-wins rule on a conflicted candle.
+- Order lifecycle driven through the pinned M8.1 state machine; positions
+  opened/closed with entry, exit, quantity, direction, fees, slippage and
+  realized/unrealized/net P&L recorded server-side.
+- Migration `0018_paper_execution.sql` (additive): order provenance +
+  simulated-provenance CHECK, position exit/mark columns + exit-state CHECK,
+  append-only `execution_fills` (exactly-once per order+sequence, unique
+  idempotency key) and append-only `execution_reconciliations`.
+- Idempotency preserved end to end: a repeated submission replays the
+  stored result, repeated fill/close processing is a no-op, and no duplicate
+  order or position is created.
+- Reconciliation **foundation** for M8.5: expected-vs-simulated order and
+  position state is compared, inconsistencies are recorded and fail closed —
+  never silently corrected.
+- Deterministic failure paths, all auditable: invalid or non-positive price,
+  stale or missing market data, rejected order, fill failure, duplicate
+  fill, SL/TP conflict, missing position, inconsistent state.
+- API + UI: `/api/execution/paper/*` (status, simulate, orders, positions,
+  fills, close, evaluate, reconciliations, reconcile) and a Trading-page
+  paper panel showing simulated orders/positions, entry/exit, open and
+  closed P&L and the reconciliation trail. **No live-trading control, no
+  broker credential form, no MT5/Exness configuration, no demo-account
+  connection.**
+- Automation remains **OFF** for every plan (`canAccessAutomation` false on
+  all tiers); the automated path is blocked at the entitlement gate.
+- Paper results are simulations, not broker fills, and are not a guarantee
+  of future performance.
+
+## Explicitly NOT in M1–M8.3 (by design, deferred)
 
 - Setup **realtime** updates (the scanner polls; no streaming).
 - **Realtime streaming / WebSockets**; session calendar and market-state
@@ -511,10 +559,18 @@ Central server-side risk engine that produces the decision M8.1's
 - **User notification preferences** (per-channel opt-in, quiet hours,
   per-strategy routing): deliberately not built in M7.3 — an alert goes to the
   owner's account email.
-- **Automated trade EXECUTION** — M8.1 built the execution architecture and
-  safety boundary; M8.2 built the risk engine that feeds those gates. No
-  order of any kind can be placed yet. Alerts remain suggestions, never
-  orders.
+- **Automated trade EXECUTION against a broker** — M8.1 built the execution
+  architecture and safety boundary, M8.2 the risk engine that feeds those
+  gates, and M8.3 the internal paper simulator that exercises the whole
+  chain. **No broker is contacted and no real or demo order can be placed**;
+  automation stays OFF and alerts remain suggestions, never orders.
+- **Broker/demo connectivity (M8.4)** — an MT5/Exness bridge, credential
+  handling via server-side secret management, and the provider
+  implementation behind the existing `ExecutionProvider` boundary.
+- **Live reconciliation against a broker (M8.5)** — M8.3 ships only the
+  foundation (expected-vs-actual comparison, finding codes, fail-closed
+  reporting); scheduled reconciliation jobs, drift repair and broker-side
+  state import are M8.5.
 - **Billing integration** — M7.4 built the subscription/entitlement
   foundation; no payment provider, checkout, portal or webhooks exist yet.
 - **AI** in the signal path — evaluation is deterministic rules; AI is
@@ -526,16 +582,21 @@ Central server-side risk engine that produces the decision M8.1's
   manager, least-privilege DB roles) — an operational task for deploy
   time, not a code deliverable.
 
-## After M8.2 (later work, outline only)
+## After M8.3 (later work, outline only)
 
 1. **More channels + preferences** — a second `NotificationProvider` (push /
    webhook / SMS) behind the M7.3 registry, plus per-user notification
    preferences and per-strategy routing.
-2. **M8.2+ trade execution** — the risk engine, position sizing and exposure
-   limits that feed the M8.1 gates, then the paper execution simulator
-   (M8.3) behind the M8.1 provider boundary, then broker/demo connectivity
-   (e.g. an MT5/Exness bridge) — each its own milestone. **Billing**
-   (provider, webhooks, checkout/portal) lands alongside or after.
+2. **M8.4 — broker/demo connectivity** — an MT5/Exness-style bridge behind
+   the existing `ExecutionProvider` boundary, with credentials held only in
+   server-side secret management (never persisted, never logged). Live
+   execution stays impossible until this lands **and** the automation
+   entitlement is granted.
+3. **M8.5 — full reconciliation** — scheduled reconciliation jobs against
+   the broker, drift detection and repair policy, and broker-state import on
+   top of the M8.3 foundation.
+4. **Billing** (provider, webhooks, checkout/portal) lands alongside or
+   after.
 
 Each of these is its own milestone. The M3 engine, M4 detector, M5 scoring
 engine, result DTOs, store, and provider abstraction are specifically

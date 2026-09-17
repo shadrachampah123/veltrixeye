@@ -46,9 +46,14 @@ describe('m8.2 risk engine migration 0017', () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
     assert.equal(status.pending.length, 0);
     assert.equal(status.checksumsMatch, true);
-    assert.equal(status.expectedCount, 17);
-    assert.equal(status.appliedCount, 17);
-    assert.equal(status.latestApplied, '0017_risk_engine.sql');
+    // 0017 is the 17th migration; later milestones append migrations after it
+    // (M8.3 adds 0018_paper_execution.sql, pinned by the paper-execution suite).
+    assert.ok(status.expectedCount >= 17);
+    assert.equal(status.appliedCount, status.expectedCount);
+    assert.ok(
+      status.latestApplied !== null && status.latestApplied >= '0017_risk_engine.sql',
+      '0017_risk_engine.sql must be applied',
+    );
     const second = await runMigrations(pool, MIGRATIONS_DIR);
     assert.equal(second.applied.length, 0);
   });

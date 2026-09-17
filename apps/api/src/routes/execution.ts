@@ -3,6 +3,8 @@ import {
   automationToggleSchema,
   executionListQuerySchema,
   executionProfileCreateSchema,
+  paperPositionActionSchema,
+  paperSimulateSchema,
   EXECUTION_ARCHITECTURE_VERSION,
   RISK_ENGINE_VERSION,
   type ExecutionStatusDto,
@@ -161,4 +163,167 @@ export async function executionRoutes(app: FastifyInstance, ctx: AppContext, con
     }
     return ctx.execution.queries.listEvents(user.id, parsed.data.limit);
   });
+}
+
+/**
+ * M8.3 — paper execution routes (internal simulation only).
+ *
+ * | Route | Auth | Notes |
+ * |---|---|---|
+ * | GET  /api/execution/paper/status  | session | Simulator readiness, automation OFF, open/closed P&L, counts. |
+ * | POST /api/execution/paper/simulate | session | Simulate ONE server-issued decision for an owned setup (identifiers only — never a price, size, approval or P&L). |
+ * | GET  /api/execution/paper/orders | session | Owner-scoped simulated orders. |
+ * | GET  /api/execution/paper/positions | session | Owner-scoped simulated positions (entry/exit/P&L). |
+ * | GET  /api/execution/paper/fills | session | Owner-scoped append-only fill ledger. |
+ * | POST /api/execution/paper/positions/:id/close | session | Synthetic close at the server market price. |
+ * | POST /api/execution/paper/evaluate | session | Apply SL/TP to open simulated positions from server market data. |
+ * | GET  /api/execution/paper/reconciliations | session | Reconciliation trail (M8.5 foundation). |
+ * | POST /api/execution/paper/reconcile | session | Run a reconciliation sweep (read-only; findings are never auto-corrected). |
+ *
+ * Deliberately ABSENT — every one of these is impossible in this platform:
+ * broker/demo-account connection, credential submission, order submission to
+ * an external venue, live-execution toggles, and any endpoint that accepts a
+ * client-authored decision, price, position size, P&L or approval.
+ */
+export async function paperExecutionRoutes(
+  app: FastifyInstance,
+  ctx: AppContext,
+  config: AppConfig,
+): Promise<void> {
+  const requireAuth = createSessionAuth(config, ctx);
+
+  app.get('/api/execution/paper/status', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    return ctx.execution.paper.status(user.id);
+  });
+
+  app.post(
+    '/api/execution/paper/simulate',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const parsed = paperSimulateSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendZodError(reply, parsed.error, 'body');
+        return;
+      }
+      const result = await ctx.execution.paper.simulate({
+        userId: user.id,
+        setupId: parsed.data.setupId,
+        executionProfileId: parsed.data.executionProfileId,
+        riskDecisionId: parsed.data.riskDecisionId ?? null,
+        meta: { ip: req.ip, userAgent: req.headers['user-agent'] ?? null },
+      });
+      return result;
+    },
+  );
+
+  app.get('/api/execution/paper/orders', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const parsed = executionListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'query');
+      return;
+    }
+    return ctx.execution.paper.listOrders(user.id, parsed.data.limit);
+  });
+
+  app.get('/api/execution/paper/positions', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const parsed = executionListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'query');
+      return;
+    }
+    return ctx.execution.paper.listPositions(user.id, parsed.data.limit);
+  });
+
+  app.get('/api/execution/paper/fills', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const parsed = executionListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'query');
+      return;
+    }
+    return ctx.execution.paper.listFills(user.id, parsed.data.limit);
+  });
+
+  app.post(
+    '/api/execution/paper/positions/:id/close',
+    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const parsedBody = paperPositionActionSchema.safeParse(req.body ?? {});
+      if (!parsedBody.success) {
+        sendZodError(reply, parsedBody.error, 'body');
+        return;
+      }
+      const params = req.params as { id?: string };
+      const outcome = await ctx.execution.paper.closePosition({
+        userId: user.id,
+        positionId: String(params.id ?? ''),
+        meta: { ip: req.ip, userAgent: req.headers['user-agent'] ?? null },
+      });
+      return outcome;
+    },
+  );
+
+  app.post(
+    '/api/execution/paper/evaluate',
+    { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const parsedBody = paperPositionActionSchema.safeParse(req.body ?? {});
+      if (!parsedBody.success) {
+        sendZodError(reply, parsedBody.error, 'body');
+        return;
+      }
+      return ctx.execution.paper.evaluateOpenPositions({
+        userId: user.id,
+        meta: { ip: req.ip, userAgent: req.headers['user-agent'] ?? null },
+      });
+    },
+  );
+
+  app.get('/api/execution/paper/reconciliations', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    const parsed = executionListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'query');
+      return;
+    }
+    return ctx.execution.paper.listReconciliations(user.id, parsed.data.limit);
+  });
+
+  app.post(
+    '/api/execution/paper/reconcile',
+    { config: { rateLimit: { max: 20, timeWindow: '1 minute' } } },
+    async (req, reply) => {
+      const ok = await requireAuth(req, reply);
+      if (!ok) return;
+      const { user } = req as AuthenticatedRequest;
+      const parsedBody = paperPositionActionSchema.safeParse(req.body ?? {});
+      if (!parsedBody.success) {
+        sendZodError(reply, parsedBody.error, 'body');
+        return;
+      }
+      return ctx.execution.paper.reconcile({ userId: user.id });
+    },
+  );
 }

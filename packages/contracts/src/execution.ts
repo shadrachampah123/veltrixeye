@@ -154,6 +154,17 @@ export interface ExecutionSubmitOrderRequest {
   clientOrderId: string;
   /** Stable execution identity (user+setup+profile+action derived). */
   idempotencyKey: string;
+  /**
+   * M8.3 — server-issued authorization id.
+   *
+   * The paper provider refuses every submit that does not carry one: an order
+   * is only ever fillable after the execution service has validated the
+   * server-issued decision, the server-issued M8.2 risk decision and every
+   * paper-simulation gate, and persisted the order as `validating`. A raw
+   * caller cannot mint this id, so the provider boundary is not a way around
+   * the gates. Absent for providers that accept orders directly (none exist).
+   */
+  authorizationId?: string;
   assetClass: AssetClass;
   symbol: string;
   side: OrderSide;

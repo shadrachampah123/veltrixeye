@@ -1,7 +1,9 @@
 /**
- * M8.1 — automated trading execution architecture.
- * M8.2 wires the risk engine into the intake gates; still no provider can
- * trade, no order is ever submitted, and automation stays OFF for every plan.
+ * M8.1 — automated trading execution architecture (safety boundary).
+ * M8.2 wires the risk engine into the intake gates.
+ * M8.3 implements the INTERNAL deterministic paper simulator behind that
+ * boundary. Still: no broker, no MT5/Exness, no demo account, no credentials,
+ * no live path, automation OFF for every plan.
  */
 export {
   allowedOrderTransitions,
@@ -11,7 +13,10 @@ export {
   isOrderTerminal,
 } from './order-machine.js';
 export { ExecutionProviderRegistry, createExecutionProviderRegistry, type RegisteredExecutionProviderInfo } from './registry.js';
-export { createPaperExecutionProvider } from './paper.js';
+export {
+  createPaperExecutionProvider,
+  type PaperSimulatorPort,
+} from './paper.js';
 export { KillSwitchService } from './kill-switch.js';
 export { ExecutionProfileService, toProfileDto, type ExecutionProfileRow } from './profiles.js';
 export { AutomationService, type AutomationStatus } from './automation.js';
@@ -26,3 +31,60 @@ export {
   type ExecutionLogger,
 } from './intake.js';
 export { ExecutionQueryService } from './queries.js';
+
+/* M8.3 — paper execution simulator (internal only) */
+export {
+  PaperExecutionService,
+  PaperIntegrityError,
+  type PaperExecutionServiceDeps,
+  type PaperExecutionServiceOptions,
+  type PaperFailureMode,
+} from './paper-service.js';
+export { AuditCollector, type PaperEventEntry, type PaperEventLogger } from './paper-events.js';
+export {
+  PAPER_COST_MODEL_NONE,
+  buildServerExecutionDecision,
+  computeEntryFill,
+  computeExitFill,
+  detectExit,
+  exitDecisionSnapshot,
+  feeMoney,
+  grossRealizedPl,
+  impliedRr,
+  isUsableCandle,
+  moneyPerPriceUnit,
+  netRealizedPl,
+  paperClientOrderId,
+  paperProviderPositionId,
+  pipsToPrice,
+  signedPriceMoveValue,
+  unrealizedPl,
+  type DecisionBuildResult,
+  type ExitDetection,
+  type FillComputation,
+  type PaperCandle,
+  type PaperCostModel,
+  type PaperOrderKind,
+  type SetupDecisionSource,
+} from './paper-engine.js';
+export {
+  evaluatePaperSimulationGates,
+  type PaperSimulationGateInput,
+  type PaperSimulationGateResult,
+} from './paper-gates.js';
+export {
+  CandleStoreMarketPriceSource,
+  paperStaleThresholdMs,
+  type MarketPriceResult,
+  type SimulatorMarketPrice,
+  type SimulatorMarketPriceSource,
+} from './paper-market.js';
+export {
+  computeExpectedNetPl,
+  reconcileOrderState,
+  reconcilePositionState,
+  type ReconciliationFillState,
+  type ReconciliationOrderState,
+  type ReconciliationPositionState,
+  type ReconciliationResult,
+} from './reconciliation.js';

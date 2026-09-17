@@ -8,7 +8,9 @@
  *  - gates: every one of the 15 gates fail-closed at the contract level
  *  - intake: decision validation, ownership masking, entitlement refusal,
  *    idempotency (sequential replay + concurrent twins), audit trail
- *  - provider boundary: paper not-ready, every trade op throws, taxonomy
+ *  - provider boundary (M8.3): the ONLY registered provider is the internal
+ *    paper simulator — it reports ready, refuses unauthorized submits, has no
+ *    broker/live capability at all, and carries no credential material
  *  - kill switch semantics + automation switch gating
  */
 import { test, before, after, describe } from 'node:test';
@@ -21,6 +23,7 @@ import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 
 import {
   ExecutionProviderError,
+  PAPER_SIMULATOR_VERSION,
   isExecutionProviderError,
   RISK_ENGINE_VERSION,
   type ExecutionDecisionInput,
@@ -821,20 +824,43 @@ describe('m8.1 read models are owner-scoped', () => {
 });
 
 describe('m8.1 provider boundary', () => {
-  test('paper provider reports honestly: configured=false, unhealthy, reason set', async () => {
-    const paper = createPaperExecutionProvider();
+  test('the only provider is the internal simulator: ready, brokerless, no secrets', async () => {
+    // The app binds the simulator; an unbound factory is honest about it and
+    // can never fall back to a fake fill.
+    const unbound = createPaperExecutionProvider();
+    assert.equal(unbound.configured, false);
+    assert.equal((await unbound.health()).healthy, false);
+
+    const paper = createPaperExecutionProvider({
+      simulator: {
+        submitAuthorizedOrder: async () => ({ providerOrderId: 'p1', status: 'accepted' }),
+      },
+    });
     assert.equal(paper.id, 'paper');
-    assert.equal(paper.configured, false);
+    // M8.3: the simulator exists, so it reports configured/healthy — it is the
+    // INTERNAL paper simulator and nothing else.
+    assert.equal(paper.configured, true);
     const health = await paper.health();
-    assert.equal(health.healthy, false);
-    assert.ok(health.reason && health.reason.length > 0);
+    assert.equal(health.healthy, true);
     const described = paper.describe();
-    assert.equal(described.configured, false);
-    assert.ok(!JSON.stringify(described).toLowerCase().includes('password'));
+    assert.equal(described.configured, true);
+    assert.equal(described.internal, true);
+    assert.equal(described.simulatorVersion, PAPER_SIMULATOR_VERSION);
+    const serialized = JSON.stringify(described).toLowerCase();
+    for (const needle of ['password', 'api_key', 'apikey', 'secret', 'token']) {
+      assert.ok(!serialized.includes(needle), `description must not carry ${needle}`);
+    }
+    // No broker mode: paper is the ONLY capability, and no live mode exists.
+    assert.deepEqual(paper.capabilities.modes, ['paper']);
+    assert.ok(!paper.capabilities.modes.includes('live' as never));
   });
 
-  test('every trading operation throws a normalized unavailable error', async () => {
-    const paper = createPaperExecutionProvider();
+  test('no live trading operation is possible: unauthorized submit refused, broker ops unavailable', async () => {
+    const paper = createPaperExecutionProvider({
+      simulator: {
+        submitAuthorizedOrder: async () => ({ providerOrderId: 'p1', status: 'accepted' }),
+      },
+    });
     const req = {
       clientOrderId: 've-x',
       idempotencyKey: 'k',
@@ -847,13 +873,22 @@ describe('m8.1 provider boundary', () => {
       stopLossPrice: null,
       takeProfitPrice: null,
     };
+    // An unauthorized submit (no server-issued authorization) is a VALIDATION
+    // refusal, not a simulated fill.
+    let submitErr: unknown = null;
+    try {
+      await paper.submitOrder(req);
+    } catch (e) {
+      submitErr = e;
+    }
+    assert.ok(isExecutionProviderError(submitErr));
+    assert.equal((submitErr as ExecutionProviderError).category, 'validation');
+
+    // Broker-style operations simply do not exist on the simulator.
     for (const op of [
-      () => paper.submitOrder(req),
       () => paper.cancelOrder('p1'),
       () => paper.modifyOrder('p1', {}),
       () => paper.getOrder('p1'),
-      () => paper.listOrders(),
-      () => paper.listPositions(),
       () => paper.closePosition('p1'),
     ]) {
       let err: unknown = null;
@@ -862,9 +897,23 @@ describe('m8.1 provider boundary', () => {
       } catch (e) {
         err = e;
       }
-      assert.ok(isExecutionProviderError(err), 'every trade op must fail with a normalized error');
+      assert.ok(isExecutionProviderError(err), 'every broker op must fail with a normalized error');
       assert.equal((err as ExecutionProviderError).category, 'unavailable');
     }
+    // Reads are never served unscoped by the provider boundary.
+    assert.deepEqual(await paper.listOrders(), []);
+    assert.deepEqual(await paper.listPositions(), []);
+
+    // An unbound provider refuses to submit at all (never a fabricated fill).
+    const unbound = createPaperExecutionProvider();
+    let unboundErr: unknown = null;
+    try {
+      await unbound.submitOrder(req);
+    } catch (e) {
+      unboundErr = e;
+    }
+    assert.ok(isExecutionProviderError(unboundErr));
+    assert.equal((unboundErr as ExecutionProviderError).category, 'unavailable');
   });
 
   test('failure taxonomy travels through the registry unchanged', async () => {

@@ -146,11 +146,15 @@ describe('m7.3 notification outbox schema', () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
     assert.equal(status.pending.length, 0);
     assert.equal(status.checksumsMatch, true);
-    // M8.2 appended 0017 (risk engine) after this suite was written; the
-    // notification outbox assertions below are unchanged.
-    assert.equal(status.expectedCount, 17, '0001…0017');
-    assert.equal(status.appliedCount, 17);
-    assert.equal(status.latestApplied, '0017_risk_engine.sql');
+    // M8.2 appended 0017 (risk engine) and M8.3 appended 0018 (paper
+    // execution) after this suite was written; the notification outbox
+    // assertions below are unchanged. The head is a floor, not a frozen
+    // number, so appending a migration never invalidates this suite.
+    assert.ok(status.expectedCount >= 17, '0001…0017');
+    assert.equal(status.appliedCount, status.expectedCount);
+    assert.ok(
+      status.latestApplied !== null && status.latestApplied >= '0017_risk_engine.sql',
+    );
   });
 
   test('the table carries every column the worker depends on', async () => {

@@ -243,7 +243,7 @@ describe('M8.2 risk API — no execution bypass', () => {
     assert.equal(toggle.statusCode, 403);
   });
 
-  test('execution status reports the risk engine version and paper not-ready', async () => {
+  test('execution status reports the risk engine version and the internal paper simulator', async () => {
     const { cookie } = await registerUser();
     const res = await app.inject({ method: 'GET', url: '/api/execution/status', headers: { cookie } });
     assert.equal(res.statusCode, 200);
@@ -251,7 +251,10 @@ describe('M8.2 risk API — no execution bypass', () => {
     assert.equal(body.riskEngineVersion, RISK_ENGINE_VERSION);
     assert.equal(body.automation.effective, false);
     const paper = body.providers.find((p: { id: string }) => p.id === 'paper');
-    assert.equal(paper.healthy, false);
-    assert.equal(paper.configured, false);
+    // M8.3 delivers the internal simulator behind the same boundary; there is
+    // still exactly one (paper) provider and no live/broker capability.
+    assert.equal(paper.healthy, true);
+    assert.equal(paper.configured, true);
+    assert.equal(body.providers.length, 1);
   });
 });
