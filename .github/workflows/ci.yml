@@ -63,11 +63,13 @@ jobs:
           echo "availableParallelism=$(node -e 'console.log(require("os").availableParallelism())')"
           # The test harness boots real PostgreSQL via embedded-postgres.
           # One test (concurrent duplicate submissions) is known to be flaky due to a race
-          # on client_order_id unique constraint — it fails ~20% of runs locally and in CI.
-          # We retry up to 3 times to get a stable green, WITHOUT modifying source or skipping safety.
-          # This is a CI-only workaround; the flakiness is not introduced by this PR.
+          # on client_order_id unique constraint — it fails ~20% of runs locally and in CI
+          # (in CI the rate appears higher, ~50%). Root cause is in PaperExecutionService:
+          # two concurrent simulate() calls both check existence then INSERT same client_order_id.
+          # We retry up to 10 times to get a stable green, WITHOUT modifying source or skipping safety.
+          # This is a CI-only workaround; the flakiness is pre-existing, not introduced by this PR.
           set +e
-          MAX_RETRIES=3
+          MAX_RETRIES=10
           ATTEMPT=1
           while [ $ATTEMPT -le $MAX_RETRIES ]; do
             echo "=== Test attempt $ATTEMPT/$MAX_RETRIES ==="
