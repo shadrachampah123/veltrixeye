@@ -296,7 +296,7 @@ async function makeWorkerApp(): Promise<{
 }
 
 function jobsForAlert(alertId: string) {
-  return pool.query<any>('SELECT * FROM notification_deliveries WHERE alert_id = $1 ORDER BY created_at', [alertId]);
+  return pool.query<any>(`SELECT id, alert_id, user_id, channel, template, idempotency_key, payload_hash, payload, recipient, status, attempts, max_attempts, provider, provider_message_id, provider_response_code, failure_category, last_error, delivered_at, created_at FROM notification_deliveries WHERE alert_id = $1 UNION ALL SELECT id, alert_id, user_id, channel, template, idempotency_key, payload_hash, payload, recipient, status, attempts, max_attempts, provider, provider_message_id, provider_response_code, failure_category, last_error, delivered_at, created_at FROM notification_webhook_deliveries WHERE alert_id = $1 ORDER BY created_at`, [alertId]);
 }
 
 function countRows(table: string): Promise<number> {
@@ -667,7 +667,7 @@ describe('m7.3 internal worker endpoints', () => {
     const local = await makeWorkerApp();
     try {
       const flow = await fullWorkflow(local.app);
-      assert.equal(local.ctx.notificationProviders.size, 0, 'no provider is configured');
+      assert.equal(local.ctx.notificationProviders.get('email'), undefined, 'email provider is not configured');
 
       const res = await local.app.inject({
         method: 'POST',
@@ -821,5 +821,32 @@ describe('m7.3 credential hygiene', () => {
     } finally {
       await local.close();
     }
+  });
+});
+
+describe('M9.1 multi-channel enqueue', () => {
+  test('enqueues opted-in webhook and default email jobs in the alert transaction', async () => {
+    const local = await makeWorkerApp();
+    try {
+      const owner = await registerUser(local.app);
+      const saved = await local.app.inject({ method: 'PUT', url: '/api/notifications/preferences', headers: { cookie: owner.cookie }, payload: {
+        preferences: [{ channel: 'webhook', enabled: true, endpointUrl: 'https://hooks.example.test/alerts', signingSecret: 'not-returned' }],
+      } });
+      assert.equal(saved.statusCode, 200, saved.body);
+      assert.equal(saved.body.includes('not-returned'), false);
+      const { strategyId, versionId } = await createPublishedVersion(owner.cookie, engulfConfig('EURUSD'), local.app);
+      await seedCandles('EURUSD', BULLISH_SHAPES, AS_OF);
+      const setupId = await detectSetup(owner.cookie, strategyId, versionId, 'EURUSD', AS_OF, local.app);
+      await scoreSetup(owner.cookie, setupId, local.app);
+      const generated = await generateAlert(owner.cookie, setupId, local.app);
+      assert.equal(generated.statusCode, 201, generated.body);
+      const rows = (await jobsForAlert(generated.json().alert.id)).rows;
+      assert.deepEqual(rows.map((row: any) => row.channel).sort(), ['email', 'webhook']);
+      const webhookJob = rows.find((row: any) => row.channel === 'webhook');
+      assert.equal(webhookJob?.recipient, 'https://hooks.example.test/alerts');
+      assert.equal(JSON.stringify(webhookJob?.payload ?? {}).includes('not-returned'), false, 'secret is not in rendered payload');
+      const listed = await local.app.inject({ method: 'GET', url: `/api/alerts/${generated.json().alert.id}/notifications`, headers: { cookie: owner.cookie } });
+      assert.equal(listed.body.includes('not-returned'), false, 'secret is not in notification API output');
+    } finally { await local.close(); }
   });
 });

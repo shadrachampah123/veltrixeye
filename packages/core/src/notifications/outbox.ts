@@ -35,6 +35,11 @@ import { Errors } from '../errors.js';
 
 /** Anything with a `query` method: a `Pool` or a transaction `PoolClient`. */
 export type Queryable = Pick<pg.Pool, 'query'>;
+const EMAIL_DELIVERY_TABLE = 'notification_deliveries';
+const WEBHOOK_DELIVERY_TABLE = 'notification_webhook_deliveries';
+function tableForChannel(channel: NotificationChannel): string {
+  return channel === 'webhook' ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
+}
 
 export interface NotificationJobRow {
   id: string;
@@ -46,6 +51,7 @@ export interface NotificationJobRow {
   payload_hash: string;
   payload: AlertNotificationPayload;
   recipient: string;
+  signing_secret: string | null;
   status: string;
   attempts: number;
   max_attempts: number;
@@ -70,6 +76,12 @@ export interface EnqueueAlertNotificationArgs {
   payload: AlertNotificationPayload;
   payloadHash: string;
   idempotencyKey: string;
+  /** Strategy owner context required for webhook tenant integrity. */
+  strategyId?: string;
+  /** Optional channel-specific destination; email defaults to the user's address. */
+  recipient?: string;
+  /** Internal webhook signing secret; never included in DTOs or logs. */
+  signingSecret?: string | null;
   /** Overrides the column default (from the deployment's retry policy). */
   maxAttempts?: number;
 }
@@ -127,11 +139,26 @@ export class NotificationOutbox {
    * twin or a crashed-and-restarted worker all collapse onto the one row.
    */
   async enqueue(q: Queryable, args: EnqueueAlertNotificationArgs): Promise<EnqueueResult> {
+    const table = tableForChannel(args.channel);
+    if (args.channel === 'webhook') {
+      if (!args.strategyId) throw Errors.internal('Webhook notification is missing strategy ownership context');
+      const webhook = await q.query<NotificationJobRow>(
+        `INSERT INTO notification_webhook_deliveries
+          (alert_id, user_id, strategy_id, template, idempotency_key, payload_hash, payload, recipient, signing_secret, max_attempts)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (alert_id) DO NOTHING RETURNING *`,
+        [args.alertId, args.userId, args.strategyId, args.template, args.idempotencyKey, args.payloadHash, JSON.stringify(args.payload), args.recipient, args.signingSecret ?? null, args.maxAttempts ?? this.defaults.maxAttempts],
+      );
+      if (webhook.rows[0]) return { row: webhook.rows[0], created: true };
+      const existingWebhook = await q.query<NotificationJobRow>('SELECT * FROM notification_webhook_deliveries WHERE alert_id = $1', [args.alertId]);
+      if (!existingWebhook.rows[0]) throw Errors.internal('Webhook notification job could not be created for this alert');
+      return { row: existingWebhook.rows[0], created: false };
+    }
     const inserted = await q.query<NotificationJobRow>(
-      `INSERT INTO notification_deliveries
+      `INSERT INTO ${table}
          (alert_id, user_id, channel, template, idempotency_key, payload_hash,
           payload, recipient, max_attempts)
-       SELECT $1, u.id, $3, $4, $5, $6, $7, u.email, $8
+       SELECT $1, u.id, $3, $4, $5, $6, $7, COALESCE($8, u.email), $9
          FROM users u
         WHERE u.id = $2
        ON CONFLICT (alert_id, channel) DO NOTHING
@@ -144,6 +171,7 @@ export class NotificationOutbox {
         args.idempotencyKey,
         args.payloadHash,
         JSON.stringify(args.payload),
+        args.recipient ?? null,
         args.maxAttempts ?? this.defaults.maxAttempts,
       ],
     );
@@ -153,7 +181,7 @@ export class NotificationOutbox {
 
     // Existing job (replay or the loser of a race): read the winner.
     const existing = await q.query<NotificationJobRow>(
-      'SELECT * FROM notification_deliveries WHERE alert_id = $1 AND channel = $2',
+      `SELECT * FROM ${table} WHERE alert_id = $1 AND channel = $2`,
       [args.alertId, args.channel],
     );
     const existingRow = existing.rows[0];
@@ -173,10 +201,19 @@ export class NotificationOutbox {
     if (!owned.rows[0]) throw Errors.notFound('Alert not found');
 
     const res = await this.pool.query<NotificationJobRow>(
-      `SELECT * FROM notification_deliveries
-        WHERE alert_id = $1
-        ORDER BY created_at ASC, id ASC
-        LIMIT $2`,
+      `SELECT * FROM (
+         SELECT id, alert_id, user_id, channel, template, idempotency_key, payload_hash, payload, recipient,
+           NULL::text AS signing_secret, status, attempts, max_attempts, provider, provider_message_id,
+           provider_response_code, failure_category, last_error, next_attempt_at, locked_at, locked_by,
+           delivered_at, created_at, updated_at
+         FROM notification_deliveries WHERE alert_id = $1
+         UNION ALL
+         SELECT id, alert_id, user_id, channel, template, idempotency_key, payload_hash, payload, recipient,
+           signing_secret, status, attempts, max_attempts, provider, provider_message_id,
+           provider_response_code, failure_category, last_error, next_attempt_at, locked_at, locked_by,
+           delivered_at, created_at, updated_at
+         FROM notification_webhook_deliveries WHERE alert_id = $1
+       ) jobs ORDER BY created_at ASC, id ASC LIMIT $2`,
       [alertId, MAX_NOTIFICATIONS_PER_ALERT],
     );
     return res.rows.map(toNotificationDto);
@@ -191,36 +228,30 @@ export class NotificationOutbox {
    * retry budget bounded even if a worker dies repeatedly.
    */
   async claimBatch(limit: number, workerId: string, q: Queryable = this.pool): Promise<NotificationJobRow[]> {
+    const [email, webhook] = await Promise.all([
+      this.claimTable(EMAIL_DELIVERY_TABLE, limit, workerId, q),
+      this.claimTable(WEBHOOK_DELIVERY_TABLE, limit, workerId, q),
+    ]);
+    return [...email, ...webhook].sort((a, b) => a.next_attempt_at.getTime() - b.next_attempt_at.getTime()).slice(0, limit);
+  }
+
+  private async claimTable(table: string, limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {
     const res = await q.query<NotificationJobRow>(
       `WITH candidate AS (
-         SELECT id
-           FROM notification_deliveries
-          WHERE status = 'pending'
-            AND next_attempt_at <= now()
-            AND attempts < max_attempts
-          ORDER BY next_attempt_at ASC, created_at ASC
-          LIMIT $1
-          FOR UPDATE SKIP LOCKED
+         SELECT id FROM ${table}
+          WHERE status = 'pending' AND next_attempt_at <= now() AND attempts < max_attempts
+          ORDER BY next_attempt_at ASC, created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED
        )
-       UPDATE notification_deliveries n
-          SET status = 'processing',
-              locked_at = now(),
-              locked_by = $2,
-              attempts = n.attempts + 1,
-              failure_category = 'none',
-              last_error = NULL
-         FROM candidate c
-        WHERE n.id = c.id
-        RETURNING n.*`,
-      [limit, workerId],
-    );
+       UPDATE ${table} n SET status = 'processing', locked_at = now(), locked_by = $2,
+         attempts = n.attempts + 1, failure_category = 'none', last_error = NULL
+       FROM candidate c WHERE n.id = c.id RETURNING n.*`, [limit, workerId]);
     return res.rows;
   }
 
   /** Success: terminal, keeps the provider's receipt for traceability. */
-  async markDelivered(jobId: string, result: AttemptResult): Promise<void> {
+  async markDelivered(jobId: string, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<void> {
     await this.pool.query(
-      `UPDATE notification_deliveries
+      `UPDATE ${tableForChannel(channel)}
           SET status = 'delivered',
               provider = $2,
               provider_message_id = $3,
@@ -246,9 +277,9 @@ export class NotificationOutbox {
    * exhausted. `delayMs` comes from the worker's (pure, deterministic) backoff
    * function, so the SQL stays a single bounded UPDATE.
    */
-  async markRetry(jobId: string, delayMs: number, result: AttemptResult): Promise<'retried' | 'failed'> {
+  async markRetry(jobId: string, delayMs: number, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<'retried' | 'failed'> {
     const retried = await this.pool.query(
-      `UPDATE notification_deliveries
+      `UPDATE ${tableForChannel(channel)}
           SET status = 'pending',
               next_attempt_at = now() + ($2::int * interval '1 millisecond'),
               provider = $3,
@@ -268,14 +299,14 @@ export class NotificationOutbox {
       ],
     );
     if ((retried.rowCount ?? 0) > 0) return 'retried';
-    await this.markFailed(jobId, result);
+    await this.markFailed(jobId, result, channel);
     return 'failed';
   }
 
   /** Permanent failure or exhausted retries: dead-lettered, never retried. */
-  async markFailed(jobId: string, result: AttemptResult): Promise<void> {
+  async markFailed(jobId: string, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<void> {
     await this.pool.query(
-      `UPDATE notification_deliveries
+      `UPDATE ${tableForChannel(channel)}
           SET status = 'failed',
               provider = $2,
               provider_response_code = $3,
@@ -296,9 +327,9 @@ export class NotificationOutbox {
    * `unavailable` is the "configure delivery and these go out" state. It is
    * terminal, so a misconfigured deployment cannot spin forever.
    */
-  async markUnavailable(jobId: string, result: AttemptResult): Promise<void> {
+  async markUnavailable(jobId: string, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<void> {
     await this.pool.query(
-      `UPDATE notification_deliveries
+      `UPDATE ${tableForChannel(channel)}
           SET status = 'unavailable',
               provider = $2,
               failure_category = $3,
@@ -320,33 +351,12 @@ export class NotificationOutbox {
    */
   async recoverStale(leaseMs: number): Promise<{ recovered: number; deadLettered: number }> {
     const lease = Math.max(1, Math.trunc(leaseMs));
-    const back = await this.pool.query(
-      `UPDATE notification_deliveries
-          SET status = 'pending',
-              next_attempt_at = now(),
-              failure_category = 'stale',
-              last_error = 'worker did not finish inside the lease — recovered',
-              locked_at = NULL,
-              locked_by = NULL
-        WHERE status = 'processing'
-          AND locked_at < now() - ($1::int * interval '1 millisecond')
-          AND attempts < max_attempts`,
-      [lease],
-    );
-    const dead = await this.pool.query(
-      `UPDATE notification_deliveries
-          SET status = 'failed',
-              failure_category = 'stale',
-              last_error = 'worker did not finish inside the lease — retry budget exhausted',
-              next_attempt_at = now(),
-              locked_at = NULL,
-              locked_by = NULL
-        WHERE status = 'processing'
-          AND locked_at < now() - ($1::int * interval '1 millisecond')
-          AND attempts >= max_attempts`,
-      [lease],
-    );
-    return { recovered: back.rowCount ?? 0, deadLettered: dead.rowCount ?? 0 };
+    const results = await Promise.all([EMAIL_DELIVERY_TABLE, WEBHOOK_DELIVERY_TABLE].map(async (table) => {
+      const back = await this.pool.query(`UPDATE ${table} SET status = 'pending', next_attempt_at = now(), failure_category = 'stale', last_error = 'worker did not finish inside the lease — recovered', locked_at = NULL, locked_by = NULL WHERE status = 'processing' AND locked_at < now() - ($1::int * interval '1 millisecond') AND attempts < max_attempts`, [lease]);
+      const dead = await this.pool.query(`UPDATE ${table} SET status = 'failed', failure_category = 'stale', last_error = 'worker did not finish inside the lease — retry budget exhausted', next_attempt_at = now(), locked_at = NULL, locked_by = NULL WHERE status = 'processing' AND locked_at < now() - ($1::int * interval '1 millisecond') AND attempts >= max_attempts`, [lease]);
+      return { recovered: back.rowCount ?? 0, deadLettered: dead.rowCount ?? 0 };
+    }));
+    return results.reduce((sum, value) => ({ recovered: sum.recovered + value.recovered, deadLettered: sum.deadLettered + value.deadLettered }), { recovered: 0, deadLettered: 0 });
   }
 
   /**
@@ -357,25 +367,13 @@ export class NotificationOutbox {
    */
   async requeueUnavailable(channels: readonly NotificationChannel[], limit: number): Promise<number> {
     if (channels.length === 0) return 0;
-    const res = await this.pool.query(
-      `UPDATE notification_deliveries
-          SET status = 'pending',
-              attempts = 0,
-              failure_category = 'none',
-              last_error = NULL,
-              next_attempt_at = now(),
-              locked_at = NULL,
-              locked_by = NULL
-        WHERE id IN (
-          SELECT id FROM notification_deliveries
-           WHERE status = 'unavailable' AND channel = ANY($1::text[])
-           ORDER BY created_at ASC
-           LIMIT $2
-           FOR UPDATE SKIP LOCKED
-        )`,
-      [[...channels], Math.max(1, Math.trunc(limit))],
-    );
-    return res.rowCount ?? 0;
+    let total = 0;
+    for (const channel of channels) {
+      const table = tableForChannel(channel);
+      const res = await this.pool.query(`UPDATE ${table} SET status = 'pending', attempts = 0, failure_category = 'none', last_error = NULL, next_attempt_at = now(), locked_at = NULL, locked_by = NULL WHERE id IN (SELECT id FROM ${table} WHERE status = 'unavailable' LIMIT $1 FOR UPDATE SKIP LOCKED)`, [Math.max(1, Math.trunc(limit))]);
+      total += res.rowCount ?? 0;
+    }
+    return total;
   }
 
   /**
@@ -391,26 +389,19 @@ export class NotificationOutbox {
    * transition, which makes it unusable as an age filter.
    */
   async cleanup(policy: CleanupPolicy): Promise<number> {
-    const delivered = await this.pool.query(
-      `DELETE FROM notification_deliveries
-        WHERE status = 'delivered'
-          AND delivered_at IS NOT NULL
-          AND delivered_at < now() - ($1::int * interval '1 day')`,
-      [Math.max(1, Math.trunc(policy.deliveredRetentionDays))],
-    );
-    const failed = await this.pool.query(
-      `DELETE FROM notification_deliveries
-        WHERE status = 'failed'
-          AND created_at < now() - ($1::int * interval '1 day')`,
-      [Math.max(1, Math.trunc(policy.failedRetentionDays))],
-    );
-    return (delivered.rowCount ?? 0) + (failed.rowCount ?? 0);
+    let deleted = 0;
+    for (const table of [EMAIL_DELIVERY_TABLE, WEBHOOK_DELIVERY_TABLE]) {
+      const delivered = await this.pool.query(`DELETE FROM ${table} WHERE status = 'delivered' AND delivered_at IS NOT NULL AND delivered_at < now() - ($1::int * interval '1 day')`, [Math.max(1, Math.trunc(policy.deliveredRetentionDays))]);
+      const failed = await this.pool.query(`DELETE FROM ${table} WHERE status = 'failed' AND created_at < now() - ($1::int * interval '1 day')`, [Math.max(1, Math.trunc(policy.failedRetentionDays))]);
+      deleted += (delivered.rowCount ?? 0) + (failed.rowCount ?? 0);
+    }
+    return deleted;
   }
 
   /** Queue depth per status — the number an operator watches. */
   async depth(): Promise<OutboxDepth> {
     const res = await this.pool.query<{ status: string; n: string }>(
-      'SELECT status, count(*)::text AS n FROM notification_deliveries GROUP BY status',
+      `SELECT status, count(*)::text AS n FROM (SELECT status FROM notification_deliveries UNION ALL SELECT status FROM notification_webhook_deliveries) jobs GROUP BY status`,
     );
     const depth: OutboxDepth = { pending: 0, processing: 0, delivered: 0, failed: 0, unavailable: 0 };
     for (const row of res.rows) {

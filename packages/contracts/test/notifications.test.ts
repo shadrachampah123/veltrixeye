@@ -23,6 +23,8 @@ import {
   notificationListResponseSchema,
   notificationRunRequestSchema,
   notificationRunResponseSchema,
+  notificationPreferenceSchema,
+  notificationPreferenceRequestSchema,
 } from '../src/index.js';
 
 const CREATED = new Date(1_800_000_000_000).toISOString();
@@ -77,7 +79,7 @@ function validPayload(overrides: Record<string, unknown> = {}) {
 
 describe('m7.3 notification contracts', () => {
   test('channels, statuses and failure categories are pinned', () => {
-    assert.deepEqual([...NOTIFICATION_CHANNELS], ['email']);
+    assert.deepEqual([...NOTIFICATION_CHANNELS], ['email', 'webhook']);
     assert.deepEqual([...NOTIFICATION_STATUSES], ['pending', 'processing', 'delivered', 'failed', 'unavailable']);
     assert.deepEqual([...TERMINAL_NOTIFICATION_STATUSES], ['delivered', 'failed']);
     assert.deepEqual([...NOTIFICATION_FAILURE_CATEGORIES], [
@@ -139,6 +141,22 @@ describe('m7.3 notification contracts', () => {
       false,
       'subject is capped at 200 chars',
     );
+  });
+
+  test('M9.1 preference schemas keep webhook secrets write-only', () => {
+    const preference = notificationPreferenceSchema.parse({
+      id: '11111111-1111-4111-8111-111111111111',
+      channel: 'webhook', enabled: true, endpointUrl: 'https://hooks.example.test/alerts',
+      createdAt: CREATED, updatedAt: CREATED,
+    });
+    assert.equal(preference.channel, 'webhook');
+    assert.equal(notificationPreferenceRequestSchema.safeParse({
+      channel: 'webhook', endpointUrl: 'https://hooks.example.test/alerts', signingSecret: 'secret',
+    }).success, true);
+    assert.equal(notificationPreferenceRequestSchema.safeParse({
+      channel: 'webhook', endpointUrl: 'http://hooks.example.test/alerts',
+    }).success, true, 'HTTPS policy is enforced by the core service');
+    assert.equal(notificationPreferenceSchema.safeParse({ ...preference, signingSecret: 'secret' }).success, false);
   });
 
   test('list/run/maintenance schemas are strict and bounded', () => {

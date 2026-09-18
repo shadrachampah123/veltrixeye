@@ -158,6 +158,18 @@ export {
   type SmtpEmailConfig,
   type SmtpEmailProvider,
 } from './notifications/email.js';
+export {
+  createWebhookNotificationProvider,
+  WEBHOOK_PROVIDER_NAME,
+  type WebhookProviderConfig,
+  type WebhookNotificationProvider,
+} from './notifications/webhook.js';
+export { resolveWebhookDestination, isUnsafeAddress, type ResolvedWebhookDestination } from './notifications/webhook-security.js';
+export {
+  NotificationPreferenceService,
+  type NotificationDeliveryTarget,
+  type PreferenceQueryable,
+} from './notifications/preferences.js';
 export { redactSecrets, describeError, REDACTED, MAX_ERROR_CHARS } from './notifications/redact.js';
 
 // Scoring (foundation re-exports)

@@ -249,7 +249,7 @@ export class DeliveryWorker {
 
     if (!provider) {
       const error = `no notification provider is registered for channel "${job.channel}"`;
-      await this.outbox.markUnavailable(job.id, { failureCategory: 'configuration', error });
+      await this.outbox.markUnavailable(job.id, { failureCategory: 'configuration', error }, job.channel as NotificationChannel);
       this.logger.warn('notification delivery unavailable', {
         ...meta,
         status: 'unavailable',
@@ -264,7 +264,7 @@ export class DeliveryWorker {
         provider: provider.name,
         failureCategory: 'configuration',
         error,
-      });
+      }, job.channel as NotificationChannel);
       this.logger.warn('notification delivery unavailable', {
         ...meta,
         provider: provider.name,
@@ -284,6 +284,7 @@ export class DeliveryWorker {
         payload: job.payload,
         attempt: job.attempts,
         timeoutMs: this.policy.timeoutMs,
+        signingSecret: job.signing_secret,
       });
       return await this.record(job, provider.name, result, null);
     } catch (err) {
@@ -320,7 +321,7 @@ export class DeliveryWorker {
         providerMessageId: result.providerMessageId ?? null,
         providerResponseCode: result.providerResponseCode ?? null,
         failureCategory: 'none',
-      });
+      }, job.channel as NotificationChannel);
       this.logger.info('notification delivered', { ...meta, status: 'delivered' });
       return 'delivered';
     }
@@ -334,7 +335,7 @@ export class DeliveryWorker {
     };
 
     if (result.outcome === 'unavailable') {
-      await this.outbox.markUnavailable(job.id, attempt);
+      await this.outbox.markUnavailable(job.id, attempt, job.channel as NotificationChannel);
       this.logger.warn('notification delivery unavailable', {
         ...meta,
         status: 'unavailable',
@@ -344,7 +345,7 @@ export class DeliveryWorker {
     }
 
     if (result.outcome === 'permanent') {
-      await this.outbox.markFailed(job.id, attempt);
+      await this.outbox.markFailed(job.id, attempt, job.channel as NotificationChannel);
       this.logger.warn('notification delivery failed permanently', {
         ...meta,
         status: 'failed',
@@ -360,7 +361,7 @@ export class DeliveryWorker {
       policy: this.policy,
       idempotencyKey: job.idempotency_key,
     });
-    const outcome = await this.outbox.markRetry(job.id, delayMs, attempt);
+    const outcome = await this.outbox.markRetry(job.id, delayMs, attempt, job.channel as NotificationChannel);
     this.logger.warn(outcome === 'retried' ? 'notification attempt failed' : 'notification retries exhausted', {
       ...meta,
       status: outcome === 'retried' ? 'pending' : 'failed',
