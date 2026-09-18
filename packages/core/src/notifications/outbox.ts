@@ -118,6 +118,9 @@ export interface OutboxDepth {
 }
 
 export class NotificationOutbox {
+  private claimSequence: Promise<void> = Promise.resolve();
+  private nextSingleTable: typeof EMAIL_DELIVERY_TABLE | typeof WEBHOOK_DELIVERY_TABLE = EMAIL_DELIVERY_TABLE;
+
   constructor(
     private readonly pool: pg.Pool,
     private readonly defaults: OutboxDefaults,
@@ -228,32 +231,55 @@ export class NotificationOutbox {
    * retry budget bounded even if a worker dies repeatedly.
    */
   async claimBatch(limit: number, workerId: string, q: Queryable = this.pool): Promise<NotificationJobRow[]> {
-    const bounded = Math.max(1, Math.trunc(limit));
-    // A pool-backed claim owns its transaction so selection and state change
-    // across both tables commit as one operation. A caller-supplied client is
-    // already transaction-owned (and is used by the SKIP LOCKED tests).
-    if (q === this.pool) {
-      const client = await this.pool.connect();
-      try {
-        await client.query('BEGIN');
-        const jobs = await this.claimBatchInTransaction(bounded, workerId, client);
-        await client.query('COMMIT');
-        return jobs;
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw error;
-      } finally {
-        client.release();
+    if (!Number.isFinite(limit) || limit <= 0) return [];
+    const bounded = Math.trunc(limit);
+    // Serialize claims issued through one outbox instance so the deterministic
+    // single-row round-robin turn cannot be consumed twice concurrently.
+    let release!: () => void;
+    const previous = this.claimSequence;
+    this.claimSequence = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      // A pool-backed claim owns its transaction so selection and state change
+      // across both tables commit as one operation. A caller-supplied client is
+      // already transaction-owned (and is used by the SKIP LOCKED tests).
+      if (q === this.pool) {
+        const client = await this.pool.connect();
+        try {
+          await client.query('BEGIN');
+          const jobs = await this.claimBatchInTransaction(bounded, workerId, client);
+          await client.query('COMMIT');
+          return jobs;
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw error;
+        } finally {
+          client.release();
+        }
       }
+      return await this.claimBatchInTransaction(bounded, workerId, q);
+    } finally {
+      release();
     }
-    return this.claimBatchInTransaction(bounded, workerId, q);
   }
 
   private async claimBatchInTransaction(limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {
-    // Alternate the preferred table by worker id while reserving half the
-    // batch for each table. If one side is short, the unused capacity is
-    // filled from the other side. Every claim is therefore <= limit and every
-    // transitioned row is retained in the returned array.
+    // With a one-row batch, inspect one candidate from the preferred queue and
+    // then the other only if needed. The turn flips after every call, so a
+    // continuously non-empty queue cannot starve the other queue.
+    if (limit === 1) {
+      const first = this.nextSingleTable;
+      const second = first === EMAIL_DELIVERY_TABLE ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
+      this.nextSingleTable = second;
+      const firstJobs = await this.claimTable(first, 1, workerId, q);
+      if (firstJobs.length > 0) return firstJobs;
+      return this.claimTable(second, 1, workerId, q);
+    }
+
+    // Alternate the preferred table while reserving half the batch for each
+    // table. If one side is short, the unused capacity is filled from the
+    // other side. Every claim is therefore <= limit and every transitioned row
+    // is retained in the returned array.
     const preferWebhook = [...workerId].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 2 === 1;
     const first = preferWebhook ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
     const second = preferWebhook ? EMAIL_DELIVERY_TABLE : WEBHOOK_DELIVERY_TABLE;

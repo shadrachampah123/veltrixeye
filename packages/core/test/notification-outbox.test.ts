@@ -444,6 +444,31 @@ describe('outbox — claiming', () => {
     }
   });
 
+  test('non-positive limits claim no jobs', async () => {
+    const owner = await makeUser();
+    const emailAlert = await makeAlert(owner.id);
+    await enqueueAlert(emailAlert, owner.id);
+    const webhookAlert = await makeAlert(owner.id);
+    await enqueueWebhook(webhookAlert, owner.id);
+    assert.deepEqual(await outbox.claimBatch(0, 'zero-worker'), []);
+    assert.deepEqual(await outbox.claimBatch(-1, 'negative-worker'), []);
+    const states = await pool.query<{ status: string; n: string }>(`SELECT status, count(*)::text AS n FROM (SELECT status FROM notification_deliveries UNION ALL SELECT status FROM notification_webhook_deliveries) jobs GROUP BY status`);
+    assert.equal(Number(states.rows.find((row) => row.status === 'processing')?.n ?? 0), 0);
+    assert.equal(Number(states.rows.find((row) => row.status === 'pending')?.n ?? 0), 2);
+  });
+
+  test('limit one round-robins both continuously populated queues', async () => {
+    const owner = await makeUser();
+    for (let i = 0; i < 6; i++) await enqueueAlert(await makeAlert(owner.id), owner.id);
+    for (let i = 0; i < 6; i++) await enqueueWebhook(await makeAlert(owner.id), owner.id);
+    const claimed = [] as NotificationJobRow[];
+    for (let i = 0; i < 6; i++) claimed.push(...await outbox.claimBatch(1, `fair-worker-${i}`));
+    assert.equal(claimed.length, 6);
+    const processing = await pool.query<{ channel: string; n: string }>(`SELECT channel, count(*)::text AS n FROM (SELECT channel FROM notification_deliveries WHERE status = 'processing' UNION ALL SELECT channel FROM notification_webhook_deliveries WHERE status = 'processing') jobs GROUP BY channel`);
+    assert.ok(Number(processing.rows.find((row) => row.channel === 'email')?.n ?? 0) > 0);
+    assert.ok(Number(processing.rows.find((row) => row.channel === 'webhook')?.n ?? 0) > 0);
+  });
+
   test('claims at most the requested total across email and webhook and returns every lease', async () => {
     const owner = await makeUser();
     const created: string[] = [];
