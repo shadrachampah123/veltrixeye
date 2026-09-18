@@ -125,9 +125,9 @@ export class NotificationPreferenceService {
     const route = strategy.rows[0];
     if (route?.muted) return [];
     const rows = await q.query<PreferenceRow>(
-      `SELECT * FROM notification_preferences WHERE user_id = $1 AND enabled = true AND (channel = 'email' OR endpoint_url IS NOT NULL) ORDER BY channel`, [userId]);
+      `SELECT * FROM notification_preferences WHERE user_id = $1 AND (channel = 'email' OR (enabled = true AND endpoint_url IS NOT NULL)) ORDER BY channel`, [userId]);
     const allowed = route?.channels ?? null;
-    const targets = rows.rows.filter((row) => !allowed || allowed.includes(row.channel)).map((row) => ({
+    const targets = rows.rows.filter((row) => row.enabled && (!allowed || allowed.includes(row.channel))).map((row) => ({
       channel: row.channel, recipient: row.endpoint_url ?? '', signingSecret: row.signing_secret,
     })).filter((target) => target.channel !== 'webhook' || target.recipient !== '');
     if (!rows.rows.some((row) => row.channel === 'email') && (!allowed || allowed.includes('email'))) {

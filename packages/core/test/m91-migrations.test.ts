@@ -41,8 +41,8 @@ test('M9.1 migrations upgrade an existing 0022 database and preserve email prefe
   const before = await runMigrations(pool, oldDir);
   assert.equal(before.applied.length, 22);
   let status = await migrationStatus(pool, MIGRATIONS_DIR);
-  assert.deepEqual(status.pending.slice(-2), ['0023_notification_preferences.sql', '0024_notification_routing.sql']);
-  const files = readdirSync(MIGRATIONS_DIR).filter((file) => file.startsWith('0023_') || file.startsWith('0024_'));
+  assert.deepEqual(status.pending.slice(-3), ['0023_notification_preferences.sql', '0024_notification_routing.sql', '0025_webhook_tenant_integrity.sql']);
+  const files = readdirSync(MIGRATIONS_DIR).filter((file) => file.startsWith('0023_') || file.startsWith('0024_') || file.startsWith('0025_'));
   for (const file of files) copyFileSync(path.join(MIGRATIONS_DIR, file), path.join(oldDir, file));
   const upgraded = await runMigrations(pool, oldDir);
   assert.deepEqual(upgraded.applied, files.sort());
@@ -58,12 +58,26 @@ test('M9.1 migrations upgrade an existing 0022 database and preserve email prefe
     () => pool.query('INSERT INTO strategy_notification_preferences (user_id, strategy_id) VALUES ($1, $2)', [other.rows[0]!.id, strategy.rows[0]!.id]),
     (error: unknown) => typeof error === 'object' && error !== null && (error as { code?: string }).code === '23503',
   );
+
+  const version = await pool.query<{ id: string }>('INSERT INTO strategy_versions (strategy_id, version_number) VALUES ($1, 1) RETURNING id', [strategy.rows[0]!.id]);
+  const instrument = await pool.query<{ id: string }>('SELECT id FROM instruments LIMIT 1');
+  const setup = await pool.query<{ id: string }>(`INSERT INTO setups (strategy_version_id, instrument_id, state, direction, detected_at, as_of_ms) VALUES ($1, $2, 'confirmed', 'long', now(), 1800000000000) RETURNING id`, [version.rows[0]!.id, instrument.rows[0]!.id]);
+  const alert = await pool.query<{ id: string }>(`INSERT INTO alerts (user_id, setup_id, strategy_id, strategy_version_id, instrument_id, direction, trigger_state, quality_score, min_quality_score, title, body) VALUES ($1, $2, $3, $4, $5, 'long', 'confirmed', 80, 65, 'm91', '{}') RETURNING id`, [user.rows[0]!.id, setup.rows[0]!.id, strategy.rows[0]!.id, version.rows[0]!.id, instrument.rows[0]!.id]);
+  const webhookValues = [alert.rows[0]!.id, user.rows[0]!.id, strategy.rows[0]!.id, 'x'.repeat(64), 'y'.repeat(64), '{}', 'https://hooks.example.test'];
+  const insertWebhook = (values: unknown[]) => pool.query(`INSERT INTO notification_webhook_deliveries (alert_id, user_id, strategy_id, template, idempotency_key, payload_hash, payload, recipient) VALUES ($1, $2, $3, 'alert.webhook.v1', $4, $5, $6::jsonb, $7)`, values);
+  await assert.rejects(() => insertWebhook([alert.rows[0]!.id, other.rows[0]!.id, strategy.rows[0]!.id, ...webhookValues.slice(3)]), /violates foreign key/);
+  await insertWebhook([alert.rows[0]!.id, user.rows[0]!.id, strategy.rows[0]!.id, ...webhookValues.slice(3, 7)]);
+  const setup2 = await pool.query<{ id: string }>(`INSERT INTO setups (strategy_version_id, instrument_id, state, direction, detected_at, as_of_ms) VALUES ($1, $2, 'confirmed', 'long', now(), 1800000000001) RETURNING id`, [version.rows[0]!.id, instrument.rows[0]!.id]);
+  const alert2 = await pool.query<{ id: string }>(`INSERT INTO alerts (user_id, setup_id, strategy_id, strategy_version_id, instrument_id, direction, trigger_state, quality_score, min_quality_score, title, body) VALUES ($1, $2, $3, $4, $5, 'long', 'confirmed', 80, 65, 'm91-2', '{}') RETURNING id`, [user.rows[0]!.id, setup2.rows[0]!.id, strategy.rows[0]!.id, version.rows[0]!.id, instrument.rows[0]!.id]);
+  const otherStrategy = await pool.query<{ id: string }>('INSERT INTO strategies (user_id, name) VALUES ($1, $2) RETURNING id', [other.rows[0]!.id, 'Other Strategy']);
+  await assert.rejects(() => insertWebhook([alert2.rows[0]!.id, user.rows[0]!.id, otherStrategy.rows[0]!.id, 'z'.repeat(64), 'w'.repeat(64), '{}', 'https://hooks.example.test']), /violates foreign key/);
+  await assert.rejects(() => insertWebhook([alert2.rows[0]!.id, other.rows[0]!.id, otherStrategy.rows[0]!.id, 'q'.repeat(64), 'r'.repeat(64), '{}', 'https://hooks.example.test']), /violates foreign key/);
 });
 
 test('M9.1 migrations apply cleanly to a fresh database', async () => {
   const result = await runMigrations(freshPool, fullDir);
   const status = await migrationStatus(freshPool, fullDir);
-  assert.equal(result.applied.length, 24);
+  assert.equal(result.applied.length, 25);
   assert.equal(status.pending.length, 0);
   assert.equal(status.checksumsMatch, true);
   assert.ok((await listMigrationFiles(fullDir)).some((file) => file.name === '0024_notification_routing.sql'));
