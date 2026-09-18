@@ -37,6 +37,8 @@ import { Errors } from '../errors.js';
 export type Queryable = Pick<pg.Pool, 'query'>;
 const EMAIL_DELIVERY_TABLE = 'notification_deliveries';
 const WEBHOOK_DELIVERY_TABLE = 'notification_webhook_deliveries';
+/** Shared PostgreSQL advisory lock for the cross-instance single-row decision. */
+const NOTIFICATION_FAIRNESS_LOCK_KEY = 611_231_008;
 function tableForChannel(channel: NotificationChannel): string {
   return channel === 'webhook' ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
 }
@@ -118,9 +120,6 @@ export interface OutboxDepth {
 }
 
 export class NotificationOutbox {
-  private claimSequence: Promise<void> = Promise.resolve();
-  private nextSingleTable: typeof EMAIL_DELIVERY_TABLE | typeof WEBHOOK_DELIVERY_TABLE = EMAIL_DELIVERY_TABLE;
-
   constructor(
     private readonly pool: pg.Pool,
     private readonly defaults: OutboxDefaults,
@@ -233,44 +232,43 @@ export class NotificationOutbox {
   async claimBatch(limit: number, workerId: string, q: Queryable = this.pool): Promise<NotificationJobRow[]> {
     if (!Number.isFinite(limit) || limit <= 0) return [];
     const bounded = Math.trunc(limit);
-    // Serialize claims issued through one outbox instance so the deterministic
-    // single-row round-robin turn cannot be consumed twice concurrently.
-    let release!: () => void;
-    const previous = this.claimSequence;
-    this.claimSequence = new Promise<void>((resolve) => { release = resolve; });
-    await previous;
-    try {
-      // A pool-backed claim owns its transaction so selection and state change
-      // across both tables commit as one operation. A caller-supplied client is
-      // already transaction-owned (and is used by the SKIP LOCKED tests).
-      if (q === this.pool) {
-        const client = await this.pool.connect();
-        try {
-          await client.query('BEGIN');
-          const jobs = await this.claimBatchInTransaction(bounded, workerId, client);
-          await client.query('COMMIT');
-          return jobs;
-        } catch (error) {
-          await client.query('ROLLBACK').catch(() => {});
-          throw error;
-        } finally {
-          client.release();
-        }
+    // A pool-backed claim owns its transaction so selection and state change
+    // across both tables commit as one operation. A caller-supplied client is
+    // already transaction-owned (and is used by the SKIP LOCKED tests).
+    if (q === this.pool) {
+      const client = await this.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const jobs = await this.claimBatchInTransaction(bounded, workerId, client);
+        await client.query('COMMIT');
+        return jobs;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
       }
-      return await this.claimBatchInTransaction(bounded, workerId, q);
-    } finally {
-      release();
     }
+    return this.claimBatchInTransaction(bounded, workerId, q);
   }
 
   private async claimBatchInTransaction(limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {
-    // With a one-row batch, inspect one candidate from the preferred queue and
-    // then the other only if needed. The turn flips after every call, so a
-    // continuously non-empty queue cannot starve the other queue.
+    // A shared transaction-level advisory lock serializes the fairness
+    // decision across every process and every reconstructed Outbox instance.
+    // Cumulative attempts are durable queue history: after one side is
+    // claimed, its score rises and the other side is preferred next. Ties are
+    // deterministic, and an empty preferred queue falls back immediately.
     if (limit === 1) {
-      const first = this.nextSingleTable;
+      await q.query('SELECT pg_advisory_xact_lock($1)', [NOTIFICATION_FAIRNESS_LOCK_KEY]);
+      const scores = await q.query<{ email_score: string; webhook_score: string }>(
+        `SELECT
+           COALESCE((SELECT sum(attempts)::numeric FROM notification_deliveries), 0)::text AS email_score,
+           COALESCE((SELECT sum(attempts)::numeric FROM notification_webhook_deliveries), 0)::text AS webhook_score`,
+      );
+      const emailScore = BigInt(scores.rows[0]?.email_score ?? '0');
+      const webhookScore = BigInt(scores.rows[0]?.webhook_score ?? '0');
+      const first = emailScore <= webhookScore ? EMAIL_DELIVERY_TABLE : WEBHOOK_DELIVERY_TABLE;
       const second = first === EMAIL_DELIVERY_TABLE ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
-      this.nextSingleTable = second;
       const firstJobs = await this.claimTable(first, 1, workerId, q);
       if (firstJobs.length > 0) return firstJobs;
       return this.claimTable(second, 1, workerId, q);
