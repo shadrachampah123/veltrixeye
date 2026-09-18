@@ -6,11 +6,15 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   test:
     name: test (Node 22, ubuntu, embedded-postgres)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -26,20 +30,23 @@ jobs:
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y libpq-dev
-          # embedded-postgres uses initdb --locale=C.utf8 — ensure locale exists
+          sudo apt-get install -y libpq-dev build-essential python3
           locale -a
-          sudo locale-gen C.utf8 || true
-          # Show libpq presence for debugging
-          dpkg -l | grep -E "libpq|postgres" || true
+          sudo locale-gen C.utf8 en_US.UTF-8 || true
+          sudo update-locale || true
+          locale -a
+          dpkg -l | grep -E "libpq|postgres|build-essential" || true
           ls -l /usr/lib/x86_64-linux-gnu/libpq* || true
-          # Verify bundled postgres binary can resolve its deps (it ships its own libpq)
-          ls -l node_modules/@embedded-postgres/linux-x64/native/bin/ 2>/dev/null || echo "not yet installed — will be after npm ci"
 
       - name: Install dependencies (npm ci)
         run: |
           set -eux
           npm ci
+          # Show bundled postgres binary info
+          ls -lh node_modules/@embedded-postgres/linux-x64/native/bin/ || true
+          ls -lh node_modules/@embedded-postgres/linux-x64/native/lib/ | head -20 || true
+          node_modules/@embedded-postgres/linux-x64/native/bin/initdb --version || true
+          ldd node_modules/@embedded-postgres/linux-x64/native/bin/initdb | head -20 || true
 
       - name: Verify dev dependencies (tsx, typescript)
         run: |
@@ -49,6 +56,7 @@ jobs:
           ls -lh node_modules/.bin/tsx node_modules/.bin/tsc
           node --version
           npm --version
+          npx --yes tsx --help 2>&1 | head -5 || true
 
       - name: Typecheck (all workspaces)
         run: |
@@ -56,12 +64,59 @@ jobs:
           npm run typecheck
 
       - name: Test (all workspaces, including safety)
+        id: test
         run: |
           set -eux
           # The test harness boots real PostgreSQL via embedded-postgres (native binary).
-          # Several test files within the same workspace share the same DB_PORT by design.
-          # Node's test runner defaults to parallel file execution when availableParallelism>1,
-          # which would cause EADDRINUSE flakes. We constrain CPU affinity to 1 core so
-          # os.availableParallelism() == 1 and the runner serializes files, WITHOUT modifying
-          # the test harness or skipping any tests (including safety).
-          taskset -c 0 npm test
+          # Several test files within the same workspace share the same DB_PORT by design
+          # (e.g., alerts.test.ts and scanner.test.ts both 5441). Node's test runner can run
+          # files in parallel when --test-concurrency>1. We constrain CPU affinity to 1 core
+          # so os.availableParallelism()==1 and default concurrency is serial, WITHOUT
+          # modifying the test harness or skipping any tests (including safety).
+          # We also capture full output for debugging.
+          echo "availableParallelism=$(node -e 'console.log(require(\"os\").availableParallelism())')"
+          echo "taskset CPUs: $(taskset -c -p $$ || true)"
+          # Run with taskset to serialize
+          set +e
+          taskset -c 0 npm test 2>&1 | tee /tmp/test.log
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "EXIT_CODE=$EXIT_CODE" | tee -a /tmp/test.log
+          # Show summary
+          grep -E "^# (tests|pass|fail|suites)|^> @veltrixeye|EXIT_CODE" /tmp/test.log | tail -30 || true
+          # Keep tail for comment
+          tail -n 300 /tmp/test.log > /tmp/test-tail.log || true
+          exit $EXIT_CODE
+
+      - name: Upload test log artifact (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: /tmp/test.log
+          retention-days: 7
+
+      - name: Post failure tail as PR comment (if failed)
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let tail = '';
+            try {
+              tail = fs.readFileSync('/tmp/test-tail.log', 'utf8');
+            } catch (e) {
+              tail = `Could not read tail: ${e.message}`;
+            }
+            // Also try full log head for typecheck etc
+            let full = '';
+            try {
+              const content = fs.readFileSync('/tmp/test.log', 'utf8');
+              full = content.slice(-8000);
+            } catch {}
+            const body = `❌ CI test step failed on \`${{ github.head_ref || github.ref_name }}\` @ \`${{ github.sha }}\`\n\n**Tail (last 300 lines):**\n\`\`\`\n${tail}\n\`\`\`\n\n**Full log tail (last 8000 chars):**\n\`\`\`\n${full}\n\`\`\`\n`;
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body.slice(0, 65000)
+            });
