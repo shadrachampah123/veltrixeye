@@ -116,7 +116,7 @@ test('M9.1 webhook security rejects private, reserved and metadata destinations'
     assert.equal(isUnsafeAddress(ip), true, ip);
     await assert.rejects(() => resolveWebhookDestination(`https://${ip}/hook`));
   }
-  for (const ip of ['::', '::1', '100::1', '2001:1::1', '2001:2::1', '2001:3::1', '2001:4:112::1', '2001:10::1', '2001:20::1', '2001:30::1', '2001:db8::1', '2002::1', 'fc00::1', 'fe80::1', 'ff02::1', '64:ff9b::1', '::ffff:127.0.0.1', '::ffff:8.8.8.8']) {
+  for (const ip of ['::', '::1', '100::1', '2001:0::1', '2001:1::1', '2001:2::1', '2001:3::1', '2001:4:112::1', '2001:10::1', '2001:20::1', '2001:30::1', '2001:db8::1', '2002::1', '3fff::1', 'fc00::1', 'fe80::1', 'ff02::1', '64:ff9b::1', '::ffff:127.0.0.1', '::ffff:8.8.8.8']) {
     assert.equal(isUnsafeAddress(ip), true, ip);
     await assert.rejects(() => resolveWebhookDestination(`https://[${ip}]/hook`));
   }

@@ -85,6 +85,7 @@ const uniqueEmail = () => `notif_${randomBytes(6).toString('hex')}@example.com`;
  */
 beforeEach(async () => {
   await pool.query('DELETE FROM notification_deliveries');
+  await pool.query('DELETE FROM notification_webhook_deliveries');
 });
 
 before(async () => {
@@ -239,6 +240,24 @@ function enqueueArgs(alertId: string, userId: string): EnqueueAlertNotificationA
 
 async function enqueueAlert(alertId: string, userId: string): Promise<{ row: NotificationJobRow; created: boolean }> {
   return outbox.enqueue(pool, enqueueArgs(alertId, userId));
+}
+
+async function enqueueWebhook(alertId: string, userId: string): Promise<NotificationJobRow> {
+  const alert = await pool.query<{ strategy_id: string }>('SELECT strategy_id FROM alerts WHERE id = $1', [alertId]);
+  const payload = payloadFor(alertId);
+  const result = await outbox.enqueue(pool, {
+    alertId,
+    userId,
+    strategyId: alert.rows[0]!.strategy_id,
+    channel: 'webhook',
+    recipient: 'https://hooks.example.test/alerts',
+    signingSecret: 'webhook-test-secret',
+    template: payload.template,
+    payload,
+    payloadHash: notificationPayloadHash(payload),
+    idempotencyKey: notificationIdempotencyKey({ template: payload.template, channel: 'webhook', alertId }),
+  });
+  return result.row;
 }
 
 function fakeProvider(
@@ -423,6 +442,42 @@ describe('outbox — claiming', () => {
       clientA.release();
       clientB.release();
     }
+  });
+
+  test('claims at most the requested total across email and webhook and returns every lease', async () => {
+    const owner = await makeUser();
+    const created: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const alertId = await makeAlert(owner.id);
+      created.push((await enqueueAlert(alertId, owner.id)).row.id);
+    }
+    for (let i = 0; i < 4; i++) {
+      const alertId = await makeAlert(owner.id);
+      created.push((await enqueueWebhook(alertId, owner.id)).id);
+    }
+    const claimed = await outbox.claimBatch(4, 'mixed-worker');
+    assert.equal(claimed.length, 4);
+    assert.equal(new Set(claimed.map((job) => job.id)).size, 4);
+    assert.ok(claimed.every((job) => created.includes(job.id)));
+    const states = await pool.query<{ status: string; n: string }>(`SELECT status, count(*)::text AS n FROM (SELECT status FROM notification_deliveries UNION ALL SELECT status FROM notification_webhook_deliveries) jobs GROUP BY status`);
+    const processing = Number(states.rows.find((row) => row.status === 'processing')?.n ?? 0);
+    assert.equal(processing, 4, 'claimed total equals processing total; no omitted lease exists');
+  });
+
+  test('concurrent claims are disjoint and each respects its requested total', async () => {
+    const owner = await makeUser();
+    for (let i = 0; i < 6; i++) await enqueueAlert(await makeAlert(owner.id), owner.id);
+    for (let i = 0; i < 6; i++) await enqueueWebhook(await makeAlert(owner.id), owner.id);
+    const batches = await Promise.all([
+      outbox.claimBatch(4, 'concurrent-A'),
+      outbox.claimBatch(4, 'concurrent-B'),
+      outbox.claimBatch(4, 'concurrent-C'),
+    ]);
+    assert.ok(batches.every((batch) => batch.length <= 4));
+    const ids = batches.flat().map((job) => job.id);
+    assert.equal(new Set(ids).size, ids.length, 'concurrent claims are disjoint');
+    const processing = await pool.query<{ n: string }>(`SELECT count(*)::text AS n FROM (SELECT id FROM notification_deliveries WHERE status = 'processing' UNION ALL SELECT id FROM notification_webhook_deliveries WHERE status = 'processing') jobs`);
+    assert.equal(Number(processing.rows[0]!.n), ids.length, 'all processing rows were returned by a claimant');
   });
 
   test('a job scheduled in the future is not claimed until it is due', async () => {

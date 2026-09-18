@@ -228,14 +228,58 @@ export class NotificationOutbox {
    * retry budget bounded even if a worker dies repeatedly.
    */
   async claimBatch(limit: number, workerId: string, q: Queryable = this.pool): Promise<NotificationJobRow[]> {
-    const [email, webhook] = await Promise.all([
-      this.claimTable(EMAIL_DELIVERY_TABLE, limit, workerId, q),
-      this.claimTable(WEBHOOK_DELIVERY_TABLE, limit, workerId, q),
-    ]);
-    return [...email, ...webhook].sort((a, b) => a.next_attempt_at.getTime() - b.next_attempt_at.getTime()).slice(0, limit);
+    const bounded = Math.max(1, Math.trunc(limit));
+    // A pool-backed claim owns its transaction so selection and state change
+    // across both tables commit as one operation. A caller-supplied client is
+    // already transaction-owned (and is used by the SKIP LOCKED tests).
+    if (q === this.pool) {
+      const client = await this.pool.connect();
+      try {
+        await client.query('BEGIN');
+        const jobs = await this.claimBatchInTransaction(bounded, workerId, client);
+        await client.query('COMMIT');
+        return jobs;
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+    return this.claimBatchInTransaction(bounded, workerId, q);
+  }
+
+  private async claimBatchInTransaction(limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {
+    // Alternate the preferred table by worker id while reserving half the
+    // batch for each table. If one side is short, the unused capacity is
+    // filled from the other side. Every claim is therefore <= limit and every
+    // transitioned row is retained in the returned array.
+    const preferWebhook = [...workerId].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 2 === 1;
+    const first = preferWebhook ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
+    const second = preferWebhook ? EMAIL_DELIVERY_TABLE : WEBHOOK_DELIVERY_TABLE;
+    const firstQuota = Math.ceil(limit / 2);
+    const secondQuota = limit - firstQuota;
+    const firstJobs = await this.claimTable(first, firstQuota, workerId, q);
+    const secondJobs = await this.claimTable(second, secondQuota, workerId, q);
+    let jobs = [...firstJobs, ...secondJobs];
+    let remaining = limit - jobs.length;
+    if (remaining > 0 && firstJobs.length < firstQuota) {
+      const extra = await this.claimTable(first, Math.min(remaining, firstQuota - firstJobs.length), workerId, q);
+      jobs = [...jobs, ...extra];
+      remaining -= extra.length;
+    }
+    if (remaining > 0 && secondJobs.length < secondQuota) {
+      const extra = await this.claimTable(second, Math.min(remaining, secondQuota - secondJobs.length), workerId, q);
+      jobs = [...jobs, ...extra];
+    }
+    return jobs.sort((a, b) => {
+      const due = a.next_attempt_at.getTime() - b.next_attempt_at.getTime();
+      return due || a.created_at.getTime() - b.created_at.getTime() || a.id.localeCompare(b.id);
+    });
   }
 
   private async claimTable(table: string, limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {
+    if (limit <= 0) return [];
     const res = await q.query<NotificationJobRow>(
       `WITH candidate AS (
          SELECT id FROM ${table}

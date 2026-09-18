@@ -849,4 +849,39 @@ describe('M9.1 multi-channel enqueue', () => {
       assert.equal(listed.body.includes('not-returned'), false, 'secret is not in notification API output');
     } finally { await local.close(); }
   });
+
+  test('global email opt-out reaches alert generation and inserts zero email rows', async () => {
+    const local = await makeWorkerApp();
+    try {
+      const generateCase = async (preference: { enabled: boolean } | null, routeEmail: boolean): Promise<number> => {
+        const owner = await registerUser(local.app);
+        const { strategyId, versionId } = await createPublishedVersion(owner.cookie, engulfConfig('EURUSD'), local.app);
+        await seedCandles('EURUSD', BULLISH_SHAPES, AS_OF);
+        const setupId = await detectSetup(owner.cookie, strategyId, versionId, 'EURUSD', AS_OF, local.app);
+        await scoreSetup(owner.cookie, setupId, local.app);
+        if (preference) {
+          const saved = await local.app.inject({
+            method: 'PUT', url: '/api/notifications/preferences', headers: { cookie: owner.cookie },
+            payload: { preferences: [{ channel: 'email', enabled: preference.enabled }] },
+          });
+          assert.equal(saved.statusCode, 200, saved.body);
+        }
+        if (routeEmail) {
+          const routed = await local.app.inject({
+            method: 'PUT', url: `/api/notifications/preferences/strategies/${strategyId}`,
+            headers: { cookie: owner.cookie }, payload: { muted: false, channels: ['email'] },
+          });
+          assert.equal(routed.statusCode, 200, routed.body);
+        }
+        const generated = await generateAlert(owner.cookie, setupId, local.app);
+        assert.equal(generated.statusCode, 201, generated.body);
+        const count = await pool.query<{ n: string }>('SELECT count(*)::text AS n FROM notification_deliveries WHERE alert_id = $1', [generated.json().alert.id]);
+        return Number(count.rows[0]!.n);
+      };
+
+      assert.equal(await generateCase({ enabled: false }, true), 0, 'explicit global email opt-out inserts no email row');
+      assert.equal(await generateCase(null, false), 1, 'no preference preserves default email enqueue');
+      assert.equal(await generateCase({ enabled: true }, true), 1, 'explicit email enable permits email enqueue');
+    } finally { await local.close(); }
+  });
 });
