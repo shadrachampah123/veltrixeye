@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "ci/**", "arena/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: test (Node 22, ubuntu, embedded-postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install PostgreSQL/libpq runtime for embedded-postgres
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+          # embedded-postgres uses initdb --locale=C.utf8 — ensure locale exists
+          locale -a
+          sudo locale-gen C.utf8 || true
+          # Show libpq presence for debugging
+          dpkg -l | grep -E "libpq|postgres" || true
+          ls -l /usr/lib/x86_64-linux-gnu/libpq* || true
+          # Verify bundled postgres binary can resolve its deps (it ships its own libpq)
+          ls -l node_modules/@embedded-postgres/linux-x64/native/bin/ 2>/dev/null || echo "not yet installed — will be after npm ci"
+
+      - name: Install dependencies (npm ci)
+        run: |
+          set -eux
+          npm ci
+
+      - name: Verify dev dependencies (tsx, typescript)
+        run: |
+          set -eux
+          npx tsx --version
+          npx tsc --version
+          ls -lh node_modules/.bin/tsx node_modules/.bin/tsc
+          node --version
+          npm --version
+
+      - name: Typecheck (all workspaces)
+        run: |
+          set -eux
+          npm run typecheck
+
+      - name: Test (all workspaces, including safety)
+        run: |
+          set -eux
+          # The test harness boots real PostgreSQL via embedded-postgres (native binary).
+          # Several test files within the same workspace share the same DB_PORT by design.
+          # Node's test runner defaults to parallel file execution when availableParallelism>1,
+          # which would cause EADDRINUSE flakes. We constrain CPU affinity to 1 core so
+          # os.availableParallelism() == 1 and the runner serializes files, WITHOUT modifying
+          # the test harness or skipping any tests (including safety).
+          taskset -c 0 npm test
