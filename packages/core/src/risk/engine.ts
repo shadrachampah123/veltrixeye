@@ -78,6 +78,17 @@ export interface RiskEngineInput {
   killSwitchReason?: string | null;
   candidate: RiskCandidate;
   evaluatedAtMs: number;
+  /**
+   * M8.7 — drawdown protection data (authoritative internal sources only).
+   * When absent, drawdown checks fail closed.
+   */
+  drawdown?: {
+    currentAccountValue: DecT;
+    peakEquity: DecT;
+    dailyHighValue: DecT;
+    weeklyOpenValue: DecT;
+    initialized: boolean;
+  } | null;
 }
 
 export interface ExposureView {
@@ -145,6 +156,14 @@ const REASONS: Record<RiskRejectionCode, string> = {
   CORRELATION_METADATA_UNAVAILABLE: 'correlation metadata is required but unavailable',
   CORRELATION_EXPOSURE_LIMIT: 'correlated-group exposure would exceed the policy limit',
   OPEN_POSITION_RISK_UNCOMPUTABLE: 'open-position risk could not be computed (fail-closed)',
+  /* M8.7 — drawdown circuit breakers */
+  DAILY_DRAWDOWN_WARNING: 'daily drawdown warning threshold reached',
+  DAILY_DRAWDOWN_LIMIT: 'daily drawdown hard-stop threshold reached — trading stopped',
+  WEEKLY_DRAWDOWN_WARNING: 'weekly drawdown warning threshold reached',
+  WEEKLY_DRAWDOWN_LIMIT: 'weekly drawdown hard-stop threshold reached — trading stopped',
+  MAX_DRAWDOWN_WARNING: 'maximum drawdown warning threshold reached',
+  MAX_DRAWDOWN_LIMIT: 'maximum drawdown hard-stop threshold reached — trading stopped',
+  EQUITY_DATA_UNAVAILABLE: 'equity data is unavailable or inconsistent (fail-closed)',
 };
 
 const emptyExposure = (): ExposureView => ({
@@ -373,6 +392,73 @@ function evaluateRiskInner(input: RiskEngineInput): RiskEngineVerdict {
   if (weeklyLoss.gte(weeklyCap) && weeklyCap.isPositive) violations.push('WEEKLY_LOSS_LIMIT');
   if (input.account.consecutiveLosses >= tightened.maxConsecutiveLosses) {
     violations.push('CONSECUTIVE_LOSS_LIMIT');
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* M8.7 — drawdown-based circuit breakers                              */
+  /* ------------------------------------------------------------------ */
+  const dd = input.drawdown;
+  if (!dd || !dd.initialized || !dd.currentAccountValue.isPositive) {
+    // Equity data missing, stale, or uninitialized — fail closed.
+    violations.push('EQUITY_DATA_UNAVAILABLE');
+  } else {
+    const currentVal = dd.currentAccountValue;
+    const peak = dd.peakEquity;
+    const dailyHigh = dd.dailyHighValue;
+    const weeklyOpen = dd.weeklyOpenValue;
+
+    // Validate the complete equity ordering before calculating any drawdown.
+    // Contradictory state must never be normalized into a favorable zero.
+    if (
+      !peak.isPositive
+      || !dailyHigh.isPositive
+      || !weeklyOpen.isPositive
+      || currentVal.gt(peak)
+      || dailyHigh.lt(currentVal)
+      || weeklyOpen.gt(peak)
+      || dailyHigh.gt(peak)
+    ) {
+      violations.push('EQUITY_DATA_UNAVAILABLE');
+    } else {
+      const pct = (baseline: DecT): DecT => {
+        if (baseline.lte(DEC_ZERO)) return DEC_ZERO;
+        const drop = baseline.sub(currentVal);
+        if (drop.lte(DEC_ZERO)) return DEC_ZERO;
+        const p = drop.mul(DEC_HUNDRED).div(baseline);
+        return p ?? DEC_ZERO;
+      };
+
+      const dailyDdPct = pct(dailyHigh);
+      const weeklyDdPct = pct(weeklyOpen);
+      const maxDdPct = pct(peak);
+
+      // Daily drawdown checks (warning + hard-stop)
+      const dailyWarn = Dec.fromNumber(tightened.dailyDrawdownWarningPct) ?? DEC_ZERO;
+      const dailyLimit = Dec.fromNumber(tightened.dailyDrawdownLimitPct) ?? DEC_ZERO;
+      if (dailyDdPct.gte(dailyLimit) && dailyLimit.isPositive) {
+        violations.push('DAILY_DRAWDOWN_LIMIT');
+      } else if (dailyDdPct.gte(dailyWarn) && dailyWarn.isPositive) {
+        violations.push('DAILY_DRAWDOWN_WARNING');
+      }
+
+      // Weekly drawdown checks (warning + hard-stop)
+      const weeklyWarn = Dec.fromNumber(tightened.weeklyDrawdownWarningPct) ?? DEC_ZERO;
+      const weeklyLimit = Dec.fromNumber(tightened.weeklyDrawdownLimitPct) ?? DEC_ZERO;
+      if (weeklyDdPct.gte(weeklyLimit) && weeklyLimit.isPositive) {
+        violations.push('WEEKLY_DRAWDOWN_LIMIT');
+      } else if (weeklyDdPct.gte(weeklyWarn) && weeklyWarn.isPositive) {
+        violations.push('WEEKLY_DRAWDOWN_WARNING');
+      }
+
+      // Maximum drawdown checks (warning + hard-stop)
+      const maxWarn = Dec.fromNumber(tightened.maxDrawdownWarningPct) ?? DEC_ZERO;
+      const maxLimit = Dec.fromNumber(tightened.maxDrawdownLimitPct) ?? DEC_ZERO;
+      if (maxDdPct.gte(maxLimit) && maxLimit.isPositive) {
+        violations.push('MAX_DRAWDOWN_LIMIT');
+      } else if (maxDdPct.gte(maxWarn) && maxWarn.isPositive) {
+        violations.push('MAX_DRAWDOWN_WARNING');
+      }
+    }
   }
 
   // Close: no new risk. Still fail on kill switch / policy / invalid levels.

@@ -11,6 +11,15 @@ import { DEFAULT_MIN_RR } from './risk.js';
  *
  * M8.2 does NOT execute trades. Risk approval ≠ permission to execute.
  * Automation stays OFF; no broker/demo/paper orders are placed.
+ *
+ * M8.7 adds drawdown-based circuit breakers:
+ *  - Daily drawdown limit (from daily high account value)
+ *  - Weekly drawdown limit (from week-open account value)
+ *  - Maximum drawdown limit (from peak account value)
+ *  - Configurable warning and hard-stop thresholds
+ *  - Hard-stops block new entries; safe-direction operations remain
+ *  - All calculations use authoritative internal data only
+ *  - Missing/stale/contradictory data fails closed
  */
 
 /** Pinned engine version recorded on every risk decision. */
@@ -69,6 +78,13 @@ export const PLATFORM_RISK_CEILINGS = {
   minPaperEquity: 100,
   maxPaperEquity: 1_000_000,
   defaultPaperEquity: 10_000,
+  /* M8.7 — drawdown protection ceilings (percent of equity) */
+  /** Maximum configurable daily drawdown % (hard-stop ceiling). */
+  maxDailyDrawdownPct: 10,
+  /** Maximum configurable weekly drawdown % (hard-stop ceiling). */
+  maxWeeklyDrawdownPct: 15,
+  /** Maximum configurable maximum drawdown % (hard-stop ceiling). */
+  maxMaxDrawdownPct: 25,
 } as const;
 
 export type PlatformRiskCeilings = typeof PLATFORM_RISK_CEILINGS;
@@ -91,6 +107,13 @@ export const DEFAULT_RISK_POLICY = {
   allowedSessions: null as readonly RiskSessionWindow[] | null,
   correlationRequired: false,
   maxCorrelationGroupExposurePct: 2,
+  /* M8.7 — drawdown protection defaults (warning < hard-stop) */
+  dailyDrawdownWarningPct: 2,
+  dailyDrawdownLimitPct: 3,
+  weeklyDrawdownWarningPct: 4,
+  weeklyDrawdownLimitPct: 6,
+  maxDrawdownWarningPct: 8,
+  maxDrawdownLimitPct: 10,
 } as const;
 
 /* -------------------------------------------------------------------------- */
@@ -142,6 +165,14 @@ export const RISK_REJECTION_CODES = [
   'CORRELATION_METADATA_UNAVAILABLE',
   'CORRELATION_EXPOSURE_LIMIT',
   'OPEN_POSITION_RISK_UNCOMPUTABLE',
+  /* M8.7 — drawdown-based circuit breakers */
+  'DAILY_DRAWDOWN_WARNING',
+  'DAILY_DRAWDOWN_LIMIT',
+  'WEEKLY_DRAWDOWN_WARNING',
+  'WEEKLY_DRAWDOWN_LIMIT',
+  'MAX_DRAWDOWN_WARNING',
+  'MAX_DRAWDOWN_LIMIT',
+  'EQUITY_DATA_UNAVAILABLE',
 ] as const;
 export type RiskRejectionCode = (typeof RISK_REJECTION_CODES)[number];
 
@@ -241,6 +272,13 @@ export const riskPolicyDtoSchema = z
      * exposes it, so a subscription or API call cannot disarm a safety control.
      */
     circuitBreakerEnabled: z.boolean(),
+    /* M8.7 — drawdown protection thresholds (%) */
+    dailyDrawdownWarningPct: z.number(),
+    dailyDrawdownLimitPct: z.number(),
+    weeklyDrawdownWarningPct: z.number(),
+    weeklyDrawdownLimitPct: z.number(),
+    maxDrawdownWarningPct: z.number(),
+    maxDrawdownLimitPct: z.number(),
     createdAt: z.string(),
     updatedAt: z.string(),
   })
@@ -287,6 +325,13 @@ export const riskPolicyUpdateSchema = z
       .max(PLATFORM_RISK_CEILINGS.maxPaperEquity)
       .finite()
       .optional(),
+    /* M8.7 — drawdown protection thresholds (%) */
+    dailyDrawdownWarningPct: pctSchema(PLATFORM_RISK_CEILINGS.maxDailyDrawdownPct).optional(),
+    dailyDrawdownLimitPct: pctSchema(PLATFORM_RISK_CEILINGS.maxDailyDrawdownPct).optional(),
+    weeklyDrawdownWarningPct: pctSchema(PLATFORM_RISK_CEILINGS.maxWeeklyDrawdownPct).optional(),
+    weeklyDrawdownLimitPct: pctSchema(PLATFORM_RISK_CEILINGS.maxWeeklyDrawdownPct).optional(),
+    maxDrawdownWarningPct: pctSchema(PLATFORM_RISK_CEILINGS.maxMaxDrawdownPct).optional(),
+    maxDrawdownLimitPct: pctSchema(PLATFORM_RISK_CEILINGS.maxMaxDrawdownPct).optional(),
   })
   .strict();
 export type RiskPolicyUpdateInput = z.infer<typeof riskPolicyUpdateSchema>;
@@ -307,6 +352,10 @@ export const platformRiskCeilingsDtoSchema = z
     minPaperEquity: z.number(),
     maxPaperEquity: z.number(),
     defaultPaperEquity: z.number(),
+    /* M8.7 — drawdown protection ceilings */
+    maxDailyDrawdownPct: z.number(),
+    maxWeeklyDrawdownPct: z.number(),
+    maxMaxDrawdownPct: z.number(),
   })
   .strict();
 export type PlatformRiskCeilingsDto = z.infer<typeof platformRiskCeilingsDtoSchema>;
@@ -326,6 +375,14 @@ export const riskAccountSnapshotDtoSchema = z
     totalOpenRisk: z.number(),
     dailyWindowStart: z.string(),
     weeklyWindowStart: z.string(),
+    /* M8.7 — drawdown protection state */
+    currentAccountValue: z.number(),
+    peakEquity: z.number(),
+    currentDrawdownPct: z.number().min(0),
+    dailyHighValue: z.number(),
+    dailyDrawdownPct: z.number().min(0),
+    weeklyOpenValue: z.number(),
+    weeklyDrawdownPct: z.number().min(0),
   })
   .strict();
 export type RiskAccountSnapshotDto = z.infer<typeof riskAccountSnapshotDtoSchema>;

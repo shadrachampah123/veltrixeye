@@ -11,6 +11,8 @@ import {
  * User values may only TIGHTEN the envelope. Anything above a ceiling is
  * dropped to the ceiling at evaluation time (defence in depth — the API
  * already rejects such writes). minRr is raised to the platform floor.
+ *
+ * M8.7 adds drawdown protection fields (warning < hard-stop).
  */
 
 export interface EffectiveRiskPolicy {
@@ -32,6 +34,13 @@ export interface EffectiveRiskPolicy {
   correlationRequired: boolean;
   maxCorrelationGroupExposurePct: number;
   paperEquity: number;
+  /* M8.7 — drawdown protection thresholds */
+  dailyDrawdownWarningPct: number;
+  dailyDrawdownLimitPct: number;
+  weeklyDrawdownWarningPct: number;
+  weeklyDrawdownLimitPct: number;
+  maxDrawdownWarningPct: number;
+  maxDrawdownLimitPct: number;
 }
 
 export interface StrategyRiskOverride {
@@ -70,6 +79,13 @@ export function applyPlatformCeilings(raw: {
   correlationRequired: boolean;
   maxCorrelationGroupExposurePct: number;
   paperEquity: number;
+  /* M8.7 — drawdown protection thresholds */
+  dailyDrawdownWarningPct?: number;
+  dailyDrawdownLimitPct?: number;
+  weeklyDrawdownWarningPct?: number;
+  weeklyDrawdownLimitPct?: number;
+  maxDrawdownWarningPct?: number;
+  maxDrawdownLimitPct?: number;
 }): EffectiveRiskPolicy {
   const c = PLATFORM_RISK_CEILINGS;
   const d = DEFAULT_RISK_POLICY;
@@ -83,6 +99,30 @@ export function applyPlatformCeilings(raw: {
       : Number.isFinite(raw.maxMonetaryRiskPerTrade) && raw.maxMonetaryRiskPerTrade > 0
         ? Math.min(raw.maxMonetaryRiskPerTrade, c.maxMonetaryRiskPerTrade)
         : d.maxMonetaryRiskPerTrade;
+
+  /* M8.7 — drawdown: warning ≤ hard-stop ≤ ceiling, default if invalid */
+  const ddRaw = {
+    dailyWarn: raw.dailyDrawdownWarningPct ?? d.dailyDrawdownWarningPct,
+    dailyLimit: raw.dailyDrawdownLimitPct ?? d.dailyDrawdownLimitPct,
+    weeklyWarn: raw.weeklyDrawdownWarningPct ?? d.weeklyDrawdownWarningPct,
+    weeklyLimit: raw.weeklyDrawdownLimitPct ?? d.weeklyDrawdownLimitPct,
+    maxWarn: raw.maxDrawdownWarningPct ?? d.maxDrawdownWarningPct,
+    maxLimit: raw.maxDrawdownLimitPct ?? d.maxDrawdownLimitPct,
+  };
+  const capDrawdown = (val: number, ceil: number, fallback: number): number =>
+    Number.isFinite(val) && val > 0 ? Math.min(val, ceil) : fallback;
+
+  let dailyDrawdownWarningPct = capDrawdown(ddRaw.dailyWarn, c.maxDailyDrawdownPct, d.dailyDrawdownWarningPct);
+  const dailyDrawdownLimitPct = capDrawdown(ddRaw.dailyLimit, c.maxDailyDrawdownPct, d.dailyDrawdownLimitPct);
+  let weeklyDrawdownWarningPct = capDrawdown(ddRaw.weeklyWarn, c.maxWeeklyDrawdownPct, d.weeklyDrawdownWarningPct);
+  const weeklyDrawdownLimitPct = capDrawdown(ddRaw.weeklyLimit, c.maxWeeklyDrawdownPct, d.weeklyDrawdownLimitPct);
+  let maxDrawdownWarningPct = capDrawdown(ddRaw.maxWarn, c.maxMaxDrawdownPct, d.maxDrawdownWarningPct);
+  const maxDrawdownLimitPct = capDrawdown(ddRaw.maxLimit, c.maxMaxDrawdownPct, d.maxDrawdownLimitPct);
+
+  // Enforce warning ≤ hard-stop (tighten the warning if it exceeds the limit).
+  if (dailyDrawdownWarningPct > dailyDrawdownLimitPct) dailyDrawdownWarningPct = dailyDrawdownLimitPct;
+  if (weeklyDrawdownWarningPct > weeklyDrawdownLimitPct) weeklyDrawdownWarningPct = weeklyDrawdownLimitPct;
+  if (maxDrawdownWarningPct > maxDrawdownLimitPct) maxDrawdownWarningPct = maxDrawdownLimitPct;
 
   return {
     enabled: raw.enabled,
@@ -129,6 +169,13 @@ export function applyPlatformCeilings(raw: {
       d.maxCorrelationGroupExposurePct,
     ),
     paperEquity: equity,
+    /* M8.7 */
+    dailyDrawdownWarningPct,
+    dailyDrawdownLimitPct,
+    weeklyDrawdownWarningPct,
+    weeklyDrawdownLimitPct,
+    maxDrawdownWarningPct,
+    maxDrawdownLimitPct,
   };
 }
 
@@ -152,6 +199,13 @@ export function defaultEffectivePolicy(): EffectiveRiskPolicy {
     correlationRequired: DEFAULT_RISK_POLICY.correlationRequired,
     maxCorrelationGroupExposurePct: DEFAULT_RISK_POLICY.maxCorrelationGroupExposurePct,
     paperEquity: PLATFORM_RISK_CEILINGS.defaultPaperEquity,
+    /* M8.7 */
+    dailyDrawdownWarningPct: DEFAULT_RISK_POLICY.dailyDrawdownWarningPct,
+    dailyDrawdownLimitPct: DEFAULT_RISK_POLICY.dailyDrawdownLimitPct,
+    weeklyDrawdownWarningPct: DEFAULT_RISK_POLICY.weeklyDrawdownWarningPct,
+    weeklyDrawdownLimitPct: DEFAULT_RISK_POLICY.weeklyDrawdownLimitPct,
+    maxDrawdownWarningPct: DEFAULT_RISK_POLICY.maxDrawdownWarningPct,
+    maxDrawdownLimitPct: DEFAULT_RISK_POLICY.maxDrawdownLimitPct,
   });
 }
 
@@ -199,5 +253,12 @@ export function updateExceedsCeiling(input: RiskPolicyUpdateInput): string | nul
   if (input.paperEquity !== undefined) {
     if (input.paperEquity < c.minPaperEquity || input.paperEquity > c.maxPaperEquity) return 'paperEquity';
   }
+  /* M8.7 — drawdown ceiling checks */
+  if (input.dailyDrawdownWarningPct !== undefined && input.dailyDrawdownWarningPct > c.maxDailyDrawdownPct) return 'dailyDrawdownWarningPct';
+  if (input.dailyDrawdownLimitPct !== undefined && input.dailyDrawdownLimitPct > c.maxDailyDrawdownPct) return 'dailyDrawdownLimitPct';
+  if (input.weeklyDrawdownWarningPct !== undefined && input.weeklyDrawdownWarningPct > c.maxWeeklyDrawdownPct) return 'weeklyDrawdownWarningPct';
+  if (input.weeklyDrawdownLimitPct !== undefined && input.weeklyDrawdownLimitPct > c.maxWeeklyDrawdownPct) return 'weeklyDrawdownLimitPct';
+  if (input.maxDrawdownWarningPct !== undefined && input.maxDrawdownWarningPct > c.maxMaxDrawdownPct) return 'maxDrawdownWarningPct';
+  if (input.maxDrawdownLimitPct !== undefined && input.maxDrawdownLimitPct > c.maxMaxDrawdownPct) return 'maxDrawdownLimitPct';
   return null;
 }

@@ -109,7 +109,7 @@ function render(props: Partial<React.ComponentProps<typeof SafetyPanel>> = {}): 
 test('panel renders every scope, the breaker summary and the safety version', () => {
   const html = render();
   assert.match(html, /Safety controls \(M8\.6\)/);
-  assert.match(html, /m8\.6-safety-controls-1/);
+  assert.match(html, /m8\.7-safety-controls-1/);
   assert.match(html, /Global platform kill switch/);
   assert.match(html, /Account kill switch/);
   assert.match(html, /Per strategy/);

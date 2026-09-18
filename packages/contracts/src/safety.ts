@@ -36,12 +36,20 @@ import { KILL_SWITCH_SCOPES } from './execution.js';
  *    active, and automation disable is now possible without an entitlement
  *    (turning a safety control OFF is never gated by a subscription).
  *
+ * M8.7 extends the safety surface with drawdown-based circuit breakers:
+ *  - Daily/weekly/maximum drawdown limits computed from authoritative
+ *    internal account data (immutable initial equity + cumulative realized P&L).
+ *  - Configurable warning and hard-stop thresholds for each drawdown type.
+ *  - Hard-stops trip the circuit breaker (durable kill switch + event).
+ *  - Warnings surface in the safety status but do not trip the breaker.
+ *  - Missing/stale/contradictory equity data fails closed.
+ *
  * Live execution remains impossible by construction; nothing here grants a
- * trading capability — M8.6 only strengthens the brakes.
+ * trading capability — M8.7 only strengthens the brakes.
  */
 
-/** Pinned M8.6 safety-controls version (audit/UI; rows keep their own versions). */
-export const SAFETY_CONTROLS_VERSION = 'm8.6-safety-controls-1';
+/** Pinned safety-controls version (audit/UI; rows keep their own versions). */
+export const SAFETY_CONTROLS_VERSION = 'm8.7-safety-controls-1';
 
 /** Where a switch state came from. Machine-stable vocabulary. */
 export const KILL_SWITCH_SOURCES = ['operator', 'user', 'circuit_breaker'] as const;
@@ -152,6 +160,46 @@ export type KillSwitchEntryDto = z.infer<typeof killSwitchEntryDtoSchema>;
  * the circuit-breaker summary, and whether the global switch is environment-
  * pinned. The UI renders THIS and nothing else (no separate truth to drift).
  */
+/**
+ * M8.7 — drawdown protection state surfaced in the safety status.
+ * Read-only for users; computed from authoritative internal data.
+ */
+export const drawdownProtectionStatusSchema = z
+  .object({
+    /** Current account value (immutable tracked baseline + cumulative realized P&L). */
+    currentAccountValue: z.number(),
+    /** Highest account value ever recorded. */
+    peakEquity: z.number(),
+    /** Current drawdown from peak (0–100+ %). */
+    currentDrawdownPct: z.number().min(0),
+    /** Configured warning threshold for max drawdown. */
+    maxDrawdownWarningPct: z.number(),
+    /** Configured hard-stop threshold for max drawdown. */
+    maxDrawdownLimitPct: z.number(),
+    /** Whether max drawdown warning is active. */
+    maxDrawdownWarningActive: z.boolean(),
+    /** Whether max drawdown hard-stop is active. */
+    maxDrawdownLimitActive: z.boolean(),
+    /** Daily drawdown from the daily high (0–100+ %). */
+    dailyDrawdownPct: z.number().min(0),
+    dailyDrawdownWarningPct: z.number(),
+    dailyDrawdownLimitPct: z.number(),
+    dailyDrawdownWarningActive: z.boolean(),
+    dailyDrawdownLimitActive: z.boolean(),
+    /** Weekly drawdown from the weekly open (0–100+ %). */
+    weeklyDrawdownPct: z.number().min(0),
+    weeklyDrawdownWarningPct: z.number(),
+    weeklyDrawdownLimitPct: z.number(),
+    weeklyDrawdownWarningActive: z.boolean(),
+    weeklyDrawdownLimitActive: z.boolean(),
+    /** Whether ANY hard-stop threshold is breached. */
+    anyHardStopActive: z.boolean(),
+    /** Whether data was available for drawdown calculations. */
+    dataAvailable: z.boolean(),
+  })
+  .strict();
+export type DrawdownProtectionStatus = z.infer<typeof drawdownProtectionStatusSchema>;
+
 export const killSwitchStatusDtoSchema = z
   .object({
     safetyVersion: z.string(),
@@ -194,6 +242,12 @@ export const killSwitchStatusDtoSchema = z
         effective: z.boolean(),
       })
       .strict(),
+    /**
+     * M8.7 — drawdown/equity protection state (read-only for users).
+     * When `anyHardStopActive` is true, new automated entries are refused.
+     * Position exits and safe-direction operations remain possible.
+     */
+    drawdownProtection: drawdownProtectionStatusSchema.optional(),
   })
   .strict();
 export type KillSwitchStatusDto = z.infer<typeof killSwitchStatusDtoSchema>;
@@ -250,11 +304,17 @@ export type EmergencyStopResultDto = z.infer<typeof emergencyStopResultDtoSchema
  * own codes, pinned here so core/UI/tests share one list). KILL_SWITCH_ACTIVE
  * is NOT included — the breaker must never trip itself into a loop, and a
  * switch that is already on needs no re-trip.
+ *
+ * M8.7 adds drawdown hard-stop codes to the breaker set.
  */
 export const RISK_CIRCUIT_BREAKER_CODES = [
   'DAILY_LOSS_LIMIT',
   'WEEKLY_LOSS_LIMIT',
   'CONSECUTIVE_LOSS_LIMIT',
+  'DAILY_DRAWDOWN_LIMIT',
+  'WEEKLY_DRAWDOWN_LIMIT',
+  'MAX_DRAWDOWN_LIMIT',
+  'EQUITY_DATA_UNAVAILABLE',
 ] as const;
 export type RiskCircuitBreakerCode = (typeof RISK_CIRCUIT_BREAKER_CODES)[number];
 

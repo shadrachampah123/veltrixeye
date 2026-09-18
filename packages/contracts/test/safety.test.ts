@@ -42,7 +42,7 @@ const S2 = '22222222-2222-4222-8222-222222222222';
 
 describe('m8.6 safety contract — pinned vocabularies', () => {
   test('versions and vocabularies are pinned', () => {
-    assert.equal(SAFETY_CONTROLS_VERSION, 'm8.6-safety-controls-1');
+    assert.equal(SAFETY_CONTROLS_VERSION, 'm8.7-safety-controls-1');
     assert.deepEqual(KILL_SWITCH_SOURCES, ['operator', 'user', 'circuit_breaker']);
     assert.deepEqual(KILL_SWITCH_EVENT_ACTIONS, ['activated', 'cleared']);
     // The four M8.1 scopes are unchanged…
@@ -54,15 +54,23 @@ describe('m8.6 safety contract — pinned vocabularies', () => {
     assert.equal(EXECUTION_ARCHITECTURE_VERSION, 'm8.1-execution-arch-1');
   });
 
-  test('circuit-breaker codes are exactly the loss-limit family', () => {
+  test('circuit-breaker codes are exactly the loss-limit and drawdown family', () => {
     assert.deepEqual(RISK_CIRCUIT_BREAKER_CODES, [
       'DAILY_LOSS_LIMIT',
       'WEEKLY_LOSS_LIMIT',
       'CONSECUTIVE_LOSS_LIMIT',
+      'DAILY_DRAWDOWN_LIMIT',
+      'WEEKLY_DRAWDOWN_LIMIT',
+      'MAX_DRAWDOWN_LIMIT',
+      'EQUITY_DATA_UNAVAILABLE',
     ]);
     assert.equal(isCircuitBreakerCode('DAILY_LOSS_LIMIT'), true);
     assert.equal(isCircuitBreakerCode('WEEKLY_LOSS_LIMIT'), true);
     assert.equal(isCircuitBreakerCode('CONSECUTIVE_LOSS_LIMIT'), true);
+    assert.equal(isCircuitBreakerCode('DAILY_DRAWDOWN_LIMIT'), true);
+    assert.equal(isCircuitBreakerCode('WEEKLY_DRAWDOWN_LIMIT'), true);
+    assert.equal(isCircuitBreakerCode('MAX_DRAWDOWN_LIMIT'), true);
+    assert.equal(isCircuitBreakerCode('EQUITY_DATA_UNAVAILABLE'), true);
     // KILL_SWITCH_ACTIVE must never re-trip the breaker (no self-referential loop).
     assert.equal(isCircuitBreakerCode('KILL_SWITCH_ACTIVE'), false);
     assert.equal(isCircuitBreakerCode('RR_BELOW_MINIMUM'), false);

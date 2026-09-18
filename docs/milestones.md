@@ -1,8 +1,8 @@
 # Milestone Boundaries
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
-M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2, M8.3, M8.4, M8.5
-and M8.6**. The boundaries below
+M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2, M8.3, M8.4, M8.5,
+M8.6 and M8.7**. The boundaries below
 are deliberate and enforced: M1 shipped foundations and contracts; M2 added real historical
 market data; M3 added deterministic strategy evaluation; M4 added
 deterministic setup detection and lifecycle management; M5 added
@@ -701,20 +701,26 @@ user-operable safety-control surface. Design: [execution.md](./execution.md)
   (0016 CHECK intact), no broker connectivity, no credentials, alerts remain
   suggestions.
 
-## After M8.6 (later work, outline only)
+## M8.7 — delivered (Advanced Risk Circuit Breakers & Safety Completion)
+
+Completes the final M8 milestone with all remaining risk/safety controls.
+
+- **Drawdown protection:** daily/weekly/maximum drawdown limits computed from authoritative internal account data (paper equity + cumulative realized P&L). Deterministic, fail-closed: missing/stale/uninitialized data produces `EQUITY_DATA_UNAVAILABLE` and refuses automation.
+- **Configurable thresholds:** warning and hard-stop levels for each drawdown type. Safe defaults (daily 2%/3%, weekly 4%/6%, max 8%/10%); platform ceilings (daily ≤10%, weekly ≤15%, max ≤25%); CHECK constraints enforce warning ≤ hard-stop. User-editable within platform ceilings; cannot bypass global kill switch.
+- **Circuit-breaker integration:** new codes `DAILY_DRAWDOWN_LIMIT`, `WEEKLY_DRAWDOWN_LIMIT`, `MAX_DRAWDOWN_LIMIT`, and `EQUITY_DATA_UNAVAILABLE` all trip the M8.6 circuit breaker (durable user kill switch with append-only event). Warnings surface in the safety status without tripping.
+- **Safety status extended:** the safety panel now shows drawdown protection state (current account value, peak equity, drawdown percentages, warning/hard-stop active flags).
+- **Migration 0022** (additive; no prior constraint altered): drawdown columns on `risk_policies` and `risk_account_states` (peak equity, daily high, weekly open, cumulative realized P&L, initialization flag).
+- **M8.7 changes no execution capability**: live execution remains impossible (0016 CHECK intact), no broker connectivity, no credentials, automation OFF for every plan, DisabledMT5Transport disabled.
+
+## After M8.7 (later work, outline only)
 
 1. **More channels + preferences** — a second `NotificationProvider` (push /
    webhook / SMS) behind the M7.3 registry, plus per-user notification
    preferences and per-strategy routing.
 2. **Operational broker transport** — validate a concrete MT5 bridge and an
    approved external secret manager on demo infrastructure. M8.4 deliberately
-   ships neither and makes no connectivity claim. M8.5/M8.6 prepare
-   reconciliation and safety plumbing for it; the transport itself is
-   gated on external validation.
-3. **M8.7 — controlled live automation (maybe)** — only after transport
-   validation, secret management, broker/account authorization and
-   operational review are ALL complete. Until then `canAccessAutomation`
-   remains false for every plan, and the M8.6 brakes (kill switches,
-   circuit breakers, environment pin) apply to every path that exists.
-4. **Billing** (provider, webhooks, checkout/portal) lands alongside or
+   ships neither and makes no connectivity claim. M8.5/M8.6/M8.7 prepare
+   reconciliation, safety plumbing, and drawdown protection for it; the
+   transport itself is gated on external validation.
+3. **Billing** (provider, webhooks, checkout/portal) lands alongside or
    after.

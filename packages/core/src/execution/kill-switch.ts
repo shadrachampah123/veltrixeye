@@ -237,7 +237,9 @@ export class KillSwitchService {
    * no reason overwrite — the FIRST trip reason is the one on record).
    */
   async tripCircuitBreaker(userId: string, reason: string): Promise<{ changed: boolean }> {
-    if (await this.isUserActive(userId)) return { changed: false };
+    // Do not perform a non-locking read here: two first-time trips can both
+    // observe "no row" before either transaction inserts one. apply() owns
+    // the serialization point and computes changed from the locked row.
     return this.apply({
       scope: 'user',
       targetId: userId,
@@ -422,6 +424,13 @@ export class KillSwitchService {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      // SELECT FOR UPDATE cannot lock an absent first-time row. Serialize by
+      // logical switch identity as well, so concurrent first trips cannot
+      // produce two changed=true events or race to overwrite provenance.
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))',
+        ['kill-switch', `${args.scope}:${args.targetId ?? ''}`],
+      );
       const existing = await client.query<{ active: boolean }>(
         `SELECT active FROM kill_switches
           WHERE scope = $1 AND ($2::uuid IS NULL AND target_id IS NULL OR target_id = $2::uuid)
