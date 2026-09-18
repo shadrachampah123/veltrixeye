@@ -183,7 +183,7 @@ describe('m8.6 safety API — status + strict inputs', () => {
     assert.equal(res.statusCode, 200);
     const body = res.json();
     assert.equal(killSwitchStatusDtoSchema.safeParse(body).success, true, JSON.stringify(body));
-    assert.equal(body.safetyVersion, 'm8.6-safety-controls-1');
+    assert.equal(body.safetyVersion, 'm8.7-safety-controls-1');
     assert.equal(body.globalForcedByEnvironment, false);
     assert.equal(body.anyActive, false);
     assert.equal(body.global.active, false);

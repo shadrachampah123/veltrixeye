@@ -39,6 +39,13 @@ const policy: RiskPolicyDto = {
   paperEquity: 10_000,
   // M8.6 — platform-controlled circuit breaker (read-only in the DTO).
   circuitBreakerEnabled: true,
+  // M8.7 — drawdown protection defaults
+  dailyDrawdownWarningPct: 2,
+  dailyDrawdownLimitPct: 3,
+  weeklyDrawdownWarningPct: 4,
+  weeklyDrawdownLimitPct: 6,
+  maxDrawdownWarningPct: 8,
+  maxDrawdownLimitPct: 10,
   createdAt: '2024-01-01T00:00:00.000Z',
   updatedAt: '2024-01-01T00:00:00.000Z',
 };
@@ -53,6 +60,14 @@ const account: RiskAccountSnapshotDto = {
   totalOpenRisk: 0,
   dailyWindowStart: '2024-01-01',
   weeklyWindowStart: '2024-01-01',
+  // M8.7 — drawdown protection state
+  currentAccountValue: 10_000,
+  peakEquity: 10_000,
+  currentDrawdownPct: 0,
+  dailyHighValue: 10_000,
+  dailyDrawdownPct: 0,
+  weeklyOpenValue: 10_000,
+  weeklyDrawdownPct: 0,
 };
 
 function render(extra: Partial<React.ComponentProps<typeof RiskPolicyPanel>> = {}): string {

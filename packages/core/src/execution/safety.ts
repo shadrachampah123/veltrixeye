@@ -1,11 +1,16 @@
 import type pg from 'pg';
 import type {
+  DrawdownProtectionStatus,
   EmergencyStopResultDto,
   KillSwitchMutationResultDto,
   KillSwitchScope,
   KillSwitchStatusDto,
 } from '@veltrixeye/contracts';
-import { EMERGENCY_STOP_DEFAULT_REASON } from '@veltrixeye/contracts';
+import {
+  DEFAULT_RISK_POLICY,
+  EMERGENCY_STOP_DEFAULT_REASON,
+  PLATFORM_RISK_CEILINGS,
+} from '@veltrixeye/contracts';
 import type { AuditEntry } from '../audit.js';
 import type { AuditService } from '../audit.js';
 import type { AutomationService } from './automation.js';
@@ -46,7 +51,7 @@ export class SafetyControlsService {
     },
   ) {}
 
-  /** Owner-scoped safety status: switches + breaker + automation summary. */
+  /** Owner-scoped safety status: switches + breaker + automation summary + drawdown protection. */
   async getStatus(userId: string): Promise<KillSwitchStatusDto> {
     const [status, automation] = await Promise.all([
       this.deps.killSwitches.statusFor(userId),
@@ -59,7 +64,137 @@ export class SafetyControlsService {
         automationEnabled: automation.automationEnabled,
         effective: automation.effective,
       },
+      drawdownProtection: await this.loadDrawdownProtection(userId),
     };
+  }
+
+  /**
+   * M8.7 — load drawdown protection state for the safety panel.
+   * Uses authoritative internal risk policy + account state.
+   * Returns undefined if no risk data exists yet (safe default).
+   */
+  private async loadDrawdownProtection(userId: string): Promise<DrawdownProtectionStatus | undefined> {
+    try {
+      // Read the risk policy for drawdown thresholds
+      const policyRes = await this.pool.query<{
+        daily_drawdown_warning_pct: string;
+        daily_drawdown_limit_pct: string;
+        weekly_drawdown_warning_pct: string;
+        weekly_drawdown_limit_pct: string;
+        max_drawdown_warning_pct: string;
+        max_drawdown_limit_pct: string;
+        paper_equity: string;
+      }>(
+        `SELECT daily_drawdown_warning_pct, daily_drawdown_limit_pct,
+                weekly_drawdown_warning_pct, weekly_drawdown_limit_pct,
+                max_drawdown_warning_pct, max_drawdown_limit_pct,
+                paper_equity
+           FROM risk_policies WHERE user_id = $1`,
+        [userId],
+      );
+      const policyRow = policyRes.rows[0];
+      if (!policyRow) return undefined;
+
+      const ddWarn = Number(policyRow.daily_drawdown_warning_pct ?? DEFAULT_RISK_POLICY.dailyDrawdownWarningPct);
+      const ddLimit = Number(policyRow.daily_drawdown_limit_pct ?? DEFAULT_RISK_POLICY.dailyDrawdownLimitPct);
+      const wdWarn = Number(policyRow.weekly_drawdown_warning_pct ?? DEFAULT_RISK_POLICY.weeklyDrawdownWarningPct);
+      const wdLimit = Number(policyRow.weekly_drawdown_limit_pct ?? DEFAULT_RISK_POLICY.weeklyDrawdownLimitPct);
+      const mdWarn = Number(policyRow.max_drawdown_warning_pct ?? DEFAULT_RISK_POLICY.maxDrawdownWarningPct);
+      const mdLimit = Number(policyRow.max_drawdown_limit_pct ?? DEFAULT_RISK_POLICY.maxDrawdownLimitPct);
+      const paperEquity = Number(
+        policyRow.paper_equity ?? PLATFORM_RISK_CEILINGS.defaultPaperEquity,
+      );
+
+      // Read the account state for current drawdown values (latest across all profiles).
+      // Once initialized, paper_equity is policy metadata only and is never
+      // used to rewrite the tracked account value.
+      const stateRes = await this.pool.query<{
+        initial_equity: string;
+        peak_equity: string;
+        daily_high_value: string;
+        weekly_open_value: string;
+        cumulative_realized_pl: string;
+        equity_initialized: boolean;
+      }>(
+        `SELECT initial_equity, peak_equity, daily_high_value, weekly_open_value,
+                cumulative_realized_pl, equity_initialized
+           FROM risk_account_states WHERE user_id = $1
+           ORDER BY version DESC LIMIT 1`,
+        [userId],
+      );
+      const stateRow = stateRes.rows[0];
+      if (!stateRow || !stateRow.equity_initialized) {
+        // No tracked state yet — policy-only display, never a risk input.
+        return {
+          currentAccountValue: paperEquity,
+          peakEquity: paperEquity,
+          currentDrawdownPct: 0,
+          maxDrawdownWarningPct: mdWarn,
+          maxDrawdownLimitPct: mdLimit,
+          maxDrawdownWarningActive: false,
+          maxDrawdownLimitActive: false,
+          dailyDrawdownPct: 0,
+          dailyDrawdownWarningPct: ddWarn,
+          dailyDrawdownLimitPct: ddLimit,
+          dailyDrawdownWarningActive: false,
+          dailyDrawdownLimitActive: false,
+          weeklyDrawdownPct: 0,
+          weeklyDrawdownWarningPct: wdWarn,
+          weeklyDrawdownLimitPct: wdLimit,
+          weeklyDrawdownWarningActive: false,
+          weeklyDrawdownLimitActive: false,
+          anyHardStopActive: false,
+          dataAvailable: false,
+        };
+      }
+
+      const initialEquity = Number(stateRow.initial_equity);
+      const currentAccountValue = initialEquity + Number(stateRow.cumulative_realized_pl ?? 0);
+      const peakEquity = Number(stateRow.peak_equity);
+      const dailyHigh = Number(stateRow.daily_high_value);
+      const weeklyOpen = Number(stateRow.weekly_open_value);
+      if (
+        ![initialEquity, currentAccountValue, peakEquity, dailyHigh, weeklyOpen].every(Number.isFinite)
+        || initialEquity <= 0
+        || currentAccountValue > peakEquity
+        || dailyHigh < currentAccountValue
+        || dailyHigh > peakEquity
+        || weeklyOpen > peakEquity
+      ) {
+        return undefined;
+      }
+      const pctOf = (base: number) => base > 0 ? Math.max(0, ((base - currentAccountValue) / base) * 100) : 0;
+
+      const currentDd = pctOf(peakEquity);
+      const dailyDd = pctOf(dailyHigh);
+      const weeklyDd = pctOf(weeklyOpen);
+
+      return {
+        currentAccountValue,
+        peakEquity,
+        currentDrawdownPct: currentDd,
+        maxDrawdownWarningPct: mdWarn,
+        maxDrawdownLimitPct: mdLimit,
+        maxDrawdownWarningActive: currentDd >= mdWarn,
+        maxDrawdownLimitActive: currentDd >= mdLimit,
+        dailyDrawdownPct: dailyDd,
+        dailyDrawdownWarningPct: ddWarn,
+        dailyDrawdownLimitPct: ddLimit,
+        dailyDrawdownWarningActive: dailyDd >= ddWarn,
+        dailyDrawdownLimitActive: dailyDd >= ddLimit,
+        weeklyDrawdownPct: weeklyDd,
+        weeklyDrawdownWarningPct: wdWarn,
+        weeklyDrawdownLimitPct: wdLimit,
+        weeklyDrawdownWarningActive: weeklyDd >= wdWarn,
+        weeklyDrawdownLimitActive: weeklyDd >= wdLimit,
+        anyHardStopActive: currentDd >= mdLimit || dailyDd >= ddLimit || weeklyDd >= wdLimit,
+        dataAvailable: true,
+      };
+    } catch {
+      // Fail-closed: if we can't read drawdown state, don't block the status
+      // but indicate data is unavailable.
+      return undefined;
+    }
   }
 
   /** Activate a switch (scope must be user/strategy/execution_profile). */

@@ -71,6 +71,14 @@ function baseInput(overrides: Partial<RiskEngineInput> = {}): RiskEngineInput {
       asOfMs: ANCHOR,
     },
     evaluatedAtMs: ANCHOR,
+    /* M8.7 — drawdown protection data (authoritative internal) */
+    drawdown: {
+      currentAccountValue: Dec.fromInt(10_000)!,
+      peakEquity: Dec.fromInt(10_000)!,
+      dailyHighValue: Dec.fromInt(10_000)!,
+      weeklyOpenValue: Dec.fromInt(10_000)!,
+      initialized: true,
+    },
     ...overrides,
   };
 }

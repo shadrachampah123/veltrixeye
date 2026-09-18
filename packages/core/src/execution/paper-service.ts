@@ -909,6 +909,34 @@ export class PaperExecutionService {
         };
       }
 
+      // Closing a paper position and updating the account ledger share these
+      // locks with policy updates and risk evaluation. The user lock comes
+      // first everywhere, preventing paperEquity from racing baseline setup.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+        'risk-policy',
+        authorization.userId,
+      ]);
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+        `risk:${authorization.userId}`,
+        authorization.executionProfileId,
+      ]);
+      // Re-check after serialization: a concurrent close may have committed
+      // while this transaction waited for the profile lock.
+      const serializedExisting = await client.query<OrderRow>(
+        'SELECT * FROM execution_orders WHERE client_order_id = $1',
+        [authorization.clientOrderId],
+      );
+      const serializedOrder = serializedExisting.rows[0];
+      if (serializedOrder) {
+        await client.query('ROLLBACK');
+        return {
+          providerOrderId: serializedOrder.id,
+          status: 'accepted',
+          filledQuantity: Number(serializedOrder.filled_quantity),
+          averagePrice: numOrNull(serializedOrder.average_fill_price),
+          receipt: { replay: true, status: serializedOrder.status },
+        };
+      }
       const orderId = await this.insertOrder(client, authorization);
 
       if (this.failureMode.orderRejection || this.failureMode.fillFailure) {
@@ -1054,12 +1082,26 @@ export class PaperExecutionService {
 
     let positionId: string;
     let positionApplied = true;
+    let realizedPl: number | null = null;
     if (authorization.kind === 'entry') {
       positionId = await this.openPositionRow(client, { authorization, orderId, fill, collector, filledAtMs });
     } else {
       const closed = await this.closePositionRow(client, { authorization, orderId, fill, collector, filledAtMs });
       positionId = closed.positionId;
       positionApplied = closed.applied;
+      realizedPl = closed.realizedPl;
+    }
+
+    // The position close and the authoritative risk-ledger increment are in
+    // the same transaction. A rollback therefore cannot leave either side
+    // committed, and replayed closes do not increment the ledger again.
+    if (positionApplied && authorization.kind !== 'entry' && realizedPl !== null) {
+      await this.deps.risk.recordRealizedPlInTransaction(client, {
+        userId: authorization.userId,
+        executionProfileId: authorization.executionProfileId,
+        realizedPl,
+        nowMs: filledAtMs,
+      });
     }
 
     if (positionApplied) {
@@ -1219,7 +1261,7 @@ export class PaperExecutionService {
       collector: AuditCollector;
       filledAtMs: number;
     },
-  ): Promise<{ positionId: string; applied: boolean }> {
+  ): Promise<{ positionId: string; applied: boolean; realizedPl: number | null }> {
     const { authorization, orderId, fill, collector, filledAtMs } = args;
     const positionId = authorization.positionId;
     if (!positionId) {
@@ -1239,7 +1281,7 @@ export class PaperExecutionService {
       // Repeated exit processing: the position is already closed. No second
       // fill, no second P&L swing — the caller replays the stored outcome.
       collector.add('paper_fill_duplicate_ignored', { positionId, alreadyClosed: true });
-      return { positionId, applied: false };
+      return { positionId, applied: false, realizedPl: null };
     }
     if (position.id !== authorization.positionId || position.symbol !== authorization.symbol) {
       throw new ExecutionProviderError('validation', 'exit authorization does not match the position');
@@ -1293,7 +1335,7 @@ export class PaperExecutionService {
       fees: totalFees.toFixed(10),
       simulated: true,
     });
-    return { positionId, applied: true };
+    return { positionId, applied: true, realizedPl: net.toNumber(10) };
   }
 
   private async submitExitOrder(args: {
@@ -1436,15 +1478,10 @@ export class PaperExecutionService {
     const fills = orderRow.rows[0] ? await this.loadFillsForOrder(orderRow.rows[0].id) : [];
     const realized = updatedPosition ? numOrNull(updatedPosition.realized_pl) : null;
 
-    // Simulated P&L feeds the server-owned M8.2 account snapshot, so loss
-    // limits and consecutive-loss counters react to paper results too.
+    // Simulated P&L is accounted for inside fillOrder's transaction. Keep
+    // this audit entry after the commit so audit failure cannot roll back the
+    // already-committed financial mutation or double-count it on replay.
     if (realized !== null && updatedPosition?.status === 'closed') {
-      await this.deps.risk.recordRealizedPl({
-        userId: args.userId,
-        executionProfileId: position.execution_profile_id,
-        realizedPl: realized,
-        nowMs: args.nowMs,
-      });
       await this.deps.audit.log({
         userId: args.userId,
         action: 'execution.paper_position_closed',
