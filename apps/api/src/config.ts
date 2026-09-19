@@ -14,6 +14,7 @@ import {
   MAX_NOTIFICATION_BATCH_SIZE,
 } from '@veltrixeye/contracts';
 import type { SmtpEmailConfig as SmtpEmailConfigShape } from '@veltrixeye/core';
+import { validateExecutionTransportConfig } from '@veltrixeye/core';
 import { DEFAULT_TRUSTED_PROXIES, parseTrustedProxies } from './trust-proxy.js';
 
 /**
@@ -306,6 +307,8 @@ export type AppConfig = z.infer<typeof envSchema> & {
 };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  // M10 validates opt-in transport settings without enabling or registering a transport.
+  validateExecutionTransportConfig(env);
   const result = envSchema.safeParse(env);
   if (!result.success) {
     const issues = result.error.issues
