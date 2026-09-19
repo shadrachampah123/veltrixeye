@@ -16,8 +16,14 @@
  *  8. stalled worker → recovered (or dead-lettered when the budget is gone)
  *  9. two workers never deliver the same job
  * 10. no provider / unconfigured provider → `unavailable`, never `delivered`
- * 11. retention deletes terminal rows, never work that is still owed
- * 12. owner scoping, payload determinism and credential redaction
+ *  11. retention deletes terminal rows, never work that is still owed
+ *  12. owner scoping, payload determinism and credential redaction
+ *  13. (M9.1 remediation) cross-queue claim fairness is DURABLE state in
+ *      notification_delivery_fairness: cleanup of delivery rows, alert
+ *      cascade deletes, retries, stale recovery, worker restarts, outbox
+ *      reconstruction and concurrent workers can all not reset or bias it,
+ *      for single-row AND batch claims, while exact claim-limit invariants
+ *      (non-positive/non-finite => zero claims, total <= limit) hold.
  */
 import { test, before, beforeEach, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -82,10 +88,19 @@ const uniqueEmail = () => `notif_${randomBytes(6).toString('hex')}@example.com`;
  * The worker drains the whole outbox by design (it has no per-test filter), so
  * every test starts from an empty queue: a "claimed: 1" assertion then really
  * means "this test's job", not "some earlier test's leftovers".
+ *
+ * The fairness ledger is reset here ONLY as deterministic test groundwork —
+ * no production code path ever clears it. `cleanup()`, retries, stale recovery
+ * and outbox reconstruction must leave it untouched, and the fairness tests
+ * below prove exactly that on top of this shared starting state.
  */
 beforeEach(async () => {
   await pool.query('DELETE FROM notification_deliveries');
   await pool.query('DELETE FROM notification_webhook_deliveries');
+  await pool.query(
+    `UPDATE notification_delivery_fairness
+        SET email_claims = 0, webhook_claims = 0, last_channel = 'webhook'`,
+  );
 });
 
 before(async () => {
@@ -421,40 +436,105 @@ describe('outbox — claiming', () => {
   test('SKIP LOCKED: a job claimed in an open transaction is invisible to a second worker', async () => {
     const owner = await makeUser();
     const alertId = await makeAlert(owner.id);
-    await enqueueAlert(alertId, owner.id);
+    const { row } = await enqueueAlert(alertId, owner.id);
 
-    const clientA = await pool.connect();
-    const clientB = await pool.connect();
+    // A second connection holding the ROW lock (exactly what a claim in an
+    // open transaction holds) must not block or fool a competing claim: the
+    // claim query skips the locked row. The fairness decision itself is then
+    // serialized by the shared advisory lock, so no ledger write is lost.
+    const holder = await pool.connect();
     try {
-      await clientA.query('BEGIN');
-      const first = await outbox.claimBatch(10, 'A', clientA);
-      assert.equal(first.length, 1, 'worker A claims the job');
+      await holder.query('BEGIN');
+      await holder.query('SELECT id FROM notification_deliveries WHERE id = $1 FOR UPDATE', [row.id]);
 
-      await clientB.query('BEGIN');
-      // Same instant, different connection: the row is locked by A, so B skips
-      // it instead of blocking or double-claiming.
-      const second = await outbox.claimBatch(10, 'B', clientB);
-      assert.equal(second.length, 0, 'worker B must not see the locked row');
+      const claimWhileLocked = outbox.claimBatch(10, 'skipping-worker');
+      const timedOut = new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 3_000));
+      const skipped = await Promise.race([claimWhileLocked, timedOut]);
+      assert.notEqual(skipped, 'timeout', 'a competing claim skips locked rows instead of blocking on them');
+      assert.equal(skipped.length, 0, 'worker B must not see the locked row');
 
-      await clientA.query('COMMIT');
-      await clientB.query('COMMIT');
+      await holder.query('ROLLBACK');
     } finally {
-      clientA.release();
-      clientB.release();
+      holder.release();
     }
+
+    // Once the row lock is released the job is claimable — and the ledger
+    // counts that claim.
+    const after = await outbox.claimBatch(10, 'after-release');
+    assert.equal(after.length, 1);
+    assert.equal(after[0]?.id, row.id);
+    const ledger = await pool.query<{ e: string }>('SELECT email_claims::text AS e FROM notification_delivery_fairness WHERE singleton = true');
+    assert.equal(ledger.rows[0]?.e, '1', 'the zero-claim attempt left the durable score untouched; the real claim counted');
   });
 
-  test('non-positive limits claim no jobs', async () => {
+  test('concurrent claims from open transactions never double-claim or lose ledger updates', async () => {
     const owner = await makeUser();
     const emailAlert = await makeAlert(owner.id);
     await enqueueAlert(emailAlert, owner.id);
     const webhookAlert = await makeAlert(owner.id);
     await enqueueWebhook(webhookAlert, owner.id);
+
+    // Two workers claiming through separate long-lived transaction clients.
+    // The shared fairness lock ORDERS the decisions: B waits for A's claim
+    // transaction to finish instead of racing it, then finds nothing to take.
+    // Each job is claimed at most once and the ledger ends at exactly one
+    // credit per committed claim — no lost updates.
+    const clientA = await pool.connect();
+    const clientB = await pool.connect();
+    try {
+      await clientA.query('BEGIN');
+      const a = await outbox.claimBatch(10, 'A', clientA);
+      await clientB.query('BEGIN');
+      const bPromise = outbox.claimBatch(10, 'B', clientB);
+      let bSettled = false;
+      const bTracking = bPromise.then((rows) => {
+        bSettled = true;
+        return rows;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.ok(!bSettled, "worker B is serialized behind A's decision instead of interleaving with it");
+      await clientA.query('COMMIT');
+      const b = await bTracking;
+      await clientB.query('COMMIT');
+      const claimed = [...a, ...b];
+      assert.equal(new Set(claimed.map((job) => job.id)).size, claimed.length, 'never the same job twice');
+      assert.equal(b.length, 0, 'B finds the committed claims, not stealable rows');
+    } finally {
+      clientA.release();
+      clientB.release();
+    }
+    const ledger = await pool.query<{ e: string; w: string }>('SELECT email_claims::text AS e, webhook_claims::text AS w FROM notification_delivery_fairness WHERE singleton = true');
+    const counted = Number(ledger.rows[0]?.e ?? '0') + Number(ledger.rows[0]?.w ?? '0');
+    const processing = await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM (SELECT id FROM notification_deliveries WHERE status = 'processing' UNION ALL SELECT id FROM notification_webhook_deliveries WHERE status = 'processing') jobs`,
+    );
+    assert.equal(counted, Number(processing.rows[0]?.n ?? '0'), 'every committed claim advanced the durable ledger exactly once');
+  });
+
+  test('non-positive and non-finite limits claim no jobs and never touch fairness state', async () => {
+    const owner = await makeUser();
+    const emailAlert = await makeAlert(owner.id);
+    await enqueueAlert(emailAlert, owner.id);
+    const webhookAlert = await makeAlert(owner.id);
+    await enqueueWebhook(webhookAlert, owner.id);
+    const ledgerBefore = await pool.query(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w, last_channel, updated_at FROM notification_delivery_fairness WHERE singleton = true',
+    );
     assert.deepEqual(await outbox.claimBatch(0, 'zero-worker'), []);
     assert.deepEqual(await outbox.claimBatch(-1, 'negative-worker'), []);
+    assert.deepEqual(await outbox.claimBatch(Number.NaN, 'nan-worker'), []);
+    assert.deepEqual(await outbox.claimBatch(Number.POSITIVE_INFINITY, 'infinite-worker'), []);
+    assert.deepEqual(await outbox.claimBatch(Number.NEGATIVE_INFINITY, '-infinite-worker'), []);
     const states = await pool.query<{ status: string; n: string }>(`SELECT status, count(*)::text AS n FROM (SELECT status FROM notification_deliveries UNION ALL SELECT status FROM notification_webhook_deliveries) jobs GROUP BY status`);
     assert.equal(Number(states.rows.find((row) => row.status === 'processing')?.n ?? 0), 0);
     assert.equal(Number(states.rows.find((row) => row.status === 'pending')?.n ?? 0), 2);
+    // Rejected limits return BEFORE any coordination: the durable fairness
+    // row is byte-identical, down to its timestamp — nothing was locked,
+    // reseeded or rewritten for a claim that cannot exist.
+    const ledgerAfter = await pool.query(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w, last_channel, updated_at FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.deepEqual(ledgerAfter.rows[0], ledgerBefore.rows[0], 'invalid limits never touch fairness state');
   });
 
   test('limit one fairness survives reconstruction with both queues continuously populated', async () => {
@@ -496,12 +576,25 @@ describe('outbox — claiming', () => {
     await enqueueWebhook(webhookAlert, owner.id);
     const first = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(1, 'cleanup-worker');
     assert.equal(first[0]?.id, firstEmail.row.id);
+    // Balanced start (credits 0/0): the durable round-robin prefers email.
+    const ledgerBefore = await pool.query(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w, last_channel, updated_at FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.deepEqual(ledgerBefore.rows[0], { e: '1', w: '0', last_channel: 'email', updated_at: ledgerBefore.rows[0]!.updated_at }, 'the claim advanced the durable ledger');
     await pool.query(`UPDATE notification_deliveries SET status = 'delivered', delivered_at = now() - interval '2 days', created_at = now() - interval '2 days' WHERE id = $1`, [firstEmail.row.id]);
-    await outbox.cleanup({ deliveredRetentionDays: 1, failedRetentionDays: 1 });
-    assert.equal((await pool.query('SELECT count(*)::int AS n FROM notification_delivery_fairness')).rows[0]!.n, 1);
+    const removed = await outbox.cleanup({ deliveredRetentionDays: 1, failedRetentionDays: 1 });
+    assert.equal(removed, 1, 'normal retention deleted the delivered job row');
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM notification_deliveries')).rows[0]!.n, 0, 'the row the old sum(attempts) score was made of is gone');
+    // The fairness ledger survives untouched: same singleton row, same
+    // counters, same turn, not even its timestamp moved — cleanup does not
+    // merely "not reset" the state, it never touches the table at all.
+    const ledgerAfter = await pool.query(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w, last_channel, updated_at FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.deepEqual(ledgerAfter.rows[0], ledgerBefore.rows[0], 'cleanup left the durable fairness state byte-identical');
     const newEmail = await enqueueAlert(await makeAlert(owner.id), owner.id);
     const afterCleanup = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(1, 'reconstructed-after-cleanup');
-    assert.equal(afterCleanup[0]?.channel, 'webhook', 'persistent turn still prefers webhook after email history cleanup');
+    assert.equal(afterCleanup[0]?.channel, 'webhook', 'persistent ledger still prefers webhook after email history cleanup');
     assert.notEqual(afterCleanup[0]?.id, newEmail.row.id);
   });
 
@@ -513,6 +606,148 @@ describe('outbox — claiming', () => {
     await enqueueWebhook(await makeAlert(owner.id), owner.id);
     const second = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(1, 'webhook-returned');
     assert.equal(second[0]?.channel, 'webhook');
+  });
+
+  test('batch-path fairness is durable too: cleaning one queue cannot reset it', async () => {
+    const owner = await makeUser();
+    for (let i = 0; i < 6; i++) await enqueueAlert(await makeAlert(owner.id), owner.id);
+    for (let i = 0; i < 6; i++) await enqueueWebhook(await makeAlert(owner.id), owner.id);
+    const first = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(4, 'batch-worker-1');
+    const second = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(4, 'batch-worker-2');
+    assert.equal(first.length, 4);
+    assert.equal(second.length, 4);
+    for (const job of [...first, ...second]) await outbox.markDelivered(job.id, { failureCategory: 'none' }, job.channel as 'email' | 'webhook');
+    // Retention wipes the email queue's history while the webhook queue's
+    // fresh delivered rows stay: the reviewed sum(attempts) score would reset
+    // email to zero and treat it as starved-then-light forever after.
+    await pool.query(`UPDATE notification_deliveries SET delivered_at = now() - interval '2 days', created_at = now() - interval '2 days' WHERE status = 'delivered'`);
+    const removed = await outbox.cleanup({ deliveredRetentionDays: 1, failedRetentionDays: 1 });
+    assert.equal(removed, 4, 'cleanup removed the entire aged email delivery history');
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM notification_deliveries WHERE status = 'delivered'`)).rows[0]!.n, 0);
+    const ledger = await pool.query<{ e: string; w: string }>(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.deepEqual(ledger.rows[0], { e: '4', w: '4' }, 'the durable ledger still remembers every claim cleanup deleted');
+    // New backlog on both queues; reconstructed outboxes keep it balanced.
+    for (let i = 0; i < 4; i++) await enqueueAlert(await makeAlert(owner.id), owner.id);
+    for (let i = 0; i < 4; i++) await enqueueWebhook(await makeAlert(owner.id), owner.id);
+    const third = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(4, 'reconstructed-batch');
+    assert.equal(third.length, 4);
+    const emails = third.filter((job) => job.channel === 'email').length;
+    assert.equal(emails, 2, 'after one queue was cleaned, a batch still serves both queues from durable state');
+  });
+
+  test('batch claims stay balanced while both queues are continuously available', async () => {
+    const owner = await makeUser();
+    for (let round = 0; round < 5; round++) {
+      for (let i = 0; i < 4; i++) await enqueueAlert(await makeAlert(owner.id), owner.id);
+      for (let i = 0; i < 4; i++) await enqueueWebhook(await makeAlert(owner.id), owner.id);
+      const claimed = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(4, `balanced-worker-${round}`);
+      assert.equal(claimed.length, 4);
+      assert.equal(claimed.filter((job) => job.channel === 'email').length, 2, `round ${round}: each queue keeps its reserved half`);
+      for (const job of claimed) await outbox.markDelivered(job.id, { failureCategory: 'none' }, job.channel as 'email' | 'webhook');
+      // Continuous availability THROUGH retention: cleanup between rounds
+      // (age-based, so these fresh rows survive) must not skew the ledger.
+      await outbox.cleanup({ deliveredRetentionDays: 1, failedRetentionDays: 1 });
+    }
+    const ledger = await pool.query<{ e: string; w: string }>(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.deepEqual(ledger.rows[0], { e: '10', w: '10' }, 'ten claims per queue across five reconstructed workers');
+  });
+
+  test('worker identity cannot bias the claim decision', async () => {
+    const owner = await makeUser();
+    for (let i = 0; i < 6; i++) await enqueueAlert(await makeAlert(owner.id), owner.id);
+    // Email-only backlog. Before the remediation the batch path preferred one
+    // table by parity of a hash of the worker id, so an id that favored the
+    // EMPTY webhook queue halved the batch. Durable state has no such bias:
+    // a drained preferred side yields its whole quota to the queue that works.
+    const drained = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(6, 'worker-0');
+    assert.equal(drained.length, 6, 'the other queue yields its full reserved half to the queue that has work');
+    assert.ok(drained.every((job) => job.channel === 'email'));
+    // When webhook returns, the durable deficit prefers it immediately —
+    // whatever id the next (reconstructed) worker carries.
+    await enqueueWebhook(await makeAlert(owner.id), owner.id);
+    const next = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(1, 'different-worker-id');
+    assert.equal(next[0]?.channel, 'webhook', 'the starved queue is preferred by the durable ledger, not by id parity');
+  });
+
+  test('retries and stale recovery do not disturb the durable fairness state', async () => {
+    const owner = await makeUser();
+    const email = await enqueueAlert(await makeAlert(owner.id), owner.id);
+    const webhook = await enqueueWebhook(await makeAlert(owner.id), owner.id);
+    const first = await outbox.claimBatch(1, 'retry-cycle'); // balanced ledger -> email is preferred
+    assert.equal(first[0]?.id, email.row.id);
+    const second = await outbox.claimBatch(1, 'retry-cycle'); // deficit -> webhook is preferred
+    assert.equal(second[0]?.id, webhook.id);
+    const ledgerBefore = await pool.query(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w, last_channel, updated_at FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.equal(ledgerBefore.rows[0]!.e, '1');
+    assert.equal(ledgerBefore.rows[0]!.w, '1');
+
+    // The email job fails and is retried (this INFLATES its attempts column —
+    // exactly what the reviewed sum(attempts) score was made of), and the
+    // webhook job's worker dies inside the lease so stale recovery requeues it.
+    await outbox.markRetry(first[0]!.id, 0, { failureCategory: 'transient', error: 'smtp timeout' }, 'email');
+    await pool.query(`UPDATE notification_webhook_deliveries SET locked_at = now() - interval '1 hour' WHERE id = $1`, [second[0]!.id]);
+    assert.deepEqual(await outbox.recoverStale(60_000), { recovered: 1, deadLettered: 0 });
+
+    const ledgerAfter = await pool.query(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w, last_channel, updated_at FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.deepEqual(ledgerAfter.rows[0], ledgerBefore.rows[0], 'retries and stale recovery never move the ledger');
+
+    // Email now has attempts=2 vs webhook attempts=1. The retired sum(attempts)
+    // rule would call email the heavier queue and starve it behind webhook;
+    // the durable ledger counts only CLAIMS, so both sit at 1 and the turn
+    // simply alternates from the durable state.
+    const third = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(1, 'post-recovery-worker');
+    assert.equal(third[0]?.channel, 'email', 'attempt inflation from retries cannot buy a queue the next claim');
+    const fourth = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(1, 'post-recovery-worker-2');
+    assert.equal(fourth[0]?.channel, 'webhook');
+    const ledgerEnd = await pool.query(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.deepEqual(ledgerEnd.rows[0], { e: '2', w: '2' });
+  });
+
+  test('deleting an alert row (cascade) cannot rewind the fairness ledger', async () => {
+    const owner = await makeUser();
+    const alertId = await makeAlert(owner.id);
+    await enqueueAlert(alertId, owner.id);
+    const claimed = await outbox.claimBatch(1, 'cascade-worker');
+    assert.equal(claimed.length, 1);
+    const before = await pool.query(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w, last_channel, updated_at FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    // The alert and its delivery rows disappear under the FK cascade — the
+    // other retention pathway the reviewed score was exposed to.
+    await pool.query('DELETE FROM alerts WHERE id = $1', [alertId]);
+    await outbox.cleanup({ deliveredRetentionDays: 1, failedRetentionDays: 1 });
+    const after = await pool.query(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w, last_channel, updated_at FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.deepEqual(after.rows[0], before.rows[0], 'the claim stays counted even though the job row cascaded away');
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM notification_deliveries')).rows[0]!.n, 0);
+  });
+
+  test('concurrent batch claims never lose a durable fairness update', async () => {
+    const owner = await makeUser();
+    for (let i = 0; i < 8; i++) await enqueueAlert(await makeAlert(owner.id), owner.id);
+    for (let i = 0; i < 8; i++) await enqueueWebhook(await makeAlert(owner.id), owner.id);
+    const batches = await Promise.all(Array.from({ length: 4 }, (_, i) =>
+      new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(4, `parallel-batch-${i}`),
+    ));
+    const claimed = batches.flat();
+    assert.equal(new Set(claimed.map((job) => job.id)).size, claimed.length, 'disjoint claims');
+    assert.equal(claimed.length, 16, 'every queued job is claimed exactly once across four concurrent workers');
+    const ledger = await pool.query<{ e: string; w: string }>(
+      'SELECT email_claims::text AS e, webhook_claims::text AS w FROM notification_delivery_fairness WHERE singleton = true',
+    );
+    assert.equal(Number(ledger.rows[0]?.e), claimed.filter((job) => job.channel === 'email').length, 'no lost email-queue update');
+    assert.equal(Number(ledger.rows[0]?.w), claimed.filter((job) => job.channel === 'webhook').length, 'no lost webhook-queue update');
   });
 
   test('claims at most the requested total across email and webhook and returns every lease', async () => {

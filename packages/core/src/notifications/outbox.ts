@@ -31,13 +31,19 @@ import { Errors } from '../errors.js';
  *  - every state transition below is a single conditional UPDATE whose
  *    `WHERE` carries the expected status, so a stale worker cannot overwrite
  *    a newer state (it simply updates zero rows).
+ *  - cross-queue fairness is durable state in `notification_delivery_fairness`
+ *    (M9.1 remediation): every claim decision reads and writes it under the
+ *    shared transaction-level advisory lock 611_231_008, so it is atomic with
+ *    the claim and survives cleanup, retries, stale recovery, restarts and
+ *    outbox reconstruction — unlike the score it replaces, it is not derived
+ *    from retention-managed delivery rows.
  */
 
 /** Anything with a `query` method: a `Pool` or a transaction `PoolClient`. */
 export type Queryable = Pick<pg.Pool, 'query'>;
 const EMAIL_DELIVERY_TABLE = 'notification_deliveries';
 const WEBHOOK_DELIVERY_TABLE = 'notification_webhook_deliveries';
-/** Shared PostgreSQL advisory lock for the cross-instance single-row decision. */
+/** Shared PostgreSQL advisory lock for the durable cross-instance fairness decision. */
 const NOTIFICATION_FAIRNESS_LOCK_KEY = 611_231_008;
 function tableForChannel(channel: NotificationChannel): string {
   return channel === 'webhook' ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
@@ -222,12 +228,22 @@ export class NotificationOutbox {
   }
 
   /**
-   * Claim up to `limit` due jobs atomically.
+   * Claim up to `limit` due jobs atomically across both delivery queues.
    *
    * `FOR UPDATE SKIP LOCKED` is what makes two workers safe: a row already
    * locked by another claim is skipped instead of blocking, so two concurrent
    * `runOnce` calls process disjoint sets. `attempts < max_attempts` keeps the
    * retry budget bounded even if a worker dies repeatedly.
+   *
+   * Cross-queue fairness (M9.1 remediation): every claim decision — single
+   * row or batch — is taken under the shared transaction-level advisory lock
+   * and is derived from the durable ledger in `notification_delivery_fairness`.
+   * It is never derived from `sum(attempts)` over the delivery tables (that
+   * history is deleted by `cleanup()`), from instance memory (lost on restart
+   * or reconstruction), or from the worker identity (changes every deploy).
+   * The ledger update commits in the same transaction as the claim, so a
+   * rolled-back claim never advances fairness and a committed claim can never
+   * lose its ledger increment.
    */
   async claimBatch(limit: number, workerId: string, q: Queryable = this.pool): Promise<NotificationJobRow[]> {
     if (!Number.isFinite(limit) || limit <= 0) return [];
@@ -253,38 +269,61 @@ export class NotificationOutbox {
   }
 
   private async claimBatchInTransaction(limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {
-    // The advisory lock serializes every single-row decision across workers.
-    // The singleton row is locked and updated in this same transaction, so
-    // fairness survives delivery cleanup, retries, restarts, and reconstruction.
+    // M9.1 remediation — ONE durable decision for EVERY claim size. The
+    // transaction-level advisory lock serializes the decision across all
+    // workers and processes; the singleton fairness row is locked and updated
+    // inside this same transaction. Because fairness state lives in its own
+    // table, no retention cleanup, cascade delete, retry or restart can reset
+    // it — the old sum(attempts) score could, since delivery rows age out.
+    await q.query('SELECT pg_advisory_xact_lock($1)', [NOTIFICATION_FAIRNESS_LOCK_KEY]);
+    // Self-heal the singleton row (migration seeding is idempotent anyway) so
+    // a claim can never fail on a freshly provisioned replica.
+    await q.query(
+      `INSERT INTO notification_delivery_fairness (singleton, last_channel)
+       VALUES (true, 'webhook') ON CONFLICT (singleton) DO NOTHING`,
+    );
+    // The row lock is redundant under the advisory lock but keeps the
+    // read-decide-record unit atomic even against a writer outside this file.
+    const state = await q.query<{ last_channel: string; email_claims: string; webhook_claims: string }>(
+      `SELECT last_channel, email_claims::text AS email_claims, webhook_claims::text AS webhook_claims
+         FROM notification_delivery_fairness
+        WHERE singleton = true
+        FOR UPDATE`,
+    );
+    const ledger = state.rows[0];
+    const emailClaims = BigInt(ledger?.email_claims ?? '0');
+    const webhookClaims = BigInt(ledger?.webhook_claims ?? '0');
+    // Preferred: the queue with fewer LIFETIME claims (durable, retention-
+    // independent). Balanced: continue the round-robin from the last served
+    // queue. Both rules are deterministic under the shared lock.
+    const first =
+      emailClaims < webhookClaims
+        ? EMAIL_DELIVERY_TABLE
+        : webhookClaims < emailClaims
+          ? WEBHOOK_DELIVERY_TABLE
+          : (ledger?.last_channel ?? 'webhook') === 'email'
+            ? WEBHOOK_DELIVERY_TABLE
+            : EMAIL_DELIVERY_TABLE;
+    const second = first === EMAIL_DELIVERY_TABLE ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
+
     if (limit === 1) {
-      await q.query('SELECT pg_advisory_xact_lock($1)', [NOTIFICATION_FAIRNESS_LOCK_KEY]);
-      await q.query(
-        `INSERT INTO notification_delivery_fairness (singleton, last_channel)
-         VALUES (true, 'webhook') ON CONFLICT (singleton) DO NOTHING`,
-      );
-      const state = await q.query<{ last_channel: NotificationChannel }>(
-        'SELECT last_channel FROM notification_delivery_fairness WHERE singleton = true FOR UPDATE',
-      );
-      const last = state.rows[0]?.last_channel === 'email' ? 'email' : 'webhook';
-      const first = last === 'email' ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
-      const second = first === EMAIL_DELIVERY_TABLE ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
       const firstJobs = await this.claimTable(first, 1, workerId, q);
       if (firstJobs.length > 0) {
-        await this.recordFairnessTurn(first, q);
+        await this.recordFairnessClaims(q, first === EMAIL_DELIVERY_TABLE ? 1 : 0, first === WEBHOOK_DELIVERY_TABLE ? 1 : 0);
         return firstJobs;
       }
+      // An empty preferred queue is never starvation for the other one.
       const secondJobs = await this.claimTable(second, 1, workerId, q);
-      if (secondJobs.length > 0) await this.recordFairnessTurn(second, q);
+      if (secondJobs.length > 0) {
+        await this.recordFairnessClaims(q, second === EMAIL_DELIVERY_TABLE ? 1 : 0, second === WEBHOOK_DELIVERY_TABLE ? 1 : 0);
+      }
       return secondJobs;
     }
 
-    // Alternate the preferred table while reserving half the batch for each
-    // table. If one side is short, the unused capacity is filled from the
-    // other side. Every claim is therefore <= limit and every transitioned row
-    // is retained in the returned array.
-    const preferWebhook = [...workerId].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 2 === 1;
-    const first = preferWebhook ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
-    const second = preferWebhook ? EMAIL_DELIVERY_TABLE : WEBHOOK_DELIVERY_TABLE;
+    // Batch: reserve half the batch for each queue, the durable ledger's
+    // preferred side taking the odd row. Unused capacity of a drained queue
+    // goes to the other side, bounded so every decision still claims at most
+    // `limit` rows in total and returns every transitioned row.
     const firstQuota = Math.ceil(limit / 2);
     const secondQuota = limit - firstQuota;
     const firstJobs = await this.claimTable(first, firstQuota, workerId, q);
@@ -292,27 +331,46 @@ export class NotificationOutbox {
     let jobs = [...firstJobs, ...secondJobs];
     let remaining = limit - jobs.length;
     if (remaining > 0 && firstJobs.length < firstQuota) {
-      const extra = await this.claimTable(first, Math.min(remaining, firstQuota - firstJobs.length), workerId, q);
+      // The preferred queue could not fill its half: the other side takes it.
+      const extra = await this.claimTable(second, remaining, workerId, q);
       jobs = [...jobs, ...extra];
       remaining -= extra.length;
     }
     if (remaining > 0 && secondJobs.length < secondQuota) {
-      const extra = await this.claimTable(second, Math.min(remaining, secondQuota - secondJobs.length), workerId, q);
+      const extra = await this.claimTable(first, remaining, workerId, q);
       jobs = [...jobs, ...extra];
     }
+    const webhookClaimed = jobs.reduce((n, job) => n + (job.channel === 'webhook' ? 1 : 0), 0);
+    await this.recordFairnessClaims(q, jobs.length - webhookClaimed, webhookClaimed);
     return jobs.sort((a, b) => {
       const due = a.next_attempt_at.getTime() - b.next_attempt_at.getTime();
       return due || a.created_at.getTime() - b.created_at.getTime() || a.id.localeCompare(b.id);
     });
   }
 
-  private async recordFairnessTurn(table: string, q: Queryable): Promise<void> {
-    const channel = table === EMAIL_DELIVERY_TABLE ? 'email' : 'webhook';
+  /**
+   * Record the claims THIS transaction actually made into the durable ledger:
+   * lifetime counters only ever grow, and the round-robin turn moves to the
+   * queue that received more claims this decision (a balanced split keeps the
+   * turn, so the next tie-break still alternates). Running it under the
+   * advisory lock, in the claiming transaction, is what makes fairness both
+   * atomic (claim and score commit or roll back together) and durable (the
+   * counters live outside the retention-managed delivery tables).
+   */
+  private async recordFairnessClaims(q: Queryable, emailClaimed: number, webhookClaimed: number): Promise<void> {
+    if (emailClaimed === 0 && webhookClaimed === 0) return;
     await q.query(
       `UPDATE notification_delivery_fairness
-          SET last_channel = $1, updated_at = now()
+          SET email_claims = email_claims + $1::bigint,
+              webhook_claims = webhook_claims + $2::bigint,
+              last_channel = CASE
+                WHEN $1 > $2 THEN 'email'::text
+                WHEN $2 > $1 THEN 'webhook'::text
+                ELSE last_channel
+              END,
+              updated_at = now()
         WHERE singleton = true`,
-      [channel],
+      [emailClaimed, webhookClaimed],
     );
   }
 
