@@ -214,3 +214,5 @@ export * from './execution/index.js';
 // Risk management engine (M8.2) — server-authoritative, fail-closed; does not execute
 export * from './risk/index.js';
 
+// M10: isolated non-live transport foundation; not registered with production execution.
+export * from './execution/transport/index.js';
