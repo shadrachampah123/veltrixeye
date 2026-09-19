@@ -73,6 +73,22 @@ services:
         value: '60000'
       - key: NOTIFICATION_WORKER_BATCH_SIZE
         value: '25'
+      # --- M9.2 push + secret hardening ---
+      # 32-byte base64 key for AES-256-GCM encryption of webhook/push secrets at rest.
+      # Production MUST fail closed without it. Generate: openssl rand -base64 32
+      # Render's encrypted env vars alone do NOT constitute DB secret protection.
+      - key: WEBHOOK_SECRET_ENCRYPTION_KEY
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
+      - key: PUSH_ENABLED
+        value: 'true'
+      - key: PUSH_PROVIDER_TIMEOUT_MS
+        value: '15000'
       # --- M8.6 deployment-level global kill switch ---
       # 'true' pins the platform-wide emergency stop ON for every account
       # regardless of database state (new execution + paper simulation

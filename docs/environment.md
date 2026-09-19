@@ -58,6 +58,12 @@ git-ignored and never contain values you would commit.
 | `NOTIFICATION_WORKER_TOKEN` | secret, ≤256 chars | *(empty)* | Shared secret for `POST /api/internal/notifications/deliveries/*` (external cron). **Empty ⇒ those routes return 404.** |
 | `NOTIFICATION_RETENTION_DELIVERED_DAYS` | int 1–3650 | `30` | How long delivered rows are kept. |
 | `NOTIFICATION_RETENTION_FAILED_DAYS` | int 1–3650 | `120` | How long dead letters are kept (failure audit trail). |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | secret, 32-byte base64 | *(empty, required in production)* | M9.2 AES-256-GCM key for webhook signing secrets and push keys at rest. **Server-only, never logged, never returned, redacted.** Production fails closed if missing/invalid. Generate: `openssl rand -base64 32`. Render's encrypted env vars alone do NOT constitute DB secret protection. |
+| `VAPID_PUBLIC_KEY` | string, base64url | *(empty = push unavailable)* | M9.2 VAPID public key for Web Push. Safe to expose via authenticated `GET /api/notifications/push/vapid-public-key`. |
+| `VAPID_PRIVATE_KEY` | secret, base64url | *(empty = push unavailable)* | M9.2 VAPID private key — **server-only, never logged, never returned, never in describe(), redacted**. |
+| `VAPID_SUBJECT` | string, mailto/https | *(empty = push unavailable)* | M9.2 VAPID subject claim, e.g. `mailto:alerts@example.com`. |
+| `PUSH_ENABLED` | `true` \| `false` | `true` | M9.2 enable push channel. `false` disables push provider (jobs become `unavailable`). |
+| `PUSH_PROVIDER_TIMEOUT_MS` | int 1000–120000 | `15000` | M9.2 per-attempt push provider budget. |
 | `SCANNER_ENABLED` | `true` \| `false` | `false` | M7.5 live scanner. `false` (dev default) ⇔ scanner only runs when triggered via API; `true` starts an in-process ticker that calls `scanner.runOnce()` every `SCANNER_INTERVAL_MS`. Safe with concurrent triggers due to advisory locking. |
 | `SCANNER_INTERVAL_MS` | int 30000–3600000 | `300000` | Interval between scanner runs when `SCANNER_ENABLED=true` (5m default). |
 | `SCANNER_PROVIDER_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-request provider timeout for scanner fetches. |

@@ -26,6 +26,8 @@ import {
   createNotificationProviderRegistry,
   createSmtpEmailProvider,
   createWebhookNotificationProvider,
+  createPushNotificationProvider,
+  createSecretManager,
   NotificationOutbox,
   NotificationPreferenceService,
   DeliveryWorker,
@@ -142,22 +144,49 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   // bound to an adapter; an unconfigured email adapter is still registered
   // when its credentials exist, and simply omitted when they do not, so the
   // worker records `unavailable` instead of faking a delivery.
+  // M9.2 — secret manager for webhook/push secrets at rest (AES-256-GCM)
+  // Production fails closed if WEBHOOK_SECRET_ENCRYPTION_KEY missing.
+  const secretManager = createSecretManager(config.notification.secret.encryptionKey, config.NODE_ENV);
+
   const notificationProviders = createNotificationProviderRegistry();
   const emailProvider = createSmtpEmailProvider(config.notification.email);
   if (emailProvider.configured) notificationProviders.register(emailProvider);
   // M9.1 — webhook is endpoint-configured per notification preference.
   notificationProviders.register(createWebhookNotificationProvider({ timeoutMs: config.notification.retry.timeoutMs }));
+  // M9.2 — push provider (Web Push with VAPID)
+  if (config.notification.push.enabled) {
+    const pushProvider = createPushNotificationProvider({
+      vapidPublicKey: config.notification.push.publicKey,
+      vapidPrivateKey: config.notification.push.privateKey,
+      subject: config.notification.push.subject,
+      timeoutMs: config.notification.push.timeoutMs,
+    });
+    // Register push even if not fully configured? M7.3 pattern: email only if configured, webhook always.
+    // For push, we register always so worker can record unavailable vs delivered honestly,
+    // but only if enabled flag true. The provider itself reports configured:false when keys missing.
+    notificationProviders.register(pushProvider);
+  }
 
-  const notifications = new NotificationOutbox(pool, {
-    maxAttempts: config.notification.retry.maxAttempts,
-  });
-  const preferences = new NotificationPreferenceService(pool);
+  const notifications = new NotificationOutbox(
+    pool,
+    {
+      maxAttempts: config.notification.retry.maxAttempts,
+    },
+    secretManager,
+  );
+  const preferences = new NotificationPreferenceService(pool, secretManager);
   const deliveryWorker = new DeliveryWorker(pool, notificationProviders, config.notification.retry, {
     retention: config.notification.retention,
+    secretManager,
     // Defence in depth: adapters redact their own secrets, and the worker also
     // scrubs the credentials THIS deployment configured out of any provider
     // error before it is stored in `last_error` or written to a log line.
-    redact: (text) => redactSecrets(text, [config.notification.email.pass]),
+    redact: (text) =>
+      redactSecrets(text, [
+        config.notification.email.pass,
+        config.notification.push.privateKey,
+        config.notification.secret.encryptionKey,
+      ]),
   });
 
   const ingestion = new IngestionService(pool, providerRegistry, candles);

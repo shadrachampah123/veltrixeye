@@ -9,6 +9,8 @@ import {
   type NotificationStatus,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
+import type { SecretManager } from './secret-manager.js';
+import { looksEncrypted } from './secret-manager.js';
 
 /**
  * The durable outbox (M7.3) — the ONLY writer/reader of
@@ -32,21 +34,24 @@ import { Errors } from '../errors.js';
  *    `WHERE` carries the expected status, so a stale worker cannot overwrite
  *    a newer state (it simply updates zero rows).
  *  - cross-queue fairness is durable state in `notification_delivery_fairness`
- *    (M9.1 remediation): every claim decision reads and writes it under the
- *    shared transaction-level advisory lock 611_231_008, so it is atomic with
- *    the claim and survives cleanup, retries, stale recovery, restarts and
- *    outbox reconstruction — unlike the score it replaces, it is not derived
- *    from retention-managed delivery rows.
+ *    (M9.1 remediation, extended to 3-way in M9.2): every claim decision reads
+ *    and writes it under the shared transaction-level advisory lock 611_231_008,
+ *    so it is atomic with the claim and survives cleanup, retries, stale
+ *    recovery, restarts and outbox reconstruction — unlike the score it replaces,
+ *    it is not derived from retention-managed delivery rows.
  */
 
 /** Anything with a `query` method: a `Pool` or a transaction `PoolClient`. */
 export type Queryable = Pick<pg.Pool, 'query'>;
 const EMAIL_DELIVERY_TABLE = 'notification_deliveries';
 const WEBHOOK_DELIVERY_TABLE = 'notification_webhook_deliveries';
+const PUSH_DELIVERY_TABLE = 'notification_push_deliveries';
 /** Shared PostgreSQL advisory lock for the durable cross-instance fairness decision. */
 const NOTIFICATION_FAIRNESS_LOCK_KEY = 611_231_008;
 function tableForChannel(channel: NotificationChannel): string {
-  return channel === 'webhook' ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
+  if (channel === 'webhook') return WEBHOOK_DELIVERY_TABLE;
+  if (channel === 'push') return PUSH_DELIVERY_TABLE;
+  return EMAIL_DELIVERY_TABLE;
 }
 
 export interface NotificationJobRow {
@@ -60,6 +65,8 @@ export interface NotificationJobRow {
   payload: AlertNotificationPayload;
   recipient: string;
   signing_secret: string | null;
+  signing_secret_encrypted?: string | null;
+  signing_secret_key_version?: number | null;
   status: string;
   attempts: number;
   max_attempts: number;
@@ -84,12 +91,15 @@ export interface EnqueueAlertNotificationArgs {
   payload: AlertNotificationPayload;
   payloadHash: string;
   idempotencyKey: string;
-  /** Strategy owner context required for webhook tenant integrity. */
+  /** Strategy owner context required for webhook/push tenant integrity. */
   strategyId?: string;
   /** Optional channel-specific destination; email defaults to the user's address. */
   recipient?: string;
-  /** Internal webhook signing secret; never included in DTOs or logs. */
+  /** Internal webhook/push signing secret; never included in DTOs or logs. */
   signingSecret?: string | null;
+  /** Encrypted variant for M9.2 hardening */
+  signingSecretEncrypted?: string | null;
+  signingSecretKeyVersion?: number | null;
   /** Overrides the column default (from the deployment's retry policy). */
   maxAttempts?: number;
 }
@@ -126,10 +136,46 @@ export interface OutboxDepth {
 }
 
 export class NotificationOutbox {
+  private readonly secretManager?: SecretManager;
   constructor(
     private readonly pool: pg.Pool,
     private readonly defaults: OutboxDefaults,
-  ) {}
+    secretManager?: SecretManager,
+  ) {
+    this.secretManager = secretManager;
+  }
+
+  private encryptSecret(plaintext: string | null | undefined): { encrypted: string | null; keyVersion: number | null; plaintextForLegacy: string | null } {
+    if (!plaintext) return { encrypted: null, keyVersion: null, plaintextForLegacy: null };
+    if (!this.secretManager) {
+      return { encrypted: null, keyVersion: null, plaintextForLegacy: plaintext };
+    }
+    if (looksEncrypted(plaintext)) {
+      return { encrypted: plaintext, keyVersion: this.secretManager.keyVersion, plaintextForLegacy: null };
+    }
+    try {
+      const enc = this.secretManager.encrypt(plaintext);
+      return { encrypted: enc.ciphertext, keyVersion: enc.keyVersion, plaintextForLegacy: null };
+    } catch {
+      return { encrypted: null, keyVersion: null, plaintextForLegacy: plaintext };
+    }
+  }
+
+  private decryptSecret(row: { signing_secret: string | null; signing_secret_encrypted?: string | null; signing_secret_key_version?: number | null }): string | null {
+    if ((row as { signing_secret_encrypted?: string | null }).signing_secret_encrypted) {
+      const enc = (row as { signing_secret_encrypted?: string | null }).signing_secret_encrypted!;
+      const version = (row as { signing_secret_key_version?: number | null }).signing_secret_key_version ?? this.secretManager?.keyVersion ?? 1;
+      if (this.secretManager) {
+        try {
+          return this.secretManager.decrypt(enc, version);
+        } catch {
+          return row.signing_secret ?? null;
+        }
+      }
+      return row.signing_secret ?? null;
+    }
+    return row.signing_secret ?? null;
+  }
 
   /**
    * Insert one job for an alert, idempotently.
@@ -148,19 +194,39 @@ export class NotificationOutbox {
    */
   async enqueue(q: Queryable, args: EnqueueAlertNotificationArgs): Promise<EnqueueResult> {
     const table = tableForChannel(args.channel);
-    if (args.channel === 'webhook') {
-      if (!args.strategyId) throw Errors.internal('Webhook notification is missing strategy ownership context');
-      const webhook = await q.query<NotificationJobRow>(
-        `INSERT INTO notification_webhook_deliveries
-          (alert_id, user_id, strategy_id, template, idempotency_key, payload_hash, payload, recipient, signing_secret, max_attempts)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    if (args.channel === 'webhook' || args.channel === 'push') {
+      if (!args.strategyId) throw Errors.internal(`${args.channel} notification is missing strategy ownership context`);
+      // M9.2: encrypt signing secret at rest if secret manager available
+      const enc = this.encryptSecret(args.signingSecret ?? null);
+      // Prefer encrypted, fallback to plaintext for dev/test without manager
+      const finalSecret = enc.plaintextForLegacy;
+      const finalEncrypted = enc.encrypted ?? args.signingSecretEncrypted ?? null;
+      const finalKeyVersion = enc.keyVersion ?? args.signingSecretKeyVersion ?? null;
+
+      const row = await q.query<NotificationJobRow>(
+        `INSERT INTO ${table}
+          (alert_id, user_id, strategy_id, template, idempotency_key, payload_hash, payload, recipient, signing_secret, signing_secret_encrypted, signing_secret_key_version, max_attempts)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          ON CONFLICT (alert_id) DO NOTHING RETURNING *`,
-        [args.alertId, args.userId, args.strategyId, args.template, args.idempotencyKey, args.payloadHash, JSON.stringify(args.payload), args.recipient, args.signingSecret ?? null, args.maxAttempts ?? this.defaults.maxAttempts],
+        [
+          args.alertId,
+          args.userId,
+          args.strategyId,
+          args.template,
+          args.idempotencyKey,
+          args.payloadHash,
+          JSON.stringify(args.payload),
+          args.recipient,
+          finalSecret,
+          finalEncrypted,
+          finalKeyVersion,
+          args.maxAttempts ?? this.defaults.maxAttempts,
+        ],
       );
-      if (webhook.rows[0]) return { row: webhook.rows[0], created: true };
-      const existingWebhook = await q.query<NotificationJobRow>('SELECT * FROM notification_webhook_deliveries WHERE alert_id = $1', [args.alertId]);
-      if (!existingWebhook.rows[0]) throw Errors.internal('Webhook notification job could not be created for this alert');
-      return { row: existingWebhook.rows[0], created: false };
+      if (row.rows[0]) return { row: row.rows[0], created: true };
+      const existing = await q.query<NotificationJobRow>(`SELECT * FROM ${table} WHERE alert_id = $1`, [args.alertId]);
+      if (!existing.rows[0]) throw Errors.internal(`${args.channel} notification job could not be created for this alert`);
+      return { row: existing.rows[0], created: false };
     }
     const inserted = await q.query<NotificationJobRow>(
       `INSERT INTO ${table}
@@ -221,6 +287,12 @@ export class NotificationOutbox {
            provider_response_code, failure_category, last_error, next_attempt_at, locked_at, locked_by,
            delivered_at, created_at, updated_at
          FROM notification_webhook_deliveries WHERE alert_id = $1
+         UNION ALL
+         SELECT id, alert_id, user_id, channel, template, idempotency_key, payload_hash, payload, recipient,
+           COALESCE(signing_secret_encrypted, signing_secret) AS signing_secret, status, attempts, max_attempts, provider, provider_message_id,
+           provider_response_code, failure_category, last_error, next_attempt_at, locked_at, locked_by,
+           delivered_at, created_at, updated_at
+         FROM notification_push_deliveries WHERE alert_id = $1
        ) jobs ORDER BY created_at ASC, id ASC LIMIT $2`,
       [alertId, MAX_NOTIFICATIONS_PER_ALERT],
     );
@@ -228,28 +300,28 @@ export class NotificationOutbox {
   }
 
   /**
-   * Claim up to `limit` due jobs atomically across both delivery queues.
+   * Claim up to `limit` due jobs atomically across all delivery queues.
    *
    * `FOR UPDATE SKIP LOCKED` is what makes two workers safe: a row already
    * locked by another claim is skipped instead of blocking, so two concurrent
    * `runOnce` calls process disjoint sets. `attempts < max_attempts` keeps the
    * retry budget bounded even if a worker dies repeatedly.
    *
-   * Cross-queue fairness (M9.1 remediation): every claim decision — single
-   * row or batch — is taken under the shared transaction-level advisory lock
-   * and is derived from the durable ledger in `notification_delivery_fairness`.
-   * It is never derived from `sum(attempts)` over the delivery tables (that
-   * history is deleted by `cleanup()`), from instance memory (lost on restart
-   * or reconstruction), or from the worker identity (changes every deploy).
-   * The ledger update commits in the same transaction as the claim, so a
-   * rolled-back claim never advances fairness and a committed claim can never
-   * lose its ledger increment.
+   * Cross-queue fairness (M9.1 remediation, M9.2 extended to 3-way): every claim
+   * decision — single row or batch — is taken under the shared transaction-level
+   * advisory lock and is derived from the durable ledger in
+   * `notification_delivery_fairness`. It is never derived from `sum(attempts)`
+   * over the delivery tables (that history is deleted by `cleanup()`), from
+   * instance memory (lost on restart or reconstruction), or from the worker
+   * identity (changes every deploy). The ledger update commits in the same
+   * transaction as the claim, so a rolled-back claim never advances fairness
+   * and a committed claim can never lose its ledger increment.
    */
   async claimBatch(limit: number, workerId: string, q: Queryable = this.pool): Promise<NotificationJobRow[]> {
     if (!Number.isFinite(limit) || limit <= 0) return [];
     const bounded = Math.trunc(limit);
     // A pool-backed claim owns its transaction so selection and state change
-    // across both tables commit as one operation. A caller-supplied client is
+    // across all tables commit as one operation. A caller-supplied client is
     // already transaction-owned (and is used by the SKIP LOCKED tests).
     if (q === this.pool) {
       const client = await this.pool.connect();
@@ -269,23 +341,22 @@ export class NotificationOutbox {
   }
 
   private async claimBatchInTransaction(limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {
-    // M9.1 remediation — ONE durable decision for EVERY claim size. The
-    // transaction-level advisory lock serializes the decision across all
-    // workers and processes; the singleton fairness row is locked and updated
-    // inside this same transaction. Because fairness state lives in its own
-    // table, no retention cleanup, cascade delete, retry or restart can reset
-    // it — the old sum(attempts) score could, since delivery rows age out.
+    // M9.1 remediation + M9.2 3-way — ONE durable decision for EVERY claim size.
     await q.query('SELECT pg_advisory_xact_lock($1)', [NOTIFICATION_FAIRNESS_LOCK_KEY]);
-    // Self-heal the singleton row (migration seeding is idempotent anyway) so
-    // a claim can never fail on a freshly provisioned replica.
     await q.query(
       `INSERT INTO notification_delivery_fairness (singleton, last_channel)
        VALUES (true, 'webhook') ON CONFLICT (singleton) DO NOTHING`,
     );
-    // The row lock is redundant under the advisory lock but keeps the
-    // read-decide-record unit atomic even against a writer outside this file.
-    const state = await q.query<{ last_channel: string; email_claims: string; webhook_claims: string }>(
-      `SELECT last_channel, email_claims::text AS email_claims, webhook_claims::text AS webhook_claims
+    const state = await q.query<{
+      last_channel: string;
+      email_claims: string;
+      webhook_claims: string;
+      push_claims: string;
+    }>(
+      `SELECT last_channel,
+              email_claims::text AS email_claims,
+              webhook_claims::text AS webhook_claims,
+              COALESCE(push_claims, 0)::text AS push_claims
          FROM notification_delivery_fairness
         WHERE singleton = true
         FOR UPDATE`,
@@ -293,55 +364,85 @@ export class NotificationOutbox {
     const ledger = state.rows[0];
     const emailClaims = BigInt(ledger?.email_claims ?? '0');
     const webhookClaims = BigInt(ledger?.webhook_claims ?? '0');
-    // Preferred: the queue with fewer LIFETIME claims (durable, retention-
-    // independent). Balanced: continue the round-robin from the last served
-    // queue. Both rules are deterministic under the shared lock.
-    const first =
-      emailClaims < webhookClaims
-        ? EMAIL_DELIVERY_TABLE
-        : webhookClaims < emailClaims
-          ? WEBHOOK_DELIVERY_TABLE
-          : (ledger?.last_channel ?? 'webhook') === 'email'
-            ? WEBHOOK_DELIVERY_TABLE
-            : EMAIL_DELIVERY_TABLE;
-    const second = first === EMAIL_DELIVERY_TABLE ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
+    const pushClaims = BigInt(ledger?.push_claims ?? '0');
+
+    type QueueInfo = { channel: NotificationChannel; table: string; claims: bigint; rrIndex: number };
+    const lastChannel = (ledger?.last_channel ?? 'webhook') as NotificationChannel;
+
+    // Round-robin order after last_channel: e.g. last=webhook => push, email, webhook
+    // Define canonical order
+    const canonical: NotificationChannel[] = ['email', 'webhook', 'push'];
+    const lastIdx = canonical.indexOf(lastChannel);
+    const rrOrder: NotificationChannel[] = lastIdx >= 0 ? [...canonical.slice(lastIdx + 1), ...canonical.slice(0, lastIdx + 1)] : [...canonical];
+    // Map channel to rrIndex (0 = next to serve, 2 = last served)
+    const rrIndexMap = new Map<NotificationChannel, number>();
+    rrOrder.forEach((ch, idx) => {
+      // The last element is the last_channel itself, so it should have highest index (least preferred for tie)
+      // Actually rrOrder is [next, ..., last], so index 0 is most preferred for tie, last is least
+      rrIndexMap.set(ch, idx);
+    });
+
+    const queues: QueueInfo[] = [
+      { channel: 'email', table: EMAIL_DELIVERY_TABLE, claims: emailClaims, rrIndex: rrIndexMap.get('email') ?? 0 },
+      { channel: 'webhook', table: WEBHOOK_DELIVERY_TABLE, claims: webhookClaims, rrIndex: rrIndexMap.get('webhook') ?? 1 },
+      { channel: 'push', table: PUSH_DELIVERY_TABLE, claims: pushClaims, rrIndex: rrIndexMap.get('push') ?? 2 },
+    ];
+
+    // Sort by claims ascending, then rrIndex ascending (round-robin tie-break)
+    const sorted = [...queues].sort((a, b) => {
+      if (a.claims < b.claims) return -1;
+      if (a.claims > b.claims) return 1;
+      return a.rrIndex - b.rrIndex;
+    });
 
     if (limit === 1) {
-      const firstJobs = await this.claimTable(first, 1, workerId, q);
-      if (firstJobs.length > 0) {
-        await this.recordFairnessClaims(q, first === EMAIL_DELIVERY_TABLE ? 1 : 0, first === WEBHOOK_DELIVERY_TABLE ? 1 : 0);
-        return firstJobs;
+      for (const qInfo of sorted) {
+        const jobs = await this.claimTable(qInfo.table, 1, workerId, q);
+        if (jobs.length > 0) {
+          await this.recordFairnessClaims(q, {
+            email: qInfo.channel === 'email' ? 1 : 0,
+            webhook: qInfo.channel === 'webhook' ? 1 : 0,
+            push: qInfo.channel === 'push' ? 1 : 0,
+          });
+          return jobs;
+        }
       }
-      // An empty preferred queue is never starvation for the other one.
-      const secondJobs = await this.claimTable(second, 1, workerId, q);
-      if (secondJobs.length > 0) {
-        await this.recordFairnessClaims(q, second === EMAIL_DELIVERY_TABLE ? 1 : 0, second === WEBHOOK_DELIVERY_TABLE ? 1 : 0);
-      }
-      return secondJobs;
+      return [];
     }
 
-    // Batch: reserve half the batch for each queue, the durable ledger's
-    // preferred side taking the odd row. Unused capacity of a drained queue
-    // goes to the other side, bounded so every decision still claims at most
-    // `limit` rows in total and returns every transitioned row.
-    const firstQuota = Math.ceil(limit / 2);
-    const secondQuota = limit - firstQuota;
-    const firstJobs = await this.claimTable(first, firstQuota, workerId, q);
-    const secondJobs = await this.claimTable(second, secondQuota, workerId, q);
-    let jobs = [...firstJobs, ...secondJobs];
-    let remaining = limit - jobs.length;
-    if (remaining > 0 && firstJobs.length < firstQuota) {
-      // The preferred queue could not fill its half: the other side takes it.
-      const extra = await this.claimTable(second, remaining, workerId, q);
-      jobs = [...jobs, ...extra];
-      remaining -= extra.length;
+    // Batch: distribute limit fairly across 3 queues in preference order, but
+    // fill up to limit when one or more queues are empty/insufficient.
+    // First pass uses decreasing remainingQueues so that empty queues do not strand capacity:
+    // e.g. limit 4, queues [push(empty), email, webhook] => per ceil(4/3)=2,0, then ceil(4/2)=2,2, then ceil(2/1)=2,2 => 2+2 balanced.
+    let jobs: NotificationJobRow[] = [];
+    let remaining = limit;
+    let remainingQueues = sorted.length;
+    for (const qInfo of sorted) {
+      if (remaining <= 0) break;
+      const per = Math.max(1, Math.ceil(remaining / remainingQueues));
+      const claimed = await this.claimTable(qInfo.table, per, workerId, q);
+      jobs = [...jobs, ...claimed];
+      remaining = limit - jobs.length;
+      remainingQueues--;
     }
-    if (remaining > 0 && secondJobs.length < secondQuota) {
-      const extra = await this.claimTable(first, remaining, workerId, q);
-      jobs = [...jobs, ...extra];
+    // Second pass: if some queue had fewer than its quota, fill the leftover from any queue that still has work.
+    if (remaining > 0) {
+      for (const qInfo of sorted) {
+        if (remaining <= 0) break;
+        const extra = await this.claimTable(qInfo.table, remaining, workerId, q);
+        if (extra.length > 0) {
+          jobs = [...jobs, ...extra];
+          remaining = limit - jobs.length;
+        }
+      }
     }
-    const webhookClaimed = jobs.reduce((n, job) => n + (job.channel === 'webhook' ? 1 : 0), 0);
-    await this.recordFairnessClaims(q, jobs.length - webhookClaimed, webhookClaimed);
+
+    const counts = {
+      email: jobs.reduce((n, job) => n + (job.channel === 'email' ? 1 : 0), 0),
+      webhook: jobs.reduce((n, job) => n + (job.channel === 'webhook' ? 1 : 0), 0),
+      push: jobs.reduce((n, job) => n + (job.channel === 'push' ? 1 : 0), 0),
+    };
+    await this.recordFairnessClaims(q, counts);
     return jobs.sort((a, b) => {
       const due = a.next_attempt_at.getTime() - b.next_attempt_at.getTime();
       return due || a.created_at.getTime() - b.created_at.getTime() || a.id.localeCompare(b.id);
@@ -357,20 +458,26 @@ export class NotificationOutbox {
    * atomic (claim and score commit or roll back together) and durable (the
    * counters live outside the retention-managed delivery tables).
    */
-  private async recordFairnessClaims(q: Queryable, emailClaimed: number, webhookClaimed: number): Promise<void> {
-    if (emailClaimed === 0 && webhookClaimed === 0) return;
+  private async recordFairnessClaims(
+    q: Queryable,
+    counts: { email: number; webhook: number; push: number },
+  ): Promise<void> {
+    const { email, webhook, push } = counts;
+    if (email === 0 && webhook === 0 && push === 0) return;
     await q.query(
       `UPDATE notification_delivery_fairness
           SET email_claims = email_claims + $1::bigint,
               webhook_claims = webhook_claims + $2::bigint,
+              push_claims = COALESCE(push_claims, 0) + $3::bigint,
               last_channel = CASE
-                WHEN $1 > $2 THEN 'email'::text
-                WHEN $2 > $1 THEN 'webhook'::text
+                WHEN $1 > $2 AND $1 > $3 THEN 'email'::text
+                WHEN $2 > $1 AND $2 > $3 THEN 'webhook'::text
+                WHEN $3 > $1 AND $3 > $2 THEN 'push'::text
                 ELSE last_channel
               END,
               updated_at = now()
         WHERE singleton = true`,
-      [emailClaimed, webhookClaimed],
+      [email, webhook, push],
     );
   }
 
@@ -384,7 +491,9 @@ export class NotificationOutbox {
        )
        UPDATE ${table} n SET status = 'processing', locked_at = now(), locked_by = $2,
          attempts = n.attempts + 1, failure_category = 'none', last_error = NULL
-       FROM candidate c WHERE n.id = c.id RETURNING n.*`, [limit, workerId]);
+       FROM candidate c WHERE n.id = c.id RETURNING n.*`,
+      [limit, workerId],
+    );
     return res.rows;
   }
 
@@ -491,12 +600,24 @@ export class NotificationOutbox {
    */
   async recoverStale(leaseMs: number): Promise<{ recovered: number; deadLettered: number }> {
     const lease = Math.max(1, Math.trunc(leaseMs));
-    const results = await Promise.all([EMAIL_DELIVERY_TABLE, WEBHOOK_DELIVERY_TABLE].map(async (table) => {
-      const back = await this.pool.query(`UPDATE ${table} SET status = 'pending', next_attempt_at = now(), failure_category = 'stale', last_error = 'worker did not finish inside the lease — recovered', locked_at = NULL, locked_by = NULL WHERE status = 'processing' AND locked_at < now() - ($1::int * interval '1 millisecond') AND attempts < max_attempts`, [lease]);
-      const dead = await this.pool.query(`UPDATE ${table} SET status = 'failed', failure_category = 'stale', last_error = 'worker did not finish inside the lease — retry budget exhausted', next_attempt_at = now(), locked_at = NULL, locked_by = NULL WHERE status = 'processing' AND locked_at < now() - ($1::int * interval '1 millisecond') AND attempts >= max_attempts`, [lease]);
-      return { recovered: back.rowCount ?? 0, deadLettered: dead.rowCount ?? 0 };
-    }));
-    return results.reduce((sum, value) => ({ recovered: sum.recovered + value.recovered, deadLettered: sum.deadLettered + value.deadLettered }), { recovered: 0, deadLettered: 0 });
+    const tables = [EMAIL_DELIVERY_TABLE, WEBHOOK_DELIVERY_TABLE, PUSH_DELIVERY_TABLE];
+    const results = await Promise.all(
+      tables.map(async (table) => {
+        const back = await this.pool.query(
+          `UPDATE ${table} SET status = 'pending', next_attempt_at = now(), failure_category = 'stale', last_error = 'worker did not finish inside the lease — recovered', locked_at = NULL, locked_by = NULL WHERE status = 'processing' AND locked_at < now() - ($1::int * interval '1 millisecond') AND attempts < max_attempts`,
+          [lease],
+        );
+        const dead = await this.pool.query(
+          `UPDATE ${table} SET status = 'failed', failure_category = 'stale', last_error = 'worker did not finish inside the lease — retry budget exhausted', next_attempt_at = now(), locked_at = NULL, locked_by = NULL WHERE status = 'processing' AND locked_at < now() - ($1::int * interval '1 millisecond') AND attempts >= max_attempts`,
+          [lease],
+        );
+        return { recovered: back.rowCount ?? 0, deadLettered: dead.rowCount ?? 0 };
+      }),
+    );
+    return results.reduce(
+      (sum, value) => ({ recovered: sum.recovered + value.recovered, deadLettered: sum.deadLettered + value.deadLettered }),
+      { recovered: 0, deadLettered: 0 },
+    );
   }
 
   /**
@@ -510,7 +631,10 @@ export class NotificationOutbox {
     let total = 0;
     for (const channel of channels) {
       const table = tableForChannel(channel);
-      const res = await this.pool.query(`UPDATE ${table} SET status = 'pending', attempts = 0, failure_category = 'none', last_error = NULL, next_attempt_at = now(), locked_at = NULL, locked_by = NULL WHERE id IN (SELECT id FROM ${table} WHERE status = 'unavailable' LIMIT $1 FOR UPDATE SKIP LOCKED)`, [Math.max(1, Math.trunc(limit))]);
+      const res = await this.pool.query(
+        `UPDATE ${table} SET status = 'pending', attempts = 0, failure_category = 'none', last_error = NULL, next_attempt_at = now(), locked_at = NULL, locked_by = NULL WHERE id IN (SELECT id FROM ${table} WHERE status = 'unavailable' LIMIT $1 FOR UPDATE SKIP LOCKED)`,
+        [Math.max(1, Math.trunc(limit))],
+      );
       total += res.rowCount ?? 0;
     }
     return total;
@@ -530,9 +654,15 @@ export class NotificationOutbox {
    */
   async cleanup(policy: CleanupPolicy): Promise<number> {
     let deleted = 0;
-    for (const table of [EMAIL_DELIVERY_TABLE, WEBHOOK_DELIVERY_TABLE]) {
-      const delivered = await this.pool.query(`DELETE FROM ${table} WHERE status = 'delivered' AND delivered_at IS NOT NULL AND delivered_at < now() - ($1::int * interval '1 day')`, [Math.max(1, Math.trunc(policy.deliveredRetentionDays))]);
-      const failed = await this.pool.query(`DELETE FROM ${table} WHERE status = 'failed' AND created_at < now() - ($1::int * interval '1 day')`, [Math.max(1, Math.trunc(policy.failedRetentionDays))]);
+    for (const table of [EMAIL_DELIVERY_TABLE, WEBHOOK_DELIVERY_TABLE, PUSH_DELIVERY_TABLE]) {
+      const delivered = await this.pool.query(
+        `DELETE FROM ${table} WHERE status = 'delivered' AND delivered_at IS NOT NULL AND delivered_at < now() - ($1::int * interval '1 day')`,
+        [Math.max(1, Math.trunc(policy.deliveredRetentionDays))],
+      );
+      const failed = await this.pool.query(
+        `DELETE FROM ${table} WHERE status = 'failed' AND created_at < now() - ($1::int * interval '1 day')`,
+        [Math.max(1, Math.trunc(policy.failedRetentionDays))],
+      );
       deleted += (delivered.rowCount ?? 0) + (failed.rowCount ?? 0);
     }
     return deleted;
@@ -541,7 +671,11 @@ export class NotificationOutbox {
   /** Queue depth per status — the number an operator watches. */
   async depth(): Promise<OutboxDepth> {
     const res = await this.pool.query<{ status: string; n: string }>(
-      `SELECT status, count(*)::text AS n FROM (SELECT status FROM notification_deliveries UNION ALL SELECT status FROM notification_webhook_deliveries) jobs GROUP BY status`,
+      `SELECT status, count(*)::text AS n FROM (
+         SELECT status FROM notification_deliveries
+         UNION ALL SELECT status FROM notification_webhook_deliveries
+         UNION ALL SELECT status FROM notification_push_deliveries
+       ) jobs GROUP BY status`,
     );
     const depth: OutboxDepth = { pending: 0, processing: 0, delivered: 0, failed: 0, unavailable: 0 };
     for (const row of res.rows) {

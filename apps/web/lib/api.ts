@@ -78,6 +78,14 @@ import type {
   EmergencyStopResultDto,
   KillSwitchActivateInput,
   KillSwitchClearInput,
+  // M9.1/M9.2 — notification preferences + push
+  NotificationPreferencesResponse,
+  NotificationPreference,
+  StrategyNotificationPreference,
+  StrategyNotificationPreferenceRequest,
+  PushSubscriptionRequest,
+  VapidPublicKeyResponse,
+  QuietHours,
 } from '@veltrixeye/contracts';
 import {
   MAX_ALERTS_LIMIT,
@@ -433,6 +441,50 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(triggerState ? { triggerState } : {}),
     }),
+
+  // -------------------------------------------------------------------------
+  // M9.1/M9.2 — notification preferences + push
+  // -------------------------------------------------------------------------
+
+  /** GET /api/notifications/preferences — owner-scoped preferences + quiet hours */
+  getNotificationPreferences: () => request<NotificationPreferencesResponse>('/notifications/preferences'),
+
+  /** PUT /api/notifications/preferences — update preferences */
+  updateNotificationPreferences: (input: { preferences: { channel: string; enabled: boolean; endpointUrl?: string; signingSecret?: string }[]; quietHours?: QuietHours | null }) =>
+    request<NotificationPreferencesResponse>('/notifications/preferences', {
+      method: 'PUT',
+      body: JSON.stringify(input),
+    }),
+
+  /** GET /api/notifications/preferences/strategies — per-strategy routing */
+  listStrategyNotificationPreferences: () => request<{ preferences: StrategyNotificationPreference[] }>('/notifications/preferences/strategies'),
+
+  /** GET /api/notifications/preferences/strategies/:id */
+  getStrategyNotificationPreference: (strategyId: string) =>
+    request<{ preference: StrategyNotificationPreference | null }>(
+      `/notifications/preferences/strategies/${encodeURIComponent(strategyId)}`,
+    ),
+
+  /** PUT /api/notifications/preferences/strategies/:id */
+  updateStrategyNotificationPreference: (strategyId: string, input: StrategyNotificationPreferenceRequest) =>
+    request<{ preference: StrategyNotificationPreference }>(
+      `/notifications/preferences/strategies/${encodeURIComponent(strategyId)}`,
+      { method: 'PUT', body: JSON.stringify(input) },
+    ),
+
+  /** GET /api/notifications/push/vapid-public-key */
+  getVapidPublicKey: () => request<VapidPublicKeyResponse>('/notifications/push/vapid-public-key'),
+
+  /** POST /api/notifications/push/subscriptions */
+  subscribePush: (input: PushSubscriptionRequest) =>
+    request<{ preference: NotificationPreference }>('/notifications/push/subscriptions', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  /** DELETE /api/notifications/preferences/:channel */
+  deleteNotificationPreference: (channel: string) =>
+    request<{ ok: boolean }>(`/notifications/preferences/${encodeURIComponent(channel)}`, { method: 'DELETE' }),
 
   // -------------------------------------------------------------------------
   // Scanner (M7.5 — live scanner / production market flow)

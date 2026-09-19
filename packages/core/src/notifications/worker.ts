@@ -15,6 +15,7 @@ import {
 import { NotificationOutbox, type CleanupPolicy, type NotificationJobRow } from './outbox.js';
 import { describeError } from './redact.js';
 import type { NotificationProviderRegistry, NotificationSendResult } from './provider.js';
+import type { SecretManager } from './secret-manager.js';
 
 /**
  * The delivery worker (M7.3) — the ONLY component that performs delivery I/O.
@@ -107,6 +108,8 @@ export interface DeliveryWorkerOptions {
    * still cannot reach `last_error` or a log line.
    */
   redact?: (text: string) => string;
+  /** M9.2 secret manager for decrypting webhook/push secrets at delivery time */
+  secretManager?: SecretManager;
 }
 
 /** A no-op logger: the worker never throws because of logging. */
@@ -120,6 +123,7 @@ export class DeliveryWorker {
   private readonly outbox: NotificationOutbox;
   private readonly instanceId: string;
   private readonly logger: DeliveryWorkerLogger;
+  private readonly secretManager?: SecretManager;
 
   constructor(
     pool: pg.Pool,
@@ -127,7 +131,8 @@ export class DeliveryWorker {
     private readonly policy: DeliveryRetryPolicy = DEFAULT_DELIVERY_RETRY_POLICY,
     options: DeliveryWorkerOptions = {},
   ) {
-    this.outbox = new NotificationOutbox(pool, { maxAttempts: policy.maxAttempts });
+    this.secretManager = options.secretManager;
+    this.outbox = new NotificationOutbox(pool, { maxAttempts: policy.maxAttempts }, this.secretManager);
     this.instanceId = options.instanceId ?? `worker-${randomUUID()}`;
     this.logger = options.logger ?? SILENT_LOGGER;
     this.redact = options.redact ?? ((text: string) => text);
@@ -275,6 +280,18 @@ export class DeliveryWorker {
     }
 
     try {
+      // M9.2: prefer encrypted secret, decrypt if needed
+      let signingSecret: string | null = job.signing_secret;
+      const enc = (job as { signing_secret_encrypted?: string | null }).signing_secret_encrypted;
+      const keyVersion = (job as { signing_secret_key_version?: number | null }).signing_secret_key_version;
+      if (enc && this.secretManager) {
+        try {
+          signingSecret = this.secretManager.decrypt(enc, keyVersion ?? this.secretManager.keyVersion);
+        } catch {
+          // fallback to plaintext if decryption fails (migration path)
+          signingSecret = job.signing_secret;
+        }
+      }
       const result = await provider.send({
         jobId: job.id,
         idempotencyKey: job.idempotency_key,
@@ -284,7 +301,7 @@ export class DeliveryWorker {
         payload: job.payload,
         attempt: job.attempts,
         timeoutMs: this.policy.timeoutMs,
-        signingSecret: job.signing_secret,
+        signingSecret,
       });
       return await this.record(job, provider.name, result, null);
     } catch (err) {

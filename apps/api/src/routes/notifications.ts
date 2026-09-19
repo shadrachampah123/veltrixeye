@@ -4,6 +4,7 @@ import {
   notificationMaintenanceRequestSchema,
   notificationRunRequestSchema,
   notificationPreferencesRequestSchema,
+  pushSubscriptionRequestSchema,
   strategyNotificationPreferenceRequestSchema,
 } from '@veltrixeye/contracts';
 import { Errors } from '@veltrixeye/core';
@@ -103,6 +104,58 @@ export async function notificationRoutes(
     const preference = await ctx.preferences.upsertStrategy(user.id, strategyId, parsed.data);
     await ctx.audit.log({ userId: user.id, action: 'notification.strategy_preferences_updated', entityType: 'strategy', entityId: strategyId, ip: req.ip, userAgent: req.headers['user-agent'] ?? null, metadata: { muted: preference.muted, channels: preference.channels } });
     return { preference };
+  });
+
+  // M9.2 — push VAPID public key (authenticated, public key is not secret but still owner-scoped to avoid enumeration)
+  app.get('/api/notifications/push/vapid-public-key', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const publicKey = config.notification.push.publicKey;
+    if (!publicKey) {
+      return reply.code(404).send({ error: { code: 'not_found', message: 'Push not configured' } });
+    }
+    return { publicKey };
+  });
+
+  // M9.2 — push subscription creation (owner-scoped, encrypted at rest)
+  app.post('/api/notifications/push/subscriptions', preferenceRateLimit, async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const parsed = pushSubscriptionRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'body');
+      return;
+    }
+    const { user } = req as AuthenticatedRequest;
+    const preference = await ctx.preferences.upsertPushSubscription(user.id, parsed.data);
+    await ctx.audit.log({
+      userId: user.id,
+      action: 'notification.push_subscription_created',
+      ip: req.ip,
+      userAgent: req.headers['user-agent'] ?? null,
+      metadata: { endpoint: parsed.data.endpoint.slice(0, 80) }, // truncated, no keys
+    });
+    return { preference };
+  });
+
+  // M9.2 — narrowly scoped delete for push/webhook/email preferences
+  app.delete('/api/notifications/preferences/:channel', preferenceRateLimit, async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { channel } = req.params as { channel: string };
+    if (!['email', 'webhook', 'push'].includes(channel)) {
+      throw Errors.notFound('Channel not found');
+    }
+    const { user } = req as AuthenticatedRequest;
+    await ctx.preferences.remove(user.id, channel as never);
+    await ctx.audit.log({
+      userId: user.id,
+      action: 'notification.preference_removed',
+      ip: req.ip,
+      userAgent: req.headers['user-agent'] ?? null,
+      metadata: { channel },
+    });
+    return { ok: true };
   });
 
   // GET /api/alerts/:alertId/notifications — owner-scoped delivery status
