@@ -87,11 +87,24 @@ it cannot authorize a second exchange, and the local status remains queryable.
 
 Within one adapter instance, submit reservations are keyed by execution ID and
 canonical order parameters, made **before any await/exchange**. Cancellation has
-its own execution-ID/order-ID reservation. Concurrent twins share the same
-promise. Request IDs cannot be reused for another operation/execution/payload;
-changed payloads fail with `idempotency_conflict`. Results and failures remain
-cached. A replay returns the **original** acknowledgement IDs and timestamp;
+its own execution-ID/order-ID reservation, created only after local preflight
+confirms a connected transport and matching acknowledged order. Concurrent twins
+share the same promise, including while awaiting audit. Initially invalid
+cancellation preflight consumes no reservation or request-ID capacity: wrong IDs,
+missing orders and pre-acknowledgement cancellations can be corrected/retried.
+Once reserved, request IDs cannot be reused for another operation/execution/payload;
+changed payloads fail with `idempotency_conflict`. Submission results/failures and
+all **attempted** cancellation results/failures remain cached. A replay returns the **original** acknowledgement IDs and timestamp;
 use `orderStatus` for current simulated state.
+
+M10.1 tracks entry into the exchange independently of audit completion. A reserved
+cancellation that fails before exchange (including audit failure or disconnect
+while awaiting audit) releases only its execution reservation; existing request-ID
+bindings remain. This permits an explicit authorized retry, never an automatic
+retry. Once exchange is entered, rejection, timeout, malformed response, failure,
+or post-exchange audit failure **never** releases the reservation. Submission
+reservations are never released by this logic. Disconnect/reconnect epochs also
+prevent a request waiting on audit from executing on a replacement connection.
 
 The ledger is bounded (10,000 executions by default, bounded request aliases).
 Capacity exhaustion fails closed rather than evicting old identities. It is
@@ -118,7 +131,8 @@ select and no gateway is contacted. Existing SecretManager behavior is untouched
 
 ## Audit and secret handling
 
-An injected synchronous audit sink receives immutable, allowlisted events:
+An injected synchronous or asynchronous audit sink (`void | Promise<void>`)
+receives immutable, allowlisted events:
 request/execution/correlation IDs, operation, from/to state, timestamp, non-live
 mode, and a fixed sanitized error code/message/uncertainty flag. No order payload,
 raw provider response, arbitrary error text, stack, cause, login, password, broker
@@ -128,15 +142,26 @@ a durable audit sink. Gate denials happen before transport invocation and return
 only a sanitized authorization error; existing production gate auditing remains
 with the unchanged intake/safety services.
 
+M10.1 awaits every audit callback inside the sanitizing error boundary. Both
+synchronous throws and rejected promises become a fresh fixed-message transport
+error, without the original message, stack or cause. No sink promise is abandoned
+as an unhandled rejection. Pre-exchange audit failure prevents exchange; after an
+exchange attempt, audit failure cannot permit a duplicate exchange. A sink that
+never settles leaves the operation pending without advancing past that audit;
+exchange deadlines do not impose a separate audit deadline. Connection attempts
+are reserved before awaiting audit, and disconnect remains authoritative during
+all audit waits.
+
 Do not route real data through the legacy M8.4 response normalizers without a
 separate redaction review: they retain provider messages/error causes. M10 does
 not call them or change their behavior.
 
 ## Verification
 
-- `packages/core/test/m10-transport.test.ts`: 69 tests, including network and
+- `packages/core/test/m10-transport.test.ts`: 94 tests, including network and
   process-start tripwires across every transport scenario, capability binding,
-  immutable requests, fault injection, concurrency, secret-safe audit and gates.
+  immutable requests, fault injection, concurrency, secret-safe audit and gates;
+  25 M10.1 regressions cover async audit and cancellation preflight/reservations.
 - `apps/api/test/m10-transport-config.test.ts`: 8 startup configuration tests.
 - Full existing suite (including M8.7, M9.1 fairness and M9.2 notification/push,
   SecretManager and migration 0028) is run unchanged.

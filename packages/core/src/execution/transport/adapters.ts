@@ -16,8 +16,8 @@ export interface SafeTransportOptions {
   /** No eviction: capacity exhaustion stops new identities rather than risking a replay. */
   maxExecutions?: number;
   now?: () => number;
-  /** Receives only allowlisted, immutable events. Sink failure stops the operation. */
-  audit?: (event: Readonly<ExecutionTransportEvent>) => void;
+  /** Receives only allowlisted, immutable events. Awaited before exchange; sync/async sink failures are sanitized. */
+  audit?: (event: Readonly<ExecutionTransportEvent>) => void | Promise<void>;
 }
 type WireOperation = 'connect' | 'submit' | 'cancel';
 type Request = TransportContext | TransportSubmitRequest | TransportCancelRequest;
@@ -28,7 +28,7 @@ const wireResultSchema = transportContextSchema.extend({
 class WireFailure {
   constructor(readonly code: TransportErrorCode) {}
 }
-interface Entry { fingerprint: string; result: Promise<TransportResult> }
+interface Entry { fingerprint: string; result: Promise<TransportResult>; attempted: boolean }
 
 /** Operational mechanics only. This class never decides whether execution is authorized. */
 abstract class SafeExecutionTransport implements ExecutionTransport {
@@ -36,6 +36,7 @@ abstract class SafeExecutionTransport implements ExecutionTransport {
   abstract readonly mode: ExecutionTransportMode;
   private state: TransportConnectionState = 'disconnected';
   private connecting: Promise<TransportHealth> | null = null;
+  private connectionEpoch = 0;
   private readonly pending = new Set<AbortController>();
   private readonly submissions = new Map<string, Entry>();
   private readonly cancellations = new Map<string, Entry>();
@@ -63,11 +64,11 @@ abstract class SafeExecutionTransport implements ExecutionTransport {
     return { requestId: context.requestId, executionId: context.executionId,
       correlationId: context.correlationId, timestamp: new Date(this.now()).toISOString() };
   }
-  private emit(context: TransportContext, operation: ExecutionTransportEvent['operation'],
+  private async emit(context: TransportContext, operation: ExecutionTransportEvent['operation'],
     from: ExecutionTransportEvent['from'], to: ExecutionTransportEvent['to'],
-    error: ExecutionTransportEvent['error'] = null): void {
+    error: ExecutionTransportEvent['error'] = null): Promise<void> {
     const event = Object.freeze({ ...this.stamp(context), mode: this.mode, live: this.live, operation, from, to, error });
-    try { this.options.audit?.(event); } catch { throw new ExecutionTransportError('transport_failure'); }
+    try { await this.options.audit?.(event); } catch { throw new ExecutionTransportError('transport_failure'); }
   }
   private healthResult(context: TransportContext, error: TransportHealth['error'] = null): TransportHealth {
     return Object.freeze({ ...this.stamp(context), mode: this.mode, live: this.live, state: this.state,
@@ -84,37 +85,43 @@ abstract class SafeExecutionTransport implements ExecutionTransport {
     if (this.state === 'connected') return this.healthResult(context);
     if (this.connecting) { await this.connecting; return this.healthResult(context); }
     const from = this.state;
-    this.emit(context, 'connect', from, 'connecting');
+    const epoch = this.connectionEpoch;
+    // Reserve synchronously: awaiting an audit callback must not admit a second connect.
     this.state = 'connecting';
-    this.connecting = (async () => {
+    this.connecting = Promise.resolve().then(async () => {
       try {
+        await this.emit(context, 'connect', from, 'connecting');
+        if (epoch !== this.connectionEpoch || this.state !== 'connecting') throw new WireFailure('unavailable');
         const raw = await this.deadline('connect', context);
-        if (this.state !== 'connecting') throw new WireFailure('unavailable');
+        if (epoch !== this.connectionEpoch || this.state !== 'connecting') throw new WireFailure('unavailable');
         if (!z.object({ connected: z.literal(true) }).strict().safeParse(raw).success) throw new WireFailure('malformed_response');
-        this.emit(context, 'connect', this.state, 'connected');
+        await this.emit(context, 'connect', this.state, 'connected');
+        if (epoch !== this.connectionEpoch || this.state !== 'connecting') throw new WireFailure('unavailable');
         this.state = 'connected';
         return this.healthResult(context);
       } catch (error) {
         const detail = transportError(error instanceof WireFailure ? error.code : 'transport_failure');
-        // A deliberate disconnect must not be undone by a late response/failure.
-        if (this.state !== 'disconnected') {
-          this.emit(context, 'connect', this.state, 'unavailable', detail);
+        // Stop before awaiting the failure audit; a disconnect during audit stays stopped.
+        if (epoch === this.connectionEpoch && this.state !== 'disconnected') {
+          const failedFrom = this.state;
           this.state = 'unavailable';
+          await this.emit(context, 'connect', failedFrom, 'unavailable', detail);
         }
         return this.healthResult(context, detail);
       }
-    })();
+    });
     try { return await this.connecting; } finally { this.connecting = null; }
   }
   async disconnect(input: TransportContext): Promise<TransportHealth> {
     const context = this.context(input);
+    this.connectionEpoch++;
     for (const controller of this.pending) controller.abort();
     const from = this.state;
     this.state = 'disconnected';
-    this.emit(context, 'disconnect', from, 'disconnected');
+    await this.emit(context, 'disconnect', from, 'disconnected');
     return this.healthResult(context);
   }
-  private async deadline(operation: WireOperation, request: Request): Promise<unknown> {
+  private async deadline(operation: WireOperation, request: Request, onExchange?: () => void): Promise<unknown> {
     const controller = new AbortController();
     this.pending.add(controller);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -128,6 +135,7 @@ abstract class SafeExecutionTransport implements ExecutionTransport {
         }),
         Promise.resolve().then(() => {
           if (controller.signal.aborted) throw new WireFailure('unavailable');
+          onExchange?.();
           return this.exchange(operation, request, controller.signal);
         }),
       ]);
@@ -142,9 +150,9 @@ abstract class SafeExecutionTransport implements ExecutionTransport {
     return Object.freeze({ ...this.stamp(context), mode: this.mode, live: this.live, operation, state, orderId,
       error: code ? transportError(code, uncertain) : null });
   }
-  private refuse(context: TransportContext, operation: 'submit' | 'cancel', code: TransportErrorCode): TransportResult {
+  private async refuse(context: TransportContext, operation: 'submit' | 'cancel', code: TransportErrorCode): Promise<TransportResult> {
     const result = this.result(context, operation, 'failed', null, code);
-    this.emit(context, operation, this.state, 'failed', result.error);
+    await this.emit(context, operation, this.state, 'failed', result.error);
     return result;
   }
   async submit(input: TransportSubmitRequest, permit: TransportAuthorization): Promise<TransportResult> {
@@ -165,32 +173,55 @@ abstract class SafeExecutionTransport implements ExecutionTransport {
     const entries = operation === 'submit' ? this.submissions : this.cancellations;
     const identity = `${operation}:${request.executionId}:${fingerprint}`;
     const priorIdentity = this.requests.get(request.requestId);
-    if (priorIdentity && priorIdentity !== identity) return Promise.resolve(this.refuse(request, operation, 'idempotency_conflict'));
+    if (priorIdentity && priorIdentity !== identity) return this.refuse(request, operation, 'idempotency_conflict');
     const prior = entries.get(request.executionId);
-    if (prior && prior.fingerprint !== fingerprint) return Promise.resolve(this.refuse(request, operation, 'idempotency_conflict'));
+    if (prior && prior.fingerprint !== fingerprint) return this.refuse(request, operation, 'idempotency_conflict');
     if (priorIdentity && prior) return prior.result;
-    if ((!prior && entries.size >= this.capacity) || this.requests.size >= this.capacity * 2) {
-      return Promise.resolve(this.refuse(request, operation, 'capacity_exceeded'));
+    // Replay an attempted/reserved cancellation before inspecting current order state.
+    // Known preflight failures do not claim the execution ID or consume ledger capacity.
+    if (!prior && operation === 'cancel') {
+      const failure = this.cancelPreflight(request as TransportCancelRequest);
+      if (failure) return this.refuse(request, operation, failure);
     }
-    // Reserve synchronously before any await/exchange. Cache failures too; never auto-resubmit.
+    if ((!prior && entries.size >= this.capacity) || this.requests.size >= this.capacity * 2) {
+      return this.refuse(request, operation, 'capacity_exceeded');
+    }
+    // Reserve synchronously before audit/exchange. Submission failures and attempted cancellations stay cached.
     this.requests.set(request.requestId, identity);
     if (prior) return prior.result;
-    const result = Promise.resolve().then(() => this.perform(request, operation));
-    entries.set(request.executionId, { fingerprint, result });
-    return result;
+    const entry: Entry = {
+      fingerprint, attempted: false,
+      result: Promise.resolve().then(() => this.perform(request, operation, entry)).finally(() => {
+        // Only cancellation reservations proven never to have reached exchange may be released.
+        // Keep request-ID bindings (including aliases); never release a submission reservation.
+        if (operation === 'cancel' && !entry.attempted && entries.get(request.executionId) === entry) {
+          entries.delete(request.executionId);
+        }
+      }),
+    };
+    entries.set(request.executionId, entry);
+    return entry.result;
   }
-  private async perform(request: TransportSubmitRequest | TransportCancelRequest, operation: 'submit' | 'cancel'): Promise<TransportResult> {
+  private cancelPreflight(request: TransportCancelRequest): TransportErrorCode | null {
+    if (this.state !== 'connected') return 'unavailable';
+    const order = this.orders.get(request.executionId);
+    return order?.state === 'acknowledged' && order.orderId === request.orderId ? null : 'not_found';
+  }
+  private async perform(request: TransportSubmitRequest | TransportCancelRequest, operation: 'submit' | 'cancel', entry: Entry): Promise<TransportResult> {
     if (this.state !== 'connected') return this.refuse(request, operation, 'unavailable');
     const prior = this.orders.get(request.executionId);
     if (operation === 'cancel' && (prior?.state !== 'acknowledged' || prior.orderId !== (request as TransportCancelRequest).orderId)) {
       return this.refuse(request, operation, 'not_found');
     }
-    // Audit must be accepted BEFORE crossing the wire boundary.
-    this.emit(request, operation, prior?.state ?? this.state, 'submitting');
+    // The reservation survives asynchronous audit. A disconnect/reconnect during audit
+    // invalidates this attempt rather than permitting exchange on a new connection.
+    const epoch = this.connectionEpoch;
+    await this.emit(request, operation, prior?.state ?? this.state, 'submitting');
+    if (epoch !== this.connectionEpoch || this.state !== 'connected') return this.refuse(request, operation, 'unavailable');
     this.orders.set(request.executionId, this.result(request, operation, 'submitting', prior?.orderId ?? null));
     let result: TransportResult;
     try {
-      const raw = await this.deadline(operation, request);
+      const raw = await this.deadline(operation, request, () => { entry.attempted = true; });
       const parsed = wireResultSchema.safeParse(raw);
       if (!parsed.success) throw new WireFailure('malformed_response');
       const row = parsed.data;
@@ -204,12 +235,12 @@ abstract class SafeExecutionTransport implements ExecutionTransport {
       result = this.result(request, operation, row.state, row.orderId, row.state === 'rejected' ? 'rejected' : undefined);
     } catch (error) {
       result = this.result(request, operation, 'failed', prior?.orderId ?? null,
-        error instanceof WireFailure ? error.code : 'transport_failure', true);
+        error instanceof WireFailure ? error.code : 'transport_failure', entry.attempted);
     }
-    // Cancellation rejection leaves the acknowledged order intact; ambiguous cancellation is visible.
-    if (operation === 'cancel' && result.state === 'rejected' && prior) this.orders.set(request.executionId, prior);
+    // Rejection or a proven no-exchange cancellation leaves the order intact; uncertainty is visible.
+    if (operation === 'cancel' && (!entry.attempted || result.state === 'rejected') && prior) this.orders.set(request.executionId, prior);
     else this.orders.set(request.executionId, result);
-    this.emit(request, operation, 'submitting', result.state, result.error);
+    await this.emit(request, operation, 'submitting', result.state, result.error);
     return result;
   }
   async orderStatus(input: TransportContext): Promise<TransportResult> {
