@@ -253,25 +253,29 @@ export class NotificationOutbox {
   }
 
   private async claimBatchInTransaction(limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {
-    // A shared transaction-level advisory lock serializes the fairness
-    // decision across every process and every reconstructed Outbox instance.
-    // Cumulative attempts are durable queue history: after one side is
-    // claimed, its score rises and the other side is preferred next. Ties are
-    // deterministic, and an empty preferred queue falls back immediately.
+    // The advisory lock serializes every single-row decision across workers.
+    // The singleton row is locked and updated in this same transaction, so
+    // fairness survives delivery cleanup, retries, restarts, and reconstruction.
     if (limit === 1) {
       await q.query('SELECT pg_advisory_xact_lock($1)', [NOTIFICATION_FAIRNESS_LOCK_KEY]);
-      const scores = await q.query<{ email_score: string; webhook_score: string }>(
-        `SELECT
-           COALESCE((SELECT sum(attempts)::numeric FROM notification_deliveries), 0)::text AS email_score,
-           COALESCE((SELECT sum(attempts)::numeric FROM notification_webhook_deliveries), 0)::text AS webhook_score`,
+      await q.query(
+        `INSERT INTO notification_delivery_fairness (singleton, last_channel)
+         VALUES (true, 'webhook') ON CONFLICT (singleton) DO NOTHING`,
       );
-      const emailScore = BigInt(scores.rows[0]?.email_score ?? '0');
-      const webhookScore = BigInt(scores.rows[0]?.webhook_score ?? '0');
-      const first = emailScore <= webhookScore ? EMAIL_DELIVERY_TABLE : WEBHOOK_DELIVERY_TABLE;
+      const state = await q.query<{ last_channel: NotificationChannel }>(
+        'SELECT last_channel FROM notification_delivery_fairness WHERE singleton = true FOR UPDATE',
+      );
+      const last = state.rows[0]?.last_channel === 'email' ? 'email' : 'webhook';
+      const first = last === 'email' ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
       const second = first === EMAIL_DELIVERY_TABLE ? WEBHOOK_DELIVERY_TABLE : EMAIL_DELIVERY_TABLE;
       const firstJobs = await this.claimTable(first, 1, workerId, q);
-      if (firstJobs.length > 0) return firstJobs;
-      return this.claimTable(second, 1, workerId, q);
+      if (firstJobs.length > 0) {
+        await this.recordFairnessTurn(first, q);
+        return firstJobs;
+      }
+      const secondJobs = await this.claimTable(second, 1, workerId, q);
+      if (secondJobs.length > 0) await this.recordFairnessTurn(second, q);
+      return secondJobs;
     }
 
     // Alternate the preferred table while reserving half the batch for each
@@ -300,6 +304,16 @@ export class NotificationOutbox {
       const due = a.next_attempt_at.getTime() - b.next_attempt_at.getTime();
       return due || a.created_at.getTime() - b.created_at.getTime() || a.id.localeCompare(b.id);
     });
+  }
+
+  private async recordFairnessTurn(table: string, q: Queryable): Promise<void> {
+    const channel = table === EMAIL_DELIVERY_TABLE ? 'email' : 'webhook';
+    await q.query(
+      `UPDATE notification_delivery_fairness
+          SET last_channel = $1, updated_at = now()
+        WHERE singleton = true`,
+      [channel],
+    );
   }
 
   private async claimTable(table: string, limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {

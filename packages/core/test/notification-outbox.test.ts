@@ -488,6 +488,23 @@ describe('outbox — claiming', () => {
     assert.ok(Number(processing.rows.find((row) => row.channel === 'webhook')?.n ?? 0) > 0);
   });
 
+  test('cleanup cannot reset durable fairness state', async () => {
+    const owner = await makeUser();
+    const emailAlert = await makeAlert(owner.id);
+    const firstEmail = await enqueueAlert(emailAlert, owner.id);
+    const webhookAlert = await makeAlert(owner.id);
+    await enqueueWebhook(webhookAlert, owner.id);
+    const first = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(1, 'cleanup-worker');
+    assert.equal(first[0]?.id, firstEmail.row.id);
+    await pool.query(`UPDATE notification_deliveries SET status = 'delivered', delivered_at = now() - interval '2 days', created_at = now() - interval '2 days' WHERE id = $1`, [firstEmail.row.id]);
+    await outbox.cleanup({ deliveredRetentionDays: 1, failedRetentionDays: 1 });
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM notification_delivery_fairness')).rows[0]!.n, 1);
+    const newEmail = await enqueueAlert(await makeAlert(owner.id), owner.id);
+    const afterCleanup = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(1, 'reconstructed-after-cleanup');
+    assert.equal(afterCleanup[0]?.channel, 'webhook', 'persistent turn still prefers webhook after email history cleanup');
+    assert.notEqual(afterCleanup[0]?.id, newEmail.row.id);
+  });
+
   test('single available queue is claimed and fairness resumes when the other appears', async () => {
     const owner = await makeUser();
     await enqueueAlert(await makeAlert(owner.id), owner.id);
