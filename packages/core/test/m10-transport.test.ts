@@ -58,7 +58,7 @@ class ObservedDryRun extends DryRunExecutionTransport {
 }
 async function fixture(options: DryRunTransportOptions = {}, auth = authority()) {
   const events: ExecutionTransportEvent[] = [];
-  const transport = new ObservedDryRun({ now: () => NOW, timeoutMs: 20, audit: (event) => events.push(event), ...options });
+  const transport = new ObservedDryRun({ now: () => NOW, timeoutMs: 20, audit: (event) => { events.push(event); }, ...options });
   await transport.connect(context());
   return { transport, events, dispatcher: createTransportDispatcher(transport, auth) };
 }
@@ -80,7 +80,7 @@ after(() => { mock.restoreAll(); assert.equal(forbiddenCalls, 0, 'no broker, MT5
 describe('M10 connection, health, session and safe MT5 boundary', () => {
   test('disconnected → connecting → connected → disconnected; session explicitly simulated, never authenticated', async () => {
     const events: ExecutionTransportEvent[] = [];
-    const t = new ObservedDryRun({ now: () => NOW, audit: (e) => events.push(e) });
+    const t = new ObservedDryRun({ now: () => NOW, audit: (e) => { events.push(e); } });
     assert.equal((await t.health(context())).state, 'disconnected');
     assert.equal((await t.session(context())).account, 'none');
     const connected = await t.connect(context());
@@ -346,7 +346,7 @@ describe('M10 validation and secret-safe failures', () => {
       }
     }
     const events: ExecutionTransportEvent[] = [];
-    const t = new SecretTransport({ audit: (e) => events.push(e) }); await t.connect(context());
+    const t = new SecretTransport({ audit: (e) => { events.push(e); } }); await t.connect(context());
     const r = await createTransportDispatcher(t, authority()).submit(request());
     assert.equal(r.error?.code, 'transport_failure');
     assert.doesNotMatch(JSON.stringify({ r, events }), /SENTINEL|password|stack|cause|response/);
@@ -425,4 +425,264 @@ describe('M10 validation and secret-safe failures', () => {
       assert.match(String(e), /prohibited in M10/); assert.doesNotMatch(String(e), /SENTINEL/); return true;
     });
   });
+});
+
+// M10.1: local message-level doubles only, under the same file-wide I/O tripwires.
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+const nextTurn = () => new Promise<void>((resolve) => { setImmediate(resolve); });
+function sanitizedAuditFailure(error: unknown): boolean {
+  assert.ok(error instanceof ExecutionTransportError);
+  assert.equal(error.detail.code, 'transport_failure');
+  assert.equal(error.message, 'Transport operation failed');
+  assert.equal(error.cause, undefined);
+  assert.doesNotMatch(`${error.stack} ${JSON.stringify(error)}`, /SENTINEL/);
+  return true;
+}
+
+describe('M10.1 async audit failure safety', () => {
+  for (const kind of ['sync', 'async'] as const) {
+    for (const operation of ['submit', 'cancel'] as const) {
+      test(`${kind} audit failure before ${operation}: sanitized, no exchange or unhandled rejection`, async (t) => {
+        const unhandled: unknown[] = [];
+        const onRejection = (error: unknown) => { unhandled.push(error); };
+        process.on('unhandledRejection', onRejection);
+        t.after(() => { process.off('unhandledRejection', onRejection); });
+        const fail = () => { throw new Error('SENTINEL_password_token', { cause: new Error('SENTINEL_broker_secret') }); };
+        let failing = true;
+        const { transport, dispatcher } = await fixture({ audit: (event) => {
+          if (failing && event.operation === operation && event.to === 'submitting') {
+            if (kind === 'sync') fail();
+            return Promise.resolve().then(fail);
+          }
+        } });
+        const r = request();
+        if (operation === 'submit') {
+          await assert.rejects(dispatcher.submit(r), sanitizedAuditFailure);
+          failing = false;
+          // Audit failure must not release submission deduplication.
+          await assert.rejects(dispatcher.submit(r), sanitizedAuditFailure);
+        } else {
+          const ack = await dispatcher.submit(r);
+          const cancel = { ...context(r.executionId), orderId: ack.orderId! };
+          await assert.rejects(dispatcher.cancel(cancel), sanitizedAuditFailure);
+          assert.equal(transport.calls.cancel, 0);
+          failing = false;
+          // Cancellation is retryable only because no exchange was attempted.
+          assert.equal((await dispatcher.cancel(cancel)).state, 'cancelled');
+        }
+        assert.equal(transport.calls[operation], operation === 'submit' ? 0 : 1);
+        await nextTurn();
+        assert.deepEqual(unhandled, []);
+      });
+    }
+  }
+  for (const operation of ['submit', 'cancel'] as const) {
+    test(`async audit rejection after ${operation} acknowledgement keeps attempted operation sticky`, async () => {
+      const { transport, dispatcher } = await fixture({ audit: async (event) => {
+        await Promise.resolve();
+        if (event.operation === operation && event.to === (operation === 'submit' ? 'acknowledged' : 'cancelled')) {
+          throw new Error('SENTINEL_account_secret');
+        }
+      } });
+      const r = request();
+      if (operation === 'submit') {
+        await assert.rejects(dispatcher.submit(r), sanitizedAuditFailure);
+        await assert.rejects(dispatcher.submit({ ...r, ...context(r.executionId) }), sanitizedAuditFailure);
+      } else {
+        const ack = await dispatcher.submit(r);
+        const cancel = { ...context(r.executionId), orderId: ack.orderId! };
+        await assert.rejects(dispatcher.cancel(cancel), sanitizedAuditFailure);
+        await assert.rejects(dispatcher.cancel({ ...cancel, ...context(r.executionId) }), sanitizedAuditFailure);
+      }
+      assert.equal(transport.calls[operation], 1);
+      assert.equal((await transport.orderStatus(context(r.executionId))).state, operation === 'submit' ? 'acknowledged' : 'cancelled');
+      await nextTurn();
+    });
+  }
+  test('successful async audit is awaited for connections, orders, cancellation and disconnect', async () => {
+    const events: ExecutionTransportEvent[] = [];
+    const { transport, dispatcher } = await fixture({ audit: async (event) => {
+      await nextTurn(); events.push(event);
+    } });
+    assert.deepEqual(events.map((event) => event.to), ['connecting', 'connected']);
+    const r = request(); const ack = await dispatcher.submit(r);
+    assert.equal(events.at(-1)?.to, 'acknowledged');
+    await dispatcher.cancel({ ...context(r.executionId), orderId: ack.orderId! });
+    assert.equal(events.at(-1)?.to, 'cancelled');
+    await transport.disconnect(context());
+    assert.equal(events.at(-1)?.to, 'disconnected');
+  });
+  test('100 concurrent submissions stay behind pending async audit and still exchange only once', async () => {
+    const entered = deferred<void>(); const release = deferred<void>();
+    const { transport, dispatcher } = await fixture({ audit: async (event) => {
+      if (event.operation === 'submit' && event.to === 'submitting') {
+        entered.resolve(); await release.promise;
+      }
+    } });
+    const r = request();
+    const pending = Promise.all(Array.from({ length: 100 }, () => dispatcher.submit(r)));
+    await entered.promise; assert.equal(transport.calls.submit, 0);
+    release.resolve(); const results = await pending;
+    assert.ok(results.every((result) => result.state === 'acknowledged'));
+    assert.equal(transport.calls.submit, 1);
+  });
+  test('concurrent connects reserve one attempt before awaiting audit', async () => {
+    const entered = deferred<void>(); const release = deferred<void>();
+    const t = new ObservedDryRun({ audit: async (event) => {
+      if (event.to === 'connecting') { entered.resolve(); await release.promise; }
+    } });
+    const pending = Promise.all(Array.from({ length: 10 }, () => t.connect(context())));
+    await entered.promise; assert.equal(t.calls.connect, 0);
+    release.resolve(); assert.ok((await pending).every((row) => row.healthy));
+    assert.equal(t.calls.connect, 1);
+  });
+  for (const state of ['connecting', 'connected'] as const) {
+    test(`disconnect during async ${state} audit cannot resurrect connection`, async () => {
+      const entered = deferred<void>(); const release = deferred<void>();
+      const t = new ObservedDryRun({ audit: async (event) => {
+        if (event.operation === 'connect' && event.to === state) { entered.resolve(); await release.promise; }
+      } });
+      const pending = t.connect(context()); await entered.promise;
+      await t.disconnect(context()); release.resolve(); await pending;
+      assert.equal((await t.health(context())).state, 'disconnected');
+      assert.equal(t.calls.connect, state === 'connecting' ? 0 : 1);
+    });
+  }
+  test('async connection audit rejection is sanitized and prevents connect exchange', async () => {
+    const t = new ObservedDryRun({ audit: async () => {
+      await nextTurn(); throw new Error('SENTINEL_connection_secret');
+    } });
+    await assert.rejects(t.connect(context()), sanitizedAuditFailure);
+    assert.equal(t.calls.connect, 0);
+    assert.equal((await t.health(context())).state, 'unavailable');
+    await nextTurn();
+  });
+  test('async disconnection audit rejection is sanitized, but the transport remains stopped', async () => {
+    const { transport } = await fixture({ audit: async (event) => {
+      if (event.operation === 'disconnect') { await nextTurn(); throw new Error('SENTINEL_disconnect_secret'); }
+    } });
+    await assert.rejects(transport.disconnect(context()), sanitizedAuditFailure);
+    assert.equal((await transport.health(context())).state, 'disconnected');
+    await nextTurn();
+  });
+  test('async preflight refusal audit rejection is caught and does not reserve cancellation', async () => {
+    const { transport, dispatcher } = await fixture({ audit: async (event) => {
+      if (event.operation === 'cancel' && event.error?.code === 'not_found') {
+        await nextTurn(); throw new Error('SENTINEL_refusal_secret');
+      }
+    } });
+    const r = request(); const ack = await dispatcher.submit(r);
+    await assert.rejects(dispatcher.cancel({ ...context(r.executionId), orderId: `sim-${'f'.repeat(32)}` }), sanitizedAuditFailure);
+    assert.equal((await dispatcher.cancel({ ...context(r.executionId), orderId: ack.orderId! })).state, 'cancelled');
+    assert.equal(transport.calls.cancel, 1);
+    await nextTurn();
+  });
+});
+
+describe('M10.1 cancellation preflight and idempotency', () => {
+  test('wrong order IDs consume no reservations/capacity; corrected cancellation succeeds', async () => {
+    const { transport, dispatcher } = await fixture({ maxExecutions: 1 });
+    const r = request(); const ack = await dispatcher.submit(r);
+    const wrong = { ...context(r.executionId), orderId: `sim-${'f'.repeat(32)}` };
+    for (let i = 0; i < 10; i++) {
+      assert.equal((await dispatcher.cancel({ ...wrong, ...context(r.executionId) })).error?.code, 'not_found');
+    }
+    assert.equal(transport.calls.cancel, 0);
+    assert.equal((await dispatcher.cancel({ ...wrong, orderId: ack.orderId! })).state, 'cancelled');
+    assert.equal(transport.calls.cancel, 1);
+  });
+  test('cancellation during an in-flight submission can be retried after acknowledgement', async () => {
+    const entered = deferred<string>(); const release = deferred<void>();
+    class HeldAcknowledgement extends ObservedDryRun {
+      protected override async exchange(op: 'connect' | 'submit' | 'cancel', input: TransportContext, signal: AbortSignal) {
+        const response = await super.exchange(op, input, signal);
+        if (op === 'submit') {
+          entered.resolve((response as { orderId: string }).orderId);
+          await release.promise;
+        }
+        return response;
+      }
+    }
+    const transport = new HeldAcknowledgement({ timeoutMs: 1000 }); await transport.connect(context());
+    const dispatcher = createTransportDispatcher(transport, authority());
+    const r = request(); const submission = dispatcher.submit(r);
+    const cancel = { ...context(r.executionId), orderId: await entered.promise };
+    assert.equal((await transport.orderStatus(context(r.executionId))).state, 'submitting');
+    assert.equal((await dispatcher.cancel(cancel)).error?.code, 'not_found');
+    assert.equal(transport.calls.cancel, 0);
+    release.resolve(); assert.equal((await submission).state, 'acknowledged');
+    assert.equal((await dispatcher.cancel(cancel)).state, 'cancelled');
+    assert.deepEqual(transport.calls, { connect: 1, submit: 1, cancel: 1 });
+  });
+  test('cancel before any order exists does not poison later acknowledgement/cancellation', async () => {
+    const { transport, dispatcher } = await fixture(); const r = request();
+    assert.equal((await dispatcher.cancel({ ...context(r.executionId), orderId: `sim-${'f'.repeat(32)}` })).error?.code, 'not_found');
+    const ack = await dispatcher.submit(r);
+    assert.equal((await dispatcher.cancel({ ...context(r.executionId), orderId: ack.orderId! })).state, 'cancelled');
+    assert.equal(transport.calls.cancel, 1);
+  });
+  test('disconnected cancellation preflight can be retried after reconnect', async () => {
+    const { transport, dispatcher } = await fixture(); const r = request(); const ack = await dispatcher.submit(r);
+    const cancel = { ...context(r.executionId), orderId: ack.orderId! };
+    await transport.disconnect(context());
+    assert.equal((await dispatcher.cancel(cancel)).error?.code, 'unavailable');
+    await transport.connect(context());
+    assert.equal((await dispatcher.cancel(cancel)).state, 'cancelled'); assert.equal(transport.calls.cancel, 1);
+  });
+  for (const operation of ['submit', 'cancel'] as const) {
+    test(`disconnect/reconnect during ${operation} audit cannot exchange on the new connection`, async () => {
+      const entered = deferred<void>(); const release = deferred<void>();
+      let hold = true;
+      const { transport, dispatcher } = await fixture({ audit: async (event) => {
+        if (hold && event.operation === operation && event.to === 'submitting') { entered.resolve(); await release.promise; }
+      } });
+      const r = request();
+      const ack = operation === 'cancel' ? await dispatcher.submit(r) : null;
+      const cancel = { ...context(r.executionId), orderId: ack?.orderId ?? `sim-${'f'.repeat(32)}` };
+      const pending = operation === 'submit' ? dispatcher.submit(r) : dispatcher.cancel(cancel);
+      await entered.promise; await transport.disconnect(context()); await transport.connect(context());
+      hold = false; release.resolve(); const failed = await pending;
+      assert.equal(failed.error?.code, 'unavailable'); assert.equal(failed.error?.outcomeUnknown, false);
+      assert.equal(transport.calls[operation], 0);
+      if (operation === 'cancel') {
+        assert.equal((await dispatcher.cancel(cancel)).state, 'cancelled'); assert.equal(transport.calls.cancel, 1);
+      } else {
+        assert.deepEqual(await dispatcher.submit(r), failed); assert.equal(transport.calls.submit, 0);
+      }
+    });
+  }
+  test('concurrent cancellation aliases share one reservation while awaiting audit; conflicts remain rejected', async () => {
+    const entered = deferred<void>(); const release = deferred<void>();
+    const { transport, dispatcher } = await fixture({ audit: async (event) => {
+      if (event.operation === 'cancel' && event.to === 'submitting') { entered.resolve(); await release.promise; }
+    } });
+    const r = request(); const ack = await dispatcher.submit(r);
+    const cancel = { ...context(r.executionId), orderId: ack.orderId! };
+    const first = dispatcher.cancel(cancel); await entered.promise;
+    const duplicates = Promise.all(Array.from({ length: 50 }, () => dispatcher.cancel({ ...cancel, ...context(r.executionId) })));
+    const conflict = await dispatcher.cancel({ ...context(r.executionId), orderId: `sim-${'f'.repeat(32)}` });
+    assert.equal(conflict.error?.code, 'idempotency_conflict'); assert.equal(transport.calls.cancel, 0);
+    release.resolve(); const result = await first;
+    for (const duplicate of await duplicates) assert.deepEqual(duplicate, result);
+    assert.equal(transport.calls.cancel, 1);
+    assert.deepEqual(await dispatcher.cancel(cancel), result);
+    assert.equal((await dispatcher.cancel({ ...cancel, executionId: randomUUID() })).error?.code, 'idempotency_conflict');
+    assert.equal((await dispatcher.cancel({ ...cancel, orderId: `sim-${'f'.repeat(32)}` })).error?.code, 'idempotency_conflict');
+  });
+  for (const scenario of ['reject', 'timeout', 'failure', 'malformed'] as const) {
+    test(`attempted cancellation ${scenario} remains sticky even with a fresh request ID`, async () => {
+      const { transport, dispatcher } = await fixture({ scenarios: { cancel: scenario } });
+      const r = request(); const ack = await dispatcher.submit(r);
+      const cancel = { ...context(r.executionId), orderId: ack.orderId! };
+      const first = await dispatcher.cancel(cancel);
+      assert.deepEqual(await dispatcher.cancel({ ...cancel, ...context(r.executionId) }), first);
+      assert.equal(transport.calls.cancel, 1);
+      assert.equal(first.error?.outcomeUnknown, scenario !== 'reject');
+      assert.equal((await dispatcher.cancel({ ...context(r.executionId), orderId: `sim-${'f'.repeat(32)}` })).error?.code, 'idempotency_conflict');
+    });
+  }
 });
