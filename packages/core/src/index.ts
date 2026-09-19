@@ -164,6 +164,12 @@ export {
   type WebhookProviderConfig,
   type WebhookNotificationProvider,
 } from './notifications/webhook.js';
+export {
+  createPushNotificationProvider,
+  PUSH_PROVIDER_NAME,
+  type PushProviderConfig,
+  type PushNotificationProvider,
+} from './notifications/push.js';
 export { resolveWebhookDestination, isUnsafeAddress, type ResolvedWebhookDestination } from './notifications/webhook-security.js';
 export {
   NotificationPreferenceService,
@@ -171,6 +177,16 @@ export {
   type PreferenceQueryable,
 } from './notifications/preferences.js';
 export { redactSecrets, describeError, REDACTED, MAX_ERROR_CHARS } from './notifications/redact.js';
+export {
+  EnvKeySecretManager,
+  NoopSecretManager,
+  createSecretManager,
+  looksEncrypted,
+  SECRET_MANAGER_KEY_VERSION,
+  type SecretManager,
+  type EncryptedSecret,
+  SecretManagerError,
+} from './notifications/secret-manager.js';
 
 // Scoring (foundation re-exports)
 export { qualityGrade, QUALITY_GRADE_BANDS } from '@veltrixeye/contracts';

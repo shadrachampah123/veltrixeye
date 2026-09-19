@@ -185,6 +185,30 @@ const envSchema = z.object({
   NOTIFICATION_RETENTION_FAILED_DAYS: intEnv(1, 3650, 120),
 
   /* ---------------------------------------------------------------------- */
+  /* M9.2 — push channel + secret hardening                                    */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * 32-byte base64-encoded key for AES-256-GCM encryption of webhook signing
+   * secrets and push subscription keys at rest. Server-side only, never logged,
+   * never returned. Production MUST fail closed if missing/invalid when
+   * encryption is required — Render's encrypted env vars alone do NOT
+   * constitute application-level database secret protection.
+   * Generate with: openssl rand -base64 32
+   */
+  WEBHOOK_SECRET_ENCRYPTION_KEY: z.string().max(512).default(''),
+  /** VAPID public key (base64url) for Web Push — safe to expose via authenticated endpoint */
+  VAPID_PUBLIC_KEY: z.string().max(512).default(''),
+  /** VAPID private key (base64url) — server-only, never logged, never returned */
+  VAPID_PRIVATE_KEY: z.string().max(512).default(''),
+  /** VAPID subject — mailto: or https:// */
+  VAPID_SUBJECT: z.string().max(320).default(''),
+  /** Enable push channel */
+  PUSH_ENABLED: boolEnv(true),
+  /** Push provider timeout */
+  PUSH_PROVIDER_TIMEOUT_MS: intEnv(1_000, 120_000, 15_000),
+
+  /* ---------------------------------------------------------------------- */
   /* M7.5 — live scanner (production market-data and scanner pipeline)       */
   /* ---------------------------------------------------------------------- */
 
@@ -221,9 +245,23 @@ const envSchema = z.object({
 /** Email-channel configuration passed to the SMTP provider adapter. */
 export type NotificationEmailConfig = SmtpEmailConfigShape & { timeoutMs: number };
 
+export interface NotificationPushConfig {
+  publicKey: string;
+  privateKey: string;
+  subject: string;
+  enabled: boolean;
+  timeoutMs: number;
+}
+
+export interface NotificationSecretConfig {
+  encryptionKey: string;
+}
+
 /** Everything the delivery pipeline needs, derived once at boot. */
 export interface NotificationConfig {
   email: NotificationEmailConfig;
+  push: NotificationPushConfig;
+  secret: NotificationSecretConfig;
   retry: {
     maxAttempts: number;
     baseBackoffMs: number;
@@ -304,6 +342,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         pass: values.SMTP_PASS,
         from: values.NOTIFICATION_FROM,
         timeoutMs: values.NOTIFICATION_PROVIDER_TIMEOUT_MS,
+      },
+      push: {
+        publicKey: values.VAPID_PUBLIC_KEY,
+        privateKey: values.VAPID_PRIVATE_KEY,
+        subject: values.VAPID_SUBJECT,
+        enabled: values.PUSH_ENABLED,
+        timeoutMs: values.PUSH_PROVIDER_TIMEOUT_MS,
+      },
+      secret: {
+        encryptionKey: values.WEBHOOK_SECRET_ENCRYPTION_KEY,
       },
       retry: {
         maxAttempts: values.NOTIFICATION_MAX_ATTEMPTS,

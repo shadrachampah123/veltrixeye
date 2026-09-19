@@ -9,6 +9,7 @@ import { formatDateTime } from '@/lib/formats';
 import type { SessionDto, BillingStateDto } from '@veltrixeye/contracts';
 import { SubscriptionPanel, PlanComparison } from '@/components/subscription-panel';
 import { WatchlistPanel } from '@/components/watchlist';
+import { NotificationPreferencesPanel } from '@/components/notification-preferences';
 import { BRAND } from '@/lib/brand';
 
 function SettingsContent() {
@@ -124,6 +125,9 @@ function SettingsContent() {
               </div>
             </Card>
           </div>
+
+          {/* Notification Preferences M9.2 */}
+          <NotificationPreferencesPanel />
 
           {/* Subscription & Entitlement Foundations */}
           <SubscriptionPanel billing={billing} />

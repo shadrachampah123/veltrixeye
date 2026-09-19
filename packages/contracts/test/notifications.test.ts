@@ -25,6 +25,12 @@ import {
   notificationRunResponseSchema,
   notificationPreferenceSchema,
   notificationPreferenceRequestSchema,
+  notificationPreferencesRequestSchema,
+  strategyNotificationPreferenceSchema,
+  strategyNotificationPreferenceRequestSchema,
+  pushSubscriptionSchema,
+  pushSubscriptionRequestSchema,
+  vapidPublicKeyResponseSchema,
 } from '../src/index.js';
 
 const CREATED = new Date(1_800_000_000_000).toISOString();
@@ -79,7 +85,7 @@ function validPayload(overrides: Record<string, unknown> = {}) {
 
 describe('m7.3 notification contracts', () => {
   test('channels, statuses and failure categories are pinned', () => {
-    assert.deepEqual([...NOTIFICATION_CHANNELS], ['email', 'webhook']);
+    assert.deepEqual([...NOTIFICATION_CHANNELS], ['email', 'webhook', 'push']);
     assert.deepEqual([...NOTIFICATION_STATUSES], ['pending', 'processing', 'delivered', 'failed', 'unavailable']);
     assert.deepEqual([...TERMINAL_NOTIFICATION_STATUSES], ['delivered', 'failed']);
     assert.deepEqual([...NOTIFICATION_FAILURE_CATEGORIES], [
@@ -128,6 +134,7 @@ describe('m7.3 notification contracts', () => {
     assert.equal(notificationDtoSchema.safeParse(validNotification({ lastError: 'boom' })).success, false);
     assert.equal(notificationDtoSchema.safeParse(validNotification({ channel: 'sms' })).success, false);
     assert.equal(notificationDtoSchema.safeParse(validNotification({ status: 'retrying' })).success, false);
+    assert.equal(notificationDtoSchema.safeParse(validNotification({ channel: 'push' })).success, true, 'push is valid channel in M9.2');
   });
 
   test('rendered payloads carry the alert facts and nothing caller-supplied', () => {
@@ -146,29 +153,123 @@ describe('m7.3 notification contracts', () => {
   test('M9.1 preference schemas keep webhook secrets write-only', () => {
     const preference = notificationPreferenceSchema.parse({
       id: '11111111-1111-4111-8111-111111111111',
-      channel: 'webhook', enabled: true, endpointUrl: 'https://hooks.example.test/alerts',
-      createdAt: CREATED, updatedAt: CREATED,
+      channel: 'webhook',
+      enabled: true,
+      endpointUrl: 'https://hooks.example.test/alerts',
+      createdAt: CREATED,
+      updatedAt: CREATED,
     });
     assert.equal(preference.channel, 'webhook');
-    assert.equal(notificationPreferenceRequestSchema.safeParse({
-      channel: 'webhook', endpointUrl: 'https://hooks.example.test/alerts', signingSecret: 'secret',
-    }).success, true);
-    assert.equal(notificationPreferenceRequestSchema.safeParse({
-      channel: 'webhook', endpointUrl: 'http://hooks.example.test/alerts',
-    }).success, true, 'HTTPS policy is enforced by the core service');
+    assert.equal(
+      notificationPreferenceRequestSchema.safeParse({
+        channel: 'webhook',
+        endpointUrl: 'https://hooks.example.test/alerts',
+        signingSecret: 'secret',
+      }).success,
+      true,
+    );
+    assert.equal(
+      notificationPreferenceRequestSchema.safeParse({
+        channel: 'webhook',
+        endpointUrl: 'http://hooks.example.test/alerts',
+      }).success,
+      false,
+      'HTTPS policy enforced in M9.2',
+    );
     assert.equal(notificationPreferenceSchema.safeParse({ ...preference, signingSecret: 'secret' }).success, false);
   });
 
-  test('list/run/maintenance schemas are strict and bounded', () => {
+  test('M9.2 push accepted, invalid push rejected, channel max 3', () => {
     assert.equal(
-      notificationListResponseSchema.safeParse({ notifications: [validNotification()] }).success,
+      notificationPreferenceRequestSchema.safeParse({
+        channel: 'push',
+        endpointUrl: 'https://fcm.googleapis.com/fcm/send/abc',
+        signingSecret: JSON.stringify({ p256dh: 'B'.repeat(87) + '_-A', auth: 'abcd1234_-AB' }),
+      }).success,
       true,
     );
-    assert.equal(notificationListResponseSchema.safeParse({ notifications: [] }).success, true);
     assert.equal(
-      notificationListResponseSchema.safeParse({ notifications: [], extra: true }).success,
+      notificationPreferenceRequestSchema.safeParse({
+        channel: 'push',
+        endpointUrl: 'http://fcm.googleapis.com/fcm/send/abc',
+      }).success,
       false,
+      'push must be https',
     );
+    assert.equal(
+      notificationPreferencesRequestSchema.safeParse({
+        preferences: [
+          { channel: 'email', enabled: true },
+          { channel: 'webhook', enabled: true, endpointUrl: 'https://hooks.example.test' },
+          { channel: 'push', enabled: true, endpointUrl: 'https://push.example.test' },
+        ],
+      }).success,
+      true,
+    );
+    assert.equal(
+      notificationPreferencesRequestSchema.safeParse({
+        preferences: [
+          { channel: 'email', enabled: true },
+          { channel: 'webhook', enabled: true, endpointUrl: 'https://hooks.example.test' },
+          { channel: 'push', enabled: true, endpointUrl: 'https://push.example.test' },
+          { channel: 'email', enabled: true },
+        ],
+      }).success,
+      false,
+      'max 3',
+    );
+    assert.equal(
+      strategyNotificationPreferenceRequestSchema.safeParse({
+        muted: false,
+        channels: ['email', 'webhook', 'push'],
+      }).success,
+      true,
+    );
+    assert.equal(
+      strategyNotificationPreferenceRequestSchema.safeParse({
+        muted: false,
+        channels: ['email', 'webhook', 'push', 'email'],
+      }).success,
+      false,
+      'max 3 strategy',
+    );
+  });
+
+  test('M9.2 push subscription schema strict, secrets excluded from DTOs', () => {
+    const validSub = {
+      endpoint: 'https://fcm.googleapis.com/fcm/send/abc123',
+      keys: { p256dh: 'B'.repeat(20) + '_-_' + 'A'.repeat(10), auth: 'auth123_-_' + 'B'.repeat(10) },
+    };
+    assert.equal(pushSubscriptionSchema.safeParse(validSub).success, true);
+    assert.equal(pushSubscriptionRequestSchema.safeParse(validSub).success, true);
+    assert.equal(
+      pushSubscriptionSchema.safeParse({ endpoint: 'http://fcm.googleapis.com/fcm/send/abc', keys: validSub.keys }).success,
+      false,
+      'push endpoint must be https',
+    );
+    assert.equal(
+      pushSubscriptionSchema.safeParse({ endpoint: validSub.endpoint, keys: { p256dh: 'bad!' } }).success,
+      false,
+      'invalid p256dh',
+    );
+    assert.equal(vapidPublicKeyResponseSchema.safeParse({ publicKey: 'B'.repeat(87) }).success, true);
+    // DTO must not contain secrets
+    const pref = notificationPreferenceSchema.parse({
+      id: '11111111-1111-4111-8111-111111111111',
+      channel: 'push',
+      enabled: true,
+      endpointUrl: 'https://push.example.test',
+      createdAt: CREATED,
+      updatedAt: CREATED,
+    });
+    assert.equal((pref as unknown as Record<string, unknown>).signingSecret, undefined);
+    assert.equal(notificationPreferenceSchema.safeParse({ ...pref, p256dh: 'secret' }).success, false);
+  });
+
+  test('list/run/maintenance schemas are strict and bounded', () => {
+    assert.equal(notificationListResponseSchema.safeParse({ notifications: [validNotification()] }).success, true);
+    assert.equal(notificationListResponseSchema.safeParse({ notifications: [] }).success, true);
+    assert.equal(notificationListResponseSchema.safeParse({ notifications: [], extra: true }).success, false);
 
     assert.deepEqual(notificationRunRequestSchema.parse({}), {});
     assert.equal(notificationRunRequestSchema.safeParse({ batchSize: 0 }).success, false);
@@ -188,17 +289,10 @@ describe('m7.3 notification contracts', () => {
       }).success,
       true,
     );
-    assert.equal(
-      notificationRunResponseSchema.safeParse({ claimed: 1, delivered: 1 }).success,
-      false,
-      'every counter is required',
-    );
+    assert.equal(notificationRunResponseSchema.safeParse({ claimed: 1, delivered: 1 }).success, false, 'every counter is required');
 
     assert.deepEqual(notificationMaintenanceRequestSchema.parse({}), {});
-    assert.equal(
-      notificationMaintenanceRequestSchema.safeParse({ deliveredRetentionDays: 0 }).success,
-      false,
-    );
+    assert.equal(notificationMaintenanceRequestSchema.safeParse({ deliveredRetentionDays: 0 }).success, false);
     assert.equal(
       notificationMaintenanceResponseSchema.safeParse({
         recovered: 0,

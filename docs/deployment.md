@@ -259,6 +259,12 @@ disagree. The failing `schema` block is included in the response.
 | `SMTP_PASS` | for email delivery | SMTP password / vendor API secret (`sync: false` in `render.yaml`). Server-side only — never logged, never returned by a route |
 | `NOTIFICATION_WORKER_TOKEN` | for scheduled draining | Shared secret for `POST /api/internal/notifications/deliveries/*`. **Empty = those routes return 404.** Set it if an external scheduler (Render Cron Job) should drain the outbox while the instance is asleep |
 | `NOTIFICATION_WORKER_ENABLED` | no (default `true`) | `false` disables the in-process ticker; the outbox then drains only through the internal endpoint |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | **yes in production for M9.2** | 32-byte base64 AES-256-GCM key for webhook/push secrets at rest (`sync: false`). **Production fails closed without it.** Generate: `openssl rand -base64 32`. Render's encrypted env vars alone do NOT constitute DB secret protection. |
+| `VAPID_PUBLIC_KEY` | for push (M9.2) | VAPID public key base64url (`sync: false`). Returned via authenticated `GET /api/notifications/push/vapid-public-key`. |
+| `VAPID_PRIVATE_KEY` | for push (M9.2) | VAPID private key base64url (`sync: false`). **Server-only, never logged, never returned, never in describe().** |
+| `VAPID_SUBJECT` | for push (M9.2) | VAPID subject `mailto:` or `https://` (`sync: false`). |
+| `PUSH_ENABLED` | no (default true) | `false` disables push provider (jobs become `unavailable`). |
+| `PUSH_PROVIDER_TIMEOUT_MS` | no (default 15000) | Per-attempt push timeout. |
 
 Missing or malformed values make the API **fail at boot** with an itemized
 error (`loadConfig` zod validation) instead of misbehaving at runtime.

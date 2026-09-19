@@ -97,9 +97,10 @@ const uniqueEmail = () => `notif_${randomBytes(6).toString('hex')}@example.com`;
 beforeEach(async () => {
   await pool.query('DELETE FROM notification_deliveries');
   await pool.query('DELETE FROM notification_webhook_deliveries');
+  await pool.query('DELETE FROM notification_push_deliveries');
   await pool.query(
     `UPDATE notification_delivery_fairness
-        SET email_claims = 0, webhook_claims = 0, last_channel = 'webhook'`,
+        SET email_claims = 0, webhook_claims = 0, push_claims = 0, last_channel = 'webhook'`,
   );
 });
 

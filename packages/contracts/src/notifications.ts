@@ -34,7 +34,7 @@ import { alertTriggerStateSchema } from './alerts.js';
  */
 
 /** Delivery channels with a provider adapter in this build. */
-export const NOTIFICATION_CHANNELS = ['email', 'webhook'] as const;
+export const NOTIFICATION_CHANNELS = ['email', 'webhook', 'push'] as const;
 export type NotificationChannel = (typeof NOTIFICATION_CHANNELS)[number];
 
 /**
@@ -256,8 +256,15 @@ export const notificationPreferenceRequestSchema = z.object({
   channel: notificationChannelSchema,
   enabled: z.boolean().default(true),
   endpointUrl: z.string().url().max(2048).optional(),
-  signingSecret: z.string().min(1).max(512).optional(),
-}).strict();
+  signingSecret: z.string().min(1).max(4096).optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.channel === 'push' && value.endpointUrl && !value.endpointUrl.startsWith('https://')) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['endpointUrl'], message: 'Push endpoint must use HTTPS' });
+  }
+  if (value.channel === 'webhook' && value.endpointUrl && !value.endpointUrl.startsWith('https://')) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['endpointUrl'], message: 'Webhook endpoints must use HTTPS' });
+  }
+});
 export type NotificationPreferenceRequest = z.input<typeof notificationPreferenceRequestSchema>;
 
 export const quietHoursSchema = z.object({
@@ -268,13 +275,13 @@ export const quietHoursSchema = z.object({
 export type QuietHours = z.infer<typeof quietHoursSchema>;
 
 export const notificationPreferencesResponseSchema = z.object({
-  preferences: z.array(notificationPreferenceSchema).max(2),
+  preferences: z.array(notificationPreferenceSchema).max(3),
   quietHours: quietHoursSchema.nullable(),
 }).strict();
 export type NotificationPreferencesResponse = z.infer<typeof notificationPreferencesResponseSchema>;
 
 export const notificationPreferencesRequestSchema = z.object({
-  preferences: z.array(notificationPreferenceRequestSchema).max(2),
+  preferences: z.array(notificationPreferenceRequestSchema).max(3),
   quietHours: quietHoursSchema.nullable().optional(),
 }).strict();
 export type NotificationPreferencesRequest = z.input<typeof notificationPreferencesRequestSchema>;
@@ -282,12 +289,33 @@ export type NotificationPreferencesRequest = z.input<typeof notificationPreferen
 export const strategyNotificationPreferenceSchema = z.object({
   strategyId: z.string().uuid(),
   muted: z.boolean(),
-  channels: z.array(notificationChannelSchema).max(2).nullable(),
+  channels: z.array(notificationChannelSchema).max(3).nullable(),
 }).strict();
 export type StrategyNotificationPreference = z.infer<typeof strategyNotificationPreferenceSchema>;
 
 export const strategyNotificationPreferenceRequestSchema = z.object({
   muted: z.boolean().default(false),
-  channels: z.array(notificationChannelSchema).max(2).nullable().default(null),
+  channels: z.array(notificationChannelSchema).max(3).nullable().default(null),
 }).strict();
 export type StrategyNotificationPreferenceRequest = z.input<typeof strategyNotificationPreferenceRequestSchema>;
+
+/** M9.2 push subscription — strict validation, no generic blob. */
+export const pushSubscriptionKeysSchema = z.object({
+  p256dh: z.string().min(20).max(512).regex(/^[A-Za-z0-9_-]+={0,2}$/, 'p256dh must be base64url'),
+  auth: z.string().min(10).max(512).regex(/^[A-Za-z0-9_-]+={0,2}$/, 'auth must be base64url'),
+}).strict();
+export type PushSubscriptionKeys = z.infer<typeof pushSubscriptionKeysSchema>;
+
+export const pushSubscriptionSchema = z.object({
+  endpoint: z.string().url().max(2048).refine((url) => url.startsWith('https://'), { message: 'Push endpoint must use HTTPS' }),
+  keys: pushSubscriptionKeysSchema,
+}).strict();
+export type PushSubscription = z.infer<typeof pushSubscriptionSchema>;
+
+export const pushSubscriptionRequestSchema = pushSubscriptionSchema;
+export type PushSubscriptionRequest = z.infer<typeof pushSubscriptionRequestSchema>;
+
+export const vapidPublicKeyResponseSchema = z.object({
+  publicKey: z.string().min(1).max(512),
+}).strict();
+export type VapidPublicKeyResponse = z.infer<typeof vapidPublicKeyResponseSchema>;

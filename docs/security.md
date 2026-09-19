@@ -245,14 +245,22 @@ local stub ledger row. M7.3 added a durable outbox + worker that delivers
   per-channel redaction, retry/backoff and delivery-rate limits
   ([alerts.md](./alerts.md#10-future-channelprovider-architecture)).
 
-## Webhook secret storage
+## Webhook and push secret storage (M9.2 hardened)
 
-Webhook signing secrets are currently stored as plaintext in the server-side
-PostgreSQL preference and webhook outbox tables. They are never exposed in
-API responses, logs, audit metadata, errors or payloads. A database compromise
-therefore exposes these secrets and permits forged signatures; this limitation
-is explicit and is not equivalent to external secret-manager storage. See
-[webhook delivery security](./webhook-delivery.md).
+Webhook signing secrets and push subscription keys are now encrypted at rest via AES-256-GCM using `WEBHOOK_SECRET_ENCRYPTION_KEY` (32-byte base64). See [webhook delivery security](./webhook-delivery.md).
+
+- **Encrypted at rest:** `notification_preferences.signing_secret_encrypted`, `notification_webhook_deliveries.signing_secret_encrypted`, `notification_push_deliveries.signing_secret_encrypted` with `signing_secret_key_version`. Plaintext columns kept nullable for safe migration, new writes store encrypted and null plaintext. Reads prefer encrypted, fallback plaintext for existing rows.
+- **Production fail-closed:** `createSecretManager` throws at boot in `NODE_ENV=production` if `WEBHOOK_SECRET_ENCRYPTION_KEY` missing/invalid — no silent fallback to NoopSecretManager. Dev/test may use Noop only via explicit fixture. Render's encrypted env vars alone do NOT constitute DB secret protection.
+- **Never exposed:** secrets never in API responses, logs, audit metadata, errors, payloads, DTOs. Webhook secret input write-only (••••), push `p256dh`/`auth` never returned, VAPID private key server-only never in `describe()`, logs, errors, audit.
+- **Redaction:** `redactSecrets` scrubs encryption key, VAPID private key, SMTP pass, push keys from `last_error` and log lines.
+- **Push:** VAPID private key server-only, public key via authenticated `GET /api/notifications/push/vapid-public-key`. Subscription endpoint HTTPS-only, keys strictly validated base64url, outcome mapping 200/201 delivered, 404/410 permanent (expired), 429/5xx retryable, timeout retryable.
+
+## Alert notification delivery (M9.2)
+
+- **Three-way fairness:** lifetime `email_claims, webhook_claims, push_claims` in `notification_delivery_fairness` under advisory lock `611_231_008` + `FOR UPDATE`, durable across cleanup/cascade/retry/stale/restart, balanced round-robin from `last_channel`, capacity filling when a queue empty, worker identity cannot bias, concurrent workers cannot lose ledger updates, rollback cannot advance ledger.
+- **Push provider:** Web Push with VAPID, endpoint HTTPS validation, strict subscription schema, private key never in responses/logs/describe/errors/audit, outcome handling as above.
+- **Preferences UI:** Settings includes email/webhook/push, quiet hours, strategy routing, write-only secret inputs, permission states (unsupported/default/granted/denied), subscribe/unsubscribe flow, service worker `public/sw.js` handles push and notificationclick safely, no hard-coded branding.
+- **M8.7 unchanged, M9.1 fairness preserved, automation OFF, live execution impossible.**
 
 ## Alert notification delivery (M7.3)
 
