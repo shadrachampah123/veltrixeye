@@ -34,7 +34,7 @@ import { alertTriggerStateSchema } from './alerts.js';
  */
 
 /** Delivery channels with a provider adapter in this build. */
-export const NOTIFICATION_CHANNELS = ['email'] as const;
+export const NOTIFICATION_CHANNELS = ['email', 'webhook'] as const;
 export type NotificationChannel = (typeof NOTIFICATION_CHANNELS)[number];
 
 /**
@@ -240,3 +240,54 @@ export const notificationMaintenanceResponseSchema = z
   })
   .strict();
 export type NotificationMaintenanceResponse = z.infer<typeof notificationMaintenanceResponseSchema>;
+
+/** M9.1 owner preference DTO. Secrets are intentionally never returned. */
+export const notificationPreferenceSchema = z.object({
+  id: z.string().uuid(),
+  channel: notificationChannelSchema,
+  enabled: z.boolean(),
+  endpointUrl: z.string().url().nullable(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+}).strict();
+export type NotificationPreference = z.infer<typeof notificationPreferenceSchema>;
+
+export const notificationPreferenceRequestSchema = z.object({
+  channel: notificationChannelSchema,
+  enabled: z.boolean().default(true),
+  endpointUrl: z.string().url().max(2048).optional(),
+  signingSecret: z.string().min(1).max(512).optional(),
+}).strict();
+export type NotificationPreferenceRequest = z.input<typeof notificationPreferenceRequestSchema>;
+
+export const quietHoursSchema = z.object({
+  startMinute: z.number().int().min(0).max(1439),
+  endMinute: z.number().int().min(0).max(1439),
+  timezone: z.string().min(1).max(64),
+}).strict();
+export type QuietHours = z.infer<typeof quietHoursSchema>;
+
+export const notificationPreferencesResponseSchema = z.object({
+  preferences: z.array(notificationPreferenceSchema).max(2),
+  quietHours: quietHoursSchema.nullable(),
+}).strict();
+export type NotificationPreferencesResponse = z.infer<typeof notificationPreferencesResponseSchema>;
+
+export const notificationPreferencesRequestSchema = z.object({
+  preferences: z.array(notificationPreferenceRequestSchema).max(2),
+  quietHours: quietHoursSchema.nullable().optional(),
+}).strict();
+export type NotificationPreferencesRequest = z.input<typeof notificationPreferencesRequestSchema>;
+
+export const strategyNotificationPreferenceSchema = z.object({
+  strategyId: z.string().uuid(),
+  muted: z.boolean(),
+  channels: z.array(notificationChannelSchema).max(2).nullable(),
+}).strict();
+export type StrategyNotificationPreference = z.infer<typeof strategyNotificationPreferenceSchema>;
+
+export const strategyNotificationPreferenceRequestSchema = z.object({
+  muted: z.boolean().default(false),
+  channels: z.array(notificationChannelSchema).max(2).nullable().default(null),
+}).strict();
+export type StrategyNotificationPreferenceRequest = z.input<typeof strategyNotificationPreferenceRequestSchema>;

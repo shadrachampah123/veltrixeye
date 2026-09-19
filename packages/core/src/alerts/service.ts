@@ -23,6 +23,7 @@ import type { UserPlan } from '@veltrixeye/contracts';
 import type { StrategyService } from '../strategies/strategies.js';
 import { toNotificationDto, type NotificationOutbox } from '../notifications/outbox.js';
 import { notificationIdempotencyKey, notificationPayloadHash, renderAlertNotification } from '../notifications/render.js';
+import type { NotificationPreferenceService } from '../notifications/preferences.js';
 import { NonStubSenderError, StubAlertSender, type AlertSender } from './sender.js';
 
 /**
@@ -169,6 +170,7 @@ export interface GenerateAlertResult {
 export class AlertService {
   private readonly sender: AlertSender;
   private readonly outbox: NotificationOutbox | null;
+  private readonly preferences: NotificationPreferenceService | null;
 
   constructor(
     private readonly pool: pg.Pool,
@@ -180,7 +182,9 @@ export class AlertService {
      * generation behaves exactly as it did in M6/M7.2 (stub ledger only).
      */
     outbox: NotificationOutbox | null = null,
+    preferences: NotificationPreferenceService | null = null,
   ) {
+    this.preferences = preferences;
     // M6 hard rule, unchanged: the only delivery performed IN the request is
     // the local stub ledger entry. A real channel is delivered by the worker
     // from the outbox — refuse to boot with a non-stub sender wired.
@@ -438,21 +442,29 @@ export class AlertService {
           assetClass: setup.asset_class,
           timeframe: resolveTimeframe(version.config.timeframes),
         });
-        const enqueued = await this.outbox.enqueue(client, {
-          alertId: alertRow.id,
-          userId: args.userId,
-          channel: DEFAULT_NOTIFICATION_CHANNEL,
-          template: rendered.template,
-          payload: rendered,
-          payloadHash: notificationPayloadHash(rendered),
-          idempotencyKey: notificationIdempotencyKey({
-            template: rendered.template,
-            channel: DEFAULT_NOTIFICATION_CHANNEL,
+        const targets = this.preferences
+          ? await this.preferences.deliveryTargets(args.userId, setup.strategy_id, client)
+          : [{ channel: DEFAULT_NOTIFICATION_CHANNEL, recipient: '', signingSecret: null }];
+        for (const target of targets) {
+          const enqueued = await this.outbox.enqueue(client, {
             alertId: alertRow.id,
-          }),
-        });
-        notificationRow = toNotificationDto(enqueued.row);
-        notificationCreated = enqueued.created;
+            userId: args.userId,
+            strategyId: setup.strategy_id,
+            channel: target.channel,
+            recipient: target.recipient || undefined,
+            signingSecret: target.signingSecret,
+            template: rendered.template,
+            payload: rendered,
+            payloadHash: notificationPayloadHash(rendered),
+            idempotencyKey: notificationIdempotencyKey({
+              template: rendered.template,
+              channel: target.channel,
+              alertId: alertRow.id,
+            }),
+          });
+          if (!notificationRow) notificationRow = toNotificationDto(enqueued.row);
+          notificationCreated = notificationCreated || enqueued.created;
+        }
       }
 
       await client.query('COMMIT');

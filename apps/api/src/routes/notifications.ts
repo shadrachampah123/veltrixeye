@@ -3,6 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import {
   notificationMaintenanceRequestSchema,
   notificationRunRequestSchema,
+  notificationPreferencesRequestSchema,
+  strategyNotificationPreferenceRequestSchema,
 } from '@veltrixeye/contracts';
 import { Errors } from '@veltrixeye/core';
 import type { AppContext } from '../app.js';
@@ -47,6 +49,61 @@ export async function notificationRoutes(
 ): Promise<void> {
   const requireAuth = createSessionAuth(config, ctx);
   const adminRateLimit = { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } };
+  const preferenceRateLimit = { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } };
+
+  app.get('/api/notifications/preferences', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { user } = req as AuthenticatedRequest;
+    return ctx.preferences.preferencesResponse(user.id);
+  });
+
+  app.put('/api/notifications/preferences', preferenceRateLimit, async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const parsed = notificationPreferencesRequestSchema.safeParse(req.body);
+    if (!parsed.success) { sendZodError(reply, parsed.error, 'body'); return; }
+    const { user } = req as AuthenticatedRequest;
+    const client = await ctx.pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const preference of parsed.data.preferences) await ctx.preferences.upsert(user.id, preference, client);
+      if (parsed.data.quietHours !== undefined) await ctx.preferences.saveSettings(user.id, parsed.data.quietHours, client);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally { client.release(); }
+    await ctx.audit.log({ userId: user.id, action: 'notification.preferences_updated', ip: req.ip, userAgent: req.headers['user-agent'] ?? null, metadata: { channels: parsed.data.preferences.map((p) => p.channel), quietHoursChanged: parsed.data.quietHours !== undefined } });
+    return ctx.preferences.preferencesResponse(user.id);
+  });
+
+  app.get('/api/notifications/preferences/strategies', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    return { preferences: await ctx.preferences.listStrategies((req as AuthenticatedRequest).user.id) };
+  });
+
+  app.get('/api/notifications/preferences/strategies/:strategyId', async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { strategyId } = req.params as { strategyId: string };
+    if (!isUuid(strategyId)) throw Errors.notFound('Strategy not found');
+    return { preference: await ctx.preferences.getStrategy((req as AuthenticatedRequest).user.id, strategyId) };
+  });
+
+  app.put('/api/notifications/preferences/strategies/:strategyId', preferenceRateLimit, async (req, reply) => {
+    const ok = await requireAuth(req, reply);
+    if (!ok) return;
+    const { strategyId } = req.params as { strategyId: string };
+    if (!isUuid(strategyId)) throw Errors.notFound('Strategy not found');
+    const parsed = strategyNotificationPreferenceRequestSchema.safeParse(req.body);
+    if (!parsed.success) { sendZodError(reply, parsed.error, 'body'); return; }
+    const { user } = req as AuthenticatedRequest;
+    const preference = await ctx.preferences.upsertStrategy(user.id, strategyId, parsed.data);
+    await ctx.audit.log({ userId: user.id, action: 'notification.strategy_preferences_updated', entityType: 'strategy', entityId: strategyId, ip: req.ip, userAgent: req.headers['user-agent'] ?? null, metadata: { muted: preference.muted, channels: preference.channels } });
+    return { preference };
+  });
 
   // GET /api/alerts/:alertId/notifications — owner-scoped delivery status
   app.get('/api/alerts/:alertId/notifications', async (req, reply) => {

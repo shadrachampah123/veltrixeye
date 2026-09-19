@@ -58,6 +58,8 @@ export interface NotificationSendRequest {
   attempt: number;
   /** Per-attempt budget; the adapter aborts and reports `timeout` past it. */
   timeoutMs: number;
+  /** Optional per-destination signing secret; never logged or returned. */
+  signingSecret?: string | null;
 }
 
 export interface NotificationSendResult {

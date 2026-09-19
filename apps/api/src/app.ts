@@ -25,7 +25,9 @@ import {
   // M7.3 delivery pipeline
   createNotificationProviderRegistry,
   createSmtpEmailProvider,
+  createWebhookNotificationProvider,
   NotificationOutbox,
+  NotificationPreferenceService,
   DeliveryWorker,
   // M8.1 execution architecture (safety boundary only — no provider can trade)
   createExecutionProviderRegistry,
@@ -87,6 +89,7 @@ export interface AppContext {
   notificationProviders: NotificationProviderRegistry;
   /** M7.3: durable outbox — writes/reads `notification_deliveries`. */
   notifications: NotificationOutbox;
+  preferences: NotificationPreferenceService;
   /** M7.3: the delivery worker (run in-process, by cron, or manually). */
   deliveryWorker: DeliveryWorker;
   /** M7.3: the retry/lease policy derived from the environment. */
@@ -142,10 +145,13 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   const notificationProviders = createNotificationProviderRegistry();
   const emailProvider = createSmtpEmailProvider(config.notification.email);
   if (emailProvider.configured) notificationProviders.register(emailProvider);
+  // M9.1 — webhook is endpoint-configured per notification preference.
+  notificationProviders.register(createWebhookNotificationProvider({ timeoutMs: config.notification.retry.timeoutMs }));
 
   const notifications = new NotificationOutbox(pool, {
     maxAttempts: config.notification.retry.maxAttempts,
   });
+  const preferences = new NotificationPreferenceService(pool);
   const deliveryWorker = new DeliveryWorker(pool, notificationProviders, config.notification.retry, {
     retention: config.notification.retention,
     // Defence in depth: adapters redact their own secrets, and the worker also
@@ -156,7 +162,7 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
 
   const ingestion = new IngestionService(pool, providerRegistry, candles);
   const backtests = new BacktestService(pool, strategies, candles);
-  const alerts = new AlertService(pool, strategies, new StubAlertSender(), notifications);
+  const alerts = new AlertService(pool, strategies, new StubAlertSender(), notifications, preferences);
   const scoring = new ScoringService(pool, strategies, evaluation);
 
   // M8.1/M8.3 — execution architecture + the internal paper simulator.
@@ -312,6 +318,7 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     scanner,
     notificationProviders,
     notifications,
+    preferences,
     deliveryWorker,
     deliveryPolicy: config.notification.retry,
     // M8.1: execution architecture (safety boundary; no provider can trade)

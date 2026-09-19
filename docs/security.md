@@ -245,6 +245,15 @@ local stub ledger row. M7.3 added a durable outbox + worker that delivers
   per-channel redaction, retry/backoff and delivery-rate limits
   ([alerts.md](./alerts.md#10-future-channelprovider-architecture)).
 
+## Webhook secret storage
+
+Webhook signing secrets are currently stored as plaintext in the server-side
+PostgreSQL preference and webhook outbox tables. They are never exposed in
+API responses, logs, audit metadata, errors or payloads. A database compromise
+therefore exposes these secrets and permits forged signatures; this limitation
+is explicit and is not equivalent to external secret-manager storage. See
+[webhook delivery security](./webhook-delivery.md).
+
 ## Alert notification delivery (M7.3)
 
 - **The request path still performs no external I/O.** Generating an alert

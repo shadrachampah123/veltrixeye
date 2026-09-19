@@ -73,9 +73,8 @@ async function main(): Promise<void> {
   // never the SMTP password). Unconfigured is a normal state, not an error:
   // outbox jobs are still created and the worker records them `unavailable`
   // rather than pretending they were delivered.
-  const email = ctx.notificationProviders.list()[0];
-  if (email?.configured) {
-    const emailProvider = ctx.notificationProviders.get('email');
+  const emailProvider = ctx.notificationProviders.get('email');
+  if (emailProvider?.configured) {
     console.info(
       `[api] notification channel "email" configured: ${JSON.stringify(emailProvider?.describe() ?? {})}`,
     );
