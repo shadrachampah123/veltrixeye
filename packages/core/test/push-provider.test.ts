@@ -60,7 +60,7 @@ describe('M9.2 push provider — outcomes, validation, redaction', () => {
       timeoutMs: 1000,
     });
     assert.equal(httpRes.outcome, 'permanent');
-    assert.ok(['permanent', 'configuration'].includes(httpRes.failureCategory), 'HTTPS failure is permanent/configuration');
+    assert.ok(httpRes.failureCategory === 'permanent' || httpRes.failureCategory === 'configuration', 'HTTPS failure is permanent/configuration');
   });
 
   test('outcome mapping: 201 delivered, 404/410 permanent, 429 retryable, 5xx retryable, timeout retryable', async () => {
