@@ -25,6 +25,7 @@
 --      provider-accepted (`confirmed`, or `reconciled` with
 --      `resolution = 'provider_accepted'`).
 --        UNIQUE (execution_profile_id, order_id)      WHERE order_id IS NOT NULL
+--                                                       AND mutation_kind = 'submit'
 --                                                       AND idempotency_key IS NOT NULL
 --                                                       AND <live predicate>
 --      This subsumes "at most one unresolved mutation per managed order" and
@@ -93,6 +94,7 @@ BEGIN
     SELECT execution_profile_id, order_id
       FROM execution_provider_intents
      WHERE order_id IS NOT NULL
+       AND mutation_kind = 'submit'
        AND idempotency_key IS NOT NULL
        AND (
          status IN ('prepared', 'submitting', 'uncertain', 'confirmed')
@@ -136,6 +138,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS execution_provider_intents_lineage_attempt_uni
 CREATE UNIQUE INDEX IF NOT EXISTS execution_provider_intents_order_live_uniq
   ON execution_provider_intents (execution_profile_id, order_id)
   WHERE order_id IS NOT NULL
+    AND mutation_kind = 'submit'
     AND idempotency_key IS NOT NULL
     AND (
       status IN ('prepared', 'submitting', 'uncertain', 'confirmed')

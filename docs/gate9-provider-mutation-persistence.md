@@ -149,7 +149,8 @@ A retry (`prepareRetry`) is permitted only when:
    `reconciled`/`provider_accepted` original is **never** retried
    (`duplicate_mutation`, §6a);
 2. the retry carries a **new** client order id and **new** idempotency key;
-3. fresh risk decision and execution authorization ids are supplied — fresh
+3. fresh caller-supplied risk decision and execution authorization references
+   pass a **STRUCTURAL freshness check only**, not an approval check — fresh
    meaning an existing risk decision owned by the same user/profile that no
    Gate 9 intent has consumed, and an authorization id no Gate 9 retry has
    consumed (`retry_requires_fresh_authorization`, §6a);
@@ -172,7 +173,7 @@ restarted or one that bypasses the lock — can persist a violating row.
 
 | Invariant | Application check (error) | 0030 index |
 |---|---|---|
-| At most one **unresolved** provider mutation (`prepared` / `submitting` / `uncertain`) per managed order (`order_id`, scoped to its execution profile) | `unresolved_order_mutation` | `execution_provider_intents_order_live_uniq` on `(execution_profile_id, order_id)` for live rows |
+| At most one **unresolved** provider mutation (`prepared` / `submitting` / `uncertain`) per managed order (`order_id`, scoped to its execution profile) | `unresolved_order_mutation` | `execution_provider_intents_order_live_uniq` on `(execution_profile_id, order_id)` for live `mutation_kind = 'submit'` rows |
 | A provider-accepted submit (`confirmed`, or `reconciled` as `provider_accepted`) closes the order identity: no retry and no start-over for the **same** `order_id`; another order after confirmation needs a distinct logical order identity | `duplicate_mutation` | same index (its predicate includes provider-accepted rows) |
 | After an explicit `provider_absent` (or `rejected` / `provider_rejected`) resolution, a new mutation for that order may proceed — by start-over **or** by retry, whichever comes first | — | rows leave the index predicate on resolution |
 | A parent intent has at most one retry (no sibling retries) | `parent_already_superseded` | `execution_provider_intents_parent_uniq` on `(parent_intent_id)` |
@@ -183,6 +184,16 @@ restarted or one that bypasses the lock — can persist a violating row.
 | Uncertain mutations keep blocking until reconciliation / operator resolution resolves them | `unresolved_order_mutation` / `uncertainty_unresolved` | live index |
 | Different orders, execution profiles and provider/environment/account bindings remain independent wherever the identity model permits them | — | indexes are keyed per execution profile |
 
+**Confirmed-order closure is intentional.** After a provider-accepted submit
+(`confirmed`, or `reconciled` as `provider_accepted`), the existing
+`execution_orders` row is closed to another Gate 9 submit/start-over or retry.
+Re-entry requires a **new logical `execution_orders` row**, not just a new
+client order id, idempotency key or retry lineage. This follows the current
+Gate 9 invariant that one logical managed order cannot receive another
+provider-accepted submit. This is closure to submit re-entry only: it does
+**not** close an order/position at the provider or add cancel, modify or close
+behavior.
+
 Identity model (deliberately preserved): **no global uniqueness on
 `client_order_id` is introduced**; the 0019/0029 per-profile identity indexes
 are unchanged. The order-level index is keyed by
@@ -192,12 +203,23 @@ user_id)` ownership FK from 0029 binds the profile to its user. When no
 `order_id` is supplied, the pre-existing identity-based semantics apply
 unchanged (two different identities are two independent mutations).
 
-Gate 9 does **not** generate, evaluate or approve risk decisions or execution
-authorizations. The freshness check is structural only: the risk decision row
-must exist, belong to the same user and execution profile, and not already back
-another Gate 9 intent; the authorization id must not already appear in a Gate 9
-retry's durable event detail. No risk-engine logic (exposure, sizing, drawdown,
-TTL policy) lives in the ledger.
+`retry_requires_fresh_authorization` is a **STRUCTURAL freshness check only**.
+It means the caller supplied new references, not that Gate 9 approved a retry:
+
+- The referenced risk decision must exist, belong to the **same user and
+  execution profile**, and not already be consumed/referenced by another Gate 9
+  intent (including a prior Gate 9 retry).
+- The caller must supply a non-empty authorization id that has not already
+  been consumed/referenced in a prior Gate 9 retry's durable event detail within
+  the execution profile. The ledger treats this id as an opaque reference;
+  it does not look up or validate an authorization approval record.
+
+Passing these checks is **not approval**. Existence and ownership checks concern
+only the referenced risk decision row, not its approval status. Gate 9 does
+**not** generate, evaluate or approve risk decisions or execution authorizations.
+No risk scoring, approval logic, authorization generation or new risk behavior
+is added; no risk-engine logic (exposure, sizing, drawdown, TTL policy) lives in
+the ledger.
 
 ## 7. Reconciliation (§7)
 

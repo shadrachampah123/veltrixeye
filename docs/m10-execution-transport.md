@@ -291,8 +291,20 @@ persistence material. Full record:
   (`parent_already_superseded`), newest-member-only retries
   (`stale_parent_intent`), coherent binding/order (`binding_mismatch`) and a
   fresh caller-supplied risk/authorization reference
-  (`retry_requires_fresh_authorization`). Gate 9 still generates or approves
-  neither.
+  (`retry_requires_fresh_authorization`): a **STRUCTURAL freshness check only**.
+  The caller supplies new references; the risk decision reference must exist,
+  belong to the same user/profile, and not already back a Gate 9 intent
+  (including a prior retry). The non-empty authorization id must not already
+  be consumed/referenced by a prior Gate 9 retry within the profile; it is an
+  opaque reference, not a validated approval record. Gate 9 does **not**
+  interpret freshness as approval and neither generates nor approves risk
+  decisions or authorizations. No risk scoring or new risk behavior is added.
+  **Confirmed-order closure is intentional:** after a provider-accepted submit,
+  the existing `execution_orders` row is closed to another Gate 9 submit,
+  start-over or retry. Re-entry requires a **new logical `execution_orders`
+  row**, following the current invariant that one logical managed order cannot
+  receive another provider-accepted submit. This does **not** add cancel,
+  modify or close behavior or close an order/position at the provider.
 - `packages/core/src/db/migrations/0029_provider_mutation_persistence.sql`:
   additive only. Extends `execution_provider_intents`, and adds the mutation
   reservation, receipt, reconciliation-observation, resolution and append-only
@@ -302,8 +314,10 @@ persistence material. Full record:
 - `packages/core/src/db/migrations/0030_provider_mutation_lineage_invariants.sql`
   (M3): additive only — three partial unique indexes (one retry per parent,
   unique `(root, attempt)` per lineage, one live submit mutation per managed
-  order within its execution profile) and a pre-flight that refuses to apply on
-  conflicting rows. Migration `0029` is byte-identical.
+  order within its execution profile, explicitly scoped to
+  `mutation_kind = 'submit'`) and a read-only pre-flight with the identical
+  submit/live-state predicate that refuses to apply on conflicting rows.
+  Migration `0029` is byte-identical.
 
 The M10 transport layer is **not** wired to this ledger: `DryRunExecutionTransport`
 and `MT5ExecutionTransport` are unchanged, no provider is registered, no route or

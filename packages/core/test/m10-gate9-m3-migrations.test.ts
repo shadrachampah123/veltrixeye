@@ -104,6 +104,7 @@ interface SeedIntent {
   userId: string;
   profileId: string;
   orderId?: string | null;
+  mutationKind?: 'submit' | 'cancel' | 'modify' | 'close';
   status: 'submitting' | 'uncertain' | 'confirmed' | 'rejected';
   parentIntentId?: string;
   rootIntentId?: string;
@@ -118,7 +119,7 @@ async function seedIntent(q: ReturnType<typeof createPool>, args: SeedIntent): P
        (id, user_id, execution_profile_id, order_id, mutation_kind, client_order_id, idempotency_key, request_hash,
         provider_slug, environment, account_ref, status, outcome, terminal_evidence, resolved_at,
         reconciliation_required, reconciliation_state, parent_intent_id, root_intent_id, attempt)
-     VALUES ($1,$2,$3,$4,'submit',$5,$6,$7,'paper','paper','gate9-m3-acct',$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+     VALUES ($1,$2,$3,$4,$17,$5,$6,$7,'paper','paper','gate9-m3-acct',$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
     [
       id, args.userId, args.profileId, args.orderId ?? null, clientOrderId(), hex64(), hex64(),
       args.status,
@@ -130,6 +131,7 @@ async function seedIntent(q: ReturnType<typeof createPool>, args: SeedIntent): P
       args.parentIntentId ?? null,
       args.rootIntentId ?? null,
       args.attempt ?? 1,
+      args.mutationKind ?? 'submit',
     ],
   );
   return id;
@@ -169,6 +171,12 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
     for (const index of M3_INDEXES) {
       assert.match(statements, new RegExp(`CREATE UNIQUE INDEX IF NOT EXISTS ${index}\\b`), `0030 creates ${index}`);
     }
+    const preflightPredicate = /SELECT execution_profile_id, order_id\s+FROM execution_provider_intents\s+WHERE ([\s\S]*?)\s+GROUP BY execution_profile_id, order_id/.exec(statements)?.[1];
+    const indexPredicate = /CREATE UNIQUE INDEX IF NOT EXISTS execution_provider_intents_order_live_uniq\s+ON execution_provider_intents \(execution_profile_id, order_id\)\s+WHERE ([\s\S]*?);/.exec(statements)?.[1];
+    assert.ok(preflightPredicate);
+    assert.ok(indexPredicate);
+    assert.equal(preflightPredicate.replace(/\s+/g, ' '), indexPredicate.replace(/\s+/g, ' '), 'pre-flight and order-live index use identical predicates');
+    assert.match(indexPredicate, /mutation_kind = 'submit'/, 'order-live invariant is submit-only');
     assert.match(statements, /RAISE EXCEPTION/, '0030 refuses on conflicting data instead of repairing it');
   });
 
@@ -203,6 +211,7 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
       assert.match(byName.get('execution_provider_intents_lineage_attempt_uniq')!.columns, /\(root_intent_id, attempt\)/);
       const live = byName.get('execution_provider_intents_order_live_uniq')!;
       assert.match(live.columns, /\(execution_profile_id, order_id\)/, 'order uniqueness keeps the execution-profile dimension');
+      assert.match(live.predicate!, /mutation_kind = 'submit'::text/, 'only submit mutations participate');
       assert.match(live.predicate!, /idempotency_key IS NOT NULL/, 'scoped to Gate 9 rows');
       assert.match(live.predicate!, /'prepared'.*'submitting'.*'uncertain'.*'confirmed'/s);
       assert.match(live.predicate!, /provider_accepted/);
@@ -248,6 +257,12 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
     await seedIntent(pool, { userId, profileId, orderId: confirmedOrder, status: 'confirmed' });
     // A rejected row for an order that also has a live row is legitimate (start-over after rejection).
     await seedIntent(pool, { userId, profileId, orderId: liveOrder, status: 'rejected' });
+    // Schema-level fixtures only: non-submit kinds must not participate in
+    // the submit pre-flight, even with duplicate live rows for the same order.
+    for (const mutationKind of ['cancel', 'modify', 'close'] as const) {
+      await seedIntent(pool, { userId, profileId, orderId: liveOrder, mutationKind, status: 'uncertain' });
+      await seedIntent(pool, { userId, profileId, orderId: liveOrder, mutationKind, status: 'confirmed' });
+    }
     const snapshot = await snapshotIntents(pool);
     assert.deepEqual(await m3IndexNames(pool), []);
 
@@ -276,6 +291,10 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
       () => seedIntent(pool, { userId, profileId, status: 'rejected', parentIntentId: root, rootIntentId: root, attempt: 3 }),
       (e: unknown) => (e as { constraint?: string }).constraint === 'execution_provider_intents_parent_uniq',
     );
+    // The installed index has the same submit-only scope as the pre-flight.
+    for (const mutationKind of ['cancel', 'modify', 'close'] as const) {
+      await seedIntent(pool, { userId, profileId, orderId: liveOrder, mutationKind, status: 'submitting' });
+    }
     // A legacy row never participates: a Gate 9 row for the legacy order is accepted by the index.
     await seedIntent(pool, { userId, profileId, orderId: legacyOrder, status: 'submitting' });
   });
