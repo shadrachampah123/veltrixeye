@@ -60,10 +60,19 @@ export function canonicalMutationRequestHash(request: unknown): string {
  * call:
  *
  *   BEGIN → insert intent (prepared) + reservation → transition to submitting
- *         → COMMIT                      ← the pre-provider persistence barrier
- *         → provider call
- *         → BEGIN → insert receipt → COMMIT
- *         → BEGIN → transition intent + reservation → COMMIT
+ *         → COMMIT                       ← the pre-provider persistence barrier
+ *   BEGIN → consume barrier (CAS on the exact state_version while submitting)
+ *         → COMMIT                       ← the durable single-use provider gate
+ *         → provider call                ← still no transaction is open
+ *   BEGIN → insert receipt → COMMIT
+ *   BEGIN → transition intent + reservation → COMMIT
+ *
+ * Provider-call authorization invariant (M2): a provider call for intent I may
+ * occur only after a committed write advances `I.state_version` from exactly
+ * `barrier.state_version` while `I.status = 'submitting'`. Because every UPDATE
+ * advances `state_version` (0029 trigger), a given barrier value can authorize
+ * at most one provider call — a stale, reused or forged barrier fails closed
+ * with `barrier_not_consumable` and never reaches the provider.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -76,6 +85,7 @@ export const PROVIDER_MUTATION_ERROR_CODES = [
   'invalid_binding',
   'duplicate_mutation',
   'pre_call_persistence_failed',
+  'barrier_not_consumable',
   'intent_not_found',
   'intent_ownership_mismatch',
   'concurrent_state_change',
@@ -159,6 +169,14 @@ export interface SubmitBarrier {
   idempotencyKey: string;
   requestHash: string;
   attempt: number;
+  /**
+   * The intent version this barrier was minted at. `executeSubmit` CONSUMES the
+   * barrier by compare-and-swapping this exact value in its own committed
+   * transaction before the provider call; the consuming write advances
+   * `state_version`, so the barrier authorizes at most one provider call. The
+   * object itself is never trusted: every field is re-verified against the
+   * durable row.
+   */
   stateVersion: number;
   userId: string;
   executionProfileId: string;
@@ -570,15 +588,34 @@ export class ProviderMutationLedger {
   /* ---------------------------------------------------------------------- */
 
   /**
-   * Performs the provider call behind a committed barrier and records the
-   * normalized outcome.
+   * Performs the provider call behind a durably CONSUMED single-use barrier and
+   * records the normalized outcome.
    *
-   * The provider call itself is the caller's injected function; it runs with NO
-   * open transaction. Every failure mode that leaves the provider outcome
+   * M2 — before the provider function may run, the barrier is consumed in its
+   * own SHORT transaction: a compare-and-swap against the exact
+   * `barrier.stateVersion` while the durable intent is still
+   * `status = 'submitting'` and every identity field still matches the row.
+   * The consumption write itself advances `state_version`, so a given barrier
+   * value can authorize at most one provider call. Reuse after any
+   * version-changing path — a confirmed, rejected or reconciled outcome, an
+   * uncertain outcome, a `state_commit_failed`, restart recovery, operator
+   * resolution, or a forged/stale barrier — matches zero rows and fails closed
+   * with `barrier_not_consumable`; a database failure during consumption fails
+   * closed with `pre_call_persistence_failed`. In neither case is the provider
+   * function invoked.
+   *
+   * The provider call itself is the caller's injected function; it runs with
+   * NO open transaction. Every failure mode that leaves the provider outcome
    * unknown resolves to `uncertain` and requires reconciliation — a missing
    * response is never a rejection.
+   *
+   * Throws (before any provider call) when the barrier cannot be consumed.
    */
   async executeSubmit(barrier: SubmitBarrier, call: ProviderSubmitCall): Promise<MutationExecutionResult> {
+    // M2 — durable single-use barrier consumption. Nothing below runs unless
+    // this committed: a failed or zero-row CAS must never call the provider.
+    await this.consumeSubmitBarrier(barrier);
+
     let normalized: NormalizedSubmitOutcome;
     let providerCalled = false;
     try {
@@ -661,6 +698,117 @@ export class ProviderMutationLedger {
     const prepared = await this.prepareSubmit(input);
     if (prepared.kind === 'duplicate') return { kind: 'duplicate', intent: prepared.intent };
     return { kind: 'submitted', result: await this.executeSubmit(prepared.barrier, call) };
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* M2 — durable single-use barrier consumption                             */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Consumes a submit barrier immediately before the provider call, in its own
+   * SHORT transaction that is committed before the call starts and therefore
+   * never held open across the provider.
+   *
+   * The compare-and-swap is scoped to the full durable intent identity and the
+   * appropriate execution context — intent id, the exact `state_version`,
+   * `status = 'submitting'`, tenant ownership (`user_id`, `execution_profile_id`),
+   * mutation identity (`client_order_id`, `idempotency_key`, `request_hash`,
+   * `attempt`) and binding (`provider_slug`, `environment`, `account_ref`). The
+   * barrier object is untrusted input: every field must match the committed row
+   * or the CAS matches zero rows.
+   *
+   * Because the 0029 trigger advances `state_version` on every UPDATE, this
+   * consuming write is itself the version change that invalidates the barrier
+   * value: a second consume against the same `stateVersion` can never match, so
+   * a barrier succeeds exactly once — even when the first attempt ended in
+   * `state_commit_failed`, restart recovery or operator resolution while the
+   * intent remained (or later returned to) an unresolved state.
+   *
+   * Zero rows → `barrier_not_consumable` (fail closed). Any database failure →
+   * `pre_call_persistence_failed` (fail closed). Neither may ever reach the
+   * provider; on failure the transaction is rolled back and durable state is
+   * left exactly as it was.
+   */
+  private async consumeSubmitBarrier(barrier: SubmitBarrier): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Same per-intent lock the outcome path uses: concurrent executions of
+      // one barrier serialize here, and the loser's CAS matches zero rows.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`intent:${barrier.intentId}`]);
+
+      const consumed = await client.query<{ state_version: number }>(
+        `UPDATE execution_provider_intents
+            SET updated_at = now()
+          WHERE id = $1
+            AND mutation_kind = 'submit'
+            AND status = 'submitting'
+            AND state_version = $2
+            AND user_id = $3
+            AND execution_profile_id = $4
+            AND client_order_id = $5
+            AND idempotency_key = $6
+            AND attempt = $7
+            AND request_hash = $8
+            AND provider_slug = $9
+            AND environment = $10
+            AND account_ref IS NOT DISTINCT FROM $11
+        RETURNING state_version`,
+        [
+          barrier.intentId,
+          barrier.stateVersion,
+          barrier.userId,
+          barrier.executionProfileId,
+          barrier.clientOrderId,
+          barrier.idempotencyKey,
+          barrier.attempt,
+          barrier.requestHash,
+          barrier.providerSlug,
+          barrier.environment,
+          barrier.accountRef,
+        ],
+      );
+      if (consumed.rows.length === 0) {
+        // Fail closed: the barrier was already consumed, superseded by newer
+        // durable state, or never matched a real intent. No provider call is
+        // permitted, and nothing durable changed (rolled back below).
+        throw new ProviderMutationError(
+          'barrier_not_consumable',
+          'The submit barrier could not be consumed: it was already used, superseded, or never matched durable state; no provider call is permitted',
+          barrier.intentId,
+        );
+      }
+
+      // Append-only proof that THIS barrier value was consumed (exactly once):
+      // a `submitting → submitting` event that carries no outcome claim.
+      await insertEvent(client, {
+        intentId: barrier.intentId,
+        userId: barrier.userId,
+        executionProfileId: barrier.executionProfileId,
+        clientOrderId: barrier.clientOrderId,
+        idempotencyKey: barrier.idempotencyKey,
+        attempt: barrier.attempt,
+        fromState: 'submitting',
+        toState: 'submitting',
+        actor: 'system:mutation-ledger',
+        detail: {
+          barrier: 'submit_barrier_consumed',
+          consumedFromStateVersion: barrier.stateVersion,
+        },
+      });
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      if (error instanceof ProviderMutationError) throw error;
+      throw new ProviderMutationError(
+        'pre_call_persistence_failed',
+        'Durable barrier consumption failed; no provider call is permitted',
+        barrier.intentId,
+      );
+    } finally {
+      client.release();
+    }
   }
 
   /* ---------------------------------------------------------------------- */

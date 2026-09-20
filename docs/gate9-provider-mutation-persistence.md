@@ -9,6 +9,9 @@ or activated by this work.
 **Migration:** `0029_provider_mutation_persistence.sql`. Migration `0028` is
 byte-identical (SHA-256
 `25359093d0304d84d82982750c58ee1bb054edacf29d1d4971a32ecfb5c9e49f`, unchanged).
+Gate 9 Step 3b (M2 — durable single-use barrier consumption) added **no
+migration**: consumption is enforced in application code against the schema
+0029 already provides.
 
 This document is the record of how the Gate 9 persistence contract is
 implemented, and the read-only safety review that closes §17.
@@ -21,6 +24,7 @@ implemented, and the read-only safety review that closes §17.
 | Durable ledger service | `packages/core/src/execution/provider-mutations.ts` |
 | Schema, triggers, guards | `packages/core/src/db/migrations/0029_provider_mutation_persistence.sql` |
 | Fake-provider crash/recovery suite | `packages/core/test/m10-gate9-mutation-persistence.test.ts` |
+| Single-use barrier-consumption suite (M2) | `packages/core/test/m10-gate9-barrier-consumption.test.ts` |
 | Migration suite | `packages/core/test/m10-gate9-migrations.test.ts` |
 | Contract suite | `packages/contracts/test/m10-gate9-persistence.test.ts` |
 
@@ -69,6 +73,11 @@ intent that crashed in flight: such an intent is unresolved (§8) and may only
 be closed by documented evidence (§14). It can never produce a new submission.
 `confirmed`, `rejected` and `reconciled` are terminal; `uncertain` is not
 terminal but never leaves except through `reconciled`.
+
+One append-only `submitting → submitting` **event** also exists (M2): the
+durable consumption of the single-use submit barrier, recorded immediately
+before the provider call (§9a). It is not a state transition — the status does
+not change — and no new state was introduced.
 
 Enforced by `provider_intent_state_guard()` (BEFORE UPDATE trigger) and mirrored
 in `PROVIDER_INTENT_TRANSITIONS` for the application layer.
@@ -172,34 +181,94 @@ Gate 9 does not repair, resubmit, cancel or close anything.
 | Crash point | Durable interpretation | Where it is pinned |
 |---|---|---|
 | Before intent commit | No provider call; nothing durable | `prepareSubmit` throws `pre_call_persistence_failed`; transaction rolled back |
-| After intent commit, before provider call | `submitting` + `reserved`, unresolved, never re-sent | barrier commits status `submitting` in the same transaction |
+| After intent commit, before barrier consumption | `submitting` + `reserved`, unresolved, never re-sent | barrier commits status `submitting` in the same transaction; the minted barrier is the only path to a provider call |
+| Barrier consumption fails or matches zero rows | No provider call; durable state unchanged (rolled back) | `executeSubmit` throws `barrier_not_consumable` or `pre_call_persistence_failed` before the call |
+| After barrier consumption, before provider call | Barrier spent: exactly one consumption event durably recorded; the intent stays `submitting` and unresolved | `consumeSubmitBarrier` committed; the consumed `stateVersion` can never authorize a call again |
 | During provider call | `uncertain` (`timeout` / `connection_failure`) | `executeSubmit` catch → uncertainty |
 | After acceptance, before receipt commit | `uncertain` (`receipt_persistence_failure`) | receipt write failure path |
 | After rejection, before receipt commit | `uncertain` (`receipt_persistence_failure`) | same path |
+| Receipt committed, outcome transition fails (`state_commit_failed`) | intent stays `submitting`, but the barrier is already spent — a reuse attempt matches zero rows and cannot call the provider | `consumeSubmitBarrier` CAS on the exact `state_version` |
 | Malformed/unknown response | `uncertain` | `normalizeSubmitOutcome` |
-| Process restart | intent/reservation survive; in-flight intents become `uncertain` (`process_restart`) | `recoverAfterRestart` |
+| Process restart | intent/reservation survive; in-flight intents become `uncertain` (`process_restart`); any barrier minted before the restart is retired — its version can no longer match | `recoverAfterRestart` + barrier CAS |
 
 The system never infers `no stored response = provider rejected`, and never
-infers `reservation expired = provider mutation did not happen`.
+infers `reservation expired = provider mutation did not happen`. A crash or
+recovery at any point also never re-arms a barrier: consumption is permanent
+because the version advance is permanent.
 
 ## 9. Transaction boundary (§9)
 
 ```text
-BEGIN
+BEGIN prepare/transition
   insert intent (prepared)
   transition intent → submitting
   insert mutation reservation
   append intent events
-COMMIT                       ← the pre-provider persistence barrier
-provider call                ← no transaction is open
+COMMIT                       ← the pre-provider persistence barrier (mints SubmitBarrier)
+BEGIN barrier consumption (CAS)
+  UPDATE intent
+    WHERE id = barrier.intentId
+      AND mutation_kind = 'submit'
+      AND status = 'submitting'
+      AND state_version = barrier.stateVersion   ← exact compare-and-swap
+      AND user_id / execution_profile_id / client_order_id / idempotency_key /
+          attempt / request_hash / provider_slug / environment / account_ref
+          all match the durable row
+  advance state_version (0029 trigger)
+  append submitting → submitting consumption event
+COMMIT                       ← the single-use provider-call gate
+provider call                ← still no transaction is open
 BEGIN  insert sanitized receipt  COMMIT
 BEGIN  transition intent + reservation  COMMIT
 ```
 
-No transaction is held open across the remote provider call. A persistence
-failure before the provider call is fail-closed: the provider function is never
-invoked. If the receipt write or the state transition fails after the call, the
-mutation remains uncertain and requires reconciliation.
+No transaction is held open across the remote provider call — the provider call
+itself is **not** transactional; only its durable before- and after-states are.
+A persistence failure before the provider call is fail-closed: the provider
+function is never invoked. If the receipt write or the state transition fails
+after the call, the mutation remains uncertain and requires reconciliation.
+
+### 9a. Barrier semantics — the single-use provider-call authorization invariant
+
+> **A provider call for intent I may occur only after a committed write advances
+> `I.state_version` from exactly `barrier.stateVersion` while
+> `I.status = 'submitting'`. Because every UPDATE advances `state_version`, a
+> given barrier value can authorize at most one provider call.**
+
+`prepareSubmit` mints the barrier **and** commits the `prepared → submitting`
+authorization; `executeSubmit` then consumes the barrier in a short, separate
+transaction (`consumeSubmitBarrier`) immediately before invoking the provider
+function. The consume CAS is scoped to the full durable intent identity and the
+appropriate execution context — intent id, exact `state_version`,
+`status = 'submitting'`, tenant ownership (`user_id`, `execution_profile_id`),
+mutation identity (`client_order_id`, `idempotency_key`, `request_hash`,
+`attempt`) and binding (`provider_slug`, `environment`, `account_ref`). The
+barrier object is untrusted input: every field must match the committed row.
+
+The consuming write itself advances `state_version` (0029 trigger), which is
+what makes the barrier single-use. A simple pre-call **read** of the state would
+not be sufficient: after a `state_commit_failed` the intent is still
+`status = 'submitting'`, so a read check would pass and a reused barrier could
+invoke the provider a second time. The CAS is immune to this — the version has
+already moved past `barrier.stateVersion`, the consume matches zero rows, and
+the provider is never called. Reuse after a confirmed, rejected, reconciled or
+uncertain outcome, after `state_commit_failed`, after restart recovery, after
+operator resolution, or with a forged/stale barrier therefore fails closed.
+
+Error semantics (fail closed in every case; the provider function is never
+invoked):
+
+| Consume outcome | Result |
+|---|---|
+| CAS matches zero rows (already consumed / superseded / forged / unknown intent / wrong tenant) | `ProviderMutationError('barrier_not_consumable')` — rolled back, nothing durable changes |
+| Database failure during consumption | `ProviderMutationError('pre_call_persistence_failed')` — rolled back, nothing durable changes |
+| CAS succeeds | one committed `submitting → submitting` consumption event; only then is the provider function invoked |
+
+Consumption is append-only audit evidence, recorded through the existing
+mutation-event mechanism with `detail.barrier = 'submit_barrier_consumed'` and
+the consumed-from version; it claims no outcome, and no new event vocabulary,
+state or migration was introduced. A failed consume attempt writes nothing: it
+neither consumes the barrier nor disturbs durable state.
 
 ## 10. The existing 60-second risk TTL (§10)
 
@@ -267,6 +336,27 @@ Boundary tests: fail-closed identity validation, credential-shaped provider
 responses, terminal-state immutability, retention of unresolved evidence, submit
 only, no credential-shaped columns, and operator-resolution evidence rules.
 
+`packages/core/test/m10-gate9-barrier-consumption.test.ts` — 12 focused M2
+(single-use barrier consumption) tests against the same embedded PostgreSQL.
+They never merely assert final database state: every scenario counts provider
+invocations explicitly, and every reuse/forge/failure scenario proves the
+provider invocation count did not change.
+
+| M2 scenario | Test |
+|---|---|
+| Valid barrier consumed once: consume CAS → provider → receipt/outcome | `M2-1. …` |
+| Sequential reuse after confirmed/rejected outcome | `M2-2. …` |
+| Sequential reuse after uncertain outcome | `M2-3. …` |
+| Reuse after `state_commit_failed` (defeats a pre-call READ check) | `M2-4. …` |
+| Reuse after restart recovery | `M2-5. …` |
+| Reuse after operator resolution | `M2-6. …` |
+| Concurrent execution of one barrier → at most one provider call | `M2-7. …` |
+| Forged/stale `stateVersion` cannot call the provider | `M2-8. …` |
+| Zero-row CAS: unknown intent or wrong tenant cannot call the provider | `M2-9. …` |
+| Database failure during consumption → `pre_call_persistence_failed`, no provider call | `M2-10. …` |
+| Durable consume event persisted exactly once, audit detail, no secrets | `M2-11. …` |
+| Retry barriers are single-use too | `M2-12. …` |
+
 ## 14. Operator resolution (§14)
 
 `resolveByOperator` requires an unresolved intent, an actor identity
@@ -300,8 +390,9 @@ behavior.
 | Criterion | Status | Evidence |
 |---|---|---|
 | Durable submit intent exists before every provider-submit mutation | ✅ | `prepareSubmit` commits intent + reservation, then returns the barrier; `executeSubmit` only accepts a barrier |
-| Pre-call persistence failure blocks the provider call | ✅ | `8. a crash before intent commit permits no provider call at all` |
-| Duplicate submission prevented across restart/concurrency | ✅ | `2`, `8b`, `10`, `12`, `12b`; unique indexes + advisory lock |
+| A barrier authorizes at most one provider call (M2 single-use consumption) | ✅ | `consumeSubmitBarrier` CAS on the exact `state_version` while `submitting`, committed before the call; `M2-1`–`M2-12` count provider invocations explicitly |
+| Pre-call persistence failure blocks the provider call | ✅ | `8. a crash before intent commit permits no provider call at all`; `M2-10` (consume failure) |
+| Duplicate submission prevented across restart/concurrency | ✅ | `2`, `8b`, `10`, `12`, `12b`, `M2-7`; unique indexes + advisory lock + barrier CAS |
 | Uncertain outcomes survive restart | ✅ | `10`, `recoverAfterRestart`, DELETE guards |
 | The 60s TTL cannot erase unresolved mutation safety | ✅ | `17`; `risk_reservation_id … ON DELETE SET NULL` + DELETE guard |
 | Provider receipts are identity-verified and sanitized | ✅ | `execution_provider_receipts` CHECKs, `sanitizeProviderReceipt`, credential-leak test |
