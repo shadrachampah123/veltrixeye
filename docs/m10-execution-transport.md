@@ -152,9 +152,14 @@ exchange deadlines do not impose a separate audit deadline. Connection attempts
 are reserved before awaiting audit, and disconnect remains authoritative during
 all audit waits.
 
-Do not route real data through the legacy M8.4 response normalizers without a
-separate redaction review: they retain provider messages/error causes. M10 does
-not call them or change their behavior.
+The legacy M8.4 response normalizers (`normalizeMT5Error`, `normalizeMT5Order`
+and the MT5 provider health/account paths) were redacted under M10 Gate 10: they
+now emit fixed-message, closed-category errors with no `cause`, stack or provider
+properties; structured receipts without broker text; allowlisted health reasons;
+and configured account identifiers only (see the Gate 10 record in the
+[M10 verification report](./m10-verification.md)). M10 does not call them, and
+routing real broker data through any path still requires the broker/demo
+integration work that remains out of scope.
 
 ## Verification
 

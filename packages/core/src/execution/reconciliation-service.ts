@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import {
   EXECUTION_ARCHITECTURE_VERSION,
+  EXECUTION_FAILURE_CATEGORIES,
   ExecutionProviderError,
   isExecutionProviderError,
   PAPER_EXECUTION_PROVIDER_ID,
@@ -25,6 +26,7 @@ import {
 } from '@veltrixeye/contracts';
 import type { AuditService } from '../audit.js';
 import { Errors } from '../errors.js';
+import { toSafeProviderHealth } from './provider-health.js';
 
 /**
  * M8.5 — Provider-neutral order & position reconciliation service.
@@ -347,11 +349,8 @@ export class ReconciliationService {
           providerId,
         });
       } catch (err) {
-        const message = isExecutionProviderError(err)
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : 'unknown provider error';
+        // Persisted failure reasons come from a closed vocabulary keyed by the
+        // normalized category. Error/provider message text is never stored.
         snapshot = {
           providerId,
           accountRef: null,
@@ -359,9 +358,12 @@ export class ReconciliationService {
           orders: [],
           positions: [],
           providerUnavailable: true,
-          providerUnavailableReason: message,
+          providerUnavailableReason: providerFailureReason(err),
         };
       }
+      // Whichever snapshot provider produced the record, the persisted reason
+      // is a closed token; free text from a returned snapshot is withheld too.
+      const unavailableReason = snapshot.providerUnavailable ? persistedFailureReason(snapshot.providerUnavailableReason) : null;
 
       await this.updateStatus(client, runId, 'provider_snapshot_acquired');
       await client.query(
@@ -376,7 +378,7 @@ export class ReconciliationService {
           providerId,
           new Date(snapshot.retrievedAt),
           snapshot.providerUnavailable,
-          snapshot.providerUnavailableReason ?? null,
+          unavailableReason,
           JSON.stringify(snapshot.orders),
           JSON.stringify(snapshot.positions),
         ],
@@ -417,7 +419,7 @@ export class ReconciliationService {
           expectedField: 'provider_available',
           expectedValue: true,
           actualValue: false,
-          detail: { reason: snapshot.providerUnavailableReason ?? 'unknown' },
+          detail: { reason: unavailableReason ?? PROVIDER_FAILURE_UNKNOWN },
         });
       }
 
@@ -463,7 +465,7 @@ export class ReconciliationService {
       if (snapshot.providerUnavailable) {
         finalStatus = 'failed';
         healthState = 'provider_unavailable';
-        failureReason = snapshot.providerUnavailableReason ?? 'provider unavailable';
+        failureReason = unavailableReason ?? PROVIDER_FAILURE_UNKNOWN;
       } else if (totalCount === 0) {
         finalStatus = 'no_action';
         healthState = 'synchronized';
@@ -1056,14 +1058,13 @@ export class ProviderReconciliationSnapshotProvider implements ReconciliationSna
     void args.executionProfileId;
     const provider = this.getProvider(args.providerId);
     if (!provider) {
-      throw new ExecutionProviderError('unavailable', `Provider "${args.providerId}" is not registered`);
+      throw new ExecutionProviderError('unavailable', 'Execution provider is not registered');
     }
-    const health = await provider.health();
+    // Only the safe projection is consulted; the adapter's `reason`/`detail`
+    // never enter an error message.
+    const health = toSafeProviderHealth(await provider.health());
     if (!health.available || !health.healthy) {
-      throw new ExecutionProviderError(
-        'unavailable',
-        `Provider is not available (${health.state}: ${health.reason ?? 'no reason'})`,
-      );
+      throw new ExecutionProviderError('unavailable', 'Execution provider is not available');
     }
     let orders: ReconciliationProviderOrder[] = [];
     let positions: ReconciliationProviderPosition[] = [];
@@ -1092,10 +1093,7 @@ export class ProviderReconciliationSnapshotProvider implements ReconciliationSna
       }));
     } catch (err) {
       if (isExecutionProviderError(err)) throw err;
-      throw new ExecutionProviderError(
-        'unavailable',
-        `provider listing failed: ${(err as Error).message}`,
-      );
+      throw new ExecutionProviderError('unavailable', 'Execution provider listing failed');
     }
     return {
       providerId: args.providerId,
@@ -1111,6 +1109,24 @@ export class ProviderReconciliationSnapshotProvider implements ReconciliationSna
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * Closed vocabulary for the persisted `provider_unavailable_reason` /
+ * `failure_reason` / finding `detail.reason` values. Keyed by the normalized
+ * failure category only; provider or error message text is never persisted.
+ */
+function providerFailureReason(err: unknown): string {
+  const category = isExecutionProviderError(err) && (EXECUTION_FAILURE_CATEGORIES as readonly string[]).includes(err.category)
+    ? err.category
+    : 'unknown';
+  return `provider_error:${category}`;
+}
+const PROVIDER_FAILURE_UNKNOWN = 'provider_error:unknown';
+const PERSISTED_REASON_TOKEN = /^[a-z0-9_:.-]{1,128}$/;
+/** A reason supplied by a snapshot provider is persisted only if it is already a machine token. */
+function persistedFailureReason(reason: string | null | undefined): string {
+  return typeof reason === 'string' && PERSISTED_REASON_TOKEN.test(reason) ? reason : PROVIDER_FAILURE_UNKNOWN;
+}
 
 function compareOrderFields(
   findings: Mismatch[],

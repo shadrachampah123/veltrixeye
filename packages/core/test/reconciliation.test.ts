@@ -516,3 +516,68 @@ test('M8.5: corrective actions are ALWAYS disabled (never mutate provider)', asy
   const res = await svc.triggerRun({ userId, executionProfileId: profileId, trigger: 'manual' });
   assert.equal(res.correctiveActionsTaken, false);
 });
+
+/* ---------------- M10 Gate 10 — persisted failure reasons are closed tokens ---------------- */
+
+// Fabricated sentinel only; never a real credential.
+const GATE10_SECRET = 'FAKE-BROKER-PASSWORD-sentinel-7f3a9c2e';
+
+async function gate10PersistedText(runId: string): Promise<string> {
+  const run = await pool.query('SELECT failure_reason FROM reconciliation_runs WHERE id = $1', [runId]);
+  const snap = await pool.query('SELECT provider_unavailable_reason FROM reconciliation_snapshots WHERE run_id = $1', [runId]);
+  const findings = await pool.query('SELECT detail FROM reconciliation_findings WHERE run_id = $1', [runId]);
+  const audits = await pool.query(`SELECT metadata FROM audit_events WHERE action = 'execution.reconciliation_run_completed' AND metadata->>'runId' = $1`, [runId]);
+  return JSON.stringify({ run: run.rows, snap: snap.rows, findings: findings.rows, audits: audits.rows });
+}
+
+test('Gate 10: an ExecutionProviderError message is never persisted; the category token is', async () => {
+  const userId = await makeUser();
+  const profileId = await makeProfile(userId, MT5_EXECUTION_PROVIDER_ID);
+  const svc = build(staticSnapshot([], [], { unavailable: true, reason: `terminal rejected login password=${GATE10_SECRET}` }));
+  const res = await svc.triggerRun({ userId, executionProfileId: profileId, trigger: 'manual' });
+  assert.equal(res.run.healthState, 'provider_unavailable');
+  assert.equal(res.run.failureReason, 'provider_error:unavailable');
+  const detail = await svc.getRunDetail(userId, res.run.id);
+  const finding = detail.findings.find((f) => f.code === 'provider_unavailable');
+  assert.ok(finding);
+  assert.deepEqual(finding.detail, { reason: 'provider_error:unavailable' });
+  const persisted = await gate10PersistedText(res.run.id);
+  assert.equal(persisted.includes(GATE10_SECRET), false, persisted);
+  assert.equal(JSON.stringify(detail).includes(GATE10_SECRET), false);
+  // The already-correct allowlisted audit metadata is unchanged (no reason/message field).
+  const audit = await pool.query(`SELECT metadata FROM audit_events WHERE action = 'execution.reconciliation_run_completed' AND metadata->>'runId' = $1`, [res.run.id]);
+  assert.equal(audit.rows.length, 1);
+  assert.deepEqual(Object.keys(audit.rows[0].metadata).sort(), ['automationOff', 'correctiveActionsTaken', 'findingsOpen', 'findingsTotal', 'healthState', 'providerId', 'reconciliationVersion', 'runId', 'simulated', 'status', 'trigger']);
+});
+
+test('Gate 10: a generic (non-provider) error persists provider_error:unknown, never its message', async () => {
+  const userId = await makeUser();
+  const profileId = await makeProfile(userId);
+  const svc: ReconciliationService = new ReconciliationService(pool as any, {
+    snapshots: { async getSnapshot() { throw new Error(`boom token=${GATE10_SECRET}\n[FAKE-AUDIT] injected line`); } },
+    audit,
+  });
+  const res = await svc.triggerRun({ userId, executionProfileId: profileId, trigger: 'manual' });
+  assert.equal(res.run.failureReason, 'provider_error:unknown');
+  const persisted = await gate10PersistedText(res.run.id);
+  assert.equal(persisted.includes(GATE10_SECRET), false);
+  assert.equal(persisted.includes('FAKE-AUDIT'), false);
+  assert.equal(persisted.includes('boom'), false);
+});
+
+test('Gate 10: a snapshot RETURNED as unavailable persists only a machine-token reason', async () => {
+  const userId = await makeUser();
+  const profileId = await makeProfile(userId, MT5_EXECUTION_PROVIDER_ID);
+  const returned = (reason: string): ReconciliationSnapshotProvider => ({
+    async getSnapshot() {
+      return { providerId: MT5_EXECUTION_PROVIDER_ID, accountRef: null, retrievedAt: new Date().toISOString(), orders: [], positions: [], providerUnavailable: true, providerUnavailableReason: reason };
+    },
+  });
+  const freeText = await build(returned(`Login failed for ${GATE10_SECRET}`)).triggerRun({ userId, executionProfileId: profileId, trigger: 'manual' });
+  assert.equal(freeText.run.failureReason, 'provider_error:unknown');
+  assert.equal((await gate10PersistedText(freeText.run.id)).includes(GATE10_SECRET), false);
+  const otherUser = await makeUser();
+  const otherProfile = await makeProfile(otherUser, MT5_EXECUTION_PROVIDER_ID);
+  const token = await build(returned('mt5_transport_unconfigured')).triggerRun({ userId: otherUser, executionProfileId: otherProfile, trigger: 'manual' });
+  assert.equal(token.run.failureReason, 'mt5_transport_unconfigured');
+});

@@ -110,10 +110,12 @@ describe('M8.4 MT5 provider boundary', () => {
     }
   });
 
-  test('normalizes broker order state and safe retcode/message receipt', () => {
+  test('normalizes broker order state and a structured receipt without the broker message', () => {
+    // Gate 10: the receipt keeps bounded structured data only; the broker's
+    // free-text `message` is provider-controlled and is never retained.
     assert.deepEqual(normalizeMT5Order({ ticket: '42', symbol: 'XAUUSDm', status: 'partial', volume: 1, filledVolume: 0.4, averagePrice: 2000, retcode: 10009, message: 'done', timestampMs: NOW }), {
       providerOrderId: '42', status: 'partially_filled', filledQuantity: 0.4, averagePrice: 2000,
-      raw: { retcode: 10009, message: 'done', timestampMs: NOW },
+      raw: { retcode: 10009, timestampMs: NOW },
     });
   });
 

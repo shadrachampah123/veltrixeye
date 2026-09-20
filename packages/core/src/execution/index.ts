@@ -13,6 +13,8 @@ export {
   isOrderTerminal,
 } from './order-machine.js';
 export { ExecutionProviderRegistry, createExecutionProviderRegistry, type RegisteredExecutionProviderInfo } from './registry.js';
+/* Gate 10 — closed projection of provider health for API responses and persisted records */
+export { toSafeProviderHealth, PROVIDER_MISSING_REASON, type SafeExecutionProviderHealth } from './provider-health.js';
 export {
   createPaperExecutionProvider,
   type PaperSimulatorPort,
@@ -22,6 +24,7 @@ export {
   normalizeMT5Error,
   normalizeMT5Order,
   DisabledMT5Transport,
+  MT5_TRANSPORT_UNHEALTHY_REASON,
   type MT5Transport,
   type MT5TransportHealth,
   type MT5TransportError,
