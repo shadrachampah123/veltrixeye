@@ -797,6 +797,114 @@ describe('Gate 9 §13 — durable provider mutation persistence (fake provider)'
     );
   });
 
+  test('13c. valid not_found reconciliation preserves uncertainty and blocks retry until operator resolution', async () => {
+    const { userId, profileId } = await makeAccount();
+    const riskDecisionId = await makeRiskDecision(userId, profileId);
+    const input = submitInput({
+      userId,
+      profileId,
+      riskDecisionId,
+      monetaryRisk: '55.5',
+    });
+
+    const outcome = await ledger.executeSubmit(
+      await authorizedBarrier(input),
+      createFakeProvider({ kind: 'timeout' }).call,
+    );
+    assert.equal(outcome.intentState, 'uncertain');
+
+    // Record a valid not_found reconciliation observation
+    const observation = await ledger.recordReconciliationObservation({
+      intentId: outcome.intentId,
+      userId,
+      executionProfileId: profileId,
+      outcome: 'not_found',
+      providerStatus: null,
+      statusUncertain: false,
+    });
+
+    // 1. Observation is recorded but NOT applied (applied=false, requiresOperatorResolution=true)
+    assert.equal(observation.stale, false);
+    assert.equal(observation.applied, false);
+    assert.equal(observation.intentState, 'uncertain');
+    assert.equal(observation.resolution, null);
+    assert.equal(observation.outcome, 'uncertain');
+    assert.equal(observation.requiresOperatorResolution, true);
+
+    const obsRows = await pool.query<{ outcome: string; applied: boolean; evidence: string | null }>(
+      `SELECT outcome, applied, evidence FROM execution_provider_reconciliation_observations WHERE intent_id = $1`,
+      [outcome.intentId],
+    );
+    assert.equal(obsRows.rows.length, 1);
+    assert.equal(obsRows.rows[0]!.outcome, 'not_found');
+    assert.equal(obsRows.rows[0]!.applied, false);
+    assert.equal(obsRows.rows[0]!.evidence, null);
+
+    // 2. Intent remains uncertain
+    const intent = await intentRow(outcome.intentId);
+    assert.equal(intent.status, 'uncertain');
+    assert.equal(intent.resolution, null);
+    assert.equal(intent.outcome, 'uncertain');
+    assert.equal(intent.reconciliation_required, true);
+    assert.equal(intent.reconciliation_state, 'pending');
+    assert.equal(intent.resolved_at, null);
+
+    // 3. Reservation remains uncertain
+    const reservation = await reservationRow(outcome.intentId);
+    assert.equal(reservation.state, 'uncertain');
+    assert.equal(reservation.requires_reconciliation, true);
+
+    // 4. Unresolved exposure remains counted
+    const exposure = await ledger.unresolvedMutationExposure(profileId);
+    assert.equal(exposure.count, 1);
+    assert.equal(Number(exposure.monetaryRisk), 55.5);
+    assert.deepEqual(exposure.clientOrderIds, [outcome.clientOrderId]);
+    assert.equal(exposure.intents[0]!.state, 'uncertain');
+
+    // 5. prepareRetry remains blocked by uncertainty_unresolved
+    const retryRiskDecisionId = await makeRiskDecision(userId, profileId);
+    await assert.rejects(
+      () => ledger.prepareRetry({
+        ...submitInput({ userId, profileId, riskDecisionId: retryRiskDecisionId }),
+        parentIntentId: outcome.intentId,
+        clientOrderId: `ve-${outcome.clientOrderId.slice(3, 23)}-r1`,
+        idempotencyKey: newIdempotencyKey(),
+        riskDecisionId: retryRiskDecisionId,
+        authorizationId: `auth-${randomUUID()}`,
+      }),
+      (error: unknown) => error instanceof ProviderMutationError && error.code === 'uncertainty_unresolved',
+    );
+
+    // 6. Provider absence becomes durable only through explicit operator resolution
+    const opResolution = await ledger.resolveByOperator({
+      intentId: outcome.intentId,
+      userId,
+      executionProfileId: profileId,
+      actor: 'operator:' + userId,
+      resolvedBy: userId,
+      resolution: 'provider_absent',
+      evidence: 'operator_resolution',
+      evidenceReference: 'ops-audit#reconciliation-confirmed-absent',
+      note: 'Reconciliation observation confirmed absence, operator resolved',
+    });
+    assert.equal(opResolution.toStatus, 'reconciled');
+    assert.equal(opResolution.resolution, 'provider_absent');
+    assert.equal(opResolution.reservationState, 'known_rejected');
+
+    const resolvedIntent = await intentRow(outcome.intentId);
+    assert.equal(resolvedIntent.status, 'reconciled');
+    assert.equal(resolvedIntent.resolution, 'provider_absent');
+    assert.equal(resolvedIntent.outcome, null);
+    assert.equal(resolvedIntent.reconciliation_required, false);
+
+    const resolvedReservation = await reservationRow(outcome.intentId);
+    assert.equal(resolvedReservation.state, 'known_rejected');
+    assert.equal(resolvedReservation.requires_reconciliation, false);
+
+    const exposureAfter = await ledger.unresolvedMutationExposure(profileId);
+    assert.equal(exposureAfter.count, 0);
+  });
+
   /* ------------------------------------------------------------------------ */
   /* 14 — retry after properly resolved uncertainty                           */
   /* ------------------------------------------------------------------------ */

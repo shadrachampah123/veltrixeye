@@ -842,11 +842,13 @@ export class ProviderMutationLedger {
    * Records a reconciliation observation and, when it is current and
    * identity-verified, resolves an unresolved intent.
    *
-   * Never repairs, resubmits, cancels or closes anything. `not_found` is a
-   * proven observation of absence: it resolves the uncertainty as
-   * `provider_absent`, never as a rejection. A stale observation (a newer retry
-   * or a newer definitive outcome already exists) is recorded but cannot move
-   * durable state.
+   * Never repairs, resubmits, cancels or closes anything. `not_found` is
+   * recorded as a proven observation (`applied = false`); the intent remains
+   * `uncertain` and requires operator resolution (`requiresOperatorResolution = true`).
+   * There is no automatic `provider_absent` transition — provider absence becomes
+   * durable only through explicit operator resolution. A stale observation
+   * (a newer retry or a newer definitive outcome already exists) is recorded
+   * but cannot move durable state.
    */
   async recordReconciliationObservation(input: ReconciliationObservationInput): Promise<ReconciliationObservationResult> {
     const intent = await this.requireIntent(input.intentId, input.userId, input.executionProfileId);
