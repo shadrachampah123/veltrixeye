@@ -149,3 +149,25 @@ export {
   type ReconciliationSnapshotProvider,
   type TriggerRunOptions,
 } from './reconciliation-service.js';
+
+/* M10 Gate 9 — durable provider mutation persistence (submit only, no live transport) */
+export {
+  ProviderMutationLedger,
+  ProviderMutationError,
+  classifyTransportFailure,
+  PROVIDER_MUTATION_ERROR_CODES,
+  type MutationExecutionResult,
+  type MutationReservationRecord,
+  type OperatorResolutionInput,
+  type PrepareSubmitResult,
+  type ProviderIntentRecord,
+  type ProviderSubmitCall,
+  type ProviderSubmitResponse,
+  type ReconciliationObservationInput,
+  type ReconciliationObservationResult,
+  type ResolutionResult,
+  type RetryIntentInput,
+  type SubmitBarrier,
+  type SubmitIntentInput,
+  type SubmitOnceResult,
+} from './provider-mutations.js';

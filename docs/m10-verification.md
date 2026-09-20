@@ -339,3 +339,92 @@ longer mapped to a durable status or to `failed`, but to explicit uncertainty.
 expectation ("unsupported statuses stay unknown (Gate 9 §18/§21)"). Gate 10's
 redaction guarantees (fixed messages, no cause/stack, allowlisted reasons, bounded
 receipts) are unchanged and still pass.
+
+## Gate 9 — durable provider mutation persistence (submit only)
+
+Date: 2026-09-20 (UTC). Base: `main` `d92d733ed1c100d3b4a6b9c49284f1c89ef703f1`.
+Status: **the Gate 9 persistence contract (replacement authority for the
+unrecovered §22/§24/§31 persistence material) is implemented and verified.**
+Scope is durable persistence and recovery safety for provider order-**submit**
+mutations. **No broker, bridge, demo or live connectivity**, no credential use,
+no route, no provider registration or wiring, and no automatic
+repair/retry/cancel/close. Full record:
+[docs/gate9-provider-mutation-persistence.md](./gate9-provider-mutation-persistence.md).
+
+Scope (files): `packages/contracts/src/provider-mutations.ts` (new),
+`packages/contracts/src/index.ts`;
+`packages/core/src/execution/provider-mutations.ts` (new),
+`packages/core/src/execution/index.ts`,
+`packages/core/src/db/migrations/0029_provider_mutation_persistence.sql` (new);
+tests `packages/contracts/test/m10-gate9-persistence.test.ts` (new),
+`packages/core/test/m10-gate9-mutation-persistence.test.ts` (new),
+`packages/core/test/m10-gate9-migrations.test.ts` (new),
+`packages/core/test/m91-migrations.test.ts`,
+`packages/core/test/m92-migrations.test.ts` (both updated only to assert
+migration sets by name instead of by exact total, because a new migration now
+ships after theirs); docs `m10-execution-transport.md`,
+`gate9-provider-mutation-persistence.md` and this report.
+
+### Landed in this step
+
+- **Pre-provider persistence barrier (§9).** `prepareSubmit` commits the intent
+  and the mutation reservation, then transitions the intent to `submitting`,
+  inside one transaction. No transaction is open across the provider call, and a
+  pre-call persistence failure is fail-closed (`pre_call_persistence_failed`,
+  provider never invoked).
+- **Durable ledger (§2).** `execution_provider_intents` extended additively with
+  mutation kind, idempotency key, canonical request hash, binding, retry
+  lineage, reconciliation state/requirement, terminal evidence, resolved
+  timestamps and a reference-only credential binding.
+- **Mutation reservation (§4, §10).** A dedicated
+  `execution_provider_mutation_reservations` ledger that keeps its own exposure
+  copy and cannot be deleted while `reserved` or `uncertain`; the risk
+  reservation it references may be reclaimed by the existing 60-second TTL
+  (`ON DELETE SET NULL`) without touching it.
+- **Outcome normalization and receipts (§5, §11).** One normalizer maps every
+  response onto `accepted | rejected | uncertain`; everything else (timeout,
+  transport failure, lost/malformed response, unknown status, identity mismatch)
+  fails closed into uncertainty. Receipts are append-only, identity-verified and
+  sanitized, with a database CHECK that rejects credential-shaped keys.
+- **Retry and reconciliation (§6, §7).** A retry needs a resolved original, a
+  brand-new identity and fresh risk/authorization evidence; a repeated request
+  resolves onto the existing intent without a second provider call.
+  Reconciliation is observation only; staleness against a newer retry or a newer
+  definitive outcome is decided by the database.
+- **Operator resolution (§14).** Evidence-bearing, identity-preserving,
+  append-only, and never a deletion of the uncertain record.
+- **Restart recovery and retention (§8, §15).** In-flight intents become
+  uncertain on restart; unresolved intents, reservations, receipts, observations,
+  resolutions and events cannot be deleted.
+
+### Deliberately not in this step
+
+- **Nothing live is wired.** No provider-registry entry, no transport
+  connection, no route, no worker, no config knob. `apps/` is untouched and the
+  M8.4/M10 MT5 boundary stays disabled and unavailable.
+- **No secret-manager integration.** The binding is reference-only and
+  `secretManagerIntegrated` remains `false`.
+- **No risk/notification/entitlement/kill-switch behavior change.** The
+  risk service, its 60-second reservation TTL, notification delivery and the
+  safety controls are untouched; only two migration tests were adapted to assert
+  migration sets by name rather than by exact count.
+- **No retention/archival policy.** Gate 9 introduces no deletion routine at all.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Contracts | 216 passed (19 new Gate 9 persistence tests) |
+| Core (full, embedded PostgreSQL, serialized) | 793 passed, 0 failed (36 new Gate 9 tests) |
+| Twelve Data provider / API / Web | 33 / 282 / 183 passed |
+| Full `npm test` | **1,507 passed, 0 failed** |
+| New Gate 9 suites | 31 fake-provider crash/recovery + 5 migration + 19 contract tests |
+| Migration `0028` SHA-256 | Byte-identical to base: `25359093d0304d84d82982750c58ee1bb054edacf29d1d4971a32ecfb5c9e49f` |
+| Migration `0029` | Fresh apply clean, in-place 0028 → 0029 upgrade preserves rows, checksums match |
+| `npm run typecheck` | 0 errors across all workspaces |
+| Changed-file ESLint | Clean for every file in this change |
+
+All new suites are deterministic and offline: no network, no credential, no
+vendor artifact and no real account. `provider-mutations.ts` (contracts and
+core) imports no `node:http`/`node:net`/`node:tls`/`node:child_process`, performs
+no environment access and no filesystem access.
