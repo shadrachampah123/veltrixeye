@@ -3,9 +3,9 @@ import { ASSET_CLASSES } from './assets.js';
 import {
   EXECUTION_ARCHITECTURE_VERSION,
   ORDER_SIDES,
-  ORDER_STATUSES,
   ORDER_TYPES,
 } from './execution.js';
+import { RECONCILIATION_SNAPSHOT_ORDER_STATUSES } from './mt5-bridge-protocol.js';
 
 /**
  * M8.5 — Order & Position Reconciliation (contracts).
@@ -133,7 +133,20 @@ export const reconciliationProviderOrderSchema = z
     averagePrice: z.number().positive().nullable().optional(),
     stopLossPrice: z.number().positive().nullable().optional(),
     takeProfitPrice: z.number().positive().nullable().optional(),
-    status: z.enum(ORDER_STATUSES).optional(),
+    /**
+     * Gate 9 §21 (B9): a reconciliation SNAPSHOT may state an explicit
+     * `uncertain` provider state, in addition to the durable order statuses.
+     * This is snapshot-only vocabulary — the database `order_status`
+     * constraint is untouched, and no migration is implied by it.
+     */
+    status: z.enum(RECONCILIATION_SNAPSHOT_ORDER_STATUSES).optional(),
+    /**
+     * Set when the provider state could not be established (unknown/missing/
+     * malformed status). A matched row carrying it must keep an
+     * `uncertain_outcome` finding rather than be reported as a mismatch that
+     * authorizes any repair.
+     */
+    statusUncertain: z.boolean().optional(),
     createdAt: z.string().optional(),
     updatedAt: z.string().optional(),
     raw: z.record(z.string(), z.unknown()).optional(),
@@ -301,3 +314,9 @@ export type ReconciliationTriggerResponse = z.infer<
 
 // Version re-export for convenience.
 export { EXECUTION_ARCHITECTURE_VERSION };
+/**
+ * Snapshot-level status vocabulary (Gate 9 §21). Re-exported here because a
+ * reconciliation snapshot is the only place `uncertain` may appear: it is not a
+ * durable order status and must never be written to an order row.
+ */
+export { RECONCILIATION_SNAPSHOT_ORDER_STATUSES };

@@ -217,5 +217,125 @@ Scope (working-tree files): `packages/core/src/execution/mt5.ts`,
 - Execution safety gates, kill switches, risk/safety services, entitlements,
   contracts, `app.ts` wiring and the migrations directory are unchanged.
 
+### Superseded by Gate 9 (2026-09-20): provider status vocabulary
+
+The bullet "Status mapping is unchanged" above described Gate 10's scope only. Gate
+9 §18/§21 replaces that mapping with the protocol's closed, case-sensitive
+`PROVIDER_ORDER_STATUS_VOCABULARY`: an unknown, missing, malformed or case-variant
+provider status (`FILLED`, `' Accepted '`, `''`, a non-string) is no longer folded
+into a durable status or into `failed` at all. It normalizes to `status: null` with
+`statusUncertain: true`, which the MT5 adapter surfaces as an uncertain
+`ExecutionProviderError` and reconciliation preserves as the snapshot-only
+`uncertain` status plus an `uncertain_outcome` finding. Gate 10's redaction
+behavior is unchanged; the Gate 10 expectation was updated to the stricter rule in
+`packages/core/test/m10-gate10-redaction.test.ts` ("unsupported statuses stay
+unknown (Gate 9 §18/§21)").
+
 Not part of this gate: broker/bridge/demo integration (Gate 9), any merge,
 production deployment or live enablement.
+
+## Gate 9 — MT5 bridge protocol contract: Step 2 (pre-provider validation)
+
+Date: 2026-09-20 (UTC). Base: `main` `6fbeda415414f87863292b662319b50c973d91a2`
+(PR #33). Status: **Step 2 of the Gate 9 plan is implemented and verified.** This
+is protocol-contract and validation work only — **no broker, bridge, demo or live
+connectivity**, no credential use, no migration, no route, and no provider is
+registered or wired. It is explicitly **not** a claim that Gate 9 as a whole is
+closed.
+
+Scope (files): `packages/contracts/src/mt5-bridge-protocol.ts` (new),
+`packages/contracts/src/index.ts`, `execution.ts`, `reconciliation.ts`;
+`packages/core/src/execution/protocol.ts` (new), `readiness.ts` (new), `index.ts`,
+`mt5.ts`, `gates.ts`, `paper-gates.ts`, `provider-health.ts`,
+`reconciliation-service.ts`; tests
+`packages/contracts/test/m10-gate9-protocol.test.ts` (new),
+`packages/core/test/m10-gate9-validation.test.ts` (new),
+`packages/core/test/m10-gate9-reconciliation.test.ts` (new),
+`packages/core/test/mt5.test.ts`, `packages/core/test/m10-gate10-redaction.test.ts`;
+docs `m10-execution-transport.md` and this report.
+
+### Landed in this step
+
+- **Protocol identity and strictness.** `veltrixeye.mt5-bridge` at `1.0.0` with
+  explicit per-message identity, strict (non-passthrough) schemas, bounded
+  strings/numbers/timestamps, closed enums, and semver rules that reject a higher
+  MAJOR instead of reinterpreting it (MINOR mismatch rejected, PATCH tolerated,
+  malformed rejected — never coerced).
+- **Durable order identity (B2).** `ve-<24 hex>` and `ve-<20 hex>-rN` with
+  deterministic refusal codes; checked **first** in the MT5 submit path, ahead of
+  health, symbol lookup and idempotency lookup, so a malformed identity yields a
+  certain pre-exchange refusal and provably zero transport calls.
+- **One readiness rule (B5, R7.4.4).** `readiness.ts` resolves readiness for the
+  M8.1 gates, M8.3 paper gates, MT5 health projection, MT5 execution path and the
+  reconciliation snapshot adapter from one strict implementation: explicit boolean
+  `true` only, per-profile conditions, uncertain state refuses, and a
+  dependency-chain rule so a narrower profile cannot be satisfied by a record that
+  asserts availability while admitting it is not connected or authenticated.
+  Readiness remains a precondition, never an authorization.
+- **Quote freshness (B6).** Two-sided window `-5000 ms … +15000 ms` by default,
+  inclusive bounds, floored age, future-beyond-skew refused, non-finite override
+  refused instead of disabling the check.
+- **Instrument and sizing (B7).** Closed instrument-contract validation (asset
+  class, symbol identity, contract size, tick size, digits, volume min/max/step,
+  order types, trading status) plus range and step alignment; the historical
+  zero-step `Infinity` comparison that let every volume through is closed at the
+  contract level.
+- **Provider status normalization (B9).** Closed, case-sensitive vocabulary in the
+  protocol; unknown/malformed/case-variant states become `status: null` +
+  `statusUncertain: true` and never `failed`/`rejected`; the MT5 adapter surfaces
+  them as uncertain and reconciliation records an `uncertain_outcome` finding
+  (§20/§21), never status drift, never a fabricated absence, never a repair.
+- **Audit boundary (§24/§25/§31 partial).** A strict audit-event contract with
+  credential-shaped keys and provider payloads **rejected** (not redacted),
+  definitive outcomes requiring verified evidence, and uncertain outcomes requiring
+  the uncertainty flag.
+
+### Deliberately not in this step
+
+- **Nothing is wired.** There is no provider-registry entry, no route (no
+  `/test-connection` endpoint exists or was added), no transport selection and no
+  config knob for `veltrixeye.mt5-bridge`: no production path consults the new
+  module yet, so MT5 stays disabled-by-default and every real behavior is
+  unchanged.
+- **Provider-side durability is later work.** §22's "persist locally uncertain
+  before the provider call" and §24's submit-intent/reservation/receipt storage
+  need the persistence step and are deferred with the adapter work, together with
+  the operator runbook and an end-to-end fake-bridge harness.
+- **No secret-manager binding.** §31's attestation-to-credential binding is not
+  implemented; the protocol carries non-secret reference fields only, and an
+  unusable attestation refuses the handshake (`attestation_mismatch`) rather than
+  being retried as an envelope problem.
+- **Open item — vendor price rules.** The limit/stop price-rule text for MT5 is
+  absent from this repository, so price handling stays at the bounded price schema
+  plus tick/digits contract compatibility. No vendor-specific price behavior was
+  invented, and none should be assumed from this step.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Contracts | 197 passed (75 new Gate 9 protocol tests) |
+| Core (full, embedded PostgreSQL included) | 757 passed |
+| New Gate 9 core suites | 32 pre-provider validation + 5 reconciliation-uncertainty tests |
+| Twelve Data provider / API / Web | 33 / 282 / 183 passed |
+| Full `npm test` | **1,452 passed, 0 failed, 0 skipped** |
+| `npm run typecheck` | 0 errors |
+| Changed-file ESLint / `git diff --check` | Clean |
+| Migration 0028 SHA-256 | Byte-identical to base: `25359093d0304d84d82982750c58ee1bb054edacf29d1d4971a32ecfb5c9e49f`; no migration 0029 |
+| `ORDER_STATUSES` | unchanged (10 members, no `uncertain`); `uncertain` is snapshot-only vocabulary |
+
+Both suites are deterministic and offline: no network, no credential, no vendor
+artifact and no real account. `packages/contracts/src/mt5-bridge-protocol.ts`,
+`packages/core/src/execution/protocol.ts` and `readiness.ts` contain no
+`node:http`/`node:net`/`node:child_process` import, no environment access and no
+filesystem access, and `apps/` is untouched by this step.
+
+### Superseded expectation from Gate 10
+
+Gate 10 recorded "status mapping is unchanged". Gate 9 §18/§21 supersedes that:
+unsupported provider statuses (including case variants such as `FILLED`) are no
+longer mapped to a durable status or to `failed`, but to explicit uncertainty.
+`packages/core/test/m10-gate10-redaction.test.ts` was updated to the stricter
+expectation ("unsupported statuses stay unknown (Gate 9 §18/§21)"). Gate 10's
+redaction guarantees (fixed messages, no cause/stack, allowlisted reasons, bounded
+receipts) are unchanged and still pass.

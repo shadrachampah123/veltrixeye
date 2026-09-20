@@ -7,6 +7,7 @@ import {
   type PaperSimulationGateId,
 } from '@veltrixeye/contracts';
 import { Dec } from '../risk/decimal.js';
+import { resolveExecutionReadiness } from './readiness.js';
 
 /**
  * M8.3 — paper simulation gates (pure, ordered, fail-closed).
@@ -132,10 +133,18 @@ export function evaluatePaperSimulationGates(
       }
 
       case 'provider_ready': {
+        // Gate 9 §7/§26 (B5, R7.4.4): same resolver as the health path. The
+        // simulator is only "ready" when each declared condition is the strict
+        // boolean `true`; truthy junk, missing fields and provider strings are
+        // refusals, not green lights.
         const health = input.providerHealth;
         if (health === null) return fail(gate, 'paper simulator health is unknown');
-        if (!health.configured) return fail(gate, 'paper simulator is not configured');
-        if (!health.healthy) return fail(gate, 'paper simulator is not healthy');
+        const { decision, flags } = resolveExecutionReadiness(health, 'paperGateHealth');
+        if (decision.code === 'health_not_an_object' || decision.code === 'health_malformed') {
+          return fail(gate, 'paper simulator health is malformed');
+        }
+        if (!flags.configured) return fail(gate, 'paper simulator is not configured');
+        if (!decision.ready) return fail(gate, 'paper simulator is not healthy');
         break;
       }
 

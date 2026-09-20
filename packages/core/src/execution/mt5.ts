@@ -2,7 +2,9 @@ import {
   EXECUTION_FAILURE_CATEGORIES,
   ExecutionProviderError,
   MT5_EXECUTION_PROVIDER_ID,
+  normalizeProviderOrderStatus,
   type AssetClass,
+  type BridgeQuote,
   type ExecutionAccountInfo,
   type ExecutionFailureCategory,
   type ExecutionInstrumentMetadata,
@@ -13,9 +15,16 @@ import {
   type ExecutionProviderPositionState,
   type ExecutionSubmitOrderOutcome,
   type ExecutionSubmitOrderRequest,
-  type OrderStatus,
   type OrderType,
 } from '@veltrixeye/contracts';
+import {
+  bridgeOrderIdentityError,
+  bridgeQuoteError,
+  bridgeReadinessError,
+  bridgeVolumeError,
+  validateBridgeInstrument,
+} from './protocol.js';
+import { explicitHealthFlags, resolveExecutionReadiness } from './readiness.js';
 
 /** Vendor-neutral records returned by an MT5 terminal/gateway transport. */
 export interface MT5AccountSnapshot {
@@ -138,13 +147,19 @@ export interface MT5ProviderConfig {
   /** Explicit canonical -> broker mapping. Never accepted on an order request. */
   symbols: ReadonlyMap<string, string>;
   maxQuoteAgeMs?: number;
+  /**
+   * Forward-drift tolerance accepted on broker quote timestamps (§8). The
+   * protocol default is 5000 ms; a deployment may narrow it, never disable it.
+   */
+  clockSkewMs?: number;
   now?: () => number;
 }
 
-const statusMap: Record<string, OrderStatus> = {
-  requested: 'submitted', placed: 'accepted', accepted: 'accepted', partial: 'partially_filled',
-  filled: 'filled', rejected: 'rejected', cancelled: 'cancelled', canceled: 'cancelled', expired: 'expired',
-};
+/**
+ * The provider-status table lives in the protocol contract
+ * (`PROVIDER_ORDER_STATUS_VOCABULARY`) so no adapter can maintain a laxer copy.
+ * `normalizeProviderOrderStatus` is the only reader of it.
+ */
 
 /* -------------------------------------------------------------------------- */
 /* Redaction boundary (Gate 10)                                                */
@@ -272,9 +287,17 @@ export function normalizeMT5Error(error: unknown, operation: string): ExecutionP
  * than persisted, because a mangled identity could match the wrong order later.
  */
 export function normalizeMT5Order(row: MT5OrderSnapshot): ExecutionProviderOrderState {
+  // Gate 9 §18/§21 (B9): an unknown, missing, malformed or case-variant broker
+  // status used to be folded into `failed` — a definitive failure invented from
+  // "we could not read the state". It is now an explicitly uncertain status:
+  // `status: null` + `statusUncertain: true`, which reconciliation preserves as
+  // an `uncertain_outcome` finding. A non-string status can no longer throw
+  // inside the normalizer either (the old `.toLowerCase()` did).
+  const status = normalizeProviderOrderStatus(typeof row?.status === 'string' ? row.status : undefined);
   return {
     providerOrderId: requireProviderTicket(row.ticket, 'order'),
-    status: statusMap[row.status.toLowerCase()] ?? 'failed',
+    status: status.status,
+    ...(status.statusUncertain ? { statusUncertain: true as const } : {}),
     filledQuantity: row.filledVolume ?? 0,
     averagePrice: row.averagePrice ?? null,
     raw: { retcode: boundedInteger(row.retcode, 0, MAX_RETCODE), timestampMs: boundedInteger(row.timestampMs, 0, MAX_EPOCH_MS) },
@@ -294,23 +317,46 @@ export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5P
   const capabilities: ExecutionProviderCapabilities = { modes: ['demo'], orderTypes: ['market', 'limit', 'stop'] };
   const now = config.now ?? Date.now;
   const canonicalFor = (providerSymbol: string) => [...config.symbols].find(([, value]) => value === providerSymbol)?.[0] ?? providerSymbol;
+  const policy = { maxQuoteAgeMs: config.maxQuoteAgeMs, clockSkewMs: config.clockSkewMs };
   const requireAvailable = async (): Promise<void> => {
     if (config.environment === 'live') throw new ExecutionProviderError('validation', 'Live MT5 execution is prohibited in M8.4');
     if (!config.enabled) throw new ExecutionProviderError('unavailable', 'MT5 provider is disabled');
     const health = await transport.health().catch((e) => { throw normalizeMT5Error(e, 'health check'); });
-    if (!health.configured || !health.authenticated || !health.connected || !health.healthy) {
-      throw new ExecutionProviderError(health.authenticated ? 'unavailable' : 'authentication', 'MT5 provider is not ready');
-    }
+    // Gate 9 §7/§26 (B5, R7.4.4): the execution path asks the SAME resolver as
+    // the health path instead of re-deriving readiness from truthiness. A
+    // missing, malformed, provider-string or merely truthy flag is not ready,
+    // and an uncertain health state refuses before anything is sent.
+    const refusal = bridgeReadinessError(health, 'transportHealth');
+    if (refusal) throw refusal;
   };
-  const metadata = (canonical: string, row: MT5SymbolSnapshot): ExecutionInstrumentMetadata => {
-    const quote = row.bid && row.ask && row.quoteTimestampMs ? {
-      bid: row.bid, ask: row.ask, spread: row.ask - row.bid, timestampMs: row.quoteTimestampMs,
+  /**
+   * Projects a broker symbol row onto the protocol instrument contract and
+   * validates it (§9, B7). An instrument whose contract cannot be validated is
+   * never usable as execution input — including one whose `volumeStep` is zero,
+   * which previously survived an `Infinity` step-count comparison untouched.
+   */
+  const instrumentContract = (canonical: string, row: MT5SymbolSnapshot) =>
+    validateBridgeInstrument(
+      {
+        assetClass: row.assetClass, canonicalSymbol: canonical, providerSymbol: row.symbol,
+        contractSize: row.contractSize, tickSize: row.tickSize, priceDigits: row.digits,
+        minVolume: row.volumeMin, maxVolume: row.volumeMax, volumeStep: row.volumeStep,
+        orderTypes: row.orderTypes, tradingStatus: row.tradeMode,
+        quote: row.bid !== undefined && row.ask !== undefined && row.quoteTimestampMs !== undefined
+          ? { symbol: row.symbol, bid: row.bid, ask: row.ask, timestampMs: row.quoteTimestampMs }
+          : null,
+      },
+      { canonicalSymbol: canonical, providerSymbol: row.symbol, assetClass: row.assetClass },
+    );
+  const metadata = (canonical: string, contract: NonNullable<ReturnType<typeof instrumentContract>['contract']>): ExecutionInstrumentMetadata => {
+    const quote = contract.quote ? {
+      bid: contract.quote.bid, ask: contract.quote.ask, spread: contract.quote.ask - contract.quote.bid, timestampMs: contract.quote.timestampMs,
     } : null;
     return {
-      assetClass: row.assetClass, canonicalSymbol: canonical, providerSymbol: row.symbol,
-      contractSize: row.contractSize, minVolume: row.volumeMin, maxVolume: row.volumeMax,
-      volumeStep: row.volumeStep, priceDigits: row.digits, tickSize: row.tickSize,
-      orderTypes: row.orderTypes, tradingStatus: row.tradeMode, quote,
+      assetClass: contract.assetClass, canonicalSymbol: contract.canonicalSymbol, providerSymbol: contract.providerSymbol,
+      contractSize: contract.contractSize, minVolume: contract.minVolume, maxVolume: contract.maxVolume,
+      volumeStep: contract.volumeStep, priceDigits: contract.priceDigits, tickSize: contract.tickSize,
+      orderTypes: contract.orderTypes, tradingStatus: contract.tradingStatus, quote,
     };
   };
   return {
@@ -325,12 +371,17 @@ export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5P
       if (config.environment === 'live') return { configured: transport.configured, authenticated: false, connected: false, available: false, healthy: false, state: 'disabled', reason: 'live_execution_prohibited_m8_4', checkedAt };
       try {
         const h = await transport.health();
-        // Flags are re-derived as strict booleans and the reason is an
-        // allowlisted token: a transport's free-text `reason` (or any extra
-        // property such as `detail`) never reaches the health record.
-        const configured = h.configured === true, authenticated = h.authenticated === true, connected = h.connected === true;
+        // Gate 9 §26 (R7.4.4): the flags below come from the same strict reader
+        // the execution path uses, so the health answer and the execution
+        // decision can never disagree. `available` stays derived — a transport
+        // cannot claim availability it has not established — and a transport's
+        // free-text `reason` (or an extra property such as `detail`) still never
+        // reaches the health record.
+        const flags = explicitHealthFlags(h);
+        const configured = flags.configured, authenticated = flags.authenticated, connected = flags.connected;
         const available = configured && authenticated && connected;
-        const healthy = available && h.healthy === true;
+        const readiness = resolveExecutionReadiness(h, 'transportHealth').decision;
+        const healthy = available && readiness.ready;
         const reason = healthy ? undefined : typeof h.reason === 'string' && SAFE_TRANSPORT_HEALTH_REASONS.has(h.reason) ? h.reason : MT5_TRANSPORT_UNHEALTHY_REASON;
         return { configured, authenticated, connected, available, healthy, state: healthy ? 'healthy' : available ? 'degraded' : 'unavailable', ...(reason ? { reason } : {}), checkedAt };
       } catch (e) {
@@ -357,8 +408,16 @@ export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5P
       await requireAvailable();
       const mapped = config.symbols.get(canonical);
       if (!mapped) throw new ExecutionProviderError('invalid_symbol', `No explicit MT5 symbol mapping exists for ${canonical}`);
-      try { const row = await transport.symbol(mapped); return row ? metadata(canonical, row) : null; }
-      catch (e) { throw normalizeMT5Error(e, 'instrument lookup'); }
+      try {
+        const row = await transport.symbol(mapped);
+        if (!row) return null;
+        const outcome = instrumentContract(canonical, row);
+        if (outcome.error) throw outcome.error;
+        return metadata(canonical, outcome.contract!);
+      } catch (e) {
+        if (e instanceof ExecutionProviderError) throw e;
+        throw normalizeMT5Error(e, 'instrument lookup');
+      }
     },
     async listInstruments() {
       const rows: ExecutionInstrumentMetadata[] = [];
@@ -366,29 +425,46 @@ export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5P
       return rows;
     },
     async submitOrder(request: ExecutionSubmitOrderRequest): Promise<ExecutionSubmitOrderOutcome> {
+      // 1. §11 (B2): the durable client order identity is the FIRST check,
+      //    ahead of the health call, the symbol lookup and the idempotency
+      //    lookup. A malformed identity therefore cannot produce a provider
+      //    call, a provider-side mutation, or an uncertain outcome.
+      const identityRefusal = bridgeOrderIdentityError(request?.clientOrderId);
+      if (identityRefusal) throw identityRefusal;
+      // 2. §7/§26 (B5): explicit readiness, resolved by the shared resolver.
       await requireAvailable();
       if (!request.authorizationId) throw new ExecutionProviderError('validation', 'MT5 orders require a server-issued execution authorization');
       const brokerSymbol = config.symbols.get(request.symbol);
       if (!brokerSymbol) throw new ExecutionProviderError('invalid_symbol', `No explicit MT5 symbol mapping exists for ${request.symbol}`);
       const row = await transport.symbol(brokerSymbol).catch((e) => { throw normalizeMT5Error(e, 'instrument lookup'); });
       if (!row || row.assetClass !== request.assetClass) throw new ExecutionProviderError('invalid_symbol', 'Broker instrument metadata does not match the canonical instrument');
-      if (!row.orderTypes.includes(request.orderType) || row.tradeMode !== 'open') throw new ExecutionProviderError('validation', 'Order type or trading status is not supported');
-      const steps = (request.quantity - row.volumeMin) / row.volumeStep;
-      if (request.quantity < row.volumeMin || request.quantity > row.volumeMax || Math.abs(steps - Math.round(steps)) > 1e-8) throw new ExecutionProviderError('invalid_volume', 'Risk-safe quantity does not satisfy broker volume constraints');
+      const contract = instrumentContract(request.symbol, row);
+      if (contract.error) throw contract.error;
+      const validated = contract.contract!;
+      if (!validated.orderTypes.includes(request.orderType) || validated.tradingStatus !== 'open') throw new ExecutionProviderError('validation', 'Order type or trading status is not supported');
+      // 3. §9 (B7): range AND volume-step alignment against the validated
+      //    contract. An invalid/zero step fails closed here instead of turning
+      //    the alignment check into a permissive `Infinity` comparison.
+      const volumeRefusal = bridgeVolumeError({ volume: request.quantity, contract: validated });
+      if (volumeRefusal) throw volumeRefusal;
       if (!(request.stopLossPrice && request.takeProfitPrice)) throw new ExecutionProviderError('invalid_protection', 'Stop loss and take profit are mandatory');
+      // 4. §8 (B6): two-sided quote freshness — stale AND materially future.
       if (request.orderType === 'market') {
-        if (!(row.bid && row.ask && row.bid > 0 && row.ask >= row.bid && row.quoteTimestampMs)) throw new ExecutionProviderError('invalid_price', 'Broker quote is missing or contradictory');
-        if (now() - row.quoteTimestampMs > (config.maxQuoteAgeMs ?? 15_000)) throw new ExecutionProviderError('invalid_price', 'Broker quote is stale');
+        const quote: BridgeQuote | null = validated.quote;
+        const quoteRefusal = bridgeQuoteError({ quote, nowMs: now(), policy });
+        if (quoteRefusal) throw quoteRefusal;
       }
       const existing = await transport.findOrderByClientId(request.clientOrderId).catch((e) => { throw normalizeMT5Error(e, 'idempotency lookup'); });
       if (existing) {
-        if (!statusMap[existing.status.toLowerCase()]) throw new ExecutionProviderError('uncertain', 'Existing broker order has an unknown state; reconciliation is required', { uncertain: true });
+        const prior = normalizeProviderOrderStatus(existing?.status);
+        if (prior.statusUncertain) throw new ExecutionProviderError('uncertain', 'Existing broker order has an unknown state; reconciliation is required', { uncertain: true });
         const normalized = normalizeMT5Order(existing);
         return { providerOrderId: normalized.providerOrderId, status: normalized.status === 'rejected' ? 'rejected' : 'accepted', filledQuantity: normalized.filledQuantity, averagePrice: normalized.averagePrice, receipt: normalized.raw };
       }
       try {
         const submitted = await transport.submitOrder({ clientOrderId: request.clientOrderId, symbol: brokerSymbol, side: request.side, orderType: request.orderType, volume: request.quantity, price: request.requestedPrice, stopLoss: request.stopLossPrice, takeProfit: request.takeProfitPrice });
-        if (!statusMap[submitted.status.toLowerCase()]) throw new ExecutionProviderError('uncertain', 'Broker returned an unknown order state; reconciliation is required', { uncertain: true });
+        const outcome = normalizeProviderOrderStatus(submitted?.status);
+        if (outcome.statusUncertain) throw new ExecutionProviderError('uncertain', 'Broker returned an unknown order state; reconciliation is required', { uncertain: true });
         const normalized = normalizeMT5Order(submitted);
         return { providerOrderId: normalized.providerOrderId, status: normalized.status === 'rejected' ? 'rejected' : 'accepted', filledQuantity: normalized.filledQuantity, averagePrice: normalized.averagePrice, receipt: normalized.raw };
       } catch (e) { throw normalizeMT5Error(e, 'order submission'); }
