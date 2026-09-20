@@ -402,8 +402,12 @@ describe('Gate 9 §13 — durable provider mutation persistence (fake provider)'
     const history = await events(outcome.intentId);
     assert.deepEqual(
       history.map((e) => e.to_state),
-      ['prepared', 'submitting', 'confirmed'],
+      // prepared → submitting → (M2 barrier consumed: submitting → submitting)
+      // → confirmed.
+      ['prepared', 'submitting', 'submitting', 'confirmed'],
     );
+    assert.equal(history[2]!.from_state, 'submitting');
+    assert.equal((history[2]!.detail as { barrier?: string }).barrier, 'submit_barrier_consumed');
   });
 
   /* ------------------------------------------------------------------------ */

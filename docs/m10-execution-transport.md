@@ -274,10 +274,16 @@ persistence material. Full record:
 - `packages/core/src/execution/provider-mutations.ts`: `ProviderMutationLedger`.
   `prepareSubmit` commits the intent AND the mutation reservation, then
   authorizes submission (`submitting`) **inside the same committed transaction**
-  — the pre-provider persistence barrier. `executeSubmit` performs the injected
-  provider call with no open transaction and records the normalized outcome.
-  Retry, reconciliation observation, operator resolution and restart recovery are
-  explicit, separate operations; none of them can resubmit, cancel or close.
+  — the pre-provider persistence barrier. `executeSubmit` first **consumes** the
+  barrier in a short, separate transaction — a compare-and-swap against the
+  exact `barrier.stateVersion` while the intent is still `submitting`, which
+  itself advances `state_version` — so a barrier authorizes at most one provider
+  call; a stale, reused or forged barrier fails closed
+  (`barrier_not_consumable`) and never reaches the provider. Only after the
+  consumption commit does it perform the injected provider call with no open
+  transaction and record the normalized outcome. Retry, reconciliation
+  observation, operator resolution and restart recovery are explicit, separate
+  operations; none of them can resubmit, cancel or close.
 - `packages/core/src/db/migrations/0029_provider_mutation_persistence.sql`:
   additive only. Extends `execution_provider_intents`, and adds the mutation
   reservation, receipt, reconciliation-observation, resolution and append-only
