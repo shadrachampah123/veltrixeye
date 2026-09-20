@@ -231,7 +231,19 @@ export interface ExecutionSubmitOrderOutcome {
 
 export interface ExecutionProviderOrderState {
   providerOrderId: string;
-  status: OrderStatus;
+  /**
+   * Gate 9 §18/§21 (B9): `null` ONLY when the provider's state could not be
+   * established from the closed vocabulary. It is never substituted with
+   * `failed`/`rejected`, because "we could not observe the outcome" is not
+   * evidence of a definitive failure.
+   */
+  status: OrderStatus | null;
+  /**
+   * True when the provider reported an unknown/missing/malformed status. The
+   * flag is only ever written as `true` (an absent flag means "known state"),
+   * so uncertainty survives projection and reconciliation matching.
+   */
+  statusUncertain?: true;
   filledQuantity: number;
   averagePrice: number | null;
   raw?: Record<string, unknown>;

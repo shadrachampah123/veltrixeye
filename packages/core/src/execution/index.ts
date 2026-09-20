@@ -15,6 +15,33 @@ export {
 export { ExecutionProviderRegistry, createExecutionProviderRegistry, type RegisteredExecutionProviderInfo } from './registry.js';
 /* Gate 10 — closed projection of provider health for API responses and persisted records */
 export { toSafeProviderHealth, PROVIDER_MISSING_REASON, type SafeExecutionProviderHealth } from './provider-health.js';
+/* Gate 9 §7/§26 (R7.4.4) — the single authoritative readiness interpretation */
+export {
+  READINESS_PROFILES,
+  assertExecutionReadiness,
+  explicitHealthFlags,
+  isExecutionReady,
+  readinessRequirements,
+  readinessViolationCode,
+  resolveExecutionReadiness,
+  type ReadinessProfile,
+  type ReadinessResolution,
+} from './readiness.js';
+/* Gate 9 Step 2 — strict pre-provider validation (B2/B5/B6/B7/B9) */
+export {
+  BRIDGE_DEFAULT_POLICY,
+  bridgeOrderIdentityError,
+  bridgeQuoteError,
+  bridgeReadinessError,
+  bridgeVolumeError,
+  evaluateBridgeQuote,
+  normalizeBridgeProviderStatus,
+  validateBridgeInstrument,
+  validateBridgeOrderIdentity,
+  type BridgeInstrumentOutcome,
+  type BridgeReadinessOutcome,
+  type BridgeValidationPolicy,
+} from './protocol.js';
 export {
   createPaperExecutionProvider,
   type PaperSimulatorPort,

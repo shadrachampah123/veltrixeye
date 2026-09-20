@@ -15,6 +15,12 @@ import {
 } from '../src/index.js';
 
 const NOW = 1_700_000_000_000;
+/**
+ * Gate 9 §11 (B2): the provider only accepts a durable VeltrixEye client order
+ * identity. The pre-Gate-9 fixture used a free-text id, which is now rejected
+ * before any transport call, so the shared fixture carries a valid 24-hex id.
+ */
+const CLIENT_ORDER_ID = `ve-${'a'.repeat(24)}`;
 class MockTransport implements MT5Transport {
   configured = true;
   submitted: MT5OrderRequest[] = [];
@@ -39,7 +45,7 @@ class MockTransport implements MT5Transport {
   async closePosition() {}
 }
 const request = (patch: Partial<ExecutionSubmitOrderRequest> = {}): ExecutionSubmitOrderRequest => ({
-  clientOrderId: 'veltrix-order-1', idempotencyKey: 'a'.repeat(64), authorizationId: 'server-auth',
+  clientOrderId: CLIENT_ORDER_ID, idempotencyKey: 'a'.repeat(64), authorizationId: 'server-auth',
   assetClass: 'commodity', symbol: 'XAUUSD', side: 'buy', orderType: 'market', quantity: 0.1,
   requestedPrice: null, stopLossPrice: 1990, takeProfitPrice: 2020, ...patch,
 });
@@ -86,7 +92,7 @@ describe('M8.4 MT5 provider boundary', () => {
   test('deterministically translates normalized orders without symbol override', async () => {
     const t = new MockTransport(); const result = await provider(t).submitOrder(request());
     assert.equal(result.providerOrderId, '123'); assert.equal(result.status, 'accepted');
-    assert.deepEqual(t.submitted[0], { clientOrderId: 'veltrix-order-1', symbol: 'XAUUSDm', side: 'buy', orderType: 'market', volume: 0.1, price: null, stopLoss: 1990, takeProfit: 2020 });
+    assert.deepEqual(t.submitted[0], { clientOrderId: CLIENT_ORDER_ID, symbol: 'XAUUSDm', side: 'buy', orderType: 'market', volume: 0.1, price: null, stopLoss: 1990, takeProfit: 2020 });
   });
 
   test('rejects missing server authorization and mandatory SL/TP', async () => {
@@ -126,7 +132,7 @@ describe('M8.4 MT5 provider boundary', () => {
 
   test('unknown broker response becomes an uncertain execution state', async () => {
     const t = new MockTransport();
-    t.submitOrder = async () => ({ ticket: 'maybe', clientOrderId: 'veltrix-order-1', symbol: 'XAUUSDm', status: 'vendor_new_state', volume: 0.1, timestampMs: NOW });
+    t.submitOrder = async () => ({ ticket: 'maybe', clientOrderId: CLIENT_ORDER_ID, symbol: 'XAUUSDm', status: 'vendor_new_state', volume: 0.1, timestampMs: NOW });
     await assert.rejects(provider(t).submitOrder(request()), (e: unknown) => e instanceof ExecutionProviderError && e.category === 'uncertain' && e.uncertain);
   });
 
@@ -137,7 +143,7 @@ describe('M8.4 MT5 provider boundary', () => {
   });
 
   test('duplicate retry resolves by client id before submit', async () => {
-    const t = new MockTransport(); t.existing = { ticket: 'already', clientOrderId: 'veltrix-order-1', symbol: 'XAUUSDm', status: 'accepted', volume: 0.1, timestampMs: NOW };
+    const t = new MockTransport(); t.existing = { ticket: 'already', clientOrderId: CLIENT_ORDER_ID, symbol: 'XAUUSDm', status: 'accepted', volume: 0.1, timestampMs: NOW };
     const out = await provider(t).submitOrder(request());
     assert.equal(out.providerOrderId, 'already'); assert.equal(t.submitted.length, 0);
   });

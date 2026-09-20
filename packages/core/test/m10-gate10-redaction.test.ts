@@ -126,7 +126,9 @@ class MockTransport implements MT5Transport {
   async closePosition() {}
 }
 const request = (patch: Partial<ExecutionSubmitOrderRequest> = {}): ExecutionSubmitOrderRequest => ({
-  clientOrderId: 'veltrix-order-1', idempotencyKey: 'a'.repeat(64), authorizationId: 'server-auth',
+  // Gate 9 §11 (B2): a durable VeltrixEye client order identity is required
+  // before any transport call, so the fixture uses the accepted 24-hex form.
+  clientOrderId: `ve-${'a'.repeat(24)}`, idempotencyKey: 'a'.repeat(64), authorizationId: 'server-auth',
   assetClass: 'commodity', symbol: 'XAUUSD', side: 'buy', orderType: 'market', quantity: 0.1,
   requestedPrice: null, stopLossPrice: 1990, takeProfitPrice: 2020, ...patch,
 });
@@ -414,9 +416,18 @@ describe('Gate 10 — normalizeMT5Order keeps only bounded structured data', () 
     assertNoSentinel(state, 'order state');
   });
 
-  test('mapped status behaviour is preserved and unknown statuses are failed', () => {
-    const expected: Record<string, string> = { requested: 'submitted', placed: 'accepted', accepted: 'accepted', partial: 'partially_filled', filled: 'filled', rejected: 'rejected', cancelled: 'cancelled', canceled: 'cancelled', expired: 'expired', FILLED: 'filled', vendor_new_state: 'failed' };
+  test('mapped status behaviour is preserved; unsupported statuses stay unknown (Gate 9 §18/§21)', () => {
+    const expected: Record<string, string> = { requested: 'submitted', placed: 'accepted', accepted: 'accepted', partial: 'partially_filled', filled: 'filled', rejected: 'rejected', cancelled: 'cancelled', canceled: 'cancelled', expired: 'expired' };
     for (const [status, mapped] of Object.entries(expected)) assert.equal(normalizeMT5Order(row({ status })).status, mapped, status);
+    // Gate 9 tightened this: an unmappable provider status used to be folded
+    // into a definitive `failed` (and case variants were silently lowercased).
+    // Both are now an explicitly uncertain state — "we could not read the
+    // provider" is never evidence that the broker rejected or failed the order.
+    for (const status of ['FILLED', 'vendor_new_state', '', ' Accepted ']) {
+      const state = normalizeMT5Order(row({ status }));
+      assert.equal(state.status, null, status);
+      assert.equal(state.statusUncertain, true, status);
+    }
   });
 
   test('retcode and timestamp are bounded integers or null', () => {
@@ -457,7 +468,7 @@ describe('Gate 10 — normalizeMT5Order keeps only bounded structured data', () 
     await assert.rejects(provider(malformed).submitOrder(request()), (e: unknown) => e instanceof ExecutionProviderError && e.category === 'uncertain' && e.uncertain);
 
     const existing = new MockTransport();
-    existing.existing = { ticket: 'x'.repeat(200), clientOrderId: 'veltrix-order-1', symbol: 'XAUUSDm', status: 'accepted', volume: 0.1, timestampMs: NOW, message: SECRET };
+    existing.existing = { ticket: 'x'.repeat(200), clientOrderId: `ve-${'a'.repeat(24)}`, symbol: 'XAUUSDm', status: 'accepted', volume: 0.1, timestampMs: NOW, message: SECRET };
     await assert.rejects(provider(existing).submitOrder(request()), (e: unknown) => e instanceof ExecutionProviderError && e.category === 'uncertain' && e.uncertain);
     assert.equal(existing.submitted.length, 0, 'never resubmits when the existing order cannot be identified');
     await assert.rejects(provider(existing).listOrders(), (e: unknown) => e instanceof ExecutionProviderError && e.category === 'uncertain');
@@ -612,7 +623,7 @@ describe('Gate 10 — reconciliation snapshot adapter emits fixed messages only'
 
   test('a healthy MT5 provider snapshot carries structured receipts without broker messages', async () => {
     const t = new MockTransport();
-    t.existing = { ticket: '77', clientOrderId: 'veltrix-order-1', symbol: 'XAUUSDm', status: 'filled', volume: 0.1, filledVolume: 0.1, averagePrice: 2000, retcode: 10009, message: `done password=${SECRET}`, timestampMs: NOW };
+    t.existing = { ticket: '77', clientOrderId: `ve-${'a'.repeat(24)}`, symbol: 'XAUUSDm', status: 'filled', volume: 0.1, filledVolume: 0.1, averagePrice: 2000, retcode: 10009, message: `done password=${SECRET}`, timestampMs: NOW };
     const snapshot = await new ProviderReconciliationSnapshotProvider(() => provider(t)).getSnapshot({ userId: 'u', executionProfileId: 'p', providerId: 'mt5' });
     assert.equal(snapshot.orders.length, 1);
     assert.deepEqual(snapshot.orders[0]?.raw, { retcode: 10009, timestampMs: NOW });

@@ -161,6 +161,98 @@ and configured account identifiers only (see the Gate 10 record in the
 routing real broker data through any path still requires the broker/demo
 integration work that remains out of scope.
 
+## Gate 9 — MT5 bridge protocol contract and pre-provider validation
+
+Gate 9 defines the protocol VeltrixEye would speak to an MT5 bridge/gateway and
+installs the validation that must already pass before any future byte can leave
+the process. **It is contract and pre-provider validation only: no network
+client, no SDK, no credential use, no route, no migration, and no provider is
+registered or wired.** The M8.4 MT5 composition stays disabled-by-default and
+unwired in production; `MT5ExecutionTransport` in the M10 layer remains
+unavailable.
+
+### Identity and strictness
+
+`packages/contracts/src/mt5-bridge-protocol.ts` is the protocol source of truth:
+identity `veltrixeye.mt5-bridge`, version `1.0.0`, explicit `protocolId` +
+`protocolVersion` on every message (never defaulted), strict objects with no
+`.loose()`/passthrough escape hatch, bounded strings/numbers/timestamps, closed
+enums, and semver compatibility where a **higher MAJOR is rejected rather than
+reinterpreted**, a MINOR mismatch is rejected, and PATCH differences are
+tolerated. Malformed versions are invalid, not coerced. Every mutation carries the
+account binding (account/broker/server/environment references only) — no
+credential field has a place in any schema, and `live` is refused by an explicit
+policy rule (`live_environment_prohibited`) rather than by a vocabulary accident.
+
+### Single readiness interpretation (R7.4.4)
+
+`packages/core/src/execution/readiness.ts` is now the only place that answers
+"is the transport ready?". A condition counts **only when its value is the strict
+boolean `true`** — never from a truthy value, string, number, object, missing
+field or provider label — and an uncertain/unknown health state refuses. Each
+record is judged against the conditions its own contract declares
+(`gateHealth`, `paperGateHealth`, `providerHealth`, `transportHealth`,
+`reconciliationHealth`), so M8.1/M8.3 gates, the MT5 health projection, the MT5
+execution path and the reconciliation snapshot adapter cannot disagree. Readiness
+is a **precondition, never an authorization**: `ready: true` means "not known
+broken", and every existing gate/kill-switch/risk decision still applies
+unchanged on top of it.
+
+### Pre-provider checks
+
+`packages/core/src/execution/protocol.ts` implements the checks a bridge adapter
+must clear before submission, and the M8.4 adapter now routes through it:
+
+- **Order identity (B2).** `ve-<24 hex>` initial, `ve-<20 hex>-rN` retry, max
+  length 64. This is the **first** check in `submitOrder` — ahead of health,
+  symbol lookup and the idempotency lookup — so a malformed identity produces
+  zero transport calls and a *certain* refusal, never an unknown outcome.
+- **Quote freshness (B6).** Two-sided: a quote is accepted only inside
+  `-clockSkewMs … +maxQuoteAgeMs` (protocol defaults 5000/15000 ms, floored age,
+  inclusive bounds). A materially future timestamp is invalid
+  (`quote_future_beyond_clock_skew`), never merely "fresh", and a widened
+  `maxAgeMs` cannot launder it. Deployments may narrow a bound; a non-finite
+  override is rejected instead of disabling the check.
+- **Instrument contract and sizing (B7).** Asset class, symbol identity,
+  contract size, tick size, price digits and the volume min/max/step are
+  validated as a closed record before use; missing or unusable values fail
+  closed. Volume must be finite, positive, inside the range **and** an integral
+  multiple of the step. A zero/invalid step is refused before any sizing
+  arithmetic: previously `(qty − min) / 0` produced `Infinity`, and
+  `Infinity − Math.round(Infinity)` is `NaN`, so the alignment test silently
+  passed every volume.
+- **Provider status normalization (B9).** `PROVIDER_ORDER_STATUS_VOCABULARY` is
+  closed and matched exactly (case-sensitive). Anything outside it — unknown,
+  missing, malformed or case-variant (`FILLED`) — normalizes to
+  `status: null` + `statusUncertain: true`, never to `failed`/`rejected`. The
+  normalizer cannot throw on a non-string status, and `failed` is not in its
+  range at all, so "we could not read the state" cannot be laundered into a
+  definitive failure.
+- **Uncertainty downstream.** `ExecutionProviderOrderState.status` stays nullable
+  with the extra uncertainty marker; reconciliation snapshots may state the
+  explicit `uncertain` status (snapshot-only vocabulary — the durable
+  `execution_orders` status constraint is untouched, no migration). An uncertain
+  provider state becomes an `uncertain_outcome` finding, never a `status_mismatch`,
+  never `internal_order_missing_at_provider`/`provider_order_missing_internally`,
+  and never a repair, retry or cancel.
+- **Audit boundary.** The audit event contract carries mutation identity, binding,
+  outcome and reconciliation state only. Credential-shaped keys and provider
+  payloads are **rejected** (`containsForbiddenAuditKey`), not redacted, so a
+  provider response can never be attached to an audit record by construction.
+  §31's attestation/secret-manager binding is **not** implemented: the protocol
+  carries non-secret binding references, and an unusable attestation refuses the
+  handshake (`attestation_mismatch`) instead of being retried as an envelope typo.
+
+Rejections are deterministic pre-exchange errors (`uncertain: false`) whose
+messages are fixed literals plus closed code tokens; no provider text and no
+request payload enters an error string.
+
+### Deliberately not in this step
+
+Durable submit-intent/receipt persistence and reservation storage, provider
+registry/adapter wiring, reconciliation scheduling changes, API routes, and any
+bridge/gateway/terminal process are later steps of Gate 9 and remain unimplemented.
+
 ## Verification
 
 - `packages/core/test/m10-transport.test.ts`: 94 tests, including network and
@@ -168,6 +260,14 @@ integration work that remains out of scope.
   immutable requests, fault injection, concurrency, secret-safe audit and gates;
   25 M10.1 regressions cover async audit and cancellation preflight/reservations.
 - `apps/api/test/m10-transport-config.test.ts`: 8 startup configuration tests.
+- Gate 9 Step 2: `packages/contracts/test/m10-gate9-protocol.test.ts` (75 protocol
+  tests: identity/version, strictness, binding, readiness, freshness, instrument
+  and volume rules, handshake/attestation, mutation and reconciliation identity,
+  audit contract) and `packages/core/test/m10-gate9-validation.test.ts` (31 tests
+  proving each rule refuses through the real adapter with zero transport calls),
+  plus `packages/core/test/m10-gate9-reconciliation.test.ts` (5 embedded-PostgreSQL
+  tests proving uncertainty survives reconciliation unchanged). See the Gate 9
+  record in [M10 verification report](./m10-verification.md).
 - Full existing suite (including M8.7, M9.1 fairness and M9.2 notification/push,
   SecretManager and migration 0028) is run unchanged.
 - See [M10 verification report](./m10-verification.md) for results and pre-existing

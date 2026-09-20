@@ -1,4 +1,4 @@
-import { PROVIDER_HEALTH_STATES, type ExecutionProviderHealth, type ProviderHealthState } from '@veltrixeye/contracts';
+import { isExplicitTrue, PROVIDER_HEALTH_STATES, type ExecutionProviderHealth, type ProviderHealthState } from '@veltrixeye/contracts';
 
 /**
  * Gate 10 — the only shape of provider health that leaves the service layer.
@@ -34,11 +34,14 @@ export function toSafeProviderHealth(health: ExecutionProviderHealth | null | un
   const state = (PROVIDER_HEALTH_STATES as readonly string[]).includes(health.state) ? health.state : 'unavailable';
   const checkedAt = typeof health.checkedAt === 'string' && Number.isFinite(Date.parse(health.checkedAt)) ? health.checkedAt : now().toISOString();
   return {
-    configured: health.configured === true,
-    authenticated: health.authenticated === true,
-    connected: health.connected === true,
-    available: health.available === true,
-    healthy: health.healthy === true,
+    // Gate 9 §26: `isExplicitTrue` is the same predicate the execution path
+    // resolves through, so a projection cannot disagree with a readiness
+    // decision about what "true" means.
+    configured: isExplicitTrue(health.configured),
+    authenticated: isExplicitTrue(health.authenticated),
+    connected: isExplicitTrue(health.connected),
+    available: isExplicitTrue(health.available),
+    healthy: isExplicitTrue(health.healthy),
     state,
     reason: typeof health.reason === 'string' && HEALTH_REASON_TOKEN.test(health.reason) ? health.reason : null,
     checkedAt,

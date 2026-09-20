@@ -6,6 +6,7 @@ import {
   type ExecutionMode,
 } from '@veltrixeye/contracts';
 import type { Entitlements } from '../billing/entitlements.js';
+import { resolveExecutionReadiness } from './readiness.js';
 
 /**
  * M8.1 — the safety gate contract.
@@ -210,14 +211,24 @@ export function evaluateExecutionGates(input: ExecutionGateInput): ExecutionGate
           return fail(gate, 'exposure limits would be exceeded');
         }
         break;
-      case 'provider_healthy':
+      case 'provider_healthy': {
+        // Gate 9 §7/§26 (B5, R7.4.4): the gate asks the single authoritative
+        // readiness resolver instead of truthiness-testing `healthy`. A missing
+        // record, a non-object record, a non-boolean flag and an explicitly
+        // false flag all fail closed — and the gate cannot disagree with what
+        // the health endpoint reports, because both read the same rule.
         if (input.providerHealth === null) {
           return fail(gate, 'provider health is unknown');
         }
-        if (!input.providerHealth.healthy) {
+        const readiness = resolveExecutionReadiness(input.providerHealth, 'gateHealth').decision;
+        if (readiness.code === 'health_not_an_object' || readiness.code === 'health_malformed') {
+          return fail(gate, 'provider health is malformed');
+        }
+        if (!readiness.ready) {
           return fail(gate, 'execution provider is not healthy');
         }
         break;
+      }
       case 'environment_safety':
         if (!input.environmentSafe || input.profile?.environment === 'live') {
           return fail(gate, 'execution environment is not authorized by the M8.4 safety boundary');

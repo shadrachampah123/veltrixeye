@@ -27,6 +27,7 @@ import {
 import type { AuditService } from '../audit.js';
 import { Errors } from '../errors.js';
 import { toSafeProviderHealth } from './provider-health.js';
+import { resolveExecutionReadiness } from './readiness.js';
 
 /**
  * M8.5 — Provider-neutral order & position reconciliation service.
@@ -780,6 +781,27 @@ export class ReconciliationService {
     }
 
     for (const o of unmatchedProviderOrders.values()) {
+      // §21: an unmatched row whose provider state is uncertain is an
+      // uncertainty finding, not proof of "definitive absence".
+      if (providerStateIsUncertain(o)) {
+        findings.push({
+          code: 'uncertain_outcome',
+          severity: 'critical',
+          scope: 'order',
+          internalOrderId: null,
+          internalPositionId: null,
+          providerOrderId: o.providerOrderId,
+          providerPositionId: null,
+          expectedField: 'internal_order',
+          expectedValue: 'an internal order the provider state can be reconciled against',
+          actualValue: 'unmatched provider order with an uncertain state',
+          detail: {
+            clientOrderId: o.clientOrderId ?? null,
+            note: 'M8.5 safety: unmatched + uncertain — retain for reconciliation, never close as failed',
+          },
+        });
+        continue;
+      }
       findings.push({
         code: 'provider_order_missing_internally',
         severity: 'warning',
@@ -1061,9 +1083,11 @@ export class ProviderReconciliationSnapshotProvider implements ReconciliationSna
       throw new ExecutionProviderError('unavailable', 'Execution provider is not registered');
     }
     // Only the safe projection is consulted; the adapter's `reason`/`detail`
-    // never enter an error message.
+    // never enter an error message. Gate 9 §26 (R7.4.4): whether that
+    // projection permits a snapshot is decided by the SAME readiness resolver
+    // the execution path uses — not by a second, looser pair of checks.
     const health = toSafeProviderHealth(await provider.health());
-    if (!health.available || !health.healthy) {
+    if (!resolveExecutionReadiness(health, 'reconciliationHealth').decision.ready) {
       throw new ExecutionProviderError('unavailable', 'Execution provider is not available');
     }
     let orders: ReconciliationProviderOrder[] = [];
@@ -1075,7 +1099,12 @@ export class ProviderReconciliationSnapshotProvider implements ReconciliationSna
       ]);
       orders = pOrders.map((o) => ({
         providerOrderId: o.providerOrderId,
-        status: o.status,
+        // Gate 9 §18/§21 (B9): a provider state that could not be established
+        // is snapshotted as the explicit `uncertain` status. It is never
+        // recorded as `failed`/`rejected` and never dropped, because the
+        // snapshot is the evidence later runs are judged against.
+        status: o.status === null || o.statusUncertain === true ? 'uncertain' : o.status,
+        ...(o.statusUncertain === true || o.status === null ? { statusUncertain: true } : {}),
         filledQuantity: o.filledQuantity,
         averagePrice: o.averagePrice,
         raw: o.raw,
@@ -1155,6 +1184,29 @@ function compareOrderFields(
     });
   };
 
+  // Gate 9 §20/§21 (B9): an unobservable provider state is its own finding,
+  // and it must not be reported as a status drift (which reads as "the broker
+  // contradicts us") nor as a definitive failure. Reconciliation stays at
+  // "requires reconciliation"; nothing downstream may repair on this finding.
+  if (providerStateIsUncertain(provider)) {
+    findings.push({
+      code: 'uncertain_outcome',
+      severity: 'critical',
+      scope: 'order',
+      internalOrderId: internal.id,
+      internalPositionId: null,
+      providerOrderId: provider.providerOrderId,
+      providerPositionId: null,
+      expectedField: 'provider_order_status',
+      expectedValue: 'a provider status inside the closed vocabulary',
+      actualValue: 'unknown: the provider state could not be established',
+      detail: {
+        clientOrderId: internal.client_order_id,
+        note: 'M8.5 safety: uncertainty is preserved — no auto-retry, no auto-cancel, no repair',
+      },
+    });
+    return;
+  }
   if (provider.status && provider.status !== internal.status) {
     const hard = hardStatusDrift(internal.status, provider.status);
     if (hard) add('status_mismatch', 'status', internal.status, provider.status, 'warning');
@@ -1273,6 +1325,15 @@ function comparePositionFields(
       add('take_profit_mismatch', 'takeProfitPrice', tp, provider.takeProfitPrice);
     }
   }
+}
+
+/**
+ * The snapshot-level expression of "the provider state is unknown" (§21). Both
+ * spellings are honored: an explicit `uncertain` status, or the `statusUncertain`
+ * flag set by a provider adapter that could not map a raw status.
+ */
+function providerStateIsUncertain(order: Pick<ReconciliationProviderOrder, 'status' | 'statusUncertain'>): boolean {
+  return order.statusUncertain === true || order.status === 'uncertain';
 }
 
 function hardStatusDrift(internal: string, provider: string): boolean {

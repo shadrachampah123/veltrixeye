@@ -22,3 +22,4 @@ export * from './paper-execution.js';
 export * from './reconciliation.js';
 export * from './safety.js';
 export * from './execution-transport.js';
+export * from './mt5-bridge-protocol.js';
