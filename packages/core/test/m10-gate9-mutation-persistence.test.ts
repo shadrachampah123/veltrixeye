@@ -930,12 +930,15 @@ describe('Gate 9 §13 — durable provider mutation persistence (fake provider)'
       statusUncertain: false,
     });
 
+    // M3: a retry never inherits or shares the original's approval — it needs
+    // a fresh, caller-supplied risk decision.
+    const retryRiskDecisionId = await makeRiskDecision(userId, profileId);
     const retry = await ledger.prepareRetry({
-      ...submitInput({ userId, profileId, riskDecisionId }),
+      ...submitInput({ userId, profileId, riskDecisionId: retryRiskDecisionId }),
       parentIntentId: first.intentId,
       clientOrderId: `ve-${first.clientOrderId.slice(3, 23)}-r1`,
       idempotencyKey: newIdempotencyKey(),
-      riskDecisionId,
+      riskDecisionId: retryRiskDecisionId,
       authorizationId: `auth-${randomUUID()}`,
     });
     assert.equal(retry.kind, 'authorized');
@@ -1046,12 +1049,14 @@ describe('Gate 9 §13 — durable provider mutation persistence (fake provider)'
       evidence: 'operator_resolution',
       evidenceReference: 'ops-ticket-1001',
     });
+    // M3: the retry cites a fresh risk decision, never the original's.
+    const retryRiskDecisionId = await makeRiskDecision(userId, profileId);
     const retry = await ledger.prepareRetry({
-      ...submitInput({ userId, profileId, riskDecisionId }),
+      ...submitInput({ userId, profileId, riskDecisionId: retryRiskDecisionId }),
       parentIntentId: first.intentId,
       clientOrderId: `ve-${first.clientOrderId.slice(3, 23)}-r1`,
       idempotencyKey: newIdempotencyKey(),
-      riskDecisionId,
+      riskDecisionId: retryRiskDecisionId,
       authorizationId: `auth-${randomUUID()}`,
     });
     assert.equal(retry.kind, 'authorized');

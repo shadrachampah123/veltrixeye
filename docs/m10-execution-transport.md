@@ -283,13 +283,41 @@ persistence material. Full record:
   consumption commit does it perform the injected provider call with no open
   transaction and record the normalized outcome. Retry, reconciliation
   observation, operator resolution and restart recovery are explicit, separate
-  operations; none of them can resubmit, cancel or close.
+  operations; none of them can resubmit, cancel or close. Step 3c (M3) makes
+  the duplicate-mutation and retry invariants structural inside the same
+  prepare transactions: at most one unresolved mutation per managed order
+  (`unresolved_order_mutation`), no retry or start-over of a provider-accepted
+  order identity (`duplicate_mutation`), one retry per parent
+  (`parent_already_superseded`), newest-member-only retries
+  (`stale_parent_intent`), coherent binding/order (`binding_mismatch`) and a
+  fresh caller-supplied risk/authorization reference
+  (`retry_requires_fresh_authorization`): a **STRUCTURAL freshness check only**.
+  The caller supplies new references; the risk decision reference must exist,
+  belong to the same user/profile, and not already back a Gate 9 intent
+  (including a prior retry). The non-empty authorization id must not already
+  be consumed/referenced by a prior Gate 9 retry within the profile; it is an
+  opaque reference, not a validated approval record. Gate 9 does **not**
+  interpret freshness as approval and neither generates nor approves risk
+  decisions or authorizations. No risk scoring or new risk behavior is added.
+  **Confirmed-order closure is intentional:** after a provider-accepted submit,
+  the existing `execution_orders` row is closed to another Gate 9 submit,
+  start-over or retry. Re-entry requires a **new logical `execution_orders`
+  row**, following the current invariant that one logical managed order cannot
+  receive another provider-accepted submit. This does **not** add cancel,
+  modify or close behavior or close an order/position at the provider.
 - `packages/core/src/db/migrations/0029_provider_mutation_persistence.sql`:
   additive only. Extends `execution_provider_intents`, and adds the mutation
   reservation, receipt, reconciliation-observation, resolution and append-only
   event tables, with trigger-enforced state machines, DELETE guards for
   unresolved rows, optimistic-concurrency versioning and a database-side receipt
   sanitization guard. Migration `0028` is byte-identical.
+- `packages/core/src/db/migrations/0030_provider_mutation_lineage_invariants.sql`
+  (M3): additive only — three partial unique indexes (one retry per parent,
+  unique `(root, attempt)` per lineage, one live submit mutation per managed
+  order within its execution profile, explicitly scoped to
+  `mutation_kind = 'submit'`) and a read-only pre-flight with the identical
+  submit/live-state predicate that refuses to apply on conflicting rows.
+  Migration `0029` is byte-identical.
 
 The M10 transport layer is **not** wired to this ledger: `DryRunExecutionTransport`
 and `MT5ExecutionTransport` are unchanged, no provider is registered, no route or
@@ -309,6 +337,12 @@ never delete an unresolved mutation reservation or authorize a duplicate mutatio
   apply, `0028` unchanged, in-place upgrade preserving existing rows,
   composite-FK ownership, database-enforced state machine/lineage/retention).
 - `packages/contracts/test/m10-gate9-persistence.test.ts`: 19 contract tests.
+- Step 3c (M3): `packages/core/test/m10-gate9-m3-invariants.test.ts` (21 tests
+  with real concurrent transactions; provider invocations and authorized
+  operations counted explicitly) and
+  `packages/core/test/m10-gate9-m3-migrations.test.ts` (4 tests: `0029`
+  checksum pinned, `0030` additive-only, fresh apply, in-place upgrade,
+  conflict refusal).
 
 ### Verification (Gate 9 Step 2)
 

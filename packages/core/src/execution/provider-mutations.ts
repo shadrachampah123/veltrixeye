@@ -73,6 +73,34 @@ export function canonicalMutationRequestHash(request: unknown): string {
  * advances `state_version` (0029 trigger), a given barrier value can authorize
  * at most one provider call — a stale, reused or forged barrier fails closed
  * with `barrier_not_consumable` and never reaches the provider.
+ *
+ * Structural duplicate-mutation and retry invariants (M3, Step 3c) — enforced
+ * inside the `prepareSubmit` / `prepareRetry` transactions (advisory lock, read
+ * and write in the SAME transaction) and mirrored by migration 0030:
+ *
+ *  - a managed order (`order_id`, scoped to its execution profile) carries at
+ *    most one unresolved provider mutation (`prepared` / `submitting` /
+ *    `uncertain`); a concurrent or later submission for the same order fails
+ *    closed with `unresolved_order_mutation` until reconciliation or operator
+ *    resolution resolves it. After an explicit `provider_absent` (or a
+ *    rejected) resolution a new mutation for that order may proceed;
+ *  - a provider-accepted intent (`confirmed`, or `reconciled` as
+ *    `provider_accepted`) is never retried and never "started over" under the
+ *    same order identity (`duplicate_mutation`) — another order after
+ *    confirmation needs a distinct logical order identity;
+ *  - a parent intent has at most one retry (`parent_already_superseded`), a
+ *    retry always continues the newest lineage member (`stale_parent_intent`),
+ *    a lineage never contains duplicate attempts, and a retry keeps its
+ *    parent's provider/environment/account binding and managed order identity
+ *    (`binding_mismatch`);
+ *  - a retry requires a FRESH caller-supplied risk decision and execution
+ *    authorization reference (`retry_requires_fresh_authorization`): the risk
+ *    decision must exist, belong to the same user/profile and not already back
+ *    another intent; the authorization id must not already have been consumed
+ *    by a Gate 9 retry. Gate 9 never generates or approves either.
+ *
+ * When no `order_id` is supplied the pre-existing identity-based semantics
+ * (client order id / idempotency key / request hash) apply unchanged.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -96,6 +124,11 @@ export const PROVIDER_MUTATION_ERROR_CODES = [
   'operator_evidence_required',
   'resolution_requires_unresolved_intent',
   'invalid_observation',
+  // M3 — structural duplicate-mutation and retry invariants.
+  'unresolved_order_mutation',
+  'parent_already_superseded',
+  'stale_parent_intent',
+  'binding_mismatch',
 ] as const;
 export type ProviderMutationErrorCode = (typeof PROVIDER_MUTATION_ERROR_CODES)[number];
 
@@ -245,15 +278,29 @@ export interface SubmitIntentInput {
 }
 
 export interface RetryIntentInput extends Omit<SubmitIntentInput, 'clientOrderId' | 'idempotencyKey'> {
-  /** The resolved intent this retry continues. */
+  /**
+   * The resolved intent this retry continues. It must be the NEWEST member of
+   * its lineage, not already superseded, and resolved as rejected /
+   * `provider_rejected` / `provider_absent` (M3): a provider-accepted intent
+   * is never retried. The retry keeps the parent's provider/environment/account
+   * binding; when `orderId` is omitted it inherits the parent's managed order.
+   */
   parentIntentId: string;
   /** A brand-new durable identity. Reusing an unresolved identity is refused. */
   clientOrderId: string;
   /** A brand-new idempotency identity. */
   idempotencyKey: string;
-  /** Fresh risk decision — a retry never inherits the original's approval. */
+  /**
+   * Fresh risk decision — a retry never inherits the original's approval. The
+   * reference must name an existing `risk_decisions` row owned by the same
+   * user/profile that no Gate 9 intent has consumed yet. Gate 9 never creates
+   * or approves one.
+   */
   riskDecisionId: string;
-  /** Fresh execution authorization id (server-issued, never a client boolean). */
+  /**
+   * Fresh execution authorization id (server-issued, never a client boolean).
+   * An authorization id already consumed by a Gate 9 retry is refused.
+   */
   authorizationId: string;
 }
 
@@ -456,20 +503,34 @@ export class ProviderMutationLedger {
   async prepareSubmit(input: SubmitIntentInput): Promise<PrepareSubmitResult> {
     const identity = assertSubmitIdentity(input);
     const binding = assertBinding(input);
+    const orderId = input.orderId ?? null;
 
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
+      // M3 — serialize every writer for the same managed order (scoped to the
+      // execution profile) BEFORE the unresolved-order read below: the lock and
+      // the read happen in the same transaction, so two concurrent submissions
+      // for one order with different client order ids can never both pass.
+      // Lock order is always order → identity (prepareRetry: lineage → order →
+      // identity). Released by COMMIT/ROLLBACK, never held across the provider.
+      if (orderId !== null) await acquireXactLock(client, orderLockKey(input.executionProfileId, orderId));
       // Serialize concurrent twins on the same mutation identity; the lock is
       // released by COMMIT/ROLLBACK, never held across the provider call.
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
-        `${input.executionProfileId}:${identity.clientOrderId}`,
-      ]);
+      await acquireXactLock(client, identityLockKey(input.executionProfileId, identity.clientOrderId));
 
       const existing = await this.findByIdentityIn(client, input, identity.requestHash);
       if (existing) {
         await client.query('COMMIT');
         return { kind: 'duplicate', intent: existing, reason: 'identity' };
+      }
+
+      // M3 — at most one unresolved provider mutation per managed order, and
+      // never a second mutation for an order whose submit was already
+      // provider-accepted. Without an order id the identity semantics above
+      // are the whole contract (no order-level invariant is invented).
+      if (orderId !== null) {
+        await this.assertOrderAcceptsNewMutationIn(client, input.executionProfileId, orderId);
       }
 
       const inserted = await client.query<{ id: string; state_version: number }>(
@@ -568,6 +629,11 @@ export class ProviderMutationLedger {
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       if (isUniqueViolation(error)) {
+        // 0030 defense-in-depth fired for the managed order: report the order
+        // invariant, not a generic persistence failure.
+        if (orderId !== null && violatedConstraint(error) === ORDER_LIVE_UNIQUE_INDEX) {
+          throw await this.orderLiveViolation(input.executionProfileId, orderId);
+        }
         const existing = await this.resolveByIdentity({
           executionProfileId: input.executionProfileId,
           clientOrderId: identity.clientOrderId,
@@ -820,45 +886,163 @@ export class ProviderMutationLedger {
    * mutation has been resolved according to the reconciliation/evidence rules,
    * and only with a brand-new mutation identity plus fresh risk/authorization
    * evidence. An unresolved (uncertain/in-flight) original is never retried.
+   *
+   * M3 — every verification runs INSIDE one transaction, after the lineage
+   * lock (`executionProfileId` + root intent) is held and the parent has been
+   * re-read, so two concurrent retries of one parent yield exactly one retry:
+   *
+   *  - parent exists and belongs to this user/profile;
+   *  - parent is resolved (`uncertainty_unresolved` otherwise);
+   *  - parent is not already superseded (`parent_already_superseded`) and is
+   *    the newest attempt of its lineage (`stale_parent_intent`);
+   *  - parent is eligible: `rejected`, or `reconciled` as `provider_rejected`
+   *    / `provider_absent`. A provider-accepted parent (`confirmed`, or
+   *    `reconciled` as `provider_accepted`) is never retried
+   *    (`duplicate_mutation`);
+   *  - the retry keeps the parent's provider/environment/account binding and
+   *    managed order identity (`binding_mismatch`);
+   *  - no lineage member is unresolved, and — when a managed order is bound —
+   *    no other unresolved or provider-accepted mutation exists for that order
+   *    (`unresolved_order_mutation` / `duplicate_mutation`);
+   *  - the caller-supplied risk decision and authorization reference are fresh
+   *    (`retry_requires_fresh_authorization`).
+   *
+   * Exactly one retry row is inserted and the parent is marked superseded by
+   * a compare-and-swap in the same transaction. Migration 0030 mirrors the
+   * lineage/order invariants as unique indexes (defense-in-depth).
    */
   async prepareRetry(input: RetryIntentInput): Promise<PrepareSubmitResult> {
-    const parent = await this.getIntent(input.parentIntentId);
-    if (!parent) throw new ProviderMutationError('intent_not_found', 'Original mutation intent not found');
-    if (parent.userId !== input.userId || parent.executionProfileId !== input.executionProfileId) {
-      throw new ProviderMutationError('intent_ownership_mismatch', 'Original mutation intent belongs to another account', parent.id);
-    }
-    if (isProviderIntentUnresolvedState(parent.status)) {
-      throw new ProviderMutationError(
-        'uncertainty_unresolved',
-        'The original mutation is unresolved; a retry requires resolution through verified reconciliation or authorized operator resolution',
-        parent.id,
-      );
-    }
-    if (input.clientOrderId === parent.clientOrderId || input.idempotencyKey === parent.idempotencyKey) {
-      throw new ProviderMutationError('retry_identity_reuse', 'A retry must carry a new mutation identity', parent.id);
-    }
-    if (!input.riskDecisionId?.trim() || !input.authorizationId?.trim()) {
-      throw new ProviderMutationError('retry_requires_fresh_authorization', 'A retry requires a fresh risk decision and execution authorization', parent.id);
-    }
-
+    // Pure input validation first (no durable state involved; nothing written).
     const identity = assertSubmitIdentity(input);
     const binding = assertBinding(input);
-    const attempt = parent.attempt + 1;
-    const rootIntentId = parent.rootIntentId ?? parent.id;
+
+    // Preliminary read: only to locate the lineage (root id never changes) and
+    // fail fast on an unknown/foreign parent. Every decision below is made on
+    // the parent RE-READ inside the locked transaction.
+    const preliminary = await this.getIntent(input.parentIntentId);
+    if (!preliminary) throw new ProviderMutationError('intent_not_found', 'Original mutation intent not found');
+    assertIntentOwnership(preliminary, input.userId, input.executionProfileId);
+    const rootIntentId = preliminary.rootIntentId ?? preliminary.id;
 
     const client = await this.pool.connect();
+    let orderId: string | null = input.orderId ?? null;
     try {
       await client.query('BEGIN');
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
-        `${input.executionProfileId}:${identity.clientOrderId}`,
-      ]);
-      // A retry may also never reuse the identity of another unresolved mutation.
+      // Lock order is always lineage → order → identity (prepareSubmit takes
+      // order → identity), so the two preparers can never deadlock each other.
+      await acquireXactLock(client, lineageLockKey(input.executionProfileId, rootIntentId));
+
+      const parent = await this.getIntentIn(client, input.parentIntentId);
+      if (!parent) throw new ProviderMutationError('intent_not_found', 'Original mutation intent not found');
+      assertIntentOwnership(parent, input.userId, input.executionProfileId);
+      if ((parent.rootIntentId ?? parent.id) !== rootIntentId) {
+        throw new ProviderMutationError('concurrent_state_change', 'Original mutation intent changed lineage while the retry was being prepared', parent.id);
+      }
+      // A retry never escapes the order-level invariant by omitting the order:
+      // it continues its parent's managed order unless the caller names one.
+      // (A caller-supplied order that differs from the parent's is refused
+      // below, after the lineage checks.)
+      const requestedOrderId = orderId;
+      orderId = orderId ?? parent.orderId;
+      if (orderId !== null) await acquireXactLock(client, orderLockKey(input.executionProfileId, orderId));
+      await acquireXactLock(client, identityLockKey(input.executionProfileId, identity.clientOrderId));
+
+      if (isProviderIntentUnresolvedState(parent.status)) {
+        throw new ProviderMutationError(
+          'uncertainty_unresolved',
+          'The original mutation is unresolved; a retry requires resolution through verified reconciliation or authorized operator resolution',
+          parent.id,
+        );
+      }
+      if (input.clientOrderId === parent.clientOrderId || input.idempotencyKey === parent.idempotencyKey) {
+        throw new ProviderMutationError('retry_identity_reuse', 'A retry must carry a new mutation identity', parent.id);
+      }
+      if (!input.riskDecisionId?.trim() || !input.authorizationId?.trim()) {
+        throw new ProviderMutationError('retry_requires_fresh_authorization', 'A retry requires a fresh risk decision and execution authorization', parent.id);
+      }
+
+      // The repository's existing duplicate semantics: a retry whose identity
+      // already exists (e.g. a replayed retry request) resolves onto that
+      // intent instead of minting another mutation.
       const clash = await this.findByIdentityIn(client, input, identity.requestHash);
       if (clash) {
         await client.query('COMMIT');
         return { kind: 'duplicate', intent: clash, reason: 'identity' };
       }
 
+      // M3 — at most one retry per parent; a retry continues the newest attempt.
+      if (parent.supersededByIntentId !== null) {
+        throw new ProviderMutationError(
+          'parent_already_superseded',
+          'The original mutation intent was already superseded by a retry; a parent intent may have at most one retry',
+          parent.id,
+        );
+      }
+      const lineage = await this.lineageMembersIn(client, rootIntentId);
+      const newest = lineage.reduce<LineageMember | null>((best, member) => (best === null || member.attempt > best.attempt ? member : best), null);
+      if (!newest || newest.id !== parent.id) {
+        throw new ProviderMutationError(
+          'stale_parent_intent',
+          `The original mutation intent is not the newest attempt of its lineage (newest attempt ${newest?.attempt ?? '?'}); a retry must continue the current lineage member`,
+          parent.id,
+        );
+      }
+
+      // M3 — a provider-accepted intent is never retried under the same order.
+      if (isProviderAcceptedIntent(parent)) {
+        throw new ProviderMutationError(
+          'duplicate_mutation',
+          'The original mutation was accepted by the provider; Gate 9 never retries a confirmed or provider-accepted intent — another order after confirmation needs a distinct logical order identity',
+          parent.id,
+        );
+      }
+      if (!isRetryEligibleResolution(parent)) {
+        throw new ProviderMutationError('uncertainty_unresolved', 'The original mutation is not resolved as rejected or absent; it cannot be retried', parent.id);
+      }
+
+      // M3 — retry target binding must remain coherent with the parent.
+      if (
+        input.providerSlug !== parent.providerSlug
+        || binding.environment !== parent.environment
+        || (binding.accountRef ?? null) !== (parent.accountRef ?? null)
+      ) {
+        throw new ProviderMutationError(
+          'binding_mismatch',
+          'A retry must keep the provider, environment and account binding of the mutation it continues',
+          parent.id,
+        );
+      }
+      if (requestedOrderId !== null && parent.orderId !== null && requestedOrderId !== parent.orderId) {
+        throw new ProviderMutationError('binding_mismatch', 'A retry must continue the managed order identity of the mutation it continues', parent.id);
+      }
+
+      // M3 — no unresolved member anywhere in the lineage.
+      const unresolvedMember = lineage.find((member) => isProviderIntentUnresolvedState(member.status));
+      if (unresolvedMember) {
+        throw new ProviderMutationError(
+          'uncertainty_unresolved',
+          `Attempt ${unresolvedMember.attempt} of this lineage is unresolved; a retry requires every prior attempt to be resolved`,
+          unresolvedMember.id,
+        );
+      }
+
+      // M3 — order-level invariant, evaluated under the order lock taken above
+      // (the same lock prepareSubmit takes for this managed order).
+      if (orderId !== null) {
+        await this.assertOrderAcceptsNewMutationIn(client, input.executionProfileId, orderId);
+      }
+
+      // M3 — fresh risk/authorization reference (structural checks only: Gate 9
+      // neither generates nor approves risk decisions or authorizations).
+      await this.assertFreshRetryAuthorizationIn(client, {
+        parentId: parent.id,
+        userId: input.userId,
+        executionProfileId: input.executionProfileId,
+        riskDecisionId: input.riskDecisionId,
+        authorizationId: input.authorizationId,
+      });
+
+      const attempt = parent.attempt + 1;
       const inserted = await client.query<{ id: string; state_version: number }>(
         `INSERT INTO execution_provider_intents
            (user_id, execution_profile_id, order_id, mutation_kind, client_order_id, idempotency_key,
@@ -869,7 +1053,7 @@ export class ProviderMutationLedger {
         [
           input.userId,
           input.executionProfileId,
-          input.orderId ?? null,
+          orderId,
           identity.clientOrderId,
           identity.idempotencyKey,
           identity.requestHash,
@@ -900,7 +1084,7 @@ export class ProviderMutationLedger {
         intentId,
         userId: input.userId,
         executionProfileId: input.executionProfileId,
-        orderId: input.orderId ?? null,
+        orderId,
         riskDecisionId: input.riskDecisionId,
         riskReservationId: input.riskReservationId ?? null,
         clientOrderId: identity.clientOrderId,
@@ -911,11 +1095,20 @@ export class ProviderMutationLedger {
         riskExpiresAt: input.riskExpiresAt ?? null,
       });
 
-      // The resolved original is explicitly superseded — never deleted.
-      await client.query(
-        `UPDATE execution_provider_intents SET superseded_by_intent_id = $2 WHERE id = $1`,
-        [parent.id, intentId],
+      // The resolved original is explicitly superseded — never deleted — by a
+      // compare-and-swap on the exact parent row this transaction verified.
+      const superseded = await client.query<{ id: string }>(
+        `UPDATE execution_provider_intents
+            SET superseded_by_intent_id = $2
+          WHERE id = $1
+            AND superseded_by_intent_id IS NULL
+            AND state_version = $3
+        RETURNING id`,
+        [parent.id, intentId, parent.stateVersion],
       );
+      if (superseded.rows.length === 0) {
+        throw new ProviderMutationError('parent_already_superseded', 'The original mutation intent was superseded concurrently; the retry was refused', parent.id);
+      }
 
       await insertEvent(client, {
         intentId,
@@ -967,6 +1160,17 @@ export class ProviderMutationLedger {
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       if (isUniqueViolation(error)) {
+        // 0030 defense-in-depth: report the lineage/order invariant that fired.
+        const constraint = violatedConstraint(error);
+        if (constraint === PARENT_UNIQUE_INDEX) {
+          throw new ProviderMutationError('parent_already_superseded', 'The original mutation intent already has a retry; a parent intent may have at most one retry', input.parentIntentId);
+        }
+        if (constraint === LINEAGE_ATTEMPT_UNIQUE_INDEX) {
+          throw new ProviderMutationError('stale_parent_intent', 'The lineage already contains this attempt; a retry must continue the current lineage member', input.parentIntentId);
+        }
+        if (orderId !== null && constraint === ORDER_LIVE_UNIQUE_INDEX) {
+          throw await this.orderLiveViolation(input.executionProfileId, orderId);
+        }
         const existing = await this.resolveByIdentity({
           executionProfileId: input.executionProfileId,
           clientOrderId: identity.clientOrderId,
@@ -1250,6 +1454,101 @@ export class ProviderMutationLedger {
       throw new ProviderMutationError('intent_ownership_mismatch', 'Mutation intent belongs to another account', intent.id);
     }
     return intent;
+  }
+
+  /** The intent as seen by the caller's open transaction (M3 re-read under lock). */
+  private async getIntentIn(client: pg.PoolClient, intentId: string): Promise<ProviderIntentRecord | null> {
+    const { rows } = await client.query<IntentRow>(
+      `SELECT ${INTENT_COLUMNS} FROM execution_provider_intents WHERE id = $1`,
+      [intentId],
+    );
+    return rows[0] ? toIntentRecord(rows[0]) : null;
+  }
+
+  /** Every attempt of a lineage (the root plus all retries), inside the transaction. */
+  private async lineageMembersIn(client: pg.PoolClient, rootIntentId: string): Promise<LineageMember[]> {
+    const { rows } = await client.query<LineageMember>(
+      `SELECT id, attempt, status, superseded_by_intent_id AS "supersededByIntentId"
+         FROM execution_provider_intents
+        WHERE id = $1 OR root_intent_id = $1
+        ORDER BY attempt ASC, created_at ASC`,
+      [rootIntentId],
+    );
+    return rows;
+  }
+
+  /**
+   * M3 — the managed-order invariant, evaluated inside the caller's transaction
+   * while the order lock is held: at most one unresolved provider mutation per
+   * order (`unresolved_order_mutation`), and no new mutation for an order whose
+   * submit was already provider-accepted (`duplicate_mutation`). Any row for
+   * the order counts — including a legacy row without a Gate 9 identity — so a
+   * mutation of unknown provider state is never silently duplicated.
+   */
+  private async assertOrderAcceptsNewMutationIn(client: pg.PoolClient, executionProfileId: string, orderId: string): Promise<void> {
+    const live = await findLiveOrderMutation(client, executionProfileId, orderId);
+    if (live) throw liveOrderMutationError(live);
+  }
+
+  /** Classifies a 0030 order-index violation after the transaction rolled back. */
+  private async orderLiveViolation(executionProfileId: string, orderId: string): Promise<ProviderMutationError> {
+    const live = await findLiveOrderMutation(this.pool, executionProfileId, orderId).catch(() => null);
+    if (live) return liveOrderMutationError(live);
+    return new ProviderMutationError(
+      'unresolved_order_mutation',
+      'Another provider mutation for this managed order was committed concurrently; no provider call is permitted',
+    );
+  }
+
+  /**
+   * M3 — structural freshness of the caller-supplied risk/authorization
+   * reference, checked inside the retry transaction. Gate 9 never generates,
+   * evaluates or approves a risk decision or an authorization; it only refuses
+   * a reference that is not a fresh one under the existing schema contract:
+   *
+   *  - the risk decision must exist and be owned by the same user and profile;
+   *  - it must not already back another Gate 9 intent (a retry never inherits
+   *    or shares an approval);
+   *  - the authorization id must not already have been consumed by a retry.
+   */
+  private async assertFreshRetryAuthorizationIn(
+    client: pg.PoolClient,
+    args: { parentId: string; userId: string; executionProfileId: string; riskDecisionId: string; authorizationId: string },
+  ): Promise<void> {
+    const notFresh = (message: string): ProviderMutationError =>
+      new ProviderMutationError('retry_requires_fresh_authorization', message, args.parentId);
+    if (!UUID_RE.test(args.riskDecisionId)) throw notFresh('A retry requires a fresh risk decision reference');
+
+    const decision = await client.query<{ user_id: string; execution_profile_id: string | null }>(
+      `SELECT user_id, execution_profile_id FROM risk_decisions WHERE id = $1`,
+      [args.riskDecisionId],
+    );
+    const owner = decision.rows[0];
+    if (!owner) throw notFresh('A retry requires an existing risk decision reference');
+    if (owner.user_id !== args.userId || owner.execution_profile_id !== args.executionProfileId) {
+      throw notFresh('The risk decision cited by the retry belongs to another account or execution profile');
+    }
+
+    const consumed = await client.query<{ id: string; attempt: number }>(
+      `SELECT id, attempt FROM execution_provider_intents
+        WHERE execution_profile_id = $1 AND risk_decision_id = $2
+        LIMIT 1`,
+      [args.executionProfileId, args.riskDecisionId],
+    );
+    const consumer = consumed.rows[0];
+    if (consumer) {
+      throw notFresh(`The risk decision cited by the retry already backs mutation attempt ${consumer.attempt}; a retry requires a fresh risk decision`);
+    }
+
+    const authorizationUsed = await client.query<{ intent_id: string }>(
+      `SELECT intent_id FROM execution_provider_mutation_events
+        WHERE execution_profile_id = $1 AND detail->>'authorizationId' = $2
+        LIMIT 1`,
+      [args.executionProfileId, args.authorizationId],
+    );
+    if (authorizationUsed.rows[0]) {
+      throw notFresh('The execution authorization cited by the retry was already consumed; a retry requires a fresh authorization');
+    }
   }
 
   private async findByIdentityIn(
@@ -1542,6 +1841,125 @@ function isProviderIntentTerminalState(state: ProviderIntentState): boolean {
 
 function isUniqueViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: string }).code === '23505';
+}
+
+/* -------------------------------------------------------------------------- */
+/* M3 — structural duplicate-mutation / retry invariant helpers                */
+/* -------------------------------------------------------------------------- */
+
+/** Migration 0030 index names (defense-in-depth twins of the checks above). */
+const PARENT_UNIQUE_INDEX = 'execution_provider_intents_parent_uniq';
+const LINEAGE_ATTEMPT_UNIQUE_INDEX = 'execution_provider_intents_lineage_attempt_uniq';
+const ORDER_LIVE_UNIQUE_INDEX = 'execution_provider_intents_order_live_uniq';
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+interface LineageMember {
+  id: string;
+  attempt: number;
+  status: ProviderIntentState;
+  supersededByIntentId: string | null;
+}
+
+interface LiveOrderMutation {
+  id: string;
+  status: ProviderIntentState;
+  resolution: ProviderResolution | null;
+  attempt: number;
+  clientOrderId: string;
+}
+
+/** Transaction-scoped advisory lock; released by COMMIT/ROLLBACK only. */
+async function acquireXactLock(client: pg.PoolClient, key: string): Promise<void> {
+  await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [key]);
+}
+
+/** Existing per-identity lock key (unchanged from M1/M2). */
+function identityLockKey(executionProfileId: string, clientOrderId: string): string {
+  return `${executionProfileId}:${clientOrderId}`;
+}
+
+/** M3 — one writer at a time per managed order inside an execution profile. */
+function orderLockKey(executionProfileId: string, orderId: string): string {
+  return `order:${executionProfileId}:${orderId}`;
+}
+
+/** M3 — one retry writer at a time per lineage inside an execution profile. */
+function lineageLockKey(executionProfileId: string, rootIntentId: string): string {
+  return `lineage:${executionProfileId}:${rootIntentId}`;
+}
+
+function violatedConstraint(error: unknown): string | null {
+  const constraint = (error as { constraint?: unknown } | null)?.constraint;
+  return typeof constraint === 'string' ? constraint : null;
+}
+
+function assertIntentOwnership(intent: ProviderIntentRecord, userId: string, executionProfileId: string): void {
+  if (intent.userId !== userId || intent.executionProfileId !== executionProfileId) {
+    throw new ProviderMutationError('intent_ownership_mismatch', 'Original mutation intent belongs to another account', intent.id);
+  }
+}
+
+/** `confirmed`, or `reconciled` with a `provider_accepted` resolution. */
+function isProviderAcceptedIntent(intent: { status: ProviderIntentState; resolution: ProviderResolution | null }): boolean {
+  return intent.status === 'confirmed' || (intent.status === 'reconciled' && intent.resolution === 'provider_accepted');
+}
+
+/** A retry may only continue a verified rejection or an explicit absence. */
+function isRetryEligibleResolution(intent: { status: ProviderIntentState; resolution: ProviderResolution | null }): boolean {
+  return intent.status === 'rejected'
+    || (intent.status === 'reconciled' && (intent.resolution === 'provider_rejected' || intent.resolution === 'provider_absent'));
+}
+
+/**
+ * The "live" mutation for a managed order, if any: unresolved (`prepared`,
+ * `submitting`, `uncertain`) or provider-accepted (`confirmed`, or `reconciled`
+ * as `provider_accepted`). Scoped to the execution profile like every other
+ * mutation identity lookup; the predicate is the application twin of the 0030
+ * `execution_provider_intents_order_live_uniq` index (which additionally
+ * excludes legacy rows without a Gate 9 identity — here they count, fail closed).
+ */
+async function findLiveOrderMutation(
+  queryable: Pick<pg.PoolClient, 'query'>,
+  executionProfileId: string,
+  orderId: string,
+): Promise<LiveOrderMutation | null> {
+  const { rows } = await queryable.query<{
+    id: string;
+    status: ProviderIntentState;
+    resolution: ProviderResolution | null;
+    attempt: number;
+    client_order_id: string;
+  }>(
+    `SELECT id, status, resolution, attempt, client_order_id
+       FROM execution_provider_intents
+      WHERE execution_profile_id = $1
+        AND order_id = $2
+        AND (
+          status IN ('prepared', 'submitting', 'uncertain', 'confirmed')
+          OR (status = 'reconciled' AND resolution = 'provider_accepted')
+        )
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [executionProfileId, orderId],
+  );
+  const row = rows[0];
+  return row ? { id: row.id, status: row.status, resolution: row.resolution, attempt: row.attempt, clientOrderId: row.client_order_id } : null;
+}
+
+function liveOrderMutationError(live: LiveOrderMutation): ProviderMutationError {
+  if (isProviderIntentUnresolvedState(live.status)) {
+    return new ProviderMutationError(
+      'unresolved_order_mutation',
+      `An unresolved provider mutation (attempt ${live.attempt}, status ${live.status}) already exists for this managed order; it must be resolved through reconciliation or operator resolution before another mutation is permitted`,
+      live.id,
+    );
+  }
+  return new ProviderMutationError(
+    'duplicate_mutation',
+    `The provider already accepted a submit mutation for this managed order (attempt ${live.attempt}); another order after confirmation needs a distinct logical order identity`,
+    live.id,
+  );
 }
 
 async function insertEvent(
