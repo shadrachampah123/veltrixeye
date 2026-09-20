@@ -136,7 +136,9 @@ describe('M10 Gate 9 migrations — 0029_provider_mutation_persistence.sql', () 
       [userId, profile.rows[0]!.id],
     );
 
-    copyUpTo(dir28, null);
+    // This suite pins the 0028 → 0029 step only; the 0029 → 0030 (M3) step is
+    // pinned by m10-gate9-m3-migrations.test.ts.
+    copyUpTo(dir28, 29);
     const upgraded = await runMigrations(pool, dir28);
     assert.deepEqual(upgraded.applied, ['0029_provider_mutation_persistence.sql']);
     status = await migrationStatus(pool, dir28);
