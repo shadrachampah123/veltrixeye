@@ -386,8 +386,15 @@ export function normalizeSubmitOutcome(barrier: SubmitIdentityProbe, raw: unknow
   if (containsForbiddenAuditKey(raw)) return uncertain('malformed_response');
 
   const response = raw as Record<string, unknown>;
+  // HIGH-2: `receipt` is intentionally NOT accepted from the provider response.
+  // The persisted receipt is always built from validated fields (providerOrderId,
+  // providerStatus, etc.) through `sanitizeProviderReceipt`, never copied from
+  // provider-controlled `receipt`. Any provider response carrying `receipt`
+  // (including nested credential-shaped or malformed content) is treated as
+  // malformed and becomes `uncertain`, so hostile nested data can never cross
+  // the normalization boundary or become persisted provider evidence.
   for (const key of Object.keys(response)) {
-    if (!['clientOrderId', 'idempotencyKey', 'accountRef', 'providerOrderId', 'status', 'receipt'].includes(key)) {
+    if (!['clientOrderId', 'idempotencyKey', 'accountRef', 'providerOrderId', 'status'].includes(key)) {
       return uncertain('malformed_response');
     }
   }

@@ -360,6 +360,13 @@ export interface ResolutionResult {
  * The provider response a submit adapter returns. Gate 9 has no live adapter:
  * production wiring is a separate, separately-reviewed step, and the tests
  * inject deterministic fakes.
+ *
+ * HIGH-2: `receipt` is intentionally NOT part of the provider response
+ * contract. The persisted receipt is built from validated fields only
+ * (providerOrderId, normalized status, etc.) through the closed allowlist
+ * boundary, never copied from provider-controlled nested content. Any
+ * response carrying a `receipt` field is treated as malformed (uncertain),
+ * so hostile nested data cannot cross the normalization boundary.
  */
 export interface ProviderSubmitResponse {
   clientOrderId?: unknown;
@@ -368,7 +375,6 @@ export interface ProviderSubmitResponse {
   providerOrderId?: unknown;
   /** Raw provider status token; normalized through the closed vocabulary. */
   status?: unknown;
-  receipt?: unknown;
   /** Anything else is refused: an unknown field is an unreadable response. */
 }
 

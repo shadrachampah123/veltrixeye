@@ -22,7 +22,7 @@ import {
  *
  *  - NOTHING leaves the process. There is no broker client, no socket, no
  *    credential and no external trading API anywhere in this module. A paper
- *    "order" is an internal database row marked `simulated = true`.
+ *    \"order\" is an internal database row marked `simulated = true`.
  *  - `submitOrder` REFUSES every request that does not carry a server-issued
  *    `authorizationId` (created by `PaperExecutionService` only after the
  *    server-built decision, the server-issued M8.2 risk decision and every
@@ -33,6 +33,21 @@ import {
  *    explicit close, all driven by the service. They throw rather than
  *    pretend to work.
  *  - no method accepts a client-supplied price, P&L or position size.
+ *
+ * SEPARATION BOUNDARY (MEDIUM-3) — Gate 9 Fake Bridge:
+ *  - This Paper provider/simulator is NOT the Gate 9 Fake Bridge test double.
+ *  - It is the existing M8.3 deterministic paper simulator used for paper
+ *    trading. It never implements failure-injection, scenario control,
+ *    provider-side simulated order state, or invocation tracking for the
+ *    mutation ledger.
+ *  - The future Gate 9 Fake Bridge is a provider-neutral test double
+ *    (`FakeBridge`, `DeterministicFakeProvider`, `FakeProviderState`) that
+ *    lives in test-only support code (`packages/core/test/support/fake-bridge.ts`)
+ *    and is NEVER registered as a production provider, never exported from
+ *    `packages/core/src/execution/index.ts`, and never wired in `apps/api`.
+ *  - Failure-injection behavior MUST NOT be added to this file. All
+ *    failure-injection, deterministic scenario control, and stateful fake
+ *    behavior belongs to the test-only FakeBridge, not to Paper.
  */
 export interface PaperSimulatorPort {
   /** Fill a server-authorized paper order (the only mutation entry point). */
