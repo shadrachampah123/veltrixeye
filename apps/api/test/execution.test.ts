@@ -415,6 +415,50 @@ describe('M8.4 broker management API', () => {
     assert.equal(patch.statusCode, 403);
   });
 
+  test('Gate 10: provider health is never returned verbatim — closed field set, no detail, token reasons only', async () => {
+    const { cookie } = await registerUser();
+    const SAFE_KEYS = ['authenticated', 'available', 'checkedAt', 'configured', 'connected', 'healthy', 'reason', 'state'];
+    const TOKEN = /^[a-z0-9_]{1,64}$/;
+    const inventory = await app.inject({ method: 'GET', url: '/api/execution/providers', headers: { cookie } });
+    assert.equal(inventory.statusCode, 200);
+    for (const p of inventory.json().providers) {
+      assert.deepEqual(Object.keys(p.health).sort(), SAFE_KEYS, `${p.id}: only safe health fields`);
+      assert.ok(p.health.reason === null || TOKEN.test(p.health.reason), `${p.id}: reason is a machine token`);
+    }
+    // The paper adapter's health carries a `detail` object; the API must strip it.
+    const paper = inventory.json().providers.find((p: { id: string }) => p.id === 'paper');
+    assert.equal(paper.health.healthy, true); assert.equal('detail' in paper.health, false);
+    const mt5 = inventory.json().providers.find((p: { id: string }) => p.id === 'mt5');
+    assert.equal(mt5.health.reason, 'mt5_transport_unconfigured');
+    for (const id of ['paper', 'mt5']) {
+      const single = await app.inject({ method: 'GET', url: `/api/execution/providers/${id}/status`, headers: { cookie } });
+      assert.equal(single.statusCode, 200);
+      assert.deepEqual(Object.keys(single.json().health).sort(), SAFE_KEYS, `${id}/status: only safe health fields`);
+      assert.equal(single.json().liveExecutionAvailable, false);
+    }
+    const status = await app.inject({ method: 'GET', url: '/api/execution/status', headers: { cookie } });
+    for (const p of status.json().providers) {
+      assert.deepEqual(Object.keys(p).sort(), ['authenticated', 'available', 'configured', 'connected', 'healthy', 'id', 'name', 'reason', 'state']);
+      assert.ok(p.reason === null || TOKEN.test(p.reason), `${p.id}: status reason is a machine token`);
+    }
+  });
+
+  test('Gate 10: connection test returns the safe health projection and audits no provider reason', async () => {
+    const { cookie, user } = await registerUser();
+    const created = await app.inject({ method: 'POST', url: '/api/execution/broker-profiles', headers: { cookie, 'x-forwarded-for': freshIp() }, payload: demoPayload });
+    assert.equal(created.statusCode, 201, created.body);
+    const tested = await app.inject({ method: 'POST', url: `/api/execution/broker-profiles/${created.json().profile.id}/test`, headers: { cookie, 'x-forwarded-for': freshIp() } });
+    assert.equal(tested.statusCode, 200, tested.body);
+    const body = tested.json();
+    assert.equal(body.orderPlaced, false);
+    assert.deepEqual(Object.keys(body.health).sort(), ['authenticated', 'available', 'checkedAt', 'configured', 'connected', 'healthy', 'reason', 'state']);
+    assert.equal(body.health.available, false); assert.equal(body.health.reason, 'mt5_transport_unconfigured');
+    const audit = await pool.query(`SELECT metadata FROM audit_events WHERE user_id = $1 AND action = 'execution.connection_tested'`, [user.id]);
+    assert.equal(audit.rows.length, 1);
+    assert.deepEqual(audit.rows[0].metadata, { provider: 'mt5', healthy: false, available: false, state: 'disabled', providerRegistered: true });
+    assert.equal('reason' in audit.rows[0].metadata, false, 'health.reason is never persisted into audit metadata');
+  });
+
   test('profile reads/tests are tenant isolated and connection test places no order', async () => {
     const a = await registerUser(); const b = await registerUser();
     const created = await app.inject({ method: 'POST', url: '/api/execution/broker-profiles', headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() }, payload: demoPayload });

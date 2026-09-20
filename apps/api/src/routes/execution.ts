@@ -18,6 +18,7 @@ import {
   RISK_ENGINE_VERSION,
   type ExecutionStatusDto,
 } from '@veltrixeye/contracts';
+import { toSafeProviderHealth } from '@veltrixeye/core';
 import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
@@ -84,10 +85,8 @@ export async function executionRoutes(app: FastifyInstance, ctx: AppContext, con
     const providers: ExecutionStatusDto['providers'] = [];
     for (const info of ctx.execution.providers.list()) {
       const provider = ctx.execution.providers.get(info.id);
-      const health = provider ? await provider.health() : {
-        configured: false, authenticated: false, connected: false, available: false,
-        healthy: false, state: 'unavailable' as const, reason: 'provider_missing', checkedAt: new Date().toISOString(),
-      };
+      // Safe projection only: closed state enum, machine-token reason, no `detail`.
+      const health = toSafeProviderHealth(provider ? await provider.health() : null);
       providers.push({
         id: info.id,
         name: info.name,
@@ -97,7 +96,7 @@ export async function executionRoutes(app: FastifyInstance, ctx: AppContext, con
         available: health.available,
         healthy: health.healthy,
         state: health.state,
-        reason: health.reason ?? null,
+        reason: health.reason,
       });
     }
     const { profiles } = await ctx.execution.profiles.listForUser(user.id);
@@ -113,13 +112,15 @@ export async function executionRoutes(app: FastifyInstance, ctx: AppContext, con
   });
 
   // M8.4 provider inventory/status. Safe metadata only; describe() is written
-  // by adapters and never contains credentials.
+  // by adapters and never contains credentials, and health is never the
+  // adapter object verbatim — only the safe projection (no free-text
+  // `reason`, no `detail`).
   app.get('/api/execution/providers', async (req, reply) => {
     const ok = await requireAuth(req, reply);
     if (!ok) return;
     const providers = await Promise.all(ctx.execution.providers.list().map(async (info) => {
       const provider = ctx.execution.providers.get(info.id)!;
-      return { id: info.id, name: info.name, capabilities: info.capabilities, description: provider.describe(), health: await provider.health() };
+      return { id: info.id, name: info.name, capabilities: info.capabilities, description: provider.describe(), health: toSafeProviderHealth(await provider.health()) };
     }));
     return { providers, liveExecutionAvailable: false };
   });
@@ -130,7 +131,7 @@ export async function executionRoutes(app: FastifyInstance, ctx: AppContext, con
     const providerId = (req.params as { provider?: string }).provider ?? '';
     const provider = ctx.execution.providers.get(providerId);
     if (!provider) return reply.code(404).send({ error: { code: 'not_found', message: 'Execution provider not found' } });
-    return { id: provider.id, name: provider.name, capabilities: provider.capabilities, description: provider.describe(), health: await provider.health(), liveExecutionAvailable: false };
+    return { id: provider.id, name: provider.name, capabilities: provider.capabilities, description: provider.describe(), health: toSafeProviderHealth(await provider.health()), liveExecutionAvailable: false };
   });
 
   // GET /api/execution/profiles — owner-scoped list

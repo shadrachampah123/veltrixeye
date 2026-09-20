@@ -10,6 +10,7 @@ import {
 import { Errors } from '../errors.js';
 import type { AuditService, AuditEntry } from '../audit.js';
 import type { ExecutionProviderRegistry } from './registry.js';
+import { toSafeProviderHealth } from './provider-health.js';
 
 /** Owner-scoped execution/broker profiles. Credentials are deliberately not modeled. */
 export class ExecutionProfileService {
@@ -75,9 +76,12 @@ export class ExecutionProfileService {
     if (!row) throw Errors.notFound('Execution profile not found');
     if (row.provider_slug !== MT5_EXECUTION_PROVIDER_ID) throw Errors.invalidInput('Connection tests apply only to broker profiles');
     const provider = this.registry.get(row.provider_slug);
-    const health = provider ? await provider.health() : null;
-    await this.audit.log({ userId, action: 'execution.connection_tested', entityType: 'execution_profile', entityId: profileId, ip: meta?.ip ?? null, userAgent: meta?.userAgent ?? null, metadata: { provider: row.provider_slug, healthy: health?.healthy ?? false, reason: health?.reason ?? 'provider_missing' } });
-    return { profileId, orderPlaced: false, health: health ?? unavailableHealth() };
+    // The adapter's health object is never returned or persisted verbatim: the
+    // audit row keeps closed-enum facts only (no `reason`, no `detail`) and the
+    // response is the safe projection.
+    const health = toSafeProviderHealth(provider ? await provider.health() : null);
+    await this.audit.log({ userId, action: 'execution.connection_tested', entityType: 'execution_profile', entityId: profileId, ip: meta?.ip ?? null, userAgent: meta?.userAgent ?? null, metadata: { provider: row.provider_slug, healthy: health.healthy, available: health.available, state: health.state, providerRegistered: provider !== undefined } });
+    return { profileId, orderPlaced: false, health };
   }
 
   async listForUser(userId: string): Promise<{ profiles: ExecutionProfileDto[] }> {
@@ -108,7 +112,6 @@ async function replaceMappings(client: pg.PoolClient, profileId: string, mapping
     await client.query('INSERT INTO execution_symbol_mappings (execution_profile_id, instrument_id, broker_symbol) VALUES ($1, $2, $3)', [profileId, result.rows[0].id, m.brokerSymbol]);
   }
 }
-function unavailableHealth() { return { configured: false, authenticated: false, connected: false, available: false, healthy: false, state: 'unavailable' as const, reason: 'provider_missing', checkedAt: new Date().toISOString() }; }
 
 export interface ExecutionProfileRow {
   id: string; user_id: string; mode: ExecutionMode; environment: ExecutionMode; provider_slug: string;

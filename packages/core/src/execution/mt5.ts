@@ -1,8 +1,10 @@
 import {
+  EXECUTION_FAILURE_CATEGORIES,
   ExecutionProviderError,
   MT5_EXECUTION_PROVIDER_ID,
   type AssetClass,
   type ExecutionAccountInfo,
+  type ExecutionFailureCategory,
   type ExecutionInstrumentMetadata,
   type ExecutionProvider,
   type ExecutionProviderCapabilities,
@@ -144,38 +146,144 @@ const statusMap: Record<string, OrderStatus> = {
   filled: 'filled', rejected: 'rejected', cancelled: 'cancelled', canceled: 'cancelled', expired: 'expired',
 };
 
-export function normalizeMT5Error(error: unknown, operation: string): ExecutionProviderError {
-  if (error instanceof ExecutionProviderError) return error;
-  const e = error as MT5TransportError | null;
-  const code = String(e?.code ?? '').toLowerCase();
-  const message = String(e?.message ?? '').toLowerCase();
-  if (e?.responseLost) return new ExecutionProviderError('uncertain', `${operation} outcome is uncertain; reconciliation is required`, { cause: error, uncertain: true });
-  if (/auth|login|credential|10017/.test(`${code} ${message}`)) return new ExecutionProviderError('authentication', 'Broker authentication failed', { cause: error });
-  if (/timeout|timedout/.test(`${code} ${message}`)) return new ExecutionProviderError('timeout', `${operation} timed out before submission was confirmed`, { cause: error });
-  if (/connect|network|socket/.test(`${code} ${message}`)) return new ExecutionProviderError('connection', 'Broker connection failed', { cause: error });
-  if (/symbol/.test(`${code} ${message}`)) return new ExecutionProviderError('invalid_symbol', 'Broker rejected the instrument', { cause: error });
-  if (/volume|lot/.test(`${code} ${message}`)) return new ExecutionProviderError('invalid_volume', 'Broker rejected the volume', { cause: error });
-  if (/margin|fund/.test(`${code} ${message}`)) return new ExecutionProviderError('insufficient_funds', 'Broker reported insufficient margin', { cause: error });
-  if (/market.closed|trade.disabled/.test(`${code} ${message}`)) return new ExecutionProviderError('market_closed', 'Broker market is closed or trading is disabled', { cause: error });
-  if (operation === 'order submission') {
-    return new ExecutionProviderError('uncertain', 'Order submission returned an unrecognized broker state; reconciliation is required', { cause: error, uncertain: true });
+/* -------------------------------------------------------------------------- */
+/* Redaction boundary (Gate 10)                                                */
+/*                                                                            */
+/* Everything a transport hands back — error objects, messages, codes, order   */
+/* free text, health reasons, account identifiers — is provider-controlled.    */
+/* Nothing below copies such a value into an error, a receipt, a health        */
+/* record or an account record: outputs are closed tokens, fixed literals and  */
+/* bounded structured numbers only.                                            */
+/* -------------------------------------------------------------------------- */
+
+/** Fixed reason emitted whenever a transport reports an unhealthy state with a non-allowlisted reason. */
+export const MT5_TRANSPORT_UNHEALTHY_REASON = 'mt5_transport_reported_unhealthy';
+/** The only transport health reasons the provider repeats. Anything else collapses to the constant above. */
+const SAFE_TRANSPORT_HEALTH_REASONS: ReadonlySet<string> = new Set(['mt5_transport_unconfigured', MT5_TRANSPORT_UNHEALTHY_REASON]);
+/**
+ * Categories whose outcome is ambiguous when they occur during order
+ * submission: the venue may already have accepted the order, so they are
+ * always `uncertain` there (fail-closed; reconciliation resolves them).
+ */
+const AMBIGUOUS_SUBMISSION_CATEGORIES: ReadonlySet<ExecutionFailureCategory> = new Set(['timeout', 'connection', 'uncertain', 'unknown']);
+/** Provider code/message characters consulted for classification. Never retained. */
+const CLASSIFICATION_TEXT_LIMIT = 2048;
+/** Broker order/position identifiers must be short opaque tokens before they may reach persistence (DTO cap is 128). */
+const PROVIDER_TICKET_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const MAX_RETCODE = 999_999;
+const MAX_EPOCH_MS = 9_999_999_999_999;
+/** Account currency codes are short alphabetic tokens; anything else is withheld. */
+const CURRENCY_PATTERN = /^[A-Za-z]{3,6}$/;
+
+/** Fixed, user-safe message per category. Used to rebuild pass-through errors without their upstream text. */
+const SAFE_MESSAGES: Record<ExecutionFailureCategory, (operation: string) => string> = {
+  authentication: () => 'Broker authentication failed',
+  validation: (operation) => `${operation} failed broker validation`,
+  insufficient_funds: () => 'Broker reported insufficient margin',
+  market_closed: () => 'Broker market is closed or trading is disabled',
+  rate_limited: () => 'Broker rate limit reached',
+  timeout: (operation) => `${operation} timed out before submission was confirmed`,
+  unavailable: () => 'MT5 provider is unavailable',
+  rejected: () => 'Broker rejected the request',
+  connection: () => 'Broker connection failed',
+  invalid_symbol: () => 'Broker rejected the instrument',
+  invalid_volume: () => 'Broker rejected the volume',
+  invalid_price: () => 'Broker rejected the price',
+  invalid_protection: () => 'Broker rejected the protective levels',
+  duplicate: () => 'Broker reported a duplicate order',
+  uncertain: (operation) => `${operation} outcome is uncertain; reconciliation is required`,
+  unknown: (operation) => `${operation} failed with an unrecognized broker response`,
+};
+
+/**
+ * Reads only the primitive classification hints from a thrown value. Non-objects,
+ * non-primitive fields, proxies and throwing getters all yield nothing, so a
+ * hostile transport error can neither escape the normalizer nor steer it.
+ */
+function transportErrorHints(error: unknown): { text: string; responseLost: boolean } {
+  const none = { text: '', responseLost: false };
+  if (typeof error !== 'object' || error === null) return none;
+  try {
+    const e = error as MT5TransportError;
+    const code = typeof e.code === 'string' || typeof e.code === 'number' ? String(e.code) : '';
+    const message = typeof e.message === 'string' ? e.message : '';
+    return { text: `${code} ${message}`.slice(0, CLASSIFICATION_TEXT_LIMIT).toLowerCase(), responseLost: e.responseLost === true };
+  } catch {
+    return none;
   }
-  return new ExecutionProviderError('unknown', `${operation} failed with an unrecognized broker response`, { cause: error });
 }
 
+/** Broker tickets are identities: a value that is not a short opaque token is refused, never truncated or persisted. */
+function requireProviderTicket(ticket: unknown, kind: 'order' | 'position'): string {
+  if (typeof ticket === 'string' && PROVIDER_TICKET_PATTERN.test(ticket)) return ticket;
+  throw new ExecutionProviderError('uncertain', `Broker ${kind} identifier failed validation; reconciliation is required`, { uncertain: true });
+}
+function boundedInteger(value: unknown, min: number, max: number): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max ? value : null;
+}
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * Maps any failure raised by a transport onto the closed `ExecutionProviderError`
+ * contract. The result carries a category, a fixed message and the
+ * `uncertain`/`retryable` flags — and nothing else: no `cause`, no upstream
+ * stack, message, request, header or payload.
+ *
+ * `responseLost` takes precedence over every other signal. During order
+ * submission an ambiguous signal (timeout/connection) takes precedence over
+ * every "certain rejection" signal, and an unrecognized failure is uncertain,
+ * so provider text can never turn a possibly-accepted order into a certain
+ * rejection.
+ */
+export function normalizeMT5Error(error: unknown, operation: string): ExecutionProviderError {
+  const submission = operation === 'order submission';
+  const build = (category: ExecutionFailureCategory, message: string, flags: { uncertain?: boolean; retryable?: boolean } = {}) =>
+    new ExecutionProviderError(category, message, {
+      uncertain: flags.uncertain === true || category === 'uncertain' || (submission && AMBIGUOUS_SUBMISSION_CATEGORIES.has(category)),
+      retryable: flags.retryable === true,
+    });
+  if (error instanceof ExecutionProviderError) {
+    // Rebuild from the contract fields only; the upstream instance may carry an
+    // arbitrary message, a `cause`, a stack and enumerable provider properties.
+    // A category outside the closed set (only reachable through a cast) is `unknown`.
+    const category = (EXECUTION_FAILURE_CATEGORIES as readonly string[]).includes(error.category) ? error.category : 'unknown';
+    return build(category, SAFE_MESSAGES[category](operation), { uncertain: error.uncertain === true, retryable: error.retryable === true });
+  }
+  const { text, responseLost } = transportErrorHints(error);
+  if (responseLost) return build('uncertain', SAFE_MESSAGES.uncertain(operation), { uncertain: true });
+  const ambiguous = /timeout|timed.?out/.test(text) ? 'timeout' : /connect|network|socket/.test(text) ? 'connection' : null;
+  if (submission && ambiguous) return build(ambiguous, SAFE_MESSAGES[ambiguous](operation));
+  if (/auth|login|credential|10017/.test(text)) return build('authentication', SAFE_MESSAGES.authentication(operation));
+  if (ambiguous) return build(ambiguous, SAFE_MESSAGES[ambiguous](operation));
+  if (/symbol/.test(text)) return build('invalid_symbol', SAFE_MESSAGES.invalid_symbol(operation));
+  if (/volume|lot/.test(text)) return build('invalid_volume', SAFE_MESSAGES.invalid_volume(operation));
+  if (/margin|fund/.test(text)) return build('insufficient_funds', SAFE_MESSAGES.insufficient_funds(operation));
+  if (/market.closed|trade.disabled/.test(text)) return build('market_closed', SAFE_MESSAGES.market_closed(operation));
+  if (submission) return build('uncertain', 'Order submission returned an unrecognized broker state; reconciliation is required', { uncertain: true });
+  return build('unknown', SAFE_MESSAGES.unknown(operation));
+}
+
+/**
+ * Normalizes a broker order record. The receipt keeps bounded structured data
+ * only (retcode, timestamp); the broker's free-text message is never retained.
+ * A ticket that is not a short opaque token is refused as `uncertain` rather
+ * than persisted, because a mangled identity could match the wrong order later.
+ */
 export function normalizeMT5Order(row: MT5OrderSnapshot): ExecutionProviderOrderState {
   return {
-    providerOrderId: row.ticket,
+    providerOrderId: requireProviderTicket(row.ticket, 'order'),
     status: statusMap[row.status.toLowerCase()] ?? 'failed',
     filledQuantity: row.filledVolume ?? 0,
     averagePrice: row.averagePrice ?? null,
-    raw: { retcode: row.retcode ?? null, message: row.message?.slice(0, 256) ?? null, timestampMs: row.timestampMs },
+    raw: { retcode: boundedInteger(row.retcode, 0, MAX_RETCODE), timestampMs: boundedInteger(row.timestampMs, 0, MAX_EPOCH_MS) },
   };
 }
 
 function normalizePosition(row: MT5PositionSnapshot, canonical: string): ExecutionProviderPositionState {
   return {
-    providerPositionId: row.ticket, assetClass: 'other', symbol: canonical,
+    providerPositionId: requireProviderTicket(row.ticket, 'position'), assetClass: 'other', symbol: canonical,
     direction: row.side === 'buy' ? 'long' : 'short', quantity: row.volume,
     averageEntryPrice: row.priceOpen, stopLossPrice: row.stopLoss ?? null,
     takeProfitPrice: row.takeProfit ?? null, unrealizedPl: row.profit ?? null,
@@ -217,8 +325,14 @@ export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5P
       if (config.environment === 'live') return { configured: transport.configured, authenticated: false, connected: false, available: false, healthy: false, state: 'disabled', reason: 'live_execution_prohibited_m8_4', checkedAt };
       try {
         const h = await transport.health();
-        const available = h.configured && h.authenticated && h.connected;
-        return { configured: h.configured, authenticated: h.authenticated, connected: h.connected, available, healthy: available && h.healthy, state: available && h.healthy ? 'healthy' : available ? 'degraded' : 'unavailable', reason: h.reason, checkedAt };
+        // Flags are re-derived as strict booleans and the reason is an
+        // allowlisted token: a transport's free-text `reason` (or any extra
+        // property such as `detail`) never reaches the health record.
+        const configured = h.configured === true, authenticated = h.authenticated === true, connected = h.connected === true;
+        const available = configured && authenticated && connected;
+        const healthy = available && h.healthy === true;
+        const reason = healthy ? undefined : typeof h.reason === 'string' && SAFE_TRANSPORT_HEALTH_REASONS.has(h.reason) ? h.reason : MT5_TRANSPORT_UNHEALTHY_REASON;
+        return { configured, authenticated, connected, available, healthy, state: healthy ? 'healthy' : available ? 'degraded' : 'unavailable', ...(reason ? { reason } : {}), checkedAt };
       } catch (e) {
         const err = normalizeMT5Error(e, 'health check');
         return { configured: transport.configured, authenticated: false, connected: false, available: false, healthy: false, state: 'unavailable', reason: err.category, checkedAt };
@@ -226,8 +340,18 @@ export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5P
     },
     async getAccountInfo(): Promise<ExecutionAccountInfo | null> {
       await requireAvailable();
-      try { const a = await transport.account(); return { accountRef: config.accountRef ?? a.login, broker: a.broker, server: a.server, environment: 'demo', currency: a.currency ?? null, balance: a.balance ?? null, equity: a.equity ?? null, marginFree: a.marginFree ?? null }; }
-      catch (e) { throw normalizeMT5Error(e, 'account lookup'); }
+      // Only operator-configured identifiers are exposed. The broker login and
+      // the transport's broker/server strings are provider-controlled and are
+      // never used as an account reference, not even as a fallback.
+      if (!config.accountRef || !config.server) throw new ExecutionProviderError('unavailable', 'MT5 account reference is not configured');
+      try {
+        const a = await transport.account();
+        return {
+          accountRef: config.accountRef, broker: config.broker ?? config.server, server: config.server, environment: 'demo',
+          currency: typeof a.currency === 'string' && CURRENCY_PATTERN.test(a.currency) ? a.currency : null,
+          balance: finiteOrNull(a.balance), equity: finiteOrNull(a.equity), marginFree: finiteOrNull(a.marginFree),
+        };
+      } catch (e) { throw normalizeMT5Error(e, 'account lookup'); }
     },
     async getInstrument(canonical: string) {
       await requireAvailable();

@@ -72,9 +72,11 @@ Verified using an untouched `git archive` of the base (no branch switch):
    Next/PostCSS dependency chain, including PostCSS XSS/source-map disclosure
    advisories. No dependency or lockfile changes are introduced; remediation needs
    a separate compatibility-reviewed dependency update.
-4. Legacy M8.4 MT5 normalizers retain raw provider messages/error causes. They are
-   unchanged and not used by M10. Review them before any future real integration;
-   the M10 path forwards only allowlisted errors/events.
+4. Legacy M8.4 MT5 normalizers retained raw provider messages/error causes at
+   M10.0/M10.1. **Resolved under Gate 10** (see below): they now emit fixed-message,
+   closed-category errors with no `cause`, structured receipts without broker text,
+   and allowlisted health reasons. They remain unused by the M10 transport path,
+   which forwards only allowlisted errors/events.
 
 M10 intentionally cannot be promoted to live: durable cross-process idempotency,
 production authorization resolution, durable audit, broker reconciliation,
@@ -138,10 +140,82 @@ process-start tripwires reported zero forbidden calls. Database tests use local
 embedded PostgreSQL with synthetic test credentials, not production credentials.
 
 The pre-existing typecheck/CI, lint and dependency findings above remain outside
-this two-blocker fix. Legacy MT5 normalizers remain unchanged/unwired to M10; their
-redaction review is still a prerequisite for any future real integration. The
-in-memory, per-instance idempotency limitation is unchanged.
+this two-blocker fix. Legacy MT5 normalizers were not changed by M10.1 and remain
+unwired to M10; their redaction review was completed and closed under Gate 10
+(below). The in-memory, per-instance idempotency limitation is unchanged.
 
 No merge or deployment command is part of this fix. Existing GitHub/Vercel preview
 automation is unchanged and may react to the required PR branch push; this is not
 production deployment authorization.
+
+## Gate 10 — legacy MT5 normalizer redaction (CLOSED)
+
+Date: 2026-09-20 (UTC). Base: `main` `3b0c0e29a4961b438e638a174b221acd3c9e96bf`.
+Status: **remediation completed; final read-only verification: PASS.** This gate
+is internal safety/redaction work only — it is not broker, bridge or demo
+integration.
+
+Scope (working-tree files): `packages/core/src/execution/mt5.ts`,
+`provider-health.ts` (new), `index.ts`, `profiles.ts`, `reconciliation-service.ts`,
+`apps/api/src/routes/execution.ts`; tests `packages/core/test/m10-gate10-redaction.test.ts`
+(new), `mt5.test.ts`, `reconciliation.test.ts`, `apps/api/test/execution.test.ts`.
+
+### Remediation
+
+- **Raw provider causes/messages removed** from the affected MT5 normalization
+  paths. `normalizeMT5Error` builds every result from a closed category and a fixed
+  message with no `cause`, stack, headers, request or enumerable provider
+  properties; an upstream `ExecutionProviderError` is rebuilt from its contract
+  fields, never returned verbatim. Classification reads only primitive
+  `code`/`message`/`responseLost` hints inside a bounded (2,048-character) window.
+- **Order-submission uncertainty hardened.** Timeout/connection signals are
+  classified before authentication and forced `uncertain`; unrecognized submission
+  failures are `uncertain`; `responseLost` takes precedence over every other
+  signal; provider text can no longer downgrade an ambiguous submission failure to
+  a certain outcome.
+- **`normalizeMT5Order`** keeps bounded structured receipts only (`retcode`,
+  `timestampMs`); the broker `message` is never retained; order and position
+  tickets are validated (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`) and otherwise fail
+  closed as `uncertain`. Status mapping is unchanged.
+- **Provider health/account information safely projected.** MT5 health emits
+  strict booleans and an allowlisted reason (or the fixed
+  `mt5_transport_reported_unhealthy` token) with no `detail`; every API route,
+  the broker connection test and the reconciliation snapshot adapter use the
+  closed `toSafeProviderHealth` projection. Account info requires the configured
+  account reference and server, never falls back to the broker login, and exposes
+  configured broker/server labels only.
+- **Persistence/audit paths.** Reconciliation persists closed
+  `provider_error:<category>` tokens instead of error text; connection-test audit
+  metadata records closed-enum facts only (no `reason`).
+- **Regression coverage added:** 72 focused Gate 10 tests (every classification
+  branch, unknown, pass-through, cause/stack removal, fabricated secret sentinels,
+  1 MB messages, newline/ANSI injection, non-Error throws, submission-uncertainty
+  property test, responseLost precedence, receipt/ticket validation, health
+  projection, account fallbacks, positive controls), 3 reconciliation persistence
+  tests and 2 API route/audit tests; one receipt expectation updated.
+
+### Verification (final read-only audit, then closure re-run)
+
+| Check | Result |
+|---|---|
+| Focused core (Gate 10 + MT5 + execution + M10 transport) | 217 passed |
+| Core reconciliation (embedded PostgreSQL) / API execution + M10 config | 22 / 28 passed |
+| Full `npm test` | **1,340 passed, 0 failed, 0 skipped** (contracts 122; core 720; provider 33; API 282; web 183) |
+| `npm run typecheck` | 0 errors on this base |
+| Changed-file ESLint / `git diff --check` | Passed |
+| Migration 0028 SHA-256 | Byte-identical to base: `25359093d0304d84d82982750c58ee1bb054edacf29d1d4971a32ecfb5c9e49f`; no migration 0029 |
+
+### Safety boundaries (unchanged from base)
+
+- **No broker/demo/MT5 connectivity introduced;** no credentials added; the
+  changed files contain no network, environment or filesystem access.
+- **`DisabledMT5Transport` remains active** and its class body is byte-identical
+  to the base.
+- **No live execution enabled:** the M8.4 live prohibition (`Live MT5 execution is
+  prohibited in M8.4`, `live_execution_prohibited_m8_4`, paper-only allowed
+  environments) is intact; automation and the scanner remain disabled.
+- Execution safety gates, kill switches, risk/safety services, entitlements,
+  contracts, `app.ts` wiring and the migrations directory are unchanged.
+
+Not part of this gate: broker/bridge/demo integration (Gate 9), any merge,
+production deployment or live enablement.
