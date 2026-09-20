@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import {
   BRIDGE_MUTATION_KINDS,
@@ -279,21 +278,6 @@ export function canonicalizeMutationRequest(value: unknown): string {
     .filter(([, v]) => v !== undefined)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalizeMutationRequest(v)}`).join(',')}}`;
-}
-
-/**
- * sha-256 of the canonical mutation request (§2 "canonical request
- * identity/hash"). The request MUST already be free of secrets: only identity,
- * binding and order parameters belong here (§11).
- */
-export function canonicalMutationRequestHash(request: unknown): string {
-  if (!request || typeof request !== 'object' || Array.isArray(request)) {
-    throw new Error('canonicalMutationRequestHash requires an object request');
-  }
-  if (containsForbiddenAuditKey(request)) {
-    throw new Error('canonicalMutationRequestHash refused a request carrying credential-shaped keys');
-  }
-  return createHash('sha256').update(canonicalizeMutationRequest(request), 'utf8').digest('hex');
 }
 
 /* -------------------------------------------------------------------------- */

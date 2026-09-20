@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import {
-  canonicalMutationRequestHash,
+  canonicalizeMutationRequest,
+  containsForbiddenAuditKey,
   isMutationIdentityHash,
   providerCredentialBindingSchema,
   PROVIDER_MUTATION_SECRET_MANAGER_INTEGRATED,
@@ -18,6 +20,21 @@ import {
   type ProviderUncertaintyReason,
 } from '@veltrixeye/contracts';
 import type pg from 'pg';
+
+/**
+ * Node-specific sha-256 of the canonical mutation request (§2).
+ * Moved out of `@veltrixeye/contracts` to keep the browser bundle free of
+ * `node:crypto` (Vercel build regression). Semantics are preserved exactly.
+ */
+export function canonicalMutationRequestHash(request: unknown): string {
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    throw new Error('canonicalMutationRequestHash requires an object request');
+  }
+  if (containsForbiddenAuditKey(request)) {
+    throw new Error('canonicalMutationRequestHash refused a request carrying credential-shaped keys');
+  }
+  return createHash('sha256').update(canonicalizeMutationRequest(request), 'utf8').digest('hex');
+}
 
 /**
  * M10 Gate 9 — durable provider-mutation persistence (submit only).

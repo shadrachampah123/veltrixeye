@@ -8,13 +8,17 @@
  *  - outcome normalization (§5): unknown is never rejection;
  *  - receipt sanitization (§11): credential-shaped keys are rejected, not
  *    redacted, and only allowlisted scalars survive;
- *  - canonical request identity (§6);
+ *  - canonical request identity (§6) — browser-safe canonicalization only;
  *  - the reference-only credential boundary (§11).
+ *
+ * Note: Node-specific sha-256 hashing (`canonicalMutationRequestHash`) was
+ * moved to `@veltrixeye/core` to keep `@veltrixeye/contracts` browser-safe
+ * (Vercel build regression). Contracts now tests only the stable canonical
+ * form; hashing semantics are verified in core.
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  canonicalMutationRequestHash,
   canonicalizeMutationRequest,
   isMutationIdentityHash,
   isProviderIntentTerminal,
@@ -242,24 +246,23 @@ describe('Gate 9 §11 — sanitized receipts and the credential boundary', () =>
   });
 });
 
-describe('Gate 9 §6 — canonical request identity', () => {
-  test('the canonical hash is stable and order-independent', () => {
-    const a = canonicalMutationRequestHash({ clientOrderId: 've-1', symbol: 'EURUSD', nested: { b: 2, a: 1 } });
-    const b = canonicalMutationRequestHash({ nested: { a: 1, b: 2 }, symbol: 'EURUSD', clientOrderId: 've-1' });
+describe('Gate 9 §6 — canonical request identity (browser-safe)', () => {
+  test('the canonical form is stable and order-independent', () => {
+    const a = canonicalizeMutationRequest({ clientOrderId: 've-1', symbol: 'EURUSD', nested: { b: 2, a: 1 } });
+    const b = canonicalizeMutationRequest({ nested: { a: 1, b: 2 }, symbol: 'EURUSD', clientOrderId: 've-1' });
     assert.equal(a, b);
-    assert.equal(isMutationIdentityHash(a), true);
     assert.equal(canonicalizeMutationRequest({ b: 1, a: [1, 2] }), '{"a":[1,2],"b":1}');
   });
 
-  test('a different request produces a different identity', () => {
-    const a = canonicalMutationRequestHash({ clientOrderId: 've-1', quantity: 1 });
-    const b = canonicalMutationRequestHash({ clientOrderId: 've-1', quantity: 2 });
+  test('a different request produces a different canonical form', () => {
+    const a = canonicalizeMutationRequest({ clientOrderId: 've-1', quantity: 1 });
+    const b = canonicalizeMutationRequest({ clientOrderId: 've-1', quantity: 2 });
     assert.notEqual(a, b);
   });
 
-  test('a request carrying credential-shaped keys is refused', () => {
-    assert.throws(() => canonicalMutationRequestHash({ clientOrderId: 've-1', password: 'x' }));
-    assert.throws(() => canonicalMutationRequestHash('not-an-object'));
+  test('identity hash format is validated', () => {
+    assert.equal(isMutationIdentityHash('a'.repeat(64)), true);
+    assert.equal(isMutationIdentityHash('not-a-hash'), false);
   });
 });
 
