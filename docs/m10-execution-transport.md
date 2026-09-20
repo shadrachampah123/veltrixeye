@@ -112,7 +112,10 @@ Capacity exhaustion fails closed rather than evicting old identities. It is
 only for this non-live foundation. Before any future broker transport, use a
 durable atomic reservation/acknowledgement ledger, broker client-order identity,
 restart reconciliation and explicit resolution of uncertain outcomes. Existing
-M8 database idempotency is unchanged; M10 does not claim to replace it.
+M8 database idempotency is unchanged; M10 does not claim to replace it. Gate 9's
+durable submit ledger (migration `0029`) now provides that durable foundation for
+provider-submit mutations, but the M10 adapters are deliberately left unwired to
+it: connecting a transport is a separate, separately-reviewed step.
 
 ## Configuration
 
@@ -249,11 +252,59 @@ request payload enters an error string.
 
 ### Deliberately not in this step
 
-Durable submit-intent/receipt persistence and reservation storage, provider
-registry/adapter wiring, reconciliation scheduling changes, API routes, and any
-bridge/gateway/terminal process are later steps of Gate 9 and remain unimplemented.
+Provider registry/adapter wiring, reconciliation scheduling changes, API
+routes, and any bridge/gateway/terminal process remain unimplemented later
+steps. Durable submit-intent/receipt/reservation persistence is implemented as
+the **Gate 9 persistence step** below, but it is not wired to this transport:
+the M10 adapters keep their in-memory, non-durable idempotency ledger and are
+not connected to it.
 
-## Verification
+## Gate 9 — durable provider mutation persistence (submit only)
+
+Gate 9's persistence step implements the durable ledger and recovery safety for
+**provider order-submit mutations only** (cancel/modify/close are out of scope),
+as the replacement authority for the previously unrecovered §22/§24/§31
+persistence material. Full record:
+[docs/gate9-provider-mutation-persistence.md](./gate9-provider-mutation-persistence.md).
+
+- `packages/contracts/src/provider-mutations.ts`: intent/reservation state
+  machines, sanitized-receipt contract, outcome normalization, canonical request
+  identity and the reference-only credential boundary (no secret-manager
+  integration; `secretManagerIntegrated` stays `false`).
+- `packages/core/src/execution/provider-mutations.ts`: `ProviderMutationLedger`.
+  `prepareSubmit` commits the intent AND the mutation reservation, then
+  authorizes submission (`submitting`) **inside the same committed transaction**
+  — the pre-provider persistence barrier. `executeSubmit` performs the injected
+  provider call with no open transaction and records the normalized outcome.
+  Retry, reconciliation observation, operator resolution and restart recovery are
+  explicit, separate operations; none of them can resubmit, cancel or close.
+- `packages/core/src/db/migrations/0029_provider_mutation_persistence.sql`:
+  additive only. Extends `execution_provider_intents`, and adds the mutation
+  reservation, receipt, reconciliation-observation, resolution and append-only
+  event tables, with trigger-enforced state machines, DELETE guards for
+  unresolved rows, optimistic-concurrency versioning and a database-side receipt
+  sanitization guard. Migration `0028` is byte-identical.
+
+The M10 transport layer is **not** wired to this ledger: `DryRunExecutionTransport`
+and `MT5ExecutionTransport` are unchanged, no provider is registered, no route or
+worker uses the ledger, and no live broker path exists. The existing 60-second
+risk-reservation TTL keeps its meaning for risk exposure; expiry of that row can
+never delete an unresolved mutation reservation or authorize a duplicate mutation.
+
+### Verification (Gate 9 persistence step)
+
+- `packages/core/test/m10-gate9-mutation-persistence.test.ts`: 31 embedded-
+  PostgreSQL tests covering all seventeen required fake-provider scenarios
+  (acceptance, duplicate, rejection, timeout, lost response, malformed response,
+  unknown status, crash before/during the call, restart recovery, receipt
+  persistence failure, concurrency, reconciliation, retry, refused retry, stale
+  observation, risk-TTL expiry) plus the boundary rules.
+- `packages/core/test/m10-gate9-migrations.test.ts`: 5 migration tests (fresh
+  apply, `0028` unchanged, in-place upgrade preserving existing rows,
+  composite-FK ownership, database-enforced state machine/lineage/retention).
+- `packages/contracts/test/m10-gate9-persistence.test.ts`: 19 contract tests.
+
+### Verification (Gate 9 Step 2)
 
 - `packages/core/test/m10-transport.test.ts`: 94 tests, including network and
   process-start tripwires across every transport scenario, capability binding,

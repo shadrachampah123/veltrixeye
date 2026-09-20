@@ -44,7 +44,11 @@ describe('M9.2 migrations — 0028_push_channel_and_secret_hardening.sql', () =>
     const freshPool = createPool({ databaseUrl: fresh.dbUrl });
     try {
       const result = await runMigrations(freshPool, freshDir);
-      assert.equal(result.applied.length, 28);
+      // A fresh database applies every shipped migration (0028 plus later
+      // milestones such as 0029), so assert 0028 by name and the count as a
+      // lower bound instead of an exact total.
+      assert.ok(result.applied.includes('0028_push_channel_and_secret_hardening.sql'));
+      assert.ok(result.applied.length >= 28);
       const status = await migrationStatus(freshPool, freshDir);
       assert.equal(status.pending.length, 0);
       assert.equal(status.checksumsMatch, true);

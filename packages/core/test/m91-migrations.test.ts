@@ -41,13 +41,17 @@ test('M9.1 migrations upgrade an existing 0022 database and preserve email prefe
   const before = await runMigrations(pool, oldDir);
   assert.equal(before.applied.length, 22);
   let status = await migrationStatus(pool, MIGRATIONS_DIR);
-  // M9.2 adds 0028, so pending tail now includes 6 files; we assert the M9.1 set is still present
-  const pendingTail = status.pending.slice(-6);
-  assert.ok(pendingTail.includes('0023_notification_preferences.sql'));
-  assert.ok(pendingTail.includes('0024_notification_routing.sql'));
-  assert.ok(pendingTail.includes('0025_webhook_tenant_integrity.sql'));
-  assert.ok(pendingTail.includes('0026_notification_delivery_fairness.sql'));
-  assert.ok(pendingTail.includes('0027_notification_fairness_ledger.sql'));
+  // Later milestones ship migrations after M9.1 (M9.2 added 0028, M10 Gate 9
+  // added 0029), so assert the M9.1 set by name instead of by tail position.
+  for (const file of [
+    '0023_notification_preferences.sql',
+    '0024_notification_routing.sql',
+    '0025_webhook_tenant_integrity.sql',
+    '0026_notification_delivery_fairness.sql',
+    '0027_notification_fairness_ledger.sql',
+  ]) {
+    assert.ok(status.pending.includes(file), `${file} must still be pending for a 0022 database`);
+  }
   const files = readdirSync(MIGRATIONS_DIR).filter((file) => file.startsWith('0023_') || file.startsWith('0024_') || file.startsWith('0025_') || file.startsWith('0026_') || file.startsWith('0027_') || file.startsWith('0028_'));
   for (const file of files) copyFileSync(path.join(MIGRATIONS_DIR, file), path.join(oldDir, file));
   const upgraded = await runMigrations(pool, oldDir);
@@ -89,7 +93,18 @@ test('M9.1 migrations upgrade an existing 0022 database and preserve email prefe
 test('M9.1 migrations apply cleanly to a fresh database', async () => {
   const result = await runMigrations(freshPool, fullDir);
   const status = await migrationStatus(freshPool, fullDir);
-  assert.equal(result.applied.length, 28);
+  // A fresh database applies every shipped migration (M9.1's five plus later
+  // milestones), so assert the M9.1 files by name and the count by lower bound.
+  for (const file of [
+    '0023_notification_preferences.sql',
+    '0024_notification_routing.sql',
+    '0025_webhook_tenant_integrity.sql',
+    '0026_notification_delivery_fairness.sql',
+    '0027_notification_fairness_ledger.sql',
+  ]) {
+    assert.ok(result.applied.includes(file), `${file} must be applied on a fresh database`);
+  }
+  assert.ok(result.applied.length >= 28);
   assert.equal(status.pending.length, 0);
   assert.equal(status.checksumsMatch, true);
   assert.ok((await listMigrationFiles(fullDir)).some((file) => file.name === '0024_notification_routing.sql'));

@@ -740,6 +740,45 @@ Extends M9.1 with third channel, UI, and application-level secret encryption at 
 - **Tests:** contracts push accepted/invalid, channel max 3, invalid HTTP rejected, secrets excluded; migrations fresh through 0028 and upgrade 0027→0028, data preserved, constraints correct, push_claims 0, checksumsMatch; secret manager encryption/decryption, random IV, wrong key fails, key version, malformed fails, production missing-key fail-closed, redaction; preferences push ownership, encrypted persistence, webhook encrypted, no leakage, routing, quiet hours; push provider configured/unconfigured, success 201, 404/410 permanent, 429 retryable, 5xx retryable, timeout retryable, private-key redaction; outbox push enqueue/claim, 3-way fairness balanced, one empty queue fills capacity, cleanup durability, retries/stale, cascade, concurrent, rollback, invalid limits; API auth, owner scoping, rate limits, no secret leakage; web rendering, permission denied, subscribe/unsubscribe, SW behaviour, no hard-coded branding; regression all workspaces.
 - **M8.7 unchanged, M9.1 fairness preserved, automation OFF, live execution impossible, VAPID private server-only, secrets encrypted at rest, production fails closed.**
 
+## M10.0 / Gate 9 — non-live execution transport foundation + durable provider mutation persistence
+
+Foundation work only: **no broker, bridge, demo or live connectivity and no
+order leaves the platform.** See [m10-execution-transport.md](./m10-execution-transport.md)
+and [m10-verification.md](./m10-verification.md).
+
+- **M10.0 transport foundation:** provider-neutral `ExecutionTransport` contracts,
+  a server-only dispatcher (fresh gates + a separate execution authorization
+  before every submit/cancel), an opaque one-use request-bound capability, a
+  bounded in-process idempotency ledger, sanitized errors/audit events, and two
+  non-live adapters (`MT5ExecutionTransport` permanently unavailable,
+  `DryRunExecutionTransport` for tests). `EXECUTION_TRANSPORT_MODE=mt5-live`
+  always fails startup.
+- **Gate 9 Step 2 (pre-provider validation):** the `veltrixeye.mt5-bridge`
+  protocol contract at `1.0.0` (strict, bounded, no credential field, live
+  environment refused), a single readiness interpretation, durable client-order
+  identity (`ve-<24 hex>` / `ve-<20 hex>-rN`) checked before anything else,
+  two-sided quote freshness, instrument/volume validation, and provider-status
+  normalization that keeps unknown states unknown.
+- **Gate 9 persistence step ([gate9-provider-mutation-persistence.md](./gate9-provider-mutation-persistence.md)):**
+  durable persistence and recovery safety for **provider order-submit
+  mutations only** (cancel/modify/close out of scope).
+  - migration **`0029_provider_mutation_persistence.sql`** (additive; `0028`
+    byte-identical) extends `execution_provider_intents` and adds the mutation
+    reservation, sanitized receipt, reconciliation-observation, resolution and
+    append-only event tables, with trigger-enforced state machines, DELETE
+    guards for unresolved rows, optimistic-concurrency versioning and a
+    database-side credential-key guard;
+  - `ProviderMutationLedger` implements the pre-provider persistence barrier
+    (intent + reservation committed before the provider call, no transaction
+    held open across it), outcome normalization (timeout/lost/malformed/unknown
+    ⇒ `uncertain`, never `rejected`), retry lineage, observation-only
+    reconciliation, evidence-bearing operator resolution and restart recovery;
+  - the existing 60-second risk-reservation TTL keeps its risk-exposure meaning
+    but can never erase unresolved mutation safety;
+  - **no secret-manager integration, no live wiring, no automatic
+    repair/retry/cancel/close**, and no change to order-status vocabulary or to
+    risk/notification/entitlement/kill-switch behavior.
+
 ## After M9.2 (later work, outline only)
 
 1. **Operational broker transport** — validate a concrete MT5 bridge and an approved external secret manager on demo infrastructure. M8.4 deliberately ships neither and makes no connectivity claim. M8.5/M8.6/M8.7/M9.1/M9.2 prepare reconciliation, safety plumbing, drawdown protection, notification fairness and secret hardening for it; the transport itself is gated on external validation.
