@@ -3,13 +3,14 @@ import assert from 'node:assert/strict';
 import { copyFileSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
+import { startEmbeddedPostgres, removeDirRobust } from '../../../scripts/db/embedded.mjs';
 import { createPool, MIGRATIONS_DIR, runMigrations, migrationStatus } from '../src/index.js';
 
 let db: Awaited<ReturnType<typeof startEmbeddedPostgres>>;
 let pool: ReturnType<typeof createPool>;
 let oldDir: string;
 let freshDir: string;
+let dataDir: string;
 
 function copyUpTo(destination: string, max: number | null): void {
   for (const file of readdirSync(MIGRATIONS_DIR)) {
@@ -23,23 +24,33 @@ before(async () => {
   freshDir = mkdtempSync(path.join(os.tmpdir(), 've-m92-fresh-'));
   copyUpTo(oldDir, 27);
   copyUpTo(freshDir, null);
-  const dataDir = path.join(os.tmpdir(), `ve-m92-pg-${process.pid}`);
-  rmSync(dataDir, { recursive: true, force: true });
+  dataDir = path.join(os.tmpdir(), `ve-m92-pg-${process.pid}`);
+  removeDirRobust(dataDir);
   db = await startEmbeddedPostgres({ dataDir, port: 5459, user: 'test', password: 'm92', database: 'veltrixeye_m92' });
   pool = createPool({ databaseUrl: db.dbUrl });
 }, { timeout: 180_000 });
 
 after(async () => {
-  await pool?.end();
-  await db?.stop();
-  rmSync(oldDir, { recursive: true, force: true });
-  rmSync(freshDir, { recursive: true, force: true });
+  try {
+    await pool?.end();
+  } finally {
+    try {
+      await db?.stop();
+    } finally {
+      // The Postgres data directory can still be briefly locked on Windows
+      // right after shutdown — retry-remove it robustly; the migration copies
+      // below are plain files, so a single rm is fine there.
+      if (dataDir) removeDirRobust(dataDir);
+      rmSync(oldDir, { recursive: true, force: true });
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  }
 });
 
 describe('M9.2 migrations — 0028_push_channel_and_secret_hardening.sql', () => {
   test('fresh database applies cleanly through 0028, checksumsMatch, push_claims default 0, constraints', async () => {
     const freshDbDir = path.join(os.tmpdir(), `ve-m92-fresh2-pg-${process.pid}`);
-    rmSync(freshDbDir, { recursive: true, force: true });
+    removeDirRobust(freshDbDir);
     const fresh = await startEmbeddedPostgres({ dataDir: freshDbDir, port: 5460, user: 'test', password: 'm92f', database: 'veltrixeye_m92_fresh' });
     const freshPool = createPool({ databaseUrl: fresh.dbUrl });
     try {
@@ -87,7 +98,9 @@ describe('M9.2 migrations — 0028_push_channel_and_secret_hardening.sql', () =>
     } finally {
       await freshPool.end();
       await fresh.stop();
-      rmSync(freshDbDir, { recursive: true, force: true });
+      // Postgres-managed directory: may still be locked for a moment after
+      // shutdown on Windows, so use the bounded retry-remover.
+      removeDirRobust(freshDbDir);
     }
   });
 
