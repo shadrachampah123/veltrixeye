@@ -378,19 +378,20 @@ export class ProviderMutationLedger {
       client_order_id: string;
       state: ProviderMutationReservationState;
       monetary_risk: string;
+      total_risk: string;
     }>(
-      `SELECT r.intent_id AS id, r.client_order_id, r.state, r.monetary_risk::text AS monetary_risk
+      `SELECT r.intent_id AS id, r.client_order_id, r.state, r.monetary_risk::text AS monetary_risk,
+              COALESCE(SUM(r.monetary_risk) OVER (), 0)::text AS total_risk
          FROM execution_provider_mutation_reservations r
         WHERE r.execution_profile_id = $1
           AND r.state IN ('reserved', 'uncertain')
         ORDER BY r.created_at ASC`,
       [executionProfileId],
     );
-    let total = 0;
-    for (const row of rows) total += Number(row.monetary_risk ?? 0);
     return {
       count: rows.length,
-      monetaryRisk: String(total),
+      // Summed by the database (numeric arithmetic), never by float drift.
+      monetaryRisk: rows[0]?.total_risk ?? '0',
       clientOrderIds: rows.map((r) => r.client_order_id),
       intents: rows.map((r) => ({ intentId: r.id, clientOrderId: r.client_order_id, state: r.state })),
     };
