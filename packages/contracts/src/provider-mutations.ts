@@ -147,9 +147,11 @@ export const PROVIDER_RECONCILIATION_OUTCOMES = BRIDGE_RECONCILIATION_OUTCOMES;
 export type ProviderReconciliationOutcome = BridgeReconciliationOutcome;
 
 /**
- * How an uncertain mutation was finally resolved (§7, §14). `provider_absent`
- * is the "verified absence" finding: it resolves the uncertainty WITHOUT
- * claiming a rejection (`not_found` is an observation, never a rejection).
+ * How an uncertain mutation was finally resolved (§14). `provider_absent`
+ * is the "verified absence" resolution: established through explicit operator
+ * resolution (never through an automatic reconciliation transition), it resolves
+ * the uncertainty WITHOUT claiming a rejection (`not_found` is a proven
+ * observation, never an automatic state transition or rejection).
  */
 export const PROVIDER_RESOLUTIONS = ['provider_accepted', 'provider_rejected', 'provider_absent'] as const;
 export type ProviderResolution = (typeof PROVIDER_RESOLUTIONS)[number];

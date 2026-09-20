@@ -146,9 +146,19 @@ durable state when it is current and identity-verified:
 |---|---|
 | `matched` + accepted-vocabulary status | intent → `reconciled`, `provider_accepted` |
 | `matched` + rejection-vocabulary status | intent → `reconciled`, `provider_rejected` |
-| `not_found` | recorded as verified absence (`provider_absent`, `outcome = NULL`) — **never** a rejection |
-| `mismatched` | observation only; the intent stays unresolved and needs operator resolution |
-| `uncertain` | continued uncertainty; nothing is concluded |
+| `not_found` | recorded as a proven observation (`applied = false`); intent remains `uncertain`, reservation remains `uncertain`, `requiresOperatorResolution = true`. No automatic `provider_absent` transition occurs — provider absence becomes durable only through explicit operator resolution |
+| `mismatched` | observation only (`applied = false`); the intent stays unresolved and needs operator resolution (`requiresOperatorResolution = true`) |
+| `uncertain` | continued uncertainty (`applied = false`); nothing is concluded |
+
+Valid `not_found` reconciliation is intentionally fail-closed. Because absence
+from an external query cannot prove with certainty that a remote system did not
+execute or will not eventually acknowledge an order, `recordReconciliationObservation`
+records the observation in `execution_provider_reconciliation_observations` with
+`applied = false` and returns `requiresOperatorResolution = true`. The intent
+and its mutation reservation both remain `uncertain`, unresolved exposure remains
+counted, and `prepareRetry` remains blocked (`uncertainty_unresolved`). There is
+no automatic transition to `provider_absent` or `reconciled`. Durable provider
+absence is established only through explicit operator resolution (`resolveByOperator`).
 
 Staleness is decided by the database (`provider_reconciliation_observation_staleness_guard`):
 an observation about an attempt that a newer retry in the same lineage has
@@ -229,7 +239,7 @@ connectivity is introduced.
 
 ## 13. Test inventory (§13)
 
-`packages/core/test/m10-gate9-mutation-persistence.test.ts` — 31 tests against
+`packages/core/test/m10-gate9-mutation-persistence.test.ts` — 32 tests against
 a real embedded PostgreSQL with an injected fake provider; every assertion reads
 durable database state.
 
@@ -247,7 +257,7 @@ durable database state.
 | 10 restart and recovery | `10. an in-flight mutation survives restart…` |
 | 11 receipt-persistence failure | `11. …` |
 | 12 concurrent duplicates | `12. …`, `12b. …` |
-| 13 reconciliation after uncertainty | `13. …`, `13b. verified absence is recorded as absence, never as a rejection` |
+| 13 reconciliation after uncertainty | `13. …`, `13b. verified absence is recorded as absence, never as a rejection`, `13c. valid not_found reconciliation preserves uncertainty and blocks retry until operator resolution` |
 | 14 retry after resolved uncertainty | `14. …` |
 | 15 retry while uncertainty remains | `15. …` |
 | 16 stale reconciliation vs newer retry | `16. …`, `16b. …` |
@@ -264,7 +274,9 @@ only, no credential-shaped columns, and operator-resolution evidence rules.
 (operator path) the resolving user. It writes an append-only
 `execution_provider_resolutions` row, preserves the original client-order and
 idempotency identity, and never deletes the uncertain record. Marking a finding
-"resolved" is not evidence: an empty evidence reference is refused.
+"resolved" is not evidence: an empty evidence reference is refused. Operator
+resolution is also the only path through which an uncertain mutation can transition
+to `provider_absent`, durably releasing its reservation after human/external review.
 
 ## 15. Retention (§15)
 
@@ -296,7 +308,7 @@ behavior.
 | Malformed/unknown responses fail closed into uncertainty | ✅ | `4`–`7c` |
 | Retry requires resolution and a new mutation identity | ✅ | `14`, `15` |
 | Reconciliation cannot overwrite a newer attempt | ✅ | `16`, `16b`, staleness trigger |
-| All required fake-provider crash/recovery tests pass | ✅ | 31/31 in `m10-gate9-mutation-persistence.test.ts` |
+| All required fake-provider crash/recovery tests pass | ✅ | 32/32 in `m10-gate9-mutation-persistence.test.ts` |
 | No live broker transport enabled | ✅ | No transport, route, registry entry or config change; `apps/` untouched |
 | Migration `0028` unchanged | ✅ | SHA-256 `25359093…c5c9e49f`; `git diff` empty for that file |
 | Fresh read-only safety review passes | ✅ | This section; no code path in the change performs network I/O, credential use or order mutation |
