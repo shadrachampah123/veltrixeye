@@ -1,11 +1,22 @@
 # Gate 9 — durable provider mutation persistence (submit only)
 
-**Status:** implemented (replacement authority for the unrecovered §22/§24/§31
-Gate 9 persistence material)
+**Status:** **CLOSED / PROMOTED** (2026-09-20). Gate 9's documented scope is
+complete: Step 2 (pre-provider validation, recorded in
+[m10-verification.md](./m10-verification.md)) and Steps 3a/3b/3c — the durable
+provider mutation persistence requirements (3a/M1: the durable submit ledger
+and pre-provider persistence barrier of migration `0029`; 3b/M2: durable
+single-use barrier consumption; 3c/M3: the structural duplicate-mutation and
+retry invariants of migration `0030`) — are satisfied. Gate 9's final change
+set is merged into `main` via PR #39 (`08893989eed2f392c5ebd89339e8a52420c7dcf2`),
+and migration `0030_provider_mutation_lineage_invariants.sql` is applied in
+production. This document remains the replacement authority for the
+unrecovered §22/§24/§31 Gate 9 persistence material.
 **Scope:** durable persistence and recovery safety for **provider order-submit
 mutations only**
 **Live broker execution:** excluded. No MT5/Exness transport is enabled, wired
-or activated by this work.
+or activated by this work, and closing Gate 9 does not change that:
+provider/live transport wiring has **not** been completed by Gate 9 and
+remains future, separately reviewed work.
 **Migration:** `0029_provider_mutation_persistence.sql`. Migration `0028` is
 byte-identical (SHA-256
 `25359093d0304d84d82982750c58ee1bb054edacf29d1d4971a32ecfb5c9e49f`, unchanged).

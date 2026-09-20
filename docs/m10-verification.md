@@ -428,3 +428,37 @@ All new suites are deterministic and offline: no network, no credential, no
 vendor artifact and no real account. `provider-mutations.ts` (contracts and
 core) imports no `node:http`/`node:net`/`node:tls`/`node:child_process`, performs
 no environment access and no filesystem access.
+
+## M10 promotion-gate sequence closure (2026-09-20)
+
+Final documentation closure of the documented M10 promotion-gate sequence, on
+`main` `08893989eed2f392c5ebd89339e8a52420c7dcf2` (the PR #39 merge). Recorded
+from the latest read-only audit on that base: 394/394 focused tests passed,
+`npm run typecheck` 0 errors, and no HIGH or MEDIUM findings. The step-level
+statuses above remain historical records dated to their respective steps; this
+section is the final status of the sequence. This closure is documentation
+only — no code, test, migration, contract, configuration or deployment change
+is part of it.
+
+- **Gate 9 — durable provider mutation persistence (submit only): CLOSED /
+  PROMOTED.** Gate 9's documented scope is complete: Step 2 (pre-provider
+  validation) and Steps 3a/3b/3c — the durable provider mutation persistence
+  requirements (3a/M1: migration `0029` durable submit ledger and pre-provider
+  persistence barrier; 3b/M2: durable single-use barrier consumption; 3c/M3:
+  migration `0030` structural duplicate-mutation and retry invariants) — are
+  satisfied. PR #39 is merged into `main`, and production migration `0030` is
+  applied. Gate 9 did not wire or enable any provider/live transport, and
+  closing it does not: no provider registry entry, route, worker, transport
+  connection or secret-manager binding was added, and the M8.4 MT5 boundary
+  stays disabled.
+- **Gate 10 — legacy MT5 response-normalizer redaction: PASS / CLOSED.** The
+  remediation recorded in the Gate 10 section above (final read-only
+  verification: PASS) is complete; **no Gate 10 remediation remains**.
+- **Gate 9 and Gate 10 are the currently documented numbered M10 promotion
+  gates. There is no Gate 11 currently defined in this repository**, and no
+  gate number is assigned to future work.
+- **Future, separately reviewed work** — not completed by Gate 9 or Gate 10:
+  provider/transport adapter wiring; fake-bridge/operator harness work where
+  applicable; provider registry/live integration; secret-manager binding;
+  reconciliation scheduling; retention/archival; real broker/MT5/Exness
+  integration; and live execution enablement.

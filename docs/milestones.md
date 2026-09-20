@@ -740,7 +740,7 @@ Extends M9.1 with third channel, UI, and application-level secret encryption at 
 - **Tests:** contracts push accepted/invalid, channel max 3, invalid HTTP rejected, secrets excluded; migrations fresh through 0028 and upgrade 0027→0028, data preserved, constraints correct, push_claims 0, checksumsMatch; secret manager encryption/decryption, random IV, wrong key fails, key version, malformed fails, production missing-key fail-closed, redaction; preferences push ownership, encrypted persistence, webhook encrypted, no leakage, routing, quiet hours; push provider configured/unconfigured, success 201, 404/410 permanent, 429 retryable, 5xx retryable, timeout retryable, private-key redaction; outbox push enqueue/claim, 3-way fairness balanced, one empty queue fills capacity, cleanup durability, retries/stale, cascade, concurrent, rollback, invalid limits; API auth, owner scoping, rate limits, no secret leakage; web rendering, permission denied, subscribe/unsubscribe, SW behaviour, no hard-coded branding; regression all workspaces.
 - **M8.7 unchanged, M9.1 fairness preserved, automation OFF, live execution impossible, VAPID private server-only, secrets encrypted at rest, production fails closed.**
 
-## M10.0 / Gate 9 — non-live execution transport foundation + durable provider mutation persistence
+## M10.0 / Gates 9 + 10 — delivered (non-live execution transport foundation, durable provider mutation persistence, MT5 normalizer redaction)
 
 Foundation work only: **no broker, bridge, demo or live connectivity and no
 order leaves the platform.** See [m10-execution-transport.md](./m10-execution-transport.md)
@@ -778,8 +778,31 @@ and [m10-verification.md](./m10-verification.md).
   - **no secret-manager integration, no live wiring, no automatic
     repair/retry/cancel/close**, and no change to order-status vocabulary or to
     risk/notification/entitlement/kill-switch behavior.
+- **Gate 10 (legacy MT5 response-normalizer redaction):** recorded in
+  [m10-verification.md](./m10-verification.md) — raw provider messages/causes
+  removed from the legacy M8.4 MT5 normalization, health/account and
+  persistence/audit paths; fixed-message closed-category errors, sanitized
+  receipts, allowlisted health reasons. **PASS / CLOSED**; no remediation
+  remains.
+- **M10 promotion-gate closure (2026-09-20):** Gate 9's documented scope is
+  complete — Step 2 (pre-provider validation) and Steps 3a/3b/3c (durable
+  provider mutation persistence) are satisfied — and Gate 9 is **CLOSED /
+  PROMOTED**: PR #39 is merged into `main` and production migration `0030` is
+  applied. Gate 10 is **PASS / CLOSED**. Gate 9 and Gate 10 are the currently
+  documented numbered M10 promotion gates — **there is no Gate 11 defined in
+  this repository** — and neither gate completed provider/live transport
+  wiring: the future work below remains future, separately reviewed work.
 
-## After M9.2 (later work, outline only)
+## After M10 (later work, outline only)
+
+The items below are deliberately **unnumbered**: the numbered M10
+promotion-gate sequence (Gate 9, Gate 10) is complete and closed, and no
+Gate 11 exists or is assigned to future work. Everything here is future,
+separately reviewed work — including provider/transport adapter wiring, the
+fake-bridge/operator harness where applicable, provider registry/live
+integration, secret-manager binding, reconciliation scheduling,
+retention/archival, real broker/MT5/Exness integration and live execution
+enablement — and is **not** completed by Gate 9 or Gate 10.
 
 1. **Operational broker transport** — validate a concrete MT5 bridge and an approved external secret manager on demo infrastructure. M8.4 deliberately ships neither and makes no connectivity claim. M8.5/M8.6/M8.7/M9.1/M9.2 prepare reconciliation, safety plumbing, drawdown protection, notification fairness and secret hardening for it; the transport itself is gated on external validation.
 2. **Billing** (provider, webhooks, checkout/portal) lands alongside or after.
