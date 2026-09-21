@@ -2,29 +2,29 @@
  * B1 — authorization/composition layer tests.
  *
  * Verifies:
- *  - ExecutionAuthorizationService: one-shot, TTL, exact binding, fail-closed
- *  - ExecutionCompositionService gate resolution: environment safety, broker/account binding,
- *    provider health via readiness, no live execution
+ *  - ExecutionAuthorizationService: one-shot, TTL, exact request + context
+ *    binding, fail-closed (context coverage lives in b1-h1-*; immutability
+ *    in b1-m1-*)
+ *  - MT5 provider wired through the one-shot context handoff (H1)
+ *  - Gate evaluation: environment safety, broker/account binding,
+ *    provider health, no live execution (gates themselves are unchanged)
  *  - Canonical boundary still mandatory (Gate 9 + B2)
  *  - DisabledMT5Transport preserved
- *  - No second submit path
  *  - Honest uncertainty never projected as accepted
  */
-
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { createHash, randomUUID } from 'node:crypto';
 import {
   createMT5ExecutionProvider,
   DisabledMT5Transport,
   ExecutionAuthorizationService,
-  ProviderMutationLedger,
-  createSubmitBarrierHandoff,
-  submitOrderThroughGate9,
+  createAuthorizationContextHandoff,
   evaluateExecutionGates,
+  type AuthorizationExecutionContext,
   type ExecutionGateInput,
 } from '../src/execution/index.js';
-import { ExecutionProviderError } from '@veltrixeye/contracts';
+import { ExecutionProviderError, normalizeProviderOrderStatus } from '@veltrixeye/contracts';
+import type { MT5Transport } from '../src/execution/mt5.js';
 
 // ---------------------------------------------------------------------------
 // Authorization service
@@ -32,7 +32,7 @@ import { ExecutionProviderError } from '@veltrixeye/contracts';
 
 describe('B1 — ExecutionAuthorizationService', () => {
   const baseRequest = {
-    clientOrderId: 've-abc123',
+    clientOrderId: `ve-${'a1'.repeat(12)}`,
     idempotencyKey: 'a'.repeat(64),
     assetClass: 'forex' as const,
     symbol: 'EURUSD',
@@ -45,10 +45,19 @@ describe('B1 — ExecutionAuthorizationService', () => {
     authorizationId: 'test-auth',
   };
 
-  it('mints and consumes exactly once (one-shot)', () => {
-    const clock = { now: 1_000 };
-    const svc = new ExecutionAuthorizationService({ clock: () => clock.now, ttlMs: 60_000 });
-    const auth = svc.createAuthorization({
+  const baseContext: AuthorizationExecutionContext = {
+    userId: 'u1',
+    executionProfileId: 'p1',
+    providerSlug: 'mt5',
+    environment: 'demo',
+    accountRef: 'acc-1',
+    brokerServerRef: 'srv-1',
+    setupId: 's1',
+    riskDecisionId: 'r1',
+  };
+
+  function mintArgs(overrides: Record<string, unknown> = {}) {
+    return {
       userId: 'u1',
       executionProfileId: 'p1',
       clientOrderId: baseRequest.clientOrderId,
@@ -62,87 +71,101 @@ describe('B1 — ExecutionAuthorizationService', () => {
       takeProfitPrice: baseRequest.takeProfitPrice,
       requestedPrice: null,
       providerSlug: 'mt5',
-      environment: 'demo',
+      environment: 'demo' as const,
       accountRef: 'acc-1',
       brokerServerRef: 'srv-1',
       riskDecisionId: 'r1',
       setupId: 's1',
-    });
+      ...overrides,
+    };
+  }
 
-    // First consume succeeds
-    const consumed = svc.consumeAuthorization(auth.id, {
-      ...baseRequest,
-      authorizationId: auth.id,
-    } as any);
+  it('mints and consumes exactly once (one-shot)', () => {
+    const clock = { now: 1_000 };
+    const svc = new ExecutionAuthorizationService({ clock: () => clock.now, ttlMs: 60_000 });
+    const auth = svc.createAuthorization(mintArgs());
+
+    const consumed = svc.consumeAuthorization(
+      auth.id,
+      { ...baseRequest, authorizationId: auth.id } as any,
+      baseContext,
+    );
     assert.equal(consumed.id, auth.id);
 
-    // Second consume fails closed
-    assert.throws(() => svc.consumeAuthorization(auth.id, { ...baseRequest, authorizationId: auth.id } as any), (e: any) => e instanceof ExecutionProviderError && e.category === 'validation');
+    assert.throws(
+      () => svc.consumeAuthorization(auth.id, { ...baseRequest, authorizationId: auth.id } as any, baseContext),
+      (e: any) => e instanceof ExecutionProviderError && e.category === 'validation',
+    );
   });
 
   it('refuses expired authorization (TTL)', () => {
     let now = 1_000;
     const svc = new ExecutionAuthorizationService({ clock: () => now, ttlMs: 60_000 });
-    const auth = svc.createAuthorization({
-      userId: 'u1',
-      executionProfileId: 'p1',
-      clientOrderId: baseRequest.clientOrderId,
-      idempotencyKey: baseRequest.idempotencyKey,
-      symbol: baseRequest.symbol,
-      side: baseRequest.side,
-      quantity: baseRequest.quantity,
-      assetClass: baseRequest.assetClass,
-      orderType: baseRequest.orderType,
-      stopLossPrice: baseRequest.stopLossPrice,
-      takeProfitPrice: baseRequest.takeProfitPrice,
-      requestedPrice: null,
-      providerSlug: 'mt5',
-      environment: 'demo',
-      accountRef: null,
-      brokerServerRef: null,
-      riskDecisionId: null,
-      setupId: null,
-    });
-    now += 61_000; // past TTL
-    assert.throws(() => svc.consumeAuthorization(auth.id, { ...baseRequest, authorizationId: auth.id } as any), (e: any) => e instanceof ExecutionProviderError && /expired/.test(e.message));
+    const auth = svc.createAuthorization(mintArgs({ accountRef: null, brokerServerRef: null, riskDecisionId: null, setupId: null }));
+    now += 61_000;
+    assert.throws(
+      () =>
+        svc.consumeAuthorization(
+          auth.id,
+          { ...baseRequest, authorizationId: auth.id } as any,
+          { ...baseContext, accountRef: null, brokerServerRef: null, riskDecisionId: null, setupId: null },
+        ),
+      (e: any) => e instanceof ExecutionProviderError && /expired/.test(e.message),
+    );
   });
 
   it('refuses binding mismatch (symbol, quantity, SL/TP)', () => {
     const svc = new ExecutionAuthorizationService({ ttlMs: 60_000 });
-    const auth = svc.createAuthorization({
-      userId: 'u1',
-      executionProfileId: 'p1',
-      clientOrderId: 've-xyz',
-      idempotencyKey: 'b'.repeat(64),
-      symbol: 'EURUSD',
-      side: 'buy',
-      quantity: 0.1,
-      assetClass: 'forex',
-      orderType: 'market',
-      stopLossPrice: 1.1,
-      takeProfitPrice: 1.2,
-      requestedPrice: null,
-      providerSlug: 'mt5',
-      environment: 'demo',
-      accountRef: null,
-      brokerServerRef: null,
-      riskDecisionId: null,
-      setupId: null,
-    });
+    const idempotencyKey = 'b'.repeat(64);
+    const clientOrderId = `ve-${'b2'.repeat(12)}`;
+    const auth = svc.createAuthorization(mintArgs({ clientOrderId, idempotencyKey }));
+    const req = (patch: Record<string, unknown>) =>
+      ({
+        clientOrderId,
+        idempotencyKey,
+        assetClass: 'forex',
+        symbol: 'EURUSD',
+        side: 'buy',
+        orderType: 'market',
+        quantity: 0.1,
+        stopLossPrice: 1.1,
+        takeProfitPrice: 1.2,
+        requestedPrice: null,
+        authorizationId: auth.id,
+        ...patch,
+      }) as any;
 
-    // Different symbol
-    assert.throws(() => svc.consumeAuthorization(auth.id, { clientOrderId: 've-xyz', idempotencyKey: 'b'.repeat(64), assetClass: 'forex', symbol: 'GBPUSD', side: 'buy', orderType: 'market', quantity: 0.1, stopLossPrice: 1.1, takeProfitPrice: 1.2, requestedPrice: null, authorizationId: auth.id } as any));
-
-    // Different quantity
-    assert.throws(() => svc.consumeAuthorization(auth.id, { clientOrderId: 've-xyz', idempotencyKey: 'b'.repeat(64), assetClass: 'forex', symbol: 'EURUSD', side: 'buy', orderType: 'market', quantity: 0.2, stopLossPrice: 1.1, takeProfitPrice: 1.2, requestedPrice: null, authorizationId: auth.id } as any));
-
-    // Different SL
-    assert.throws(() => svc.consumeAuthorization(auth.id, { clientOrderId: 've-xyz', idempotencyKey: 'b'.repeat(64), assetClass: 'forex', symbol: 'EURUSD', side: 'buy', orderType: 'market', quantity: 0.1, stopLossPrice: 1.0, takeProfitPrice: 1.2, requestedPrice: null, authorizationId: auth.id } as any));
+    assert.throws(() => svc.consumeAuthorization(auth.id, req({ symbol: 'GBPUSD' }), baseContext));
+    assert.throws(() => svc.consumeAuthorization(auth.id, req({ quantity: 0.2 }), baseContext));
+    assert.throws(() => svc.consumeAuthorization(auth.id, req({ stopLossPrice: 1.0 }), baseContext));
+    // All failures non-consuming: the exact request still consumes.
+    assert.equal(svc.consumeAuthorization(auth.id, req({}), baseContext).id, auth.id);
   });
 
   it('refuses unknown authorization id', () => {
     const svc = new ExecutionAuthorizationService();
-    assert.throws(() => svc.consumeAuthorization('unknown-id', baseRequest as any), (e: any) => e instanceof ExecutionProviderError);
+    assert.throws(
+      () => svc.consumeAuthorization('unknown-id', baseRequest as any, baseContext),
+      (e: any) => e instanceof ExecutionProviderError,
+    );
+  });
+
+  it('refuses context mismatch (H1)', () => {
+    const svc = new ExecutionAuthorizationService({ ttlMs: 60_000 });
+    const auth = svc.createAuthorization(mintArgs());
+    assert.throws(
+      () =>
+        svc.consumeAuthorization(
+          auth.id,
+          { ...baseRequest, authorizationId: auth.id } as any,
+          { ...baseContext, executionProfileId: 'p2' },
+        ),
+      /not issued for this execution context/,
+    );
+    assert.equal(
+      svc.consumeAuthorization(auth.id, { ...baseRequest, authorizationId: auth.id } as any, baseContext).id,
+      auth.id,
+    );
   });
 
   it('bounds map and evicts expired', () => {
@@ -155,68 +178,95 @@ describe('B1 — ExecutionAuthorizationService', () => {
     svc.createAuthorization({
       userId: 'u', executionProfileId: 'p', clientOrderId: 've-2', idempotencyKey: 'k2', symbol: 'EURUSD', side: 'buy', quantity: 0.1, assetClass: 'forex', orderType: 'market', providerSlug: 'paper', environment: 'paper', accountRef: null, brokerServerRef: null,
     });
-    now = 2000; // first expired
+    now = 2000;
     svc.createAuthorization({
       userId: 'u', executionProfileId: 'p', clientOrderId: 've-3', idempotencyKey: 'k3', symbol: 'EURUSD', side: 'buy', quantity: 0.1, assetClass: 'forex', orderType: 'market', providerSlug: 'paper', environment: 'paper', accountRef: null, brokerServerRef: null,
     });
-    // Should have evicted expired and bounded to max 2
     assert.ok(svc.size() <= 2);
   });
 });
 
 // ---------------------------------------------------------------------------
-// MT5 provider with authorization service
+// MT5 provider with authorization service (via the one-shot context handoff)
 // ---------------------------------------------------------------------------
 
 describe('B1 — MT5 provider with authorization service', () => {
+  function providerWith(authz: { consumeAuthorization(id: string, req: any): unknown }) {
+    return createMT5ExecutionProvider(
+      new DisabledMT5Transport(),
+      {
+        enabled: true,
+        environment: 'demo',
+        broker: null,
+        server: 'srv',
+        accountRef: 'acc',
+        symbols: new Map([['EURUSD', 'EURUSD']]),
+      },
+      { authorization: authz },
+    );
+  }
+
   it('refuses when authorizationId missing (presence check preserved)', async () => {
-    const provider = createMT5ExecutionProvider(new DisabledMT5Transport(), {
-      enabled: true,
-      environment: 'demo',
-      broker: null,
-      server: 'srv',
-      accountRef: 'acc',
-      symbols: new Map([['EURUSD', 'EURUSD']]),
-    });
-    await assert.rejects(() => provider.submitOrder({ clientOrderId: 've-abc', idempotencyKey: 'k', assetClass: 'forex', symbol: 'EURUSD', side: 'buy', orderType: 'market', quantity: 0.1, requestedPrice: null, stopLossPrice: 1.1, takeProfitPrice: 1.2 } as any));
+    const svc = new ExecutionAuthorizationService();
+    const handoff = createAuthorizationContextHandoff(svc);
+    const provider = providerWith(handoff.authorization);
+    await assert.rejects(() =>
+      provider.submitOrder({
+        clientOrderId: `ve-${'c3'.repeat(12)}`,
+        idempotencyKey: 'k'.repeat(64),
+        assetClass: 'forex',
+        symbol: 'EURUSD',
+        side: 'buy',
+        orderType: 'market',
+        quantity: 0.1,
+        requestedPrice: null,
+        stopLossPrice: 1.1,
+        takeProfitPrice: 1.2,
+      } as any),
+    );
   });
 
-  it('verifies authorization via service when wired, one-shot', async () => {
+  it('verifies authorization via the armed handoff, one-shot at both layers', async () => {
     const authSvc = new ExecutionAuthorizationService();
-    const provider = createMT5ExecutionProvider(new DisabledMT5Transport(), {
-      enabled: true,
-      environment: 'demo',
-      broker: null,
-      server: 'srv',
-      accountRef: 'acc',
-      symbols: new Map([['EURUSD', 'EURUSD']]),
-    }, { authorization: authSvc });
+    const handoff = createAuthorizationContextHandoff(authSvc);
+    const provider = providerWith(handoff.authorization);
 
-    const clientOrderId = 've-test123';
+    const clientOrderId = `ve-${'d4'.repeat(12)}`;
     const idempotencyKey = 'c'.repeat(64);
+    const context: AuthorizationExecutionContext = {
+      userId: 'u1',
+      executionProfileId: 'p1',
+      providerSlug: 'mt5',
+      environment: 'demo',
+      accountRef: 'acc',
+      brokerServerRef: 'srv',
+      setupId: null,
+      riskDecisionId: null,
+    };
     const auth = authSvc.createAuthorization({
       userId: 'u1', executionProfileId: 'p1', clientOrderId, idempotencyKey,
       symbol: 'EURUSD', side: 'buy', quantity: 0.1, assetClass: 'forex', orderType: 'market',
       stopLossPrice: 1.1, takeProfitPrice: 1.2, requestedPrice: null,
       providerSlug: 'mt5', environment: 'demo', accountRef: 'acc', brokerServerRef: 'srv',
     });
-
-    // First call: authorization consumed, then fails at health/transport (expected),
-    // but authorization is already consumed (one-shot).
-    // Since DisabledMT5Transport health fails, provider will throw unavailable after auth check.
-    // We check that second call fails at auth layer (not at transport).
-    await assert.rejects(() => provider.submitOrder({
+    const request = {
       clientOrderId, idempotencyKey, authorizationId: auth.id,
       assetClass: 'forex', symbol: 'EURUSD', side: 'buy', orderType: 'market', quantity: 0.1,
       requestedPrice: null, stopLossPrice: 1.1, takeProfitPrice: 1.2,
-    } as any));
+    } as any;
 
-    // Second call with same auth id should fail at auth verification (one-shot)
-    await assert.rejects(() => provider.submitOrder({
-      clientOrderId, idempotencyKey, authorizationId: auth.id,
-      assetClass: 'forex', symbol: 'EURUSD', side: 'buy', orderType: 'market', quantity: 0.1,
-      requestedPrice: null, stopLossPrice: 1.1, takeProfitPrice: 1.2,
-    } as any), (e: any) => e instanceof ExecutionProviderError && e.category === 'validation');
+    // Armed: authorization is consumed, then the provider fails later at
+    // readiness (the transport is disabled) — never at the auth layer.
+    handoff.arm(auth.id, context);
+    await assert.rejects(() => provider.submitOrder(request), /unavailable|disabled|not configured|not ready/i);
+    assert.equal(authSvc.size(), 0, 'first submit consumed the authorization');
+
+    // Second submit with the same id fails at the auth layer (one-shot):
+    // the handoff entry is spent and the authorization is gone.
+    await assert.rejects(
+      () => provider.submitOrder(request),
+      (e: any) => e instanceof ExecutionProviderError && e.category === 'validation',
+    );
   });
 
   it('DisabledMT5Transport preserved: configured false, health unhealthy, submit fails closed', async () => {
@@ -236,7 +286,21 @@ describe('B1 — MT5 provider with authorization service', () => {
     const providerHealth = await provider.health();
     assert.equal(providerHealth.healthy, false);
     assert.equal(providerHealth.state, 'disabled');
-    await assert.rejects(() => provider.submitOrder({ clientOrderId: 've-x', idempotencyKey: 'k', assetClass: 'forex', symbol: 'EURUSD', side: 'buy', orderType: 'market', quantity: 0.1, requestedPrice: null, stopLossPrice: 1.1, takeProfitPrice: 1.2, authorizationId: 'a' } as any));
+    await assert.rejects(() =>
+      provider.submitOrder({
+        clientOrderId: `ve-${'e5'.repeat(12)}`,
+        idempotencyKey: 'k'.repeat(64),
+        assetClass: 'forex',
+        symbol: 'EURUSD',
+        side: 'buy',
+        orderType: 'market',
+        quantity: 0.1,
+        requestedPrice: null,
+        stopLossPrice: 1.1,
+        takeProfitPrice: 1.2,
+        authorizationId: 'a',
+      } as any),
+    );
   });
 });
 
@@ -285,8 +349,6 @@ describe('B1 — gate evaluation fixes', () => {
 
   it('allows demo environment (B1) but still fails live', () => {
     const demo = evaluateExecutionGates(baseInput({ profile: { enabled: true, environment: 'demo' } }));
-    // Should not fail at profile_enabled; may fail later if other gates, but profile_enabled should pass
-    // Since all other gates pass, demo should pass.
     assert.equal(demo.passed, true);
 
     const live = evaluateExecutionGates(baseInput({ profile: { enabled: true, environment: 'live' as any } }));
@@ -323,20 +385,26 @@ describe('B1 — gate evaluation fixes', () => {
 
 describe('B1 — production composition audit', () => {
   it('exactly one canonical boundary: submitOrderThroughGate9 exists and is used', async () => {
-    // This test asserts the boundary function exists and has expected shape.
-    // Real audit is in Phase 3 verification script, but we assert here that
-    // the module exports the single boundary and no second path.
     const { submitOrderThroughGate9, createSubmitBarrierHandoff } = await import('../src/execution/submit-boundary.js');
     assert.ok(typeof submitOrderThroughGate9 === 'function');
     assert.ok(typeof createSubmitBarrierHandoff === 'function');
   });
 
-  it('honest uncertainty: provider returns uncertain, never projected as accepted', () => {
-    // The MT5 provider normalizes unknown broker status to uncertain, not accepted.
-    // This is covered by B2 tests, but we re-assert the invariant here.
-    // A direct check: DisabledMT5Transport submit throws unavailable, which is fail-closed,
-    // not accepted.
-    // No assertion needed beyond the fact that the provider does not invent acceptance.
-    assert.ok(true);
+  it('honest uncertainty: unknown broker statuses normalize to uncertain, never accepted', async () => {
+    // B9 — the protocol normalizer is the only reader of the status
+    // vocabulary: an unknown broker status can never project acceptance.
+    for (const unknown of ['TOTALLY_UNKNOWN', '', 'weird-status-123']) {
+      const normalized = normalizeProviderOrderStatus(unknown as any);
+      assert.equal(normalized.status, null, `status ${JSON.stringify(unknown)}`);
+      assert.equal(normalized.statusUncertain, true);
+      assert.equal(normalized.snapshotStatus, 'uncertain');
+    }
+    // Known terminal states keep their meaning.
+    assert.equal(normalizeProviderOrderStatus('accepted' as any).status, 'accepted');
+    assert.equal(normalizeProviderOrderStatus('rejected' as any).status, 'rejected');
+
+    // And the disabled transport fails closed (unavailable), never accepted.
+    const transport: MT5Transport = new DisabledMT5Transport();
+    await assert.rejects(() => transport.submitOrder({} as any), /not configured/);
   });
 });

@@ -16,6 +16,10 @@ import type { KillSwitchService } from './kill-switch.js';
 import { evaluateExecutionGates, type ExecutionGateResult } from './gates.js';
 import type { ExecutionProviderRegistry } from './registry.js';
 import type { RiskEngineService } from '../risk/service.js';
+import {
+  evaluateProviderReadinessForGate,
+  resolveBrokerAccountAuthorization,
+} from './composition-fence.js';
 
 /**
  * M8.1 — execution decision intake (the ONLY door toward a future order).
@@ -218,46 +222,22 @@ export class ExecutionIntakeService {
       reserveOnApprove: true,
     });
 
-    // B1 — server-resolved broker/account authorization (not client claims).
-    // Paper is always authorized (internal). For broker, provider must exist
-    // and describe() must match the persisted profile binding exactly.
-    let brokerAuthorized = false;
-    let accountAuthorized = false;
-    if (provider) {
-      try {
-        const described = provider.describe() as Record<string, unknown>;
-        const describedId = typeof described.id === 'string' ? described.id : null;
-        const describedEnv = typeof described.environment === 'string' ? described.environment : null;
-        const describedAccount = typeof described.accountRef === 'string' ? described.accountRef : null;
-        const describedServer = typeof described.server === 'string' ? described.server : null;
-
-        // For paper, always authorized. For broker demo, require exact binding.
-        if (profile.provider_slug === 'paper') {
-          brokerAuthorized = true;
-          accountAuthorized = true;
-        } else {
-          // Need to fetch full profile row with account_ref/broker_server for binding check
-          const fullProfile = await this.pool.query<{ account_ref: string | null; broker_server: string | null }>(
-            `SELECT account_ref, broker_server FROM execution_profiles WHERE id = $1`,
-            [profile.id],
-          );
-          const persistedAccount = fullProfile.rows[0]?.account_ref ?? null;
-          const persistedServer = fullProfile.rows[0]?.broker_server ?? null;
-          const slugMatches = describedId === profile.provider_slug;
-          const envMatches = describedEnv === profile.environment;
-          const accountMatches = (describedAccount ?? null) === (persistedAccount ?? null);
-          const serverMatches = (describedServer ?? null) === (persistedServer ?? null);
-          brokerAuthorized = Boolean(slugMatches && envMatches && serverMatches);
-          accountAuthorized = Boolean(slugMatches && envMatches && accountMatches && serverMatches);
-        }
-      } catch {
-        brokerAuthorized = false;
-        accountAuthorized = false;
-      }
-    } else if (profile.provider_slug === 'paper') {
-      brokerAuthorized = true;
-      accountAuthorized = true;
-    }
+    // B1 remediation (H3) — authoritative broker-account authorization.
+    // No grant mechanism exists in this platform version, so every broker
+    // path fails closed; editable profile metadata matching describe() is
+    // never treated as proof of authorization. The internal paper simulator
+    // involves no broker account and is authorized by construction.
+    const grant = resolveBrokerAccountAuthorization({
+      providerSlug: profile.provider_slug,
+      environment: profile.environment,
+    });
+    const brokerAuthorized = grant.brokerAuthorized;
+    const accountAuthorized = grant.accountAuthorized;
+    // B1 remediation (M3) — the FULL health record is resolved by the single
+    // authoritative readiness resolver before anything is projected into the
+    // gate input. Never reduced to `{ healthy }`, never truthiness-coerced:
+    // an apparently healthy-but-uncertain provider cannot pass.
+    const readiness = evaluateProviderReadinessForGate(rawHealth);
 
     const gate = evaluateExecutionGates({
       authenticated: true, // enforced by the API layer before this service runs
@@ -287,7 +267,7 @@ export class ExecutionIntakeService {
       },
       minRr: risk.effectiveMinRr,
       exposureWithinLimits: risk.exposureWithinLimits,
-      providerHealth: rawHealth ? { healthy: Boolean((rawHealth as { healthy?: boolean }).healthy) } : null,
+      providerHealth: readiness.gateValue,
       environmentSafe: profile.environment !== 'live' && (profile.environment === 'paper' || profile.environment === 'demo'),
       brokerAuthorized,
       accountAuthorized,

@@ -345,8 +345,10 @@ describe('m8.1 safety gates (contract level)', () => {
         gate: 'profile_enabled',
       },
       {
-        name: 'environment not paper',
-        override: { profile: { enabled: true, environment: 'live' as any } },
+        // B1 permits demo (the disabled MT5 transport fails closed honestly);
+        // live remains forbidden at the profile gate.
+        name: 'environment live is forbidden',
+        override: { profile: { enabled: true, environment: 'live' } },
         gate: 'profile_enabled',
       },
       {
