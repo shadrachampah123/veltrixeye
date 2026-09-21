@@ -577,9 +577,11 @@ reconciliation. Full design: [execution.md](./execution.md).
   *broker-side* import and repair still await an operational transport, and
   **destructive corrective actions remain gated OFF by design**.
 - **Billing integration** — M7.4 built the subscription/entitlement
-  foundation. PR1 (see [Billing — in progress](#billing--in-progress-pr1-authoritative-commercial-catalogue))
-  establishes the authoritative commercial catalogue and selects Paystack; no
-  checkout, portal, webhook or provider call exists yet.
+  foundation. PR1 (see [Billing — in progress](#billing--in-progress-pr1-catalogue--pr2-persistence--provider-seam))
+  establishes the authoritative commercial catalogue and selects Paystack; PR2
+  adds the persistence model (migration 0031), the billing contracts and the
+  provider seam. No Paystack API call, checkout, portal, webhook or
+  subscription synchronization exists yet.
 - **AI** in the signal path — evaluation is deterministic rules; AI is
   never the core signal engine.
 - **Marketplace** with paid plans or revenue sharing.
@@ -801,12 +803,14 @@ and [m10-verification.md](./m10-verification.md).
   is connected to a broker, and **no live, demo or simulated order leaves the
   platform through the transport**; execution remains unavailable to every plan.
 
-## Billing — in progress (PR1: authoritative commercial catalogue)
+## Billing — in progress (PR1: catalogue · PR2: persistence + provider seam)
 
 Reconciled with the current repository state: **B1, B2, Gate 9, M9.2 and the
 M10 transport foundation are complete; billing is the active work stream.**
 PR1 is documentation/roadmap reconciliation plus the authoritative commercial
-catalogue only — see [billing.md](./billing.md).
+catalogue. PR2 adds the billing persistence model (migration `0031`), the
+canonical billing contracts and the Paystack provider seam — see
+[billing.md](./billing.md).
 
 - **Decided:** Paystack is the payment provider; the catalogue is priced in
   **USD**; development uses **sandbox/test credentials only**; no secrets in
@@ -823,13 +827,30 @@ catalogue only — see [billing.md](./billing.md).
   gate, and leaves `canAccessAutomation` false.
 - **Compatibility boundary:** the database still stores `free`/`pro`/`premium`;
   the catalogue is `starter`/`pro`/`elite`. Nothing is renamed and no user is
-  migrated (`pro` → Pro, `premium` → Elite, `free` → no commercial tier,
-  Starter awaits **migration 0031**).
-- **Explicitly deferred to later billing PRs:** migration 0031, Paystack API
-  calls, checkout/payment initialization, verification, webhook receiver and
+  migrated (`pro` → Pro, `premium` → Elite, `free` → no commercial tier).
+  Migration 0031 keeps both CHECKs untouched and persists the commercial
+  identity in a separate `subscriptions.catalogue_plan` column bound to that
+  mapping, so **Starter is still not sellable** — it needs an internal plan
+  value *and* an entitlement definition, which is an entitlement change and
+  stays deferred.
+- **PR2 (delivered): persistence + seam, no integration.** Migration
+  `0031_provider_billing.sql` extends the ONE authoritative `subscriptions` row
+  (catalogue plan, interval, currency, provider identifiers, canonical provider
+  state, cancellation and synchronization bookkeeping) and adds
+  `billing_customers` plus the append-only `billing_provider_events` idempotency
+  ledger. It is additive and forward-only: migrations 0001–0030 are
+  byte-identical, no row is rewritten, and no second entitlement system exists.
+  `packages/contracts/src/billing-provider.ts` defines the canonical,
+  provider-neutral contracts and `packages/core/src/billing/provider.ts` the
+  `BillingProvider` seam with an EMPTY registry and a fail-closed placeholder.
+  **No Paystack API call, HTTP request, checkout, portal, webhook, signature
+  verification, synchronization worker, credential or route was added**, and no
+  new column has a writer yet.
+- **Explicitly deferred to later billing PRs:** the Paystack adapter and every
+  API call, checkout/payment initialization, verification, webhook receiver and
   signature/replay security, subscription synchronization, provider
-  customer/subscription creation, billing portal, billing UI checkout, and
-  production credentials.
+  customer/subscription creation, billing portal, billing UI checkout, the
+  Starter entitlement decision, and production credentials.
 - **Not started / not planned in the billing stream:** broker or MT5/Exness
   connectivity, live execution, automation, and any change to Gate 9, B1, B2 or
   paper-execution behaviour.
@@ -837,5 +858,5 @@ catalogue only — see [billing.md](./billing.md).
 ## After M9.2 (later work, outline only)
 
 1. **Operational broker transport** — validate a concrete MT5 bridge and an approved external secret manager on demo infrastructure. M8.4 deliberately ships neither and makes no connectivity claim. M8.5/M8.6/M8.7/M9.1/M9.2 prepare reconciliation, safety plumbing, drawdown protection, notification fairness and secret hardening for it; the transport itself is gated on external validation.
-2. **Billing** (provider, webhooks, checkout/portal) — provider and catalogue are now decided (Paystack, USD, Starter/Pro/Elite); remaining steps are listed in [billing.md](./billing.md#later-billing-prs-explicitly-not-in-pr1) and in the section above.
+2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031); remaining steps are listed in [billing.md](./billing.md#later-billing-prs-explicitly-not-in-pr2) and in the section above.
 3. **More channels** (SMS/Telegram) behind same registry if needed.
