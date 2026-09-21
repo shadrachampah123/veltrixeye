@@ -163,6 +163,7 @@ export {
   type OperatorResolutionInput,
   type PrepareSubmitResult,
   type ProviderIntentRecord,
+  type ProviderReceiptRecord,
   type ProviderSubmitCall,
   type ProviderSubmitResponse,
   type ReconciliationObservationInput,
@@ -181,8 +182,10 @@ export {
  * authorization scheme, no migration or schema change. */
 export {
   submitOrderThroughGate9,
+  createSubmitBarrierHandoff,
   type CanonicalSubmitInput,
   type CanonicalSubmitSuccess,
   type CanonicalSubmitError,
   type CanonicalSubmitResult,
+  type SubmitBarrierHandoff,
 } from './submit-boundary.js';

@@ -36,6 +36,9 @@ import {
   createPaperExecutionProvider,
   createMT5ExecutionProvider,
   DisabledMT5Transport,
+  ProviderMutationLedger,
+  createSubmitBarrierHandoff,
+  type SubmitBarrierHandoff,
   PaperExecutionService,
   CandleStoreMarketPriceSource,
   KillSwitchService,
@@ -109,6 +112,20 @@ export interface AppContext {
     intake: ExecutionIntakeService;
     queries: ExecutionQueryService;
     risk: RiskEngineService;
+    /**
+     * B2: the existing Gate 9 durable provider-mutation ledger. The canonical
+     * provider-submit boundary (`submitOrderThroughGate9`) is the only path
+     * that may authorize a provider mutation; B1 will invoke it from the
+     * execution composition layer. No production route invokes it today.
+     */
+    providerMutations: ProviderMutationLedger;
+    /**
+     * B2: the one-shot barrier handoff wired into the production MT5
+     * provider's `gate9` predicate. With no dispatcher invocation it stays
+     * empty, so the legacy MT5 boundary refuses every submit — the
+     * fail-closed posture is preserved.
+     */
+    submitHandoff: SubmitBarrierHandoff;
     /**
      * M8.3: internal deterministic paper simulator. No broker, no credential,
      * no external trading call — every order it writes is simulated.
@@ -230,9 +247,24 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     },
   });
   executionProviders.register(paperProvider);
-  // M8.4: MT5 is a registered, honest integration boundary. The deployed
-  // transport is deliberately disabled/unconfigured: no endpoint, SDK,
-  // credential, terminal, or network path exists and live is hard-stopped.
+  // B2 — the single canonical provider-submit boundary (Gate 9). The ledger
+  // and the one-shot handoff are created here so the future B1 composition
+  // layer can invoke `submitOrderThroughGate9` without further wiring.
+  //
+  // Production MT5 posture (unchanged and preserved):
+  //   - `enabled: false` — the provider refuses every trading operation;
+  //   - `DisabledMT5Transport` — no endpoint, SDK, credential, terminal, or
+  //     network path exists and live is hard-stopped;
+  //   - the new `gate9` predicate (from the handoff) — a submit may only
+  //     reach the provider's pre-flight if the canonical dispatcher has
+  //     durably consumed a single-use Gate 9 barrier for the exact mutation.
+  //     No production route or worker invokes the dispatcher today, so the
+  //     handoff stays empty and the legacy boundary refuses every submit.
+  // This adds no live MT5 execution, no broker credentials, no network
+  // integration, and no new authorization system — the Gate 9 ledger is the
+  // existing durable boundary.
+  const providerMutationLedger = new ProviderMutationLedger(pool);
+  const mt5SubmitHandoff = createSubmitBarrierHandoff();
   executionProviders.register(createMT5ExecutionProvider(new DisabledMT5Transport(), {
     enabled: false,
     environment: 'demo',
@@ -240,10 +272,12 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     server: null,
     accountRef: null,
     symbols: new Map(),
-  }));
+  }, { gate9: mt5SubmitHandoff.gate9 }));
   const execution = {
     providers: executionProviders,
     killSwitches,
+    providerMutations: providerMutationLedger,
+    submitHandoff: mt5SubmitHandoff,
     profiles: new ExecutionProfileService(pool, executionProviders, audit),
     automation,
     intake: new ExecutionIntakeService(
