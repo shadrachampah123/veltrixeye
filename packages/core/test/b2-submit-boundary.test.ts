@@ -1,37 +1,53 @@
 /**
- * B2 — establish one authoritative provider-submit boundary.
+ * B2 — one authoritative provider-submit boundary, gated by Gate 9.
  *
- * These tests prove the canonical submit boundary around the existing Gate 9
- * `ProviderMutationLedger` and the existing `MT5Provider.submitOrder` legacy
- * boundary. They run against a real embedded PostgreSQL, an injected Gate 9
- * ledger, the documented Fake Bridge (deterministic fake provider) and the
+ * These tests prove the production-facing submit architecture around the
+ * existing Gate 9 `ProviderMutationLedger` and the Gate 9-gated MT5
+ * provider. They run against a real embedded PostgreSQL, an injected Gate 9
+ * ledger, a recording MT5 transport (test tool — never a broker) and the
  * canonical `DisabledMT5Transport`. No broker, network, credential or live
  * transport is used; nothing is touched in `apps/`, `migrations/` or any
  * Gate 9 core file.
  *
+ * Architecture under test:
+ *   - production MT5 providers are built ONLY by
+ *     `createGate9MT5ExecutionProvider` (the legacy ungated factory remains
+ *     for the inherited M8.4 test surface only); its bare `submitOrder`
+ *     always refuses;
+ *   - the canonical dispatcher `submitOrderThroughGate9` commits the durable
+ *     Gate 9 intent, consumes the single-use SubmitBarrier (M2 CAS) and
+ *     HANDS THE CONSUMED BARRIER to the provider through
+ *     `submitOrderWithGate9Barrier(request, barrier)`;
+ *   - the provider re-verifies the barrier against the DURABLE intent row
+ *     (in-flight `submitting` state, `state_version = barrier.stateVersion+1`
+ *     — i.e. exactly one consuming write per migration 0029) before any
+ *     pre-flight, idempotency lookup, or transport contact.
+ *
  * Required cases:
- *   A. Gate 9 required — provider submission cannot occur without a Gate 9
- *      `SubmitBarrier`. The legacy `MT5Provider.submitOrder` refuses BEFORE
- *      any transport call when the production gate9 predicate is supplied
- *      and returns null.
+ *   A. Direct submit refuses — the production-shape gated provider refuses
+ *      every bare `submitOrder` before any transport contact.
+ *   A2. No silent ungated construction — the gated factory throws without a
+ *      real Gate 9 ledger.
+ *   A3. Legacy boundary stays available for the inherited M8.4 suite only.
  *   B. Prepare before provider — `prepareSubmit()` commits before the
- *      provider callback can execute. The fake provider never sees a call
- *      whose intent row is missing or whose barrier was never committed.
- *   C. Barrier single use — a consumed/stale barrier cannot invoke the
- *      provider a second time. The single-use CAS in
- *      `consumeSubmitBarrier` blocks the second invocation; the M2 suite
- *      (`m10-gate9-barrier-consumption.test.ts`) already proves the CAS;
- *      here we prove the boundary USES it end-to-end.
- *   D. Direct bypass blocked — the old competing submit path (legacy
- *      `MT5Provider.submitOrder` reaching `transport.submitOrder`) cannot
- *      independently reach a provider. The transport's submitted-record is
- *      empty unless the canonical path presented a barrier.
- *   E. Disabled transport preserved — the canonical path still ends in
- *      `DisabledMT5Transport` and remains unavailable. The boundary refuses
- *      closed and never bypasses the disabled transport.
- *   F. Existing regression suite — covered by the inherited regression tests
- *      (mt5.test.ts, m10-gate9-*, execution.test.ts). The boundary leaves
- *      them untouched.
+ *      provider callback can execute.
+ *   B2. Dispatcher hand-off — prepare → consume → provider receives the
+ *      consumed barrier; the transport fires exactly once, only after the
+ *      durable Gate 9 step.
+ *   C. Replay refused — a spent barrier cannot invoke the provider again,
+ *      and a canonical replay resolves as duplicate without a provider call.
+ *   C2. Forged stateVersion refuses closed at the ledger CAS (M2).
+ *   C3. Fabricated / never-consumed / mismatched barriers fail durable
+ *      verification at the provider gate.
+ *   D. The canonical dispatcher refuses non-Gate 9 providers before any
+ *      durable write.
+ *   E. Attribution: with a VALID in-flight barrier the call passes the Gate
+ *      9 gate and fails at the documented disabled-transport surface —
+ *      never mistaken for a Gate 9 refusal.
+ *   E2. The canonical path against DisabledMT5Transport durably records
+ *      uncertainty.
+ *   F. Contract guards — the gated interface is present on the production
+ *      boundary and absent from the legacy test boundary.
  */
 
 import { test, before, after, describe } from 'node:test';
@@ -49,11 +65,13 @@ import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 import { createPool, MIGRATIONS_DIR, runMigrations } from '../src/index.js';
 import {
   createMT5ExecutionProvider,
+  createGate9MT5ExecutionProvider,
   DisabledMT5Transport,
+  hasGate9BarrierSubmit,
   submitOrderThroughGate9,
   ProviderMutationLedger,
   ProviderMutationError,
-  type Gate9BarrierPredicate,
+  type Gate9SubmitBarrierProvider,
   type MT5Transport,
   type MT5OrderRequest,
   type MT5OrderSnapshot,
@@ -169,6 +187,41 @@ function makeRequest(): ExecutionSubmitOrderRequest {
   };
 }
 
+/** A valid MT5-shaped request whose identity matches the Gate 9 intent. */
+function requestFor(input: SubmitIntentInput): ExecutionSubmitOrderRequest {
+  return {
+    ...makeRequest(),
+    clientOrderId: input.clientOrderId,
+    idempotencyKey: input.idempotencyKey,
+  };
+}
+
+/** The demo configuration used with the recording transport (M8.4-valid). */
+function demoConfig() {
+  return {
+    enabled: true,
+    environment: 'demo' as const,
+    broker: 'Example MT5 Broker',
+    server: 'Example-Demo',
+    accountRef: 'masked-account',
+    symbols: new Map([['XAUUSD', 'XAUUSDm']]),
+    now: () => NOW,
+  };
+}
+
+/** The exact production MT5 configuration (deliberately disabled). */
+function productionConfig() {
+  return {
+    enabled: false,
+    environment: 'demo' as const,
+    broker: null,
+    server: null,
+    accountRef: null,
+    symbols: new Map(),
+    now: () => NOW,
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Recording MT5 transport (test tool — never a broker)                        */
 /* -------------------------------------------------------------------------- */
@@ -179,6 +232,8 @@ class RecordingMT5Transport implements MT5Transport {
   public readonly findOrderCalls: string[] = [];
   public readonly symbolCalls: string[] = [];
   public submitError: Error | null = null;
+  /** Optional probe invoked at the moment the provider mutation fires. */
+  public onSubmit: ((order: MT5OrderRequest) => Promise<void>) | null = null;
   public readonly symbolRow: MT5SymbolSnapshot = {
     symbol: 'XAUUSDm',
     assetClass: 'commodity',
@@ -206,6 +261,7 @@ class RecordingMT5Transport implements MT5Transport {
     return symbol === this.symbolRow.symbol ? this.symbolRow : null;
   }
   async submitOrder(order: MT5OrderRequest): Promise<MT5OrderSnapshot> {
+    if (this.onSubmit) await this.onSubmit(order);
     this.submitted.push(order);
     if (this.submitError) throw this.submitError;
     return {
@@ -241,125 +297,67 @@ interface MT5PositionSnapshot {
   profit?: number;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Gate 9 barrier adapter (canonical dispatcher's compose-side boundary)        */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Adapter that consumes a Gate 9 `SubmitBarrier` for the legacy M8.4
- * boundary. Returns the consumed barrier so the legacy pre-flight check
- * (identity, readiness, symbol, idempotency, transport) runs only after Gate 9
- * has committed and consumed the barrier.
- *
- * The barrier here is the one returned by `ProviderMutationLedger.submitOnce`
- * AFTER `executeSubmit` has consumed it. Storing it in a one-shot map mirrors
- * the production adapter exactly: a second call with the same identity cannot
- * succeed (it would have to mint a NEW durable barrier, which `submitOnce`
- * will not do for a duplicate identity — it returns `duplicate`).
- *
- * The `ledger` argument is reserved for future adapter-side assertions (e.g.
- * verifying the consumed barrier is durably spent); the adapter is currently
- * a pure in-memory one-shot map, mirroring the production-side wiring where
- * the consumed barrier is held in a single-process cache by the canonical
- * dispatcher.
- */
-function createGate9Adapter(_ledger: ProviderMutationLedger) {
-  const consumed = new Map<string, SubmitBarrier>();
-
-  return {
-    /**
-     * Records a freshly-consumed barrier for the legacy boundary. The caller
-     * has already gone through `submitOrderThroughGate9` (prepare → consume
-     * → provider call inside the ledger), so the barrier is single-use.
-     */
-    record(barrier: SubmitBarrier): void {
-      consumed.set(barrier.clientOrderId, barrier);
-    },
-    /** Returns null when no consumed barrier exists for this identity. */
-    consume(request: ExecutionSubmitOrderRequest): SubmitBarrier | null {
-      return consumed.get(request.clientOrderId) ?? null;
-    },
-    predicate(): Gate9BarrierPredicate {
-      return {
-        async consumeAuthorization(request) {
-          return consumed.get(request.clientOrderId) ?? null;
-        },
-      };
-    },
-  };
-}
+const isGate9Refusal = (e: unknown): boolean =>
+  e instanceof ExecutionProviderError && e.category === 'unavailable' && /Gate 9 submit barrier/i.test(e.message);
 
 /* -------------------------------------------------------------------------- */
 /* B2 — single canonical provider-submit boundary                              */
 /* -------------------------------------------------------------------------- */
 
 describe('B2 — single canonical provider-submit boundary', () => {
-  test('A. the canonical path refuses when no Gate 9 SubmitBarrier was presented', async () => {
+  test('A. the production-shape gated provider refuses every direct submitOrder before any transport contact', async () => {
     const transport = new RecordingMT5Transport();
-    const provider = createMT5ExecutionProvider(transport, {
-      enabled: true,
-      environment: 'demo',
-      broker: 'Example MT5 Broker',
-      server: 'Example-Demo',
-      accountRef: 'masked-account',
-      symbols: new Map([['XAUUSD', 'XAUUSDm']]),
-      now: () => NOW,
-    }, { gate9: { async consumeAuthorization() { return null; } } });
+    const provider = createGate9MT5ExecutionProvider(transport, demoConfig(), { ledger });
 
-    // No barrier presented — the legacy boundary refuses BEFORE the
-    // transport is reached. No transport submit, no symbol lookup, no
-    // idempotency lookup.
-    await assert.rejects(
-      () => provider.submitOrder(makeRequest()),
-      (e: unknown) => e instanceof ExecutionProviderError && e.category === 'unavailable'
-        && /Gate 9 submit barrier/i.test(e.message),
-    );
+    // A perfectly valid request — but no consumed Gate 9 barrier can ever
+    // accompany a bare submitOrder call. Refused BEFORE identity, BEFORE
+    // readiness, BEFORE the symbol lookup, BEFORE the idempotency lookup,
+    // BEFORE the transport.
+    await assert.rejects(() => provider.submitOrder(makeRequest()), isGate9Refusal);
     assert.equal(transport.submitted.length, 0, 'no transport call may reach submitOrder');
     assert.equal(transport.symbolCalls.length, 0, 'no pre-flight transport call may happen');
     assert.equal(transport.findOrderCalls.length, 0, 'no idempotency transport lookup may happen');
-  });
 
-  test('A2. the canonical path refuses when the gate9 predicate throws', async () => {
-    const transport = new RecordingMT5Transport();
-    const provider = createMT5ExecutionProvider(transport, {
-      enabled: true,
-      environment: 'demo',
-      broker: 'Example MT5 Broker',
-      server: 'Example-Demo',
-      accountRef: 'masked-account',
-      symbols: new Map([['XAUUSD', 'XAUUSDm']]),
-      now: () => NOW,
-    }, { gate9: { async consumeAuthorization() { throw new Error('predicate failure'); } } });
-
+    // Even a second attempt with a different identity cannot get through.
     await assert.rejects(
-      () => provider.submitOrder(makeRequest()),
-      (e: unknown) => e instanceof ExecutionProviderError && e.category === 'unavailable',
+      () => provider.submitOrder({ ...makeRequest(), clientOrderId: newClientOrderId() }),
+      isGate9Refusal,
     );
     assert.equal(transport.submitted.length, 0);
   });
 
-  test('A3. without a gate9 predicate, the legacy boundary continues to behave as documented for backward compatibility', async () => {
+  test('A2. the gated factory cannot silently construct an ungated provider', async () => {
     const transport = new RecordingMT5Transport();
-    const provider = createMT5ExecutionProvider(transport, {
-      enabled: true,
-      environment: 'demo',
-      broker: 'Example MT5 Broker',
-      server: 'Example-Demo',
-      accountRef: 'masked-account',
-      symbols: new Map([['XAUUSD', 'XAUUSDm']]),
-      now: () => NOW,
-    }); // no options → no Gate 9 predicate
-    const result = await provider.submitOrder(makeRequest());
-    assert.equal(result.status, 'accepted');
-    assert.equal(transport.submitted.length, 1, 'legacy behaviour preserved when gate9 is absent');
+    // Missing binding entirely.
+    assert.throws(
+      () => createGate9MT5ExecutionProvider(transport, demoConfig(), undefined as unknown as { ledger: ProviderMutationLedger }),
+      TypeError,
+    );
+    // Empty binding.
+    assert.throws(
+      () => createGate9MT5ExecutionProvider(transport, demoConfig(), {} as { ledger: ProviderMutationLedger }),
+      TypeError,
+    );
+    // A fabricated "ledger" without the durable read API.
+    assert.throws(
+      () => createGate9MT5ExecutionProvider(transport, demoConfig(), { ledger: {} as unknown as ProviderMutationLedger }),
+      TypeError,
+    );
   });
 
-  test('B. prepareSubmit commits before the provider callback runs (canonical dispatcher)', async () => {
+  test('A3. the legacy ungated factory stays available for the inherited M8.4 suite (not used by production)', async () => {
+    const transport = new RecordingMT5Transport();
+    const provider = createMT5ExecutionProvider(transport, demoConfig());
+    const result = await provider.submitOrder(makeRequest());
+    assert.equal(result.status, 'accepted');
+    assert.equal(transport.submitted.length, 1, 'legacy behaviour preserved for the M8.4 test surface');
+    assert.equal(hasGate9BarrierSubmit(provider), false, 'the legacy boundary exposes no Gate 9 hand-off');
+  });
+
+  test('B. prepareSubmit commits before the provider callback runs (canonical dispatcher semantics)', async () => {
     const { userId, profileId } = await makeAccount();
     const input = submitInput({ userId, profileId });
 
-    // The fake provider call asserts that the durable intent row exists
-    // BEFORE it executes — the committed barrier is the precondition.
     let providerSawBarrier = false;
     let providerSawIntent = false;
     const fakeProviderCall = async (barrier: SubmitBarrier) => {
@@ -394,63 +392,45 @@ describe('B2 — single canonical provider-submit boundary', () => {
     assert.equal(providerSawIntent, true, 'provider saw a committed intent row in `submitting` state');
   });
 
-  test('B2. the canonical dispatcher wires prepare → barrier → execute → provider in one call', async () => {
+  test('B2. the canonical dispatcher hands the consumed Gate 9 barrier to the gated provider in one coherent call', async () => {
     const { userId, profileId } = await makeAccount();
     const transport = new RecordingMT5Transport();
-    const provider = createMT5ExecutionProvider(transport, {
-      enabled: true,
-      environment: 'demo',
-      broker: 'Example MT5 Broker',
-      server: 'Example-Demo',
-      accountRef: 'masked-account',
-      symbols: new Map([['XAUUSD', 'XAUUSDm']]),
-      now: () => NOW,
-    });
-    // No gate9 predicate in production today; the canonical dispatcher is
-    // the boundary that consults Gate 9 instead of the legacy boundary.
-    void provider;
+    const provider = createGate9MT5ExecutionProvider(transport, demoConfig(), { ledger });
 
-    const request = {
+    const request: ExecutionSubmitOrderRequest = {
       clientOrderId: newClientOrderId(),
       idempotencyKey: newIdempotencyKey(),
       authorizationId: 'canonical-b2-auth',
-      assetClass: 'commodity' as const,
+      assetClass: 'commodity',
       symbol: 'XAUUSD',
-      side: 'buy' as const,
-      orderType: 'market' as const,
+      side: 'buy',
+      orderType: 'market',
       quantity: 0.1,
       requestedPrice: null,
       stopLossPrice: 1990,
       takeProfitPrice: 2020,
     };
 
-    // Use the canonical dispatcher with the paper provider, which is the
-    // currently-active provider. It does not reach a transport (paper is
-    // purely an in-process simulator), so no transport call is permitted;
-    // the canonical path proves that Gate 9 is in front of the provider call.
-    const { createPaperExecutionProvider } = await import('../src/index.js');
+    // At the exact moment the provider mutation fires, the durable Gate 9
+    // step must already be committed: the intent row exists in the in-flight
+    // `submitting` state.
+    let statusAtMutation: string | null = null;
+    transport.onSubmit = async () => {
+      const { rows } = await pool.query<{ status: string }>(
+        `SELECT status FROM execution_provider_intents WHERE client_order_id = $1`,
+        [request.clientOrderId],
+      );
+      statusAtMutation = rows[0]?.status ?? null;
+    };
 
-    // The canonical dispatcher routes through the Gate 9 ledger. The paper
-    // provider refuses without an authorization, so the outcome will be
-    // `uncertain` (the durable state), but the boundary is proven: a Gate 9
-    // intent + barrier are committed BEFORE the provider is invoked.
     const result = await submitOrderThroughGate9({
       ledger,
-      provider: createPaperExecutionProvider({
-        simulator: {
-          submitAuthorizedOrder: async () => ({
-            providerOrderId: 'paper-b2',
-            status: 'accepted' as const,
-            filledQuantity: 0.1,
-            averagePrice: 2000,
-          }),
-        },
-      }),
+      provider,
       userId,
       executionProfileId: profileId,
-      providerSlug: 'paper',
-      environment: 'paper',
-      accountRef: 'b2-acct',
+      providerSlug: 'mt5',
+      environment: 'demo',
+      accountRef: 'masked-account',
       credentialRef: 'cred-ref-b2',
       credentialFingerprint: createHash('sha256').update('b2-binding').digest('hex'),
       request,
@@ -464,6 +444,12 @@ describe('B2 — single canonical provider-submit boundary', () => {
     assert.equal(result.result.intentState, 'confirmed');
     assert.equal(result.result.outcome, 'accepted');
     assert.equal(result.result.evidence, 'provider_response_verified');
+
+    // The provider mutation happened exactly once, and only AFTER the
+    // durable Gate 9 step (the barrier hand-off worked: durable verification
+    // passed and the M8.4 pre-flight reached the transport).
+    assert.equal(transport.submitted.length, 1, 'the transport fired exactly once');
+    assert.equal(statusAtMutation, 'submitting', 'no provider mutation before the durable Gate 9 commit');
 
     // The intent and reservation are durably committed.
     const { rows: intents } = await pool.query<{ id: string; status: string }>(
@@ -480,66 +466,48 @@ describe('B2 — single canonical provider-submit boundary', () => {
     assert.equal(reservations[0]!.state, 'known_completed');
   });
 
-  test('C. a consumed/stale barrier cannot invoke the provider a second time', async () => {
-    const transport = new RecordingMT5Transport();
-    const adapter = createGate9Adapter(ledger);
-    const provider = createMT5ExecutionProvider(transport, {
-      enabled: true,
-      environment: 'demo',
-      broker: 'Example MT5 Broker',
-      server: 'Example-Demo',
-      accountRef: 'masked-account',
-      symbols: new Map([['XAUUSD', 'XAUUSDm']]),
-      now: () => NOW,
-    }, { gate9: adapter.predicate() });
-
+  test('C. a spent barrier is durably refused on replay and a canonical replay resolves as duplicate', async () => {
     const { userId, profileId } = await makeAccount();
     const input = submitInput({ userId, profileId });
+    const transport = new RecordingMT5Transport();
+    const provider = createGate9MT5ExecutionProvider(transport, demoConfig(), { ledger });
+    const request = requestFor(input);
 
-    // Canonical dispatcher: prepareSubmit → executeSubmit → consumeSubmitBarrier.
-    // The barrier is recorded for the legacy boundary's gate9 predicate.
-    const consumed = await (async () => {
-      const prepared = await ledger.prepareSubmit(input);
-      assert.equal(prepared.kind, 'authorized');
-      if (prepared.kind !== 'authorized') throw new Error('not authorized');
-      const result = await ledger.executeSubmit(prepared.barrier, async (b) => ({
-        clientOrderId: b.clientOrderId,
-        idempotencyKey: b.idempotencyKey,
-        accountRef: b.accountRef,
-        providerOrderId: 'sim-b2-c',
-        status: 'accepted',
-      }));
-      adapter.record(prepared.barrier);
-      void result;
-      return prepared.barrier;
-    })();
+    const prepared = await ledger.prepareSubmit(input);
+    assert.equal(prepared.kind, 'authorized');
+    if (prepared.kind !== 'authorized') throw new Error('not authorized');
 
-    // The first legacy call sees a consumed barrier (single-use already spent).
-    // The legacy M8.4 boundary consults the predicate (which returns the
-    // recorded consumed barrier because the request carries the same
-    // clientOrderId as the minted barrier); the legacy call then performs its
-    // pre-flight and reaches the transport. The transport submitOrder records
-    // ONE call.
-    const requestWithBarrierIdentity = {
-      ...makeRequest(),
-      clientOrderId: consumed.clientOrderId,
-      idempotencyKey: consumed.idempotencyKey,
-    };
-    const first = await provider.submitOrder(requestWithBarrierIdentity);
-    void consumed;
-    assert.equal(first.status, 'accepted');
+    // The canonical hand-off (exactly what the dispatcher does): the
+    // provider receives the consumed barrier; durable verification passes.
+    let spentBarrier: SubmitBarrier | null = null;
+    const exec = await ledger.executeSubmit(prepared.barrier, async (barrier) => {
+      spentBarrier = barrier;
+      const outcome = await provider.submitOrderWithGate9Barrier(request, barrier);
+      return {
+        clientOrderId: request.clientOrderId,
+        idempotencyKey: request.idempotencyKey,
+        accountRef: input.accountRef,
+        providerOrderId: outcome.providerOrderId,
+        status: outcome.status,
+      };
+    });
+    assert.equal(exec.outcome, 'accepted');
     assert.equal(transport.submitted.length, 1, 'the first call reached the transport exactly once');
 
-    // The second legacy call with the same identity cannot authorize a new
-    // provider mutation: the Gate 9 ledger has already spent the barrier and
-    // the prepareSubmit for the same identity resolves as duplicate without
-    // minting a new mutation. From the legacy boundary's perspective the
-    // adapter's `consumed` map still holds the original barrier, but any
-    // fresh canonical path is blocked at the ledger level (replayed as
-    // duplicate, no new barrier).
-    //
-    // To prove the second call cannot reach the transport via the canonical
-    // path, the canonical dispatcher is asked again with the same identity:
+    // Replay the same barrier object: the outcome is durably applied (the
+    // intent left `submitting`), so the provider gate refuses BEFORE any
+    // transport contact. The Gate 9 single-use guarantee holds at the
+    // provider, not just at the ledger.
+    assert.ok(spentBarrier);
+    await assert.rejects(
+      () => provider.submitOrderWithGate9Barrier(request, spentBarrier!),
+      isGate9Refusal,
+    );
+    assert.equal(transport.submitted.length, 1, 'no second provider mutation on barrier replay');
+    assert.equal(transport.symbolCalls.length, 1, 'no additional pre-flight on replay');
+
+    // A canonical replay with the same identity resolves as duplicate: the
+    // provider is never invoked a second time.
     const replay = await submitOrderThroughGate9({
       ledger,
       provider,
@@ -548,8 +516,6 @@ describe('B2 — single canonical provider-submit boundary', () => {
       providerSlug: 'paper',
       environment: 'paper',
       accountRef: 'b2-acct',
-      credentialRef: 'cred-ref-b2',
-      credentialFingerprint: createHash('sha256').update('b2-binding').digest('hex'),
       request: {
         clientOrderId: input.clientOrderId,
         idempotencyKey: input.idempotencyKey,
@@ -568,12 +534,10 @@ describe('B2 — single canonical provider-submit boundary', () => {
     if (replay.status !== 'ok') throw new Error('expected duplicate resolution to succeed');
     assert.equal(replay.kind, 'duplicate', 'a duplicate identity resolves onto the existing intent');
     assert.equal(replay.result.providerCalled, false, 'the duplicate path never invokes the provider');
-
-    // The transport saw exactly ONE submitOrder during this whole sequence.
     assert.equal(transport.submitted.length, 1, 'the provider mutation count never grew on replay');
   });
 
-  test('C2. a stale barrier (forged stateVersion) refuses closed at the ledger, the legacy boundary is never reached', async () => {
+  test('C2. a stale barrier (forged stateVersion) refuses closed at the ledger CAS', async () => {
     const { userId, profileId } = await makeAccount();
     const input = submitInput({ userId, profileId });
     const barrier = await (async () => {
@@ -582,9 +546,6 @@ describe('B2 — single canonical provider-submit boundary', () => {
       return prepared.barrier;
     })();
 
-    // Forge a future stateVersion: the M2 single-use CAS must refuse it
-    // before any provider call. The legacy M8.4 boundary never even sees
-    // the request because the canonical dispatcher fails first.
     const forged: SubmitBarrier = { ...barrier, stateVersion: barrier.stateVersion + 99 };
     await assert.rejects(
       () => ledger.executeSubmit(forged, async () => {
@@ -600,154 +561,139 @@ describe('B2 — single canonical provider-submit boundary', () => {
     assert.equal(intent.rows[0]!.status, 'submitting', 'durable state unchanged on a forged CAS');
   });
 
-  test('D. the legacy competing submit path cannot independently reach a provider without a Gate 9 barrier', async () => {
+  test('C3. fabricated, never-consumed and mismatched barriers fail durable verification at the provider gate', async () => {
+    const { userId, profileId } = await makeAccount();
+    const input = submitInput({ userId, profileId });
     const transport = new RecordingMT5Transport();
-    // Production composition: the predicate returns null when no barrier has
-    // been presented. The legacy boundary refuses; transport.submitOrder is
-    // never reached.
-    const provider = createMT5ExecutionProvider(transport, {
-      enabled: true,
-      environment: 'demo',
-      broker: 'Example MT5 Broker',
-      server: 'Example-Demo',
-      accountRef: 'masked-account',
-      symbols: new Map([['XAUUSD', 'XAUUSDm']]),
-      now: () => NOW,
-    }, { gate9: { async consumeAuthorization() { return null; } } });
+    const provider = createGate9MT5ExecutionProvider(transport, demoConfig(), { ledger });
+    const request = requestFor(input);
 
+    const prepared = await ledger.prepareSubmit(input);
+    assert.equal(prepared.kind, 'authorized');
+    if (prepared.kind !== 'authorized') throw new Error('not authorized');
+
+    // (i) A REAL barrier that was prepared but never consumed: the
+    // single-use version advance never happened, so durable verification
+    // refuses (a barrier that exists is not a barrier that was consumed).
     await assert.rejects(
-      () => provider.submitOrder(makeRequest()),
-      (e: unknown) => e instanceof ExecutionProviderError && e.category === 'unavailable',
+      () => provider.submitOrderWithGate9Barrier(request, prepared.barrier),
+      isGate9Refusal,
     );
 
-    // No transport submitOrder call is permitted.
-    assert.equal(transport.submitted.length, 0, 'the legacy path cannot reach transport.submitOrder');
-
-    // No pre-flight transport interaction either (the predicate is consulted
-    // before identity, before readiness, before the symbol lookup).
-    assert.equal(transport.symbolCalls.length, 0);
-    assert.equal(transport.findOrderCalls.length, 0);
-
-    // Even a SECOND attempt with a different request body cannot reach the
-    // transport until a Gate 9 barrier is presented.
+    // (ii) A fabricated identity: no durable row, no authorization.
+    const fabricated: SubmitBarrier = { ...prepared.barrier, intentId: randomUUID() };
     await assert.rejects(
-      () => provider.submitOrder({ ...makeRequest(), clientOrderId: `ve-${'b'.repeat(24)}` }),
-      (e: unknown) => e instanceof ExecutionProviderError && e.category === 'unavailable',
+      () => provider.submitOrderWithGate9Barrier(request, fabricated),
+      isGate9Refusal,
     );
-    assert.equal(transport.submitted.length, 0);
+
+    // (iii) A tampered stateVersion that pretends a consumption the ledger
+    // never committed.
+    const tampered: SubmitBarrier = { ...prepared.barrier, stateVersion: prepared.barrier.stateVersion + 1 };
+    await assert.rejects(
+      () => provider.submitOrderWithGate9Barrier(request, tampered),
+      isGate9Refusal,
+    );
+
+    // (iv) A barrier minted for one identity presented with another.
+    await assert.rejects(
+      () => provider.submitOrderWithGate9Barrier(
+        { ...request, clientOrderId: newClientOrderId(), idempotencyKey: newIdempotencyKey() },
+        prepared.barrier,
+      ),
+      isGate9Refusal,
+    );
+
+    assert.equal(transport.submitted.length, 0, 'no fabricated barrier ever reached the transport');
+    assert.equal(transport.symbolCalls.length, 0, 'no pre-flight transport call happened');
+    assert.equal(transport.findOrderCalls.length, 0, 'no idempotency lookup happened');
   });
 
-  test('E. the canonical path still ends in DisabledMT5Transport and remains unavailable', async () => {
-    // The MT5 production transport is DisabledMT5Transport today (no
-    // broker, no SDK, no network). Even when the canonical path presents
-    // a valid Gate 9 barrier, the transport itself fails closed as
-    // unavailable. This proves the architecture preserves the documented
-    // production fail-closed surface.
-    const transport = new DisabledMT5Transport();
-    const adapter = createGate9Adapter(ledger);
-    const provider = createMT5ExecutionProvider(transport, {
-      enabled: true,
+  test('D. the canonical dispatcher refuses a non-Gate 9 provider before any durable write', async () => {
+    const { userId, profileId } = await makeAccount();
+    const legacy = createMT5ExecutionProvider(new RecordingMT5Transport(), demoConfig());
+
+    const countIntents = async () => {
+      const { rows } = await pool.query<{ n: string }>(`SELECT count(*)::text AS n FROM execution_provider_intents`);
+      return Number(rows[0]!.n);
+    };
+    const beforeCount = await countIntents();
+
+    const result = await submitOrderThroughGate9({
+      ledger,
+      provider: legacy as unknown as Gate9SubmitBarrierProvider,
+      userId,
+      executionProfileId: profileId,
+      providerSlug: 'mt5',
       environment: 'demo',
-      broker: 'Example MT5 Broker',
-      server: 'Example-Demo',
-      accountRef: 'masked-account',
-      symbols: new Map([['XAUUSD', 'XAUUSDm']]),
-      now: () => NOW,
-    }, { gate9: adapter.predicate() });
+      request: { ...makeRequest(), clientOrderId: newClientOrderId(), idempotencyKey: newIdempotencyKey() },
+    });
+
+    assert.equal(result.status, 'error');
+    if (result.status !== 'error') throw new Error('expected the dispatcher to refuse a non-gated provider');
+    assert.equal(result.kind, 'validation');
+    assert.equal(await countIntents(), beforeCount, 'no durable Gate 9 write happens for a non-gated provider');
+  });
+
+  test('E. with a valid in-flight barrier the refusal is the disabled transport — never the Gate 9 gate', async () => {
+    // Production-faithful configuration: the exact disabled MT5 transport
+    // and the exact disabled provider config from apps/api. The Gate 9
+    // barrier is genuinely consumed and in-flight, so the ONLY thing that
+    // may refuse the mutation is the documented M8.4 fail-closed surface.
+    const provider = createGate9MT5ExecutionProvider(new DisabledMT5Transport(), productionConfig(), { ledger });
 
     const { userId, profileId } = await makeAccount();
     const input = submitInput({ userId, profileId });
     const prepared = await ledger.prepareSubmit(input);
     assert.equal(prepared.kind, 'authorized');
     if (prepared.kind !== 'authorized') throw new Error('not authorized');
-    adapter.record(prepared.barrier);
+    const request = requestFor(input);
 
-    // With the barrier presented the legacy pre-flight runs, but the
-    // transport itself is DisabledMT5Transport. Either the health gate
-    // (`requireAvailable`) refuses with `unavailable` — the documented
-    // M8.4 fail-closed surface — or the transport itself throws.
-    await assert.rejects(
-      () => provider.submitOrder({
-        clientOrderId: input.clientOrderId,
-        idempotencyKey: input.idempotencyKey,
-        authorizationId: 'disabled-b2',
-        assetClass: 'commodity',
-        symbol: 'XAUUSD',
-        side: 'buy',
-        orderType: 'market',
-        quantity: 0.1,
-        requestedPrice: null,
-        stopLossPrice: 1990,
-        takeProfitPrice: 2020,
-      }),
-      (e: unknown) => e instanceof ExecutionProviderError && e.category === 'unavailable',
-    );
+    let observed: unknown = null;
+    const exec = await ledger.executeSubmit(prepared.barrier, async (barrier) => {
+      try {
+        const outcome = await provider.submitOrderWithGate9Barrier(request, barrier);
+        return {
+          clientOrderId: request.clientOrderId,
+          idempotencyKey: request.idempotencyKey,
+          accountRef: input.accountRef,
+          providerOrderId: outcome.providerOrderId,
+          status: outcome.status,
+        };
+      } catch (error) {
+        observed = error;
+        throw error;
+      }
+    });
 
-    // The health path of DisabledMT5Transport also reports unavailable.
+    // The call went THROUGH the Gate 9 gate (durable verification passed)
+    // and failed at the provider's disabled readiness gate — the refusal
+    // message is the M8.4 surface, attributed correctly and durably.
+    assert.ok(observed instanceof ExecutionProviderError, 'the provider refused');
+    assert.equal((observed as ExecutionProviderError).category, 'unavailable');
+    assert.equal((observed as ExecutionProviderError).message, 'MT5 provider is disabled');
+    assert.doesNotMatch((observed as ExecutionProviderError).message, /Gate 9/, 'attribution: this is the disabled transport, not a Gate 9 refusal');
+    assert.equal(exec.outcome, 'uncertain', 'an unavailable provider is durably uncertain — never laundered');
+    assert.equal(exec.providerCalled, true, 'the provider call itself ran after the Gate 9 gate passed');
+
+    // The health surface remains the documented fail-closed one.
     const health = await provider.health();
     assert.equal(health.healthy, false);
     assert.equal(health.available, false);
-    assert.equal(health.reason, 'mt5_transport_unconfigured');
-
-    // The canonical dispatcher also fails closed against the disabled
-    // transport. The provider call returns `unavailable` and the ledger
-    // records it as uncertain — never as accepted or rejected.
-    const canonical = await submitOrderThroughGate9({
-      ledger,
-      provider,
-      userId,
-      executionProfileId: profileId,
-      providerSlug: 'mt5',
-      environment: 'demo',
-      accountRef: 'b2-acct',
-      credentialRef: 'cred-ref-b2',
-      credentialFingerprint: createHash('sha256').update('b2-binding').digest('hex'),
-      request: {
-        clientOrderId: `ve-${'e'.repeat(24)}`,
-        idempotencyKey: newIdempotencyKey(),
-        authorizationId: 'canonical-b2-e',
-        assetClass: 'commodity',
-        symbol: 'XAUUSD',
-        side: 'buy',
-        orderType: 'market',
-        quantity: 0.1,
-        requestedPrice: null,
-        stopLossPrice: 1990,
-        takeProfitPrice: 2020,
-      },
-    });
-
-    // The canonical path durably commits the intent + barrier; the provider
-    // call returns `unavailable` and the ledger records it as uncertain.
-    assert.equal(canonical.status, 'ok');
-    if (canonical.status !== 'ok') throw new Error('canonical dispatch returned an error');
-    assert.equal(canonical.kind, 'submitted');
-    assert.equal(canonical.result.outcome, 'uncertain');
-    assert.equal(canonical.result.intentState, 'uncertain');
-    assert.equal(canonical.result.requiresReconciliation, true);
   });
 
   test('E2. the canonical path with DisabledMT5Transport durably records uncertainty', async () => {
-    const transport = new DisabledMT5Transport();
-    const provider = createMT5ExecutionProvider(transport, {
-      enabled: true,
-      environment: 'demo',
-      broker: null,
-      server: null,
-      accountRef: null,
-      symbols: new Map(),
-      now: () => NOW,
-    });
+    const provider = createGate9MT5ExecutionProvider(new DisabledMT5Transport(), productionConfig(), { ledger });
 
     const { userId, profileId } = await makeAccount();
-    const request = {
-      clientOrderId: `ve-${'f'.repeat(24)}`,
+    const request: ExecutionSubmitOrderRequest = {
+      clientOrderId: newClientOrderId(),
       idempotencyKey: newIdempotencyKey(),
       authorizationId: 'disabled-b2-f',
-      assetClass: 'commodity' as const,
+      assetClass: 'commodity',
       symbol: 'XAUUSD',
-      side: 'buy' as const,
-      orderType: 'market' as const,
+      side: 'buy',
+      orderType: 'market',
       quantity: 0.1,
       requestedPrice: null,
       stopLossPrice: 1990,
@@ -769,26 +715,34 @@ describe('B2 — single canonical provider-submit boundary', () => {
 
     assert.equal(canonical.status, 'ok');
     if (canonical.status !== 'ok') throw new Error('canonical dispatch returned an error');
+    assert.equal(canonical.kind, 'submitted');
+    assert.equal(canonical.result.providerCalled, true, 'the barrier hand-off reached the provider');
     assert.equal(canonical.result.outcome, 'uncertain');
     assert.equal(canonical.result.intentState, 'uncertain');
+    assert.equal(canonical.result.requiresReconciliation, true);
 
-    // The disabled transport never reports `ready`. The canonical boundary
-    // makes the durably-unknown state explicit instead of laundering it.
+    // Durable uncertainty is visible in the Gate 9 store.
+    const { rows } = await pool.query<{ status: string }>(
+      `SELECT status FROM execution_provider_intents WHERE client_order_id = $1`,
+      [request.clientOrderId],
+    );
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.status, 'uncertain', 'the disabled transport never reports ready; uncertainty is durable');
+
     const health = await provider.health();
     assert.equal(health.healthy, false);
     assert.equal(health.available, false);
   });
 
-  test('F. existing M8.4 boundary tests still pass: the barrier check is purely additive', () => {
-    // This test is a sentinel: it documents the regression baseline. The
-    // actual checks live in `mt5.test.ts`, `m10-gate9-*`, `execution.test.ts`
-    // and the rest of the suite — all run by the npm test command. The
-    // B2 changes do not modify any of those tests; this file asserts only
-    // that the additive change did not break the existing surface (see the
-    // test above "A3. legacy behaviour preserved when gate9 is absent").
+  test('F. contract guards: the gated interface exists on the production boundary, not on the legacy one', () => {
     assert.equal(typeof createMT5ExecutionProvider, 'function');
-    assert.equal(typeof DisabledMT5Transport, 'function');
+    assert.equal(typeof createGate9MT5ExecutionProvider, 'function');
     assert.equal(typeof submitOrderThroughGate9, 'function');
     assert.equal(typeof ProviderMutationLedger, 'function');
+
+    const gated = createGate9MT5ExecutionProvider(new DisabledMT5Transport(), productionConfig(), { ledger });
+    assert.equal(hasGate9BarrierSubmit(gated), true, 'the production boundary accepts the Gate 9 barrier hand-off');
+    const legacy = createMT5ExecutionProvider(new DisabledMT5Transport(), productionConfig());
+    assert.equal(hasGate9BarrierSubmit(legacy), false, 'the legacy test boundary cannot be mistaken for the production one');
   });
 });

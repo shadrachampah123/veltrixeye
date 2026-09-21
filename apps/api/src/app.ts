@@ -34,8 +34,6 @@ import {
   // M8.1 execution architecture (safety boundary only — no provider can trade)
   createExecutionProviderRegistry,
   createPaperExecutionProvider,
-  createMT5ExecutionProvider,
-  DisabledMT5Transport,
   PaperExecutionService,
   CandleStoreMarketPriceSource,
   KillSwitchService,
@@ -53,6 +51,7 @@ import {
   type DeliveryRetryPolicy,
   type ExecutionProviderRegistry,
 } from '@veltrixeye/core';
+import { createExecutionSubmitBoundary, type ExecutionSubmitBoundary } from './execution-submit-boundary.js';
 import { healthRoutes } from './routes/health.js';
 import { authRoutes } from './routes/auth.js';
 import { userRoutes } from './routes/users.js';
@@ -103,6 +102,13 @@ export interface AppContext {
    */
   execution: {
     providers: ExecutionProviderRegistry;
+    /**
+     * B2: the single canonical provider-submit boundary (Gate 9 durable
+     * intent → single-use barrier → durable provider re-verification →
+     * transport). The registered MT5 provider's bare submitOrder always
+     * refuses; this is the only production submit entry point.
+     */
+    submitThroughGate9: ExecutionSubmitBoundary['submitThroughGate9'];
     killSwitches: KillSwitchService;
     profiles: ExecutionProfileService;
     automation: AutomationService;
@@ -233,16 +239,24 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   // M8.4: MT5 is a registered, honest integration boundary. The deployed
   // transport is deliberately disabled/unconfigured: no endpoint, SDK,
   // credential, terminal, or network path exists and live is hard-stopped.
-  executionProviders.register(createMT5ExecutionProvider(new DisabledMT5Transport(), {
-    enabled: false,
-    environment: 'demo',
-    broker: null,
-    server: null,
-    accountRef: null,
-    symbols: new Map(),
-  }));
+  //
+  // B2: production registers ONLY the Gate 9-gated MT5 boundary (constructed
+  // in ./execution-submit-boundary.ts with the Gate 9 ProviderMutationLedger).
+  // The registered provider's bare `submitOrder` always refuses — the single
+  // provider-submit entry point is `submitThroughGate9`, which commits the
+  // durable Gate 9 intent, consumes the single-use SubmitBarrier and hands it
+  // to the provider, which re-verifies it durably before any transport
+  // contact. An ungated MT5 provider cannot be constructed in this
+  // composition.
+  const submitBoundary = createExecutionSubmitBoundary(pool);
+  executionProviders.register(submitBoundary.mt5Provider);
   const execution = {
     providers: executionProviders,
+    // B2: the single canonical provider-submit boundary for the whole app.
+    // Gate 9 prepare → single-use barrier consumption → barrier hand-off →
+    // durable provider re-verification → transport. The only way any
+    // production code can submit is through this entry point.
+    submitThroughGate9: submitBoundary.submitThroughGate9,
     killSwitches,
     profiles: new ExecutionProfileService(pool, executionProviders, audit),
     automation,

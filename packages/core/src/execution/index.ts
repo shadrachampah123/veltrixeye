@@ -48,6 +48,7 @@ export {
 } from './paper.js';
 export {
   createMT5ExecutionProvider,
+  createGate9MT5ExecutionProvider,
   normalizeMT5Error,
   normalizeMT5Order,
   DisabledMT5Transport,
@@ -56,8 +57,7 @@ export {
   type MT5TransportHealth,
   type MT5TransportError,
   type MT5ProviderConfig,
-  type MT5ProviderOptions,
-  type Gate9BarrierPredicate,
+  type MT5Gate9Binding,
   type MT5AccountSnapshot,
   type MT5SymbolSnapshot,
   type MT5OrderRequest,
@@ -176,11 +176,15 @@ export {
 
 /* B2 — the single canonical provider-submit boundary.
  * Wires the existing Gate 9 ledger (prepareSubmit → SubmitBarrier →
- * executeSubmit → consumeSubmitBarrier → provider call) onto the
- * ExecutionProvider interface. No parallel boundary, no alternative
- * authorization scheme, no migration or schema change. */
+ * executeSubmit → consumeSubmitBarrier → provider.submitOrderWithGate9Barrier)
+ * onto the ExecutionProvider interface. The consumed barrier is handed to the
+ * provider and re-verified against the durable intent row — no parallel
+ * boundary, no alternative authorization scheme, no migration or schema
+ * change. */
 export {
   submitOrderThroughGate9,
+  hasGate9BarrierSubmit,
+  type Gate9SubmitBarrierProvider,
   type CanonicalSubmitInput,
   type CanonicalSubmitSuccess,
   type CanonicalSubmitError,

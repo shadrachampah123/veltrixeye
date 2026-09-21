@@ -17,32 +17,34 @@
  *   ProviderMutationLedger.executeSubmit()
  *     ↓
  *   consumeSubmitBarrier()                         ← M2 single-use CAS
- *     ↓
- *   ProviderSubmitCall                              ← injected provider function
- *     ↓
+ *     ↓ consumed SubmitBarrier (state_version durably advanced)
+ *   provider.submitOrderWithGate9Barrier(request, barrier)
+ *     ↓ the provider re-verifies the barrier against the DURABLE intent row
  *   provider transport / broker call                ← never reached without barrier
  *
  * Nothing in this file introduces a second boundary, an alternate permission
  * scheme, or a parallel retry policy. It composes the existing Gate 9 ledger
- * (`provider-mutations.ts`) with the existing `ExecutionProvider` interface
- * (`@veltrixeye/contracts`) and the existing `DisabledMT5Transport` failure
- * surface. No migration, schema, state machine, or vocabulary change is
+ * (`provider-mutations.ts`) with the `Gate9SubmitBarrierProvider` contract
+ * (below). No migration, schema, state machine, or vocabulary change is
  * introduced.
  *
  * Scope:
  *   - provider MUTATIONS only (submit). Cancel/modify/close are out of scope.
  *   - the canonical submit path for any execution provider that can produce a
  *     broker-side mutation. The internal paper simulator path remains
- *     unchanged (it does not reach a transport).
+ *     unchanged (it does not reach a transport and is intentionally outside
+ *     this boundary).
  *   - the M10 transport layer (`packages/core/src/execution/transport/`) is
  *     the documented future boundary. It remains unwired today and is reached
- *     only through `provider.submitOrder` once the canonical dispatcher is
+ *     only through a Gate 9-gated provider once the canonical dispatcher is
  *     adopted by an execution route.
  *
- * The legacy M8.4 `MT5Provider.submitOrder` boundary in `mt5.ts` is
- * additionally gated by an injected `gate9.consumeAuthorization` predicate
- * (see `createMT5ExecutionProvider`). When wired (production composition),
- * the predicate enforces the same "no barrier, no transport call" rule.
+ * The legacy M8.4 `MT5Provider.submitOrder` boundary in `mt5.ts` remains
+ * available as `createMT5ExecutionProvider` for the inherited M8.4 test
+ * surface only. Production providers are built exclusively by
+ * `createGate9MT5ExecutionProvider`, whose bare `submitOrder` always refuses
+ * and whose `submitOrderWithGate9Barrier` requires the consumed Gate 9
+ * barrier this dispatcher hands over (and re-verifies it durably).
  */
 
 import type {
@@ -54,9 +56,42 @@ import type {
   MutationExecutionResult,
   ProviderMutationLedger,
   ProviderSubmitCall,
+  SubmitBarrier,
   SubmitIntentInput,
   SubmitOnceResult,
 } from './provider-mutations.js';
+
+/**
+ * The Gate 9 barrier hand-off contract for broker-mutating providers.
+ *
+ * `submitOrderWithGate9Barrier` may only be invoked with a `SubmitBarrier`
+ * that `ProviderMutationLedger.executeSubmit()` has ALREADY consumed (the M2
+ * single-use CAS committed) for THIS exact mutation identity. Implementations
+ * MUST re-verify the barrier against the durable intent row — not the barrier
+ * object — before any provider-side effect:
+ *
+ *   - the durable row matches every barrier identity field;
+ *   - the row is in the in-flight `submitting` state;
+ *   - the row's `state_version` is exactly `barrier.stateVersion + 1`, i.e.
+ *     the consuming write (every UPDATE advances the version per migration
+ *     0029) has invalidated this barrier value for any second use.
+ *
+ * A replayed barrier resolves off the `submitting` state once the outcome is
+ * durably applied, and a never-consumed barrier lacks the version advance —
+ * both MUST refuse. The bare `submitOrder` of such a provider MUST refuse:
+ * there is no barrier-free path to a provider mutation.
+ */
+export interface Gate9SubmitBarrierProvider extends ExecutionProvider {
+  submitOrderWithGate9Barrier(
+    request: ExecutionSubmitOrderRequest,
+    barrier: SubmitBarrier,
+  ): Promise<ExecutionSubmitOrderOutcome>;
+}
+
+/** Runtime guard: the dispatcher fails closed before any durable write. */
+export function hasGate9BarrierSubmit(provider: ExecutionProvider): provider is Gate9SubmitBarrierProvider {
+  return typeof (provider as Partial<Gate9SubmitBarrierProvider>).submitOrderWithGate9Barrier === 'function';
+}
 
 /**
  * The canonical submit boundary input. Carries everything Gate 9 needs to
@@ -69,7 +104,8 @@ import type {
  */
 export interface CanonicalSubmitInput {
   readonly ledger: ProviderMutationLedger;
-  readonly provider: ExecutionProvider;
+  /** MUST implement the Gate 9 barrier hand-off (see above). */
+  readonly provider: Gate9SubmitBarrierProvider;
 
   readonly userId: string;
   readonly executionProfileId: string;
@@ -137,16 +173,27 @@ function projectOutcome(result: MutationExecutionResult): ExecutionSubmitOrderOu
  *   3. Consumes the barrier in its own short transaction (M2 — single-use,
  *      CAS on `state_version`, never held across a remote call) before the
  *      provider function is invoked.
- *   4. Persists the normalized receipt and the outcome transition.
+ *   4. Hands the CONSUMED barrier to the provider through
+ *      `submitOrderWithGate9Barrier(request, barrier)`; the provider
+ *      re-verifies it against the durable intent row before any transport
+ *      contact (`createGate9MT5ExecutionProvider`).
+ *   5. Persists the normalized receipt and the outcome transition.
  *
- * The injected provider call is the ONLY thing that ever reaches the
- * provider transport. A failed prepare, a zero-row CAS, or a database failure
+ * A provider without the Gate 9 barrier hand-off is refused BEFORE any
+ * durable write. A failed prepare, a zero-row CAS, or a database failure
  * during consumption refuses closed (`pre_call_persistence_failed` or
  * `barrier_not_consumable`) and the provider function is never invoked.
  */
 export async function submitOrderThroughGate9(
   input: CanonicalSubmitInput,
 ): Promise<CanonicalSubmitResult> {
+  if (!hasGate9BarrierSubmit(input.provider)) {
+    return {
+      status: 'error',
+      kind: 'validation',
+      message: 'the canonical submit boundary requires a Gate 9-gated provider (submitOrderWithGate9Barrier); refusing before any durable Gate 9 write',
+    };
+  }
   if (!input.request?.clientOrderId) {
     return { status: 'error', kind: 'validation', message: 'execution request is missing a client order identity' };
   }
@@ -174,12 +221,13 @@ export async function submitOrderThroughGate9(
     riskExpiresAt: input.riskExpiresAt ?? null,
   };
 
-  // The provider function receives the consumed barrier, NOT the raw request.
-  // The barrier is the only thing that authorizes a provider invocation; the
-  // provider's own gate composition runs unchanged on top of it.
+  // The barrier hand-off: the provider receives the CONSUMED barrier together
+  // with the request. The barrier is the only thing that authorizes a
+  // provider invocation, and the provider re-verifies it against the durable
+  // intent row; the provider's own M8.4 pre-flight runs unchanged on top of
+  // it. The authorization context is never discarded.
   const providerCall: ProviderSubmitCall = async (barrier) => {
-    void barrier; // the barrier has already been durably consumed at this point
-    const outcome = await input.provider.submitOrder(input.request);
+    const outcome = await input.provider.submitOrderWithGate9Barrier(input.request, barrier);
     return {
       clientOrderId: input.request.clientOrderId,
       idempotencyKey: input.request.idempotencyKey,
