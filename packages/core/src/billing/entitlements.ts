@@ -1,5 +1,19 @@
 import type { UserPlan } from '@veltrixeye/contracts';
 
+/**
+ * ENTITLEMENT ENFORCEMENT — the only place plan limits are resolved.
+ *
+ * Keyed on the **internal** plan values (`free` / `pro` / `premium`, stored in
+ * `users.plan` and `subscriptions.plan`), never on the commercial catalogue
+ * (`starter` / `pro` / `elite`). PR1 introduces the commercial catalogue in
+ * `./catalogue.ts`; it changes nothing here. Renaming the stored values or
+ * migrating existing users requires a migration (0031) and is out of scope for
+ * PR1 — see docs/billing.md "Compatibility boundary".
+ *
+ * `canAccessAutomation` is `false` for every plan and must stay that way: the
+ * commercial catalogue cannot grant execution capability.
+ */
+
 export interface Entitlements {
   maxStrategies: number;
   maxBacktestsPerMonth: number;
