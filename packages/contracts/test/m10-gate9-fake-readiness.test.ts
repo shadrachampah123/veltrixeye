@@ -97,7 +97,8 @@ describe('HIGH-2 — nested provider receipt handling', () => {
         clientOrderId: BARRIER.clientOrderId,
         providerOrderId: 'sim-1',
         status: 'accepted',
-        // @ts-expect-error — intentionally malformed for test
+        // `raw` is typed `unknown`, so the hostile `receipt` field compiles by design;
+        // runtime allowlist validation (HIGH-2) is what must catch it.
         receipt,
       });
       assert.equal(outcome.outcome, 'uncertain', `malformed nested receipt must not become accepted: ${JSON.stringify(receipt).slice(0, 80)}`);
@@ -126,7 +127,8 @@ describe('HIGH-2 — nested provider receipt handling', () => {
         clientOrderId: BARRIER.clientOrderId,
         providerOrderId: 'sim-1',
         status: 'accepted',
-        // @ts-expect-error — intentionally secret-shaped
+        // `raw` is typed `unknown`, so the secret-shaped `receipt` payload compiles by
+        // design; runtime forbidden-key rejection (HIGH-2) is what must catch it.
         receipt: payload,
       });
       assert.equal(outcome.outcome, 'uncertain', `secret-shaped nested receipt must be uncertain: ${JSON.stringify(payload).slice(0, 80)}`);
@@ -140,7 +142,8 @@ describe('HIGH-2 — nested provider receipt handling', () => {
         clientOrderId: BARRIER.clientOrderId,
         providerOrderId: 'sim-1',
         status: 'accepted',
-        // @ts-expect-error
+        // `raw` is typed `unknown`, so the credential-shaped spread compiles by design;
+        // runtime forbidden-key rejection is what must catch it.
         ...leak,
       });
       assert.equal(outcome.outcome, 'uncertain');
