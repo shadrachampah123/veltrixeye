@@ -56,6 +56,8 @@ export {
   type MT5TransportHealth,
   type MT5TransportError,
   type MT5ProviderConfig,
+  type MT5ProviderOptions,
+  type Gate9BarrierPredicate,
   type MT5AccountSnapshot,
   type MT5SymbolSnapshot,
   type MT5OrderRequest,
@@ -171,3 +173,16 @@ export {
   type SubmitIntentInput,
   type SubmitOnceResult,
 } from './provider-mutations.js';
+
+/* B2 — the single canonical provider-submit boundary.
+ * Wires the existing Gate 9 ledger (prepareSubmit → SubmitBarrier →
+ * executeSubmit → consumeSubmitBarrier → provider call) onto the
+ * ExecutionProvider interface. No parallel boundary, no alternative
+ * authorization scheme, no migration or schema change. */
+export {
+  submitOrderThroughGate9,
+  type CanonicalSubmitInput,
+  type CanonicalSubmitSuccess,
+  type CanonicalSubmitError,
+  type CanonicalSubmitResult,
+} from './submit-boundary.js';

@@ -17,6 +17,47 @@ import {
   type ExecutionSubmitOrderRequest,
   type OrderType,
 } from '@veltrixeye/contracts';
+import type { SubmitBarrier } from './provider-mutations.js';
+
+/**
+ * B2 — Gate 9 barrier precondition for the M8.4 boundary.
+ *
+ * When the production composition wires `createMT5ExecutionProvider` with a
+ * `gate9.consumeAuthorization` predicate, the legacy `submitOrder` boundary
+ * refuses every request that has not produced a fresh, single-use Gate 9
+ * `SubmitBarrier`. The predicate runs BEFORE any pre-flight check, BEFORE the
+ * health call, BEFORE the symbol lookup, BEFORE the idempotency lookup and
+ * BEFORE `transport.submitOrder`. Without it, the transport call is
+ * unreachable.
+ *
+ * The `SubmitBarrier` shape is exactly the Gate 9 barrier
+ * (`ProviderMutationLedger.prepareSubmit()` mints and `executeSubmit()`
+ * consumes). The predicate is the composition-side adapter that returns the
+ * consumed barrier; returning `null` (or throwing) refuses the request.
+ *
+ * Existing M8.4 unit tests pass without this option and continue to exercise
+ * the legacy pre-flight behaviour. Production wiring (a separate, separately
+ * reviewed step) supplies it.
+ */
+export interface Gate9BarrierPredicate {
+  /**
+   * Returns the consumed Gate 9 `SubmitBarrier` if and only if the caller
+   * (the canonical submit dispatcher) has presented one for this exact
+   * mutation identity. Returns `null` to refuse; throws to refuse.
+   */
+  consumeAuthorization(request: ExecutionSubmitOrderRequest): SubmitBarrier | null | Promise<SubmitBarrier | null>;
+}
+
+export interface MT5ProviderOptions {
+  /**
+   * When supplied, the legacy `submitOrder` boundary refuses every request
+   * for which `gate9.consumeAuthorization` does not return a fresh Gate 9
+   * `SubmitBarrier`. The predicate is consulted FIRST (before identity,
+   * readiness, symbol, idempotency and transport validation). The legacy
+   * direct call to `transport.submitOrder` cannot bypass it.
+   */
+  readonly gate9?: Gate9BarrierPredicate;
+}
 import {
   bridgeOrderIdentityError,
   bridgeQuoteError,
@@ -313,7 +354,7 @@ function normalizePosition(row: MT5PositionSnapshot, canonical: string): Executi
   };
 }
 
-export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5ProviderConfig): ExecutionProvider {
+export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5ProviderConfig, options: MT5ProviderOptions = {}): ExecutionProvider {
   const capabilities: ExecutionProviderCapabilities = { modes: ['demo'], orderTypes: ['market', 'limit', 'stop'] };
   const now = config.now ?? Date.now;
   const canonicalFor = (providerSymbol: string) => [...config.symbols].find(([, value]) => value === providerSymbol)?.[0] ?? providerSymbol;
@@ -425,6 +466,38 @@ export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5P
       return rows;
     },
     async submitOrder(request: ExecutionSubmitOrderRequest): Promise<ExecutionSubmitOrderOutcome> {
+      // 0. B2 — Gate 9 barrier precondition. When the production composition
+      //    has supplied a `gate9.consumeAuthorization` predicate, the legacy
+      //    direct boundary refuses every request that has not produced a
+      //    freshly-consumed Gate 9 `SubmitBarrier`. The check is intentionally
+      //    the FIRST thing in this method — before identity, before readiness,
+      //    before the symbol lookup, before the idempotency lookup, and before
+      //    `transport.submitOrder`. Without a barrier, no transport call is
+      //    reachable through this entry point.
+      //
+      //    The predicate is the canonical dispatcher's adapter over
+      //    `ProviderMutationLedger.executeSubmit(barrier, …)`. The barrier it
+      //    returns has already been consumed by the ledger's M2 single-use CAS
+      //    and cannot authorize a second provider call (Gate 9 barrier
+      //    semantics; see `m10-gate9-barrier-consumption.test.ts`). The check
+      //    is fail-closed: a thrown predicate refuses the request.
+      if (options.gate9) {
+        let barrier: SubmitBarrier | null = null;
+        try {
+          barrier = await options.gate9.consumeAuthorization(request);
+        } catch {
+          throw new ExecutionProviderError(
+            'unavailable',
+            'MT5 submit requires a Gate 9 submit barrier; none was provided',
+          );
+        }
+        if (!barrier || barrier.providerCallPermitted !== true) {
+          throw new ExecutionProviderError(
+            'unavailable',
+            'MT5 submit requires a Gate 9 submit barrier; none was provided',
+          );
+        }
+      }
       // 1. §11 (B2): the durable client order identity is the FIRST check,
       //    ahead of the health call, the symbol lookup and the idempotency
       //    lookup. A malformed identity therefore cannot produce a provider
