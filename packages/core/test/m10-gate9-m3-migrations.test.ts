@@ -32,6 +32,7 @@ const M3_INDEXES = [
 let db: Awaited<ReturnType<typeof startEmbeddedPostgres>>;
 let pool: ReturnType<typeof createPool>;
 let dir29: string;
+let dir30: string;
 let fullDir: string;
 
 function copyUpTo(destination: string, max: number | null): void {
@@ -51,8 +52,14 @@ async function databasePool(name: string): Promise<ReturnType<typeof createPool>
 
 before(async () => {
   dir29 = mkdtempSync(path.join(os.tmpdir(), 've-g9m3-0029-'));
+  dir30 = mkdtempSync(path.join(os.tmpdir(), 've-g9m3-0030-'));
   fullDir = mkdtempSync(path.join(os.tmpdir(), 've-g9m3-full-'));
   copyUpTo(dir29, 29);
+  // This suite pins the Gate 9 M3 step (0029 -> 0030). Later work streams ship
+  // migrations after it (Billing PR2 added 0031_provider_billing.sql), so the
+  // step-scoped expectations below run against a copy that ends at 0030 — the
+  // same convention m91-migrations.test.ts documents for M9.1.
+  copyUpTo(dir30, 30);
   copyUpTo(fullDir, null);
   const dataDir = path.join(os.tmpdir(), `ve-g9m3-migrations-pg-${process.pid}`);
   rmSync(dataDir, { recursive: true, force: true });
@@ -64,6 +71,7 @@ after(async () => {
   await pool?.end();
   await db?.stop();
   rmSync(dir29, { recursive: true, force: true });
+  rmSync(dir30, { recursive: true, force: true });
   rmSync(fullDir, { recursive: true, force: true });
 });
 
@@ -160,7 +168,8 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
     assert.equal(createHash('sha256').update(sql29).digest('hex'), MIGRATION_0029_SHA256, '0029 must never change');
 
     const files = readdirSync(MIGRATIONS_DIR).filter((f) => /^\d{4}_.+\.sql$/.test(f)).sort();
-    assert.equal(files.at(-1), MIGRATION_0030, '0030 is the newest migration');
+    const filesUpTo30 = files.filter((f) => Number(/^(\d{4})_/.exec(f)?.[1]) <= 30);
+    assert.equal(filesUpTo30.at(-1), MIGRATION_0030, '0030 is the newest migration of the Gate 9 M3 step');
     assert.equal(files.filter((f) => f.startsWith('0030_')).length, 1, 'exactly one 0030 migration');
 
     const sql30 = readFileSync(path.join(MIGRATIONS_DIR, MIGRATION_0030), 'utf8');
@@ -183,10 +192,10 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
   test('0030 applies cleanly on a fresh database and creates exactly the three partial unique indexes', async () => {
     const fresh = await databasePool('veltrixeye_gate9_m3_fresh');
     try {
-      const result = await runMigrations(fresh, fullDir);
+      const result = await runMigrations(fresh, dir30);
       assert.ok(result.applied.includes(MIGRATION_0029));
       assert.ok(result.applied.includes(MIGRATION_0030));
-      const status = await migrationStatus(fresh, fullDir);
+      const status = await migrationStatus(fresh, dir30);
       assert.equal(status.pending.length, 0);
       assert.equal(status.checksumsMatch, true);
       assert.equal(status.latestApplied, MIGRATION_0030);
@@ -228,6 +237,18 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
         'execution_provider_intents_execution_profile_id_client_orde_key',
         'execution_provider_intents_mutation_uniq',
       ]);
+
+      // Migrations shipped AFTER this step (Billing PR2's 0031) must not
+      // disturb the M3 invariants: apply everything and re-check.
+      const later = await runMigrations(fresh, fullDir);
+      assert.ok(
+        later.applied.every((name) => Number(/^(\d{4})_/.exec(name)?.[1]) > 30),
+        `only migrations after 0030 remain to apply (got ${later.applied.join(', ') || 'none'})`,
+      );
+      const laterStatus = await migrationStatus(fresh, fullDir);
+      assert.equal(laterStatus.pending.length, 0);
+      assert.equal(laterStatus.checksumsMatch, true);
+      assert.deepEqual(await m3IndexNames(fresh), [...M3_INDEXES].sort(), 'the M3 indexes survive later migrations');
     } finally {
       await fresh.end();
     }
@@ -236,7 +257,7 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
   test('upgrade 0029 → 0030 preserves every existing row: legacy, lineage and order-bound', async () => {
     const before = await runMigrations(pool, dir29);
     assert.equal(before.applied.length, 29);
-    let status = await migrationStatus(pool, MIGRATIONS_DIR);
+    let status = await migrationStatus(pool, dir30);
     assert.deepEqual(status.pending, [MIGRATION_0030]);
 
     // Seed 0029-era state that must survive unchanged.
@@ -269,7 +290,7 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
     copyUpTo(dir29, 30);
     const upgraded = await runMigrations(pool, dir29);
     assert.deepEqual(upgraded.applied, [MIGRATION_0030]);
-    status = await migrationStatus(pool, MIGRATIONS_DIR);
+    status = await migrationStatus(pool, dir29);
     assert.equal(status.pending.length, 0);
     assert.equal(status.checksumsMatch, true);
 
@@ -316,7 +337,7 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
       const snapshot = await snapshotIntents(conflicted);
 
       await assert.rejects(
-        () => runMigrations(conflicted, fullDir),
+        () => runMigrations(conflicted, dir30),
         (error: unknown) => {
           const message = (error as Error).message;
           return /0030 refused/.test(message)
@@ -327,7 +348,7 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
       );
       assert.equal(await snapshotIntents(conflicted), snapshot, 'the refused migration touched no row');
       assert.deepEqual(await m3IndexNames(conflicted), [], 'no index was left behind by the rolled-back migration');
-      const status = await migrationStatus(conflicted, fullDir);
+      const status = await migrationStatus(conflicted, dir30);
       assert.deepEqual(status.pending, [MIGRATION_0030], '0030 is still pending');
       assert.equal(status.checksumsMatch, true);
 
@@ -346,7 +367,7 @@ describe('M10 Gate 9 M3 migrations — 0030_provider_mutation_lineage_invariants
           WHERE id = $1`,
         [live[0]!.id],
       );
-      const retried = await runMigrations(conflicted, fullDir);
+      const retried = await runMigrations(conflicted, dir30);
       assert.deepEqual(retried.applied, [MIGRATION_0030]);
       assert.deepEqual(await m3IndexNames(conflicted), [...M3_INDEXES].sort());
       assert.equal((await conflicted.query(`SELECT 1 FROM execution_provider_intents WHERE id = $1`, [first])).rowCount, 1);

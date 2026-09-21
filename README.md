@@ -3,16 +3,17 @@
 > **Milestones M1–M8.7 + M9.1 + M9.2 + M10.0/Gate 9 (incl. B1, B2) — Foundation
 > through Risk Management, Paper Execution, Broker Boundary, Reconciliation,
 > Safety Controls, Notification Delivery and the non-live execution transport
-> foundation. Billing is in progress (PR1: authoritative commercial catalogue).**
+> foundation. Billing is in progress (PR1: commercial catalogue · PR2: billing
+> persistence + provider seam).**
 > A general-purpose SaaS platform where traders define **their own** deterministic trading strategies, scan markets against them, and receive explained, scored alerts.
 
 ## Status
 
 This repository currently contains **M1–M8.7, M9.1, M9.2 and the M10.0 / Gate 9 program**: application foundation through the M8 execution program — the **risk management engine** (M8.2, [docs/risk.md](docs/risk.md)), the execution architecture and 18-gate safety boundary (M8.1, [docs/execution.md](docs/execution.md)), the internal paper execution simulator (M8.3), the provider-neutral MT5/broker boundary with a deliberately disabled transport (M8.4), order/position reconciliation (M8.5), strengthened kill-switch & safety controls with append-only switch history, emergency stop, durable loss-limit circuit breakers and the `EXECUTION_GLOBAL_KILL_SWITCH` environment pin (M8.6), advanced risk circuit breakers (M8.7), durable notification preferences/routing/fairness (M9.1) and the push channel with secret hardening (M9.2) — plus the M10.0 **non-live** execution transport foundation, the Gate 9 MT5-bridge protocol and provider-mutation persistence, the **B1** authorization/composition layer and the **B2** authoritative provider-submit boundary. **No real or demo broker orders are executed. Automation stays OFF for every plan. No broker is connected.**
 
-**Billing — in progress (PR1).** The commercial catalogue is now authoritative and server-side: **Starter** $15/mo · $150/yr, **Pro** $39/mo · $390/yr, **Elite** $99/mo · $990/yr (USD), billed through **Paystack**. PR1 is catalogue + documentation only — there is **no checkout, payment initialization, portal, webhook, verification or subscription sync**, and no Paystack API call exists yet. The stored plan values (`free`/`pro`/`premium`) are unchanged: nothing was renamed and no user was migrated. See [docs/billing.md](docs/billing.md).
+**Billing — in progress (PR2).** The commercial catalogue is authoritative and server-side: **Starter** $15/mo · $150/yr, **Pro** $39/mo · $390/yr, **Elite** $99/mo · $990/yr (USD), billed through **Paystack**. PR2 adds the billing **persistence model** (migration `0031_provider_billing.sql`: provider-backed subscription columns, `billing_customers`, and an append-only `billing_provider_events` idempotency ledger), the canonical **billing contracts**, and the **Paystack provider seam** — an interface with an empty registry and a fail-closed placeholder. **No Paystack API integration exists yet**: no API call, no HTTP request, no checkout, no portal, no webhook route, no signature verification, no subscription synchronization and no credential change. The stored plan values (`free`/`pro`/`premium`) are unchanged — nothing was renamed, no user was migrated, and Starter is still not sellable — and `canAccessAutomation` remains `false` for every plan. See [docs/billing.md](docs/billing.md).
 
-**Not yet implemented** (by design, later milestones): a live/broker execution path (the transport foundation is non-live and gated on external validation), and the billing flow itself (checkout, webhooks, portal, subscription sync, production credentials). The deployment stays on the **Render Free** plan. See [docs/milestones.md](docs/milestones.md).
+**Not yet implemented** (by design, later milestones): a live/broker execution path (the transport foundation is non-live and gated on external validation), and the billing flow itself (Paystack adapter, checkout, webhooks, portal, subscription sync, production credentials). The deployment stays on the **Render Free** plan. See [docs/milestones.md](docs/milestones.md).
 
 ## Stack
 
