@@ -2,8 +2,11 @@
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
 M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2, M8.3, M8.4, M8.5,
-M8.6 and M8.7**. The boundaries below
-are deliberate and enforced: M1 shipped foundations and contracts; M2 added real historical
+M8.6, M8.7, M9.1, M9.2, the M10.0 / Gate 9 execution-transport program
+(transport foundation, Gate 9 protocol + persistence, B1, B2), and the start of
+billing (PR1 — authoritative commercial catalogue; **no payment flow**). The
+boundaries below are deliberate and enforced: M1 shipped foundations and
+contracts; M2 added real historical
 market data; M3 added deterministic strategy evaluation; M4 added
 deterministic setup detection and lifecycle management; M5 added
 deterministic setup quality scoring; M6 Phases 1–3 add the backtest
@@ -574,7 +577,9 @@ reconciliation. Full design: [execution.md](./execution.md).
   *broker-side* import and repair still await an operational transport, and
   **destructive corrective actions remain gated OFF by design**.
 - **Billing integration** — M7.4 built the subscription/entitlement
-  foundation; no payment provider, checkout, portal or webhooks exist yet.
+  foundation. PR1 (see [Billing — in progress](#billing--in-progress-pr1-authoritative-commercial-catalogue))
+  establishes the authoritative commercial catalogue and selects Paystack; no
+  checkout, portal, webhook or provider call exists yet.
 - **AI** in the signal path — evaluation is deterministic rules; AI is
   never the core signal engine.
 - **Marketplace** with paid plans or revenue sharing.
@@ -778,9 +783,59 @@ and [m10-verification.md](./m10-verification.md).
   - **no secret-manager integration, no live wiring, no automatic
     repair/retry/cancel/close**, and no change to order-status vocabulary or to
     risk/notification/entitlement/kill-switch behavior.
+- **B1 — authorization/composition layer (delivered).** `ExecutionAuthorizationService`
+  hands a one-shot, TTL-bounded, request- and context-bound authorization to the
+  provider call, with the context handoff, gate evaluation over the *existing*
+  gates, and honest uncertainty (never projected as accepted). Composition is
+  server-side only; `MT5ExecutionTransport` stays permanently unavailable and
+  `EXECUTION_TRANSPORT_MODE=mt5-live` still fails startup.
+- **B2 — one authoritative provider-submit boundary (delivered).** A single
+  canonical path (prepare → Gate 9 barrier → execute → provider) around the Gate 9
+  `ProviderMutationLedger`; durable state is committed before the provider call,
+  the projected outcome carries the real provider order id, replay/forgery are
+  refused before any transport call, and the disabled transport still fails
+  closed as `uncertain` — never `accepted`. Backward compatibility is preserved
+  for compositions that have not wired the handoff.
+- **Status:** B1 ✅ complete, B2 ✅ complete, Gate 9 ✅ complete (protocol +
+  persistence + invariants), M10 transport foundation ✅ complete. None of them
+  is connected to a broker, and **no live, demo or simulated order leaves the
+  platform through the transport**; execution remains unavailable to every plan.
+
+## Billing — in progress (PR1: authoritative commercial catalogue)
+
+Reconciled with the current repository state: **B1, B2, Gate 9, M9.2 and the
+M10 transport foundation are complete; billing is the active work stream.**
+PR1 is documentation/roadmap reconciliation plus the authoritative commercial
+catalogue only — see [billing.md](./billing.md).
+
+- **Decided:** Paystack is the payment provider; the catalogue is priced in
+  **USD**; development uses **sandbox/test credentials only**; no secrets in
+  source control; **Render stays on the Free plan**.
+- **Catalogue (single authoritative source, deeply frozen, validated at module
+  load):** Starter $15/mo · $150/yr (1 active strategy, 1 market category,
+  delayed/limited) · Pro $39/mo · $390/yr (5 active strategies, forex + crypto +
+  stocks, real-time) · Elite $99/mo · $990/yr (unlimited strategies, forex +
+  crypto + stocks, real-time + priority execution).
+- **Three layers kept separate:** the *commercial catalogue* (what is sold),
+  *entitlement enforcement* (`getEntitlements`, unchanged), and *future
+  execution capabilities* (still OFF for every plan). Elite's "priority
+  execution" is a commercial descriptor only: it enables nothing, bypasses no
+  gate, and leaves `canAccessAutomation` false.
+- **Compatibility boundary:** the database still stores `free`/`pro`/`premium`;
+  the catalogue is `starter`/`pro`/`elite`. Nothing is renamed and no user is
+  migrated (`pro` → Pro, `premium` → Elite, `free` → no commercial tier,
+  Starter awaits **migration 0031**).
+- **Explicitly deferred to later billing PRs:** migration 0031, Paystack API
+  calls, checkout/payment initialization, verification, webhook receiver and
+  signature/replay security, subscription synchronization, provider
+  customer/subscription creation, billing portal, billing UI checkout, and
+  production credentials.
+- **Not started / not planned in the billing stream:** broker or MT5/Exness
+  connectivity, live execution, automation, and any change to Gate 9, B1, B2 or
+  paper-execution behaviour.
 
 ## After M9.2 (later work, outline only)
 
 1. **Operational broker transport** — validate a concrete MT5 bridge and an approved external secret manager on demo infrastructure. M8.4 deliberately ships neither and makes no connectivity claim. M8.5/M8.6/M8.7/M9.1/M9.2 prepare reconciliation, safety plumbing, drawdown protection, notification fairness and secret hardening for it; the transport itself is gated on external validation.
-2. **Billing** (provider, webhooks, checkout/portal) lands alongside or after.
+2. **Billing** (provider, webhooks, checkout/portal) — provider and catalogue are now decided (Paystack, USD, Starter/Pro/Elite); remaining steps are listed in [billing.md](./billing.md#later-billing-prs-explicitly-not-in-pr1) and in the section above.
 3. **More channels** (SMS/Telegram) behind same registry if needed.

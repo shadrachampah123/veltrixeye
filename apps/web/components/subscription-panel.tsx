@@ -2,7 +2,15 @@
 
 import * as React from 'react';
 import { Badge, Card, CardHeader } from '@/components/ui';
-import type { BillingStateDto } from '@veltrixeye/contracts';
+import {
+  BILLING_CURRENCY,
+  BILLING_PROVIDER,
+  COMMERCIAL_PLAN_CATALOGUE,
+  commercialPlanForInternalPlan,
+  type BillingStateDto,
+  type PlanCatalogueEntry,
+  type UserPlan,
+} from '@veltrixeye/contracts';
 import { BRAND } from '@/lib/brand';
 import { formatDateTime } from '@/lib/formats';
 
@@ -84,34 +92,78 @@ function FeatureRow({ label, enabled, note }: { label: string; enabled: boolean;
   );
 }
 
-export function PlanComparison({ currentPlan }: { currentPlan: string }) {
-  const plans = [
-    { id: 'free', name: 'Free', price: '$0', features: ['3 strategies', '10 backtests/mo', '5 alerts/mo', 'Scanner: No', 'Automation: No'] },
-    { id: 'starter', name: 'Starter', price: '$29', features: ['10 strategies', '100 backtests/mo', '50 alerts/mo', 'Scanner: Yes', 'Automation: No'] },
-    { id: 'pro', name: 'Pro', price: '$99', features: ['Unlimited strategies', 'Unlimited backtests', 'Unlimited alerts', 'Scanner: Yes', 'Automation: Paper only'] },
-  ];
+/**
+ * Plan comparison — rendered from the single authoritative commercial catalogue
+ * (`@veltrixeye/contracts` billing catalogue), never from local placeholder
+ * values. Display only: there is no checkout, portal or payment flow, and the
+ * UI cannot grant anything the API does not already return.
+ *
+ * `currentPlan` is the **internal** plan value (`free` / `pro` / `premium`);
+ * the commercial counterpart comes from the documented compatibility mapping.
+ */
+export function PlanComparison({ currentPlan }: { currentPlan: UserPlan }) {
+  const currentCommercialPlan = commercialPlanForInternalPlan(currentPlan);
+
   return (
     <Card>
-      <CardHeader title="Plan Comparison" subtitle="Foundation for future subscription UI — no payment flow yet" />
+      <CardHeader
+        title="Plan Comparison"
+        subtitle={`Authoritative commercial catalogue · ${BILLING_CURRENCY} · billed via ${
+          BILLING_PROVIDER === 'paystack' ? 'Paystack' : BILLING_PROVIDER
+        } · no payment flow yet`}
+      />
       <div className="grid gap-4 p-5 sm:grid-cols-3">
-        {plans.map((plan) => {
-          const isCurrent = plan.id === currentPlan;
+        {COMMERCIAL_PLAN_CATALOGUE.map((plan) => {
+          const isCurrent = plan.id === currentCommercialPlan;
           return (
             <div key={plan.id} className={`rounded-lg border p-4 ${isCurrent ? 'border-signal-500/50 bg-signal-500/5' : 'border-ink-700 bg-ink-800'}`}>
               <div className="flex items-center justify-between">
                 <span className="font-semibold text-ink-50">{plan.name}</span>
                 {isCurrent && <Badge tone="success">Current</Badge>}
               </div>
-              <div className="mt-1 font-mono text-lg text-ink-100">{plan.price}<span className="text-xs text-ink-400">/mo</span></div>
-              <ul className="mt-3 space-y-1 text-xs text-ink-400">
-                {plan.features.map((f) => (
-                  <li key={f} className="flex items-center gap-1.5"><span className="text-signal-500">✓</span> {f}</li>
-                ))}
-              </ul>
+              <div className="mt-1 font-mono text-lg text-ink-100">
+                {plan.pricing.monthly.display}
+                <span className="text-xs text-ink-400">/mo</span>
+                <span className="ml-2 text-sm text-ink-300">
+                  {plan.pricing.annual.display}
+                  <span className="text-xs text-ink-400">/yr</span>
+                </span>
+              </div>
+              <PlanCatalogueFeatures plan={plan} />
             </div>
           );
         })}
       </div>
+      <div className="border-t border-ink-700 px-5 py-3 text-[11px] leading-snug text-ink-400">
+        Prices are {BILLING_CURRENCY} and come from the server-side catalogue.{' '}
+        {currentCommercialPlan === null
+          ? `Your account is on the internal "${currentPlan}" plan, which has no commercial catalogue counterpart — nothing changes for you.`
+          : 'Enforced limits are unchanged and continue to come from the API.'}{' '}
+        <strong className="text-amber-450">No billing capability yet:</strong> there is no checkout, payment method or
+        subscription management — and &ldquo;priority execution&rdquo; on Elite is a commercial descriptor only.
+        Automation, live execution and broker execution remain unavailable on every plan.
+      </div>
     </Card>
+  );
+}
+
+function PlanCatalogueFeatures({ plan }: { plan: PlanCatalogueEntry }) {
+  return (
+    <ul className="mt-3 space-y-1 text-xs text-ink-400">
+      <li className="flex items-center gap-1.5">
+        <span className="text-signal-500">✓</span> {plan.activeStrategies.display} active{' '}
+        {plan.activeStrategies.unlimited || (plan.activeStrategies.limit ?? 0) > 1 ? 'strategies' : 'strategy'}
+      </li>
+      <li className="flex items-center gap-1.5">
+        <span className="text-signal-500">✓</span> {plan.markets.display}
+      </li>
+      <li className="flex items-center gap-1.5">
+        <span className="text-signal-500">✓</span> {plan.tradeFrequency.display}
+      </li>
+      {plan.tradeFrequency.note ? <li className="pl-4 text-[10px] text-ink-500">{plan.tradeFrequency.note}</li> : null}
+      <li className="flex items-center gap-1.5">
+        <span className="text-ink-500">✕</span> No automation or live execution
+      </li>
+    </ul>
   );
 }
