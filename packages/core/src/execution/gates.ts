@@ -110,7 +110,12 @@ export function evaluateExecutionGates(input: ExecutionGateInput): ExecutionGate
       case 'profile_enabled': {
         if (!input.profile) return fail(gate, 'execution profile not found');
         if (!input.profile.enabled) return fail(gate, 'execution profile is disabled');
-        if (input.profile.environment !== 'paper') {
+        // B1: paper always permitted; demo permitted (DisabledMT5Transport in prod fails closed honestly).
+        // Live never permitted (M8.4 safety boundary preserved).
+        if (input.profile.environment === 'live') {
+          return fail(gate, `execution environment "${input.profile.environment}" is not permitted in this platform version`);
+        }
+        if (input.profile.environment !== 'paper' && input.profile.environment !== 'demo') {
           return fail(gate, `execution environment "${input.profile.environment}" is not permitted in this platform version`);
         }
         break;

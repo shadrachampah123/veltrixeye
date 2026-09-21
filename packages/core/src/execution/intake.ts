@@ -16,6 +16,10 @@ import type { KillSwitchService } from './kill-switch.js';
 import { evaluateExecutionGates, type ExecutionGateResult } from './gates.js';
 import type { ExecutionProviderRegistry } from './registry.js';
 import type { RiskEngineService } from '../risk/service.js';
+import {
+  evaluateProviderReadinessForGate,
+  resolveBrokerAccountAuthorization,
+} from './composition-fence.js';
 
 /**
  * M8.1 — execution decision intake (the ONLY door toward a future order).
@@ -206,7 +210,7 @@ export class ExecutionIntakeService {
       executionProfileId: profile.id,
     });
     const provider = this.deps.providers.get(profile.provider_slug);
-    const providerHealth = provider ? await provider.health() : null;
+    const rawHealth = provider ? await provider.health().catch(() => null) : null;
 
     // M8.2: the risk engine is the ONLY source of a risk decision. The
     // result is persisted under an advisory lock; a client boolean is never
@@ -217,6 +221,23 @@ export class ExecutionIntakeService {
       decision,
       reserveOnApprove: true,
     });
+
+    // B1 remediation (H3) — authoritative broker-account authorization.
+    // No grant mechanism exists in this platform version, so every broker
+    // path fails closed; editable profile metadata matching describe() is
+    // never treated as proof of authorization. The internal paper simulator
+    // involves no broker account and is authorized by construction.
+    const grant = resolveBrokerAccountAuthorization({
+      providerSlug: profile.provider_slug,
+      environment: profile.environment,
+    });
+    const brokerAuthorized = grant.brokerAuthorized;
+    const accountAuthorized = grant.accountAuthorized;
+    // B1 remediation (M3) — the FULL health record is resolved by the single
+    // authoritative readiness resolver before anything is projected into the
+    // gate input. Never reduced to `{ healthy }`, never truthiness-coerced:
+    // an apparently healthy-but-uncertain provider cannot pass.
+    const readiness = evaluateProviderReadinessForGate(rawHealth);
 
     const gate = evaluateExecutionGates({
       authenticated: true, // enforced by the API layer before this service runs
@@ -246,10 +267,10 @@ export class ExecutionIntakeService {
       },
       minRr: risk.effectiveMinRr,
       exposureWithinLimits: risk.exposureWithinLimits,
-      providerHealth,
-      environmentSafe: profile.environment === 'paper',
-      brokerAuthorized: profile.provider_slug === 'paper',
-      accountAuthorized: profile.provider_slug === 'paper',
+      providerHealth: readiness.gateValue,
+      environmentSafe: profile.environment !== 'live' && (profile.environment === 'paper' || profile.environment === 'demo'),
+      brokerAuthorized,
+      accountAuthorized,
     });
 
     const accepted = gate.passed;

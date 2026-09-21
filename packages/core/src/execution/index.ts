@@ -89,6 +89,9 @@ export { ExecutionQueryService } from './queries.js';
 export {
   PaperExecutionService,
   PaperIntegrityError,
+  type ComposedPaperEntryIdentity,
+  type ComposedPaperEntryInput,
+  type ComposedPaperEntryResult,
   type PaperExecutionServiceDeps,
   type PaperExecutionServiceOptions,
   type PaperFailureMode,
@@ -174,6 +177,48 @@ export {
   type SubmitIntentInput,
   type SubmitOnceResult,
 } from './provider-mutations.js';
+
+/* B1 — authorization/composition layer (authorization + composition) */
+export {
+  ExecutionAuthorizationService,
+  assertAuthorizationContext,
+  createAuthorizationContextHandoff,
+  diffAuthorizationContext,
+  type AuthorizationContextHandoff,
+  type AuthorizationContextHandoffOptions,
+  type AuthorizationExecutionContext,
+  type ExecutionAuthorization,
+  type ExecutionAuthorizationServiceOptions,
+} from './authorization.js';
+/* B1 remediation — shared composition guards (H2/H3/H4/H5/M3/M5) */
+export {
+  assertCompositionInputUnchanged,
+  evaluateProviderReadinessForGate,
+  freezeCompositionInput,
+  mapBrokerSubmitOutcome,
+  resolveBrokerAccountAuthorization,
+  runFinalSafetyFence,
+  toAuthorizationRequestBinding,
+  toGate9RiskHandoff,
+  type BrokerAccountGrantInput,
+  type BrokerSubmitDisposition,
+  type CompositionInputShape,
+  type FinalFenceDeps,
+  type FinalFenceFailCode,
+  type FinalFenceInput,
+  type FinalFenceResult,
+  type FrozenCompositionInput,
+  type Gate9RiskHandoff,
+  type LiveRiskReservation,
+  type MappedBrokerSubmitOutcome,
+  type ProviderReadinessForGate,
+} from './composition-fence.js';
+export {
+  ExecutionCompositionService,
+  type CompositionLogger,
+  type ExecutionCompositionInput,
+  type ExecutionCompositionResult,
+} from './composition.js';
 
 /* B2 — the single canonical provider-submit boundary.
  * Wires the existing Gate 9 ledger (prepareSubmit → SubmitBarrier →
