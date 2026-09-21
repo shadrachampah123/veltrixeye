@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 import type pg from 'pg';
 import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 import { createPool, MIGRATIONS_DIR, runMigrations } from '../src/index.js';
-import { ProviderMutationLedger, type SubmitIntentInput, type SubmitBarrier } from '../src/execution/provider-mutations.js';
+import { ProviderMutationLedger, type SubmitIntentInput } from '../src/execution/provider-mutations.js';
 import { FakeBridge, DeterministicFakeProvider } from './support/fake-bridge.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -183,7 +183,20 @@ describe('MEDIUM-2 — stateful fake-provider test architecture', () => {
     assert.equal(bridge.invocationCount, 0);
 
     // Submit via bridge directly
-    const barrier = { intentId: randomUUID(), clientOrderId: newClientOrderId(), idempotencyKey: newIdempotencyKey(), accountRef: 'acct-1' };
+    const barrier = {
+      intentId: randomUUID(),
+      clientOrderId: newClientOrderId(),
+      idempotencyKey: newIdempotencyKey(),
+      requestHash: newIdempotencyKey(),
+      attempt: 1,
+      stateVersion: 1,
+      userId: randomUUID(),
+      executionProfileId: randomUUID(),
+      providerSlug: 'deterministic-fake',
+      environment: 'paper' as const,
+      accountRef: 'acct-1',
+      providerCallPermitted: true as const,
+    };
     const response = await bridge.submit(barrier);
     assert.ok(response);
     assert.equal(bridge.snapshot().length, 1);
@@ -203,7 +216,20 @@ describe('MEDIUM-2 — stateful fake-provider test architecture', () => {
 
     // Scenario control
     bridge.setScenario({ kind: 'reject' });
-    const barrier2 = { intentId: randomUUID(), clientOrderId: newClientOrderId(), idempotencyKey: newIdempotencyKey(), accountRef: 'acct-1' };
+    const barrier2 = {
+      intentId: randomUUID(),
+      clientOrderId: newClientOrderId(),
+      idempotencyKey: newIdempotencyKey(),
+      requestHash: newIdempotencyKey(),
+      attempt: 1,
+      stateVersion: 1,
+      userId: randomUUID(),
+      executionProfileId: randomUUID(),
+      providerSlug: 'deterministic-fake',
+      environment: 'paper' as const,
+      accountRef: 'acct-1',
+      providerCallPermitted: true as const,
+    };
     const response2 = await bridge.submit(barrier2);
     assert.ok(response2);
     assert.equal((response2 as { status: string }).status, 'rejected');
