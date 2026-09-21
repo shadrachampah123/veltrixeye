@@ -51,6 +51,10 @@ import {
   PaperReconciliationSnapshotProvider,
   ProviderReconciliationSnapshotProvider,
   RiskEngineService,
+  ExecutionAuthorizationService,
+  createAuthorizationContextHandoff,
+  type AuthorizationContextHandoff,
+  ExecutionCompositionService,
   type ProviderRegistry,
   type NotificationProviderRegistry,
   type DeliveryRetryPolicy,
@@ -126,6 +130,19 @@ export interface AppContext {
      * fail-closed posture is preserved.
      */
     submitHandoff: SubmitBarrierHandoff;
+    /**
+     * B1: server-issued, one-shot, TTL-bound execution authorization.
+     * After gates pass, composition mints an authorization here and hands
+     * its opaque id to the provider boundary, which consumes it exactly once.
+     */
+    authorization: ExecutionAuthorizationService;
+    /**
+     * B1: the single authoritative execution composition layer unifying
+     * intake → gates → risk → readiness → broker/account server-resolved →
+     * server-issued one-shot auth → Gate 9 prepareSubmit → submitOrderThroughGate9.
+     * No second submit path exists.
+     */
+    composition: ExecutionCompositionService;
     /**
      * M8.3: internal deterministic paper simulator. No broker, no credential,
      * no external trading call — every order it writes is simulated.
@@ -247,24 +264,30 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     },
   });
   executionProviders.register(paperProvider);
-  // B2 — the single canonical provider-submit boundary (Gate 9). The ledger
-  // and the one-shot handoff are created here so the future B1 composition
-  // layer can invoke `submitOrderThroughGate9` without further wiring.
+  // B1/B2 — canonical provider-submit boundary (Gate 9) + authorization/composition.
   //
   // Production MT5 posture (unchanged and preserved):
   //   - `enabled: false` — the provider refuses every trading operation;
   //   - `DisabledMT5Transport` — no endpoint, SDK, credential, terminal, or
   //     network path exists and live is hard-stopped;
-  //   - the new `gate9` predicate (from the handoff) — a submit may only
-  //     reach the provider's pre-flight if the canonical dispatcher has
-  //     durably consumed a single-use Gate 9 barrier for the exact mutation.
-  //     No production route or worker invokes the dispatcher today, so the
-  //     handoff stays empty and the legacy boundary refuses every submit.
+  //   - the `gate9` predicate (from the handoff) — a submit may only reach
+  //     the provider's pre-flight if the canonical dispatcher has durably
+  //     consumed a single-use Gate 9 barrier for the exact mutation.
+  //   - the `authorization` predicate — B1 server-issued, one-shot, TTL-bound
+  //     authorization that must exactly match the request AND the complete
+  //     immutable execution context (H1), armed one-shot by the composition
+  //     immediately before the submit; replay, different mutation, different
+  //     context, or expired auth is refused before any transport call.
+  //   - No production route bypasses this: all broker submits go through
+  //     ExecutionCompositionService → submitOrderThroughGate9 → MT5 provider.
+  //     No direct transport.submitOrder call exists in apps/.
+  //
   // This adds no live MT5 execution, no broker credentials, no network
-  // integration, and no new authorization system — the Gate 9 ledger is the
-  // existing durable boundary.
+  // integration, and no schema change — Gate 9 ledger remains durable authority.
   const providerMutationLedger = new ProviderMutationLedger(pool);
   const mt5SubmitHandoff = createSubmitBarrierHandoff();
+  const executionAuthorization = new ExecutionAuthorizationService();
+  const executionAuthHandoff = createAuthorizationContextHandoff(executionAuthorization);
   executionProviders.register(createMT5ExecutionProvider(new DisabledMT5Transport(), {
     enabled: false,
     environment: 'demo',
@@ -272,13 +295,63 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     server: null,
     accountRef: null,
     symbols: new Map(),
-  }, { gate9: mt5SubmitHandoff.gate9 }));
+  }, { gate9: mt5SubmitHandoff.gate9, authorization: executionAuthHandoff.authorization }));
+  const executionProfilesService = new ExecutionProfileService(pool, executionProviders, audit);
+  // M8.3 paper simulator — created BEFORE the composition so the composed
+  // paper path (M6) can hand operations to it. The B1 authorization service
+  // is injected for the composed entry only; the direct simulate() flow is
+  // unchanged and never touches it.
+  paperService = new PaperExecutionService(
+    pool,
+    {
+      market: paperMarket,
+      risk,
+      killSwitches,
+      automation,
+      audit,
+      provider: () => executionProviders.get(paperProvider.id),
+      b1Authorization: executionAuthorization,
+    },
+    {
+      logger: {
+        info: (msg, meta) => {
+          if (config.NODE_ENV === 'production') {
+            console.info(`[paper] ${msg}`, meta ? JSON.stringify(meta) : '');
+          }
+        },
+        warn: (msg, meta) => console.warn(`[paper] ${msg}`, meta ? JSON.stringify(meta) : ''),
+      },
+    },
+  );
+  // B1 composition service — created after providers, killSwitches, risk, audit, ledger,
+  // handoffs, authorization, and the paper simulator so it can compose all of them.
+  // The service itself does not register a provider; the broker path invokes
+  // submitOrderThroughGate9 and the paper path hands to PaperExecutionService.
+  const executionComposition = new ExecutionCompositionService(
+    pool,
+    {
+      automation,
+      killSwitches,
+      providers: executionProviders,
+      risk,
+      audit,
+      providerMutations: providerMutationLedger,
+      submitHandoff: mt5SubmitHandoff,
+      authorization: executionAuthorization,
+      authHandoff: executionAuthHandoff,
+      paper: paperService,
+    },
+  );
+
   const execution = {
     providers: executionProviders,
     killSwitches,
     providerMutations: providerMutationLedger,
     submitHandoff: mt5SubmitHandoff,
-    profiles: new ExecutionProfileService(pool, executionProviders, audit),
+    authorization: executionAuthorization,
+    authHandoff: executionAuthHandoff,
+    composition: executionComposition,
+    profiles: executionProfilesService,
     automation,
     intake: new ExecutionIntakeService(
       pool,
@@ -296,27 +369,7 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     ),
     queries: new ExecutionQueryService(pool),
     risk,
-    paper: (paperService = new PaperExecutionService(
-      pool,
-      {
-        market: paperMarket,
-        risk,
-        killSwitches,
-        automation,
-        audit,
-        provider: () => executionProviders.get(paperProvider.id),
-      },
-      {
-        logger: {
-          info: (msg, meta) => {
-            if (config.NODE_ENV === 'production') {
-              console.info(`[paper] ${msg}`, meta ? JSON.stringify(meta) : '');
-            }
-          },
-          warn: (msg, meta) => console.warn(`[paper] ${msg}`, meta ? JSON.stringify(meta) : ''),
-        },
-      },
-    )),
+    paper: paperService,
     safety: new SafetyControlsService(pool, { killSwitches, automation, audit }),
     reconciliation: new ReconciliationService(
       pool,

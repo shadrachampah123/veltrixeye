@@ -431,6 +431,35 @@ export class RiskEngineService {
   }
 
   /**
+   * B1 (H4) — read the live reservation backing an approved decision.
+   *
+   * Read-only: used by the execution composition's final safety fence (the
+   * reservation must still be live at submit time) and by the Gate 9 risk
+   * handoff (the durable intent takes over the exact decimal exposure).
+   * Returns null when no unexpired reservation exists for this decision and
+   * profile. This creates no second risk authority — it reads the existing
+   * `risk_reservations` rows that `evaluate` wrote.
+   */
+  async getActiveReservation(args: {
+    riskDecisionId: string;
+    executionProfileId: string;
+    nowMs?: number;
+  }): Promise<{ id: string; monetaryRisk: string; expiresAt: Date } | null> {
+    const nowMs = args.nowMs ?? Date.now();
+    const res = await this.pool.query<{ id: string; monetary_risk: string; expires_at: Date }>(
+      `SELECT id, monetary_risk::text AS monetary_risk, expires_at
+         FROM risk_reservations
+        WHERE risk_decision_id = $1
+          AND execution_profile_id = $2
+          AND expires_at > to_timestamp($3 / 1000.0)`,
+      [args.riskDecisionId, args.executionProfileId, nowMs],
+    );
+    const row = res.rows[0];
+    if (!row) return null;
+    return { id: row.id, monetaryRisk: row.monetary_risk, expiresAt: row.expires_at };
+  }
+
+  /**
    * Internal (tests / future executor): record a realized P&L against the
    * server-owned account snapshot. Not exposed over HTTP.
    *

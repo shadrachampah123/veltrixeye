@@ -70,6 +70,18 @@ export interface MT5ProviderOptions {
    * `createSubmitBarrierHandoff()` from the canonical boundary.
    */
   readonly gate9?: Gate9BarrierPredicate;
+  /**
+   * B1 — execution authorization service.
+   *
+   * When supplied, `submitOrder` requires `authorizationId` to be a
+   * server-issued, one-shot, TTL-bound authorization that exactly matches
+   * the request. The check consumes the authorization (single-use) before
+   * any transport call. When absent, only presence is checked (legacy M8.4
+   * behavior) — production composition must supply it.
+   */
+  readonly authorization?: {
+    consumeAuthorization(authorizationId: string, request: ExecutionSubmitOrderRequest): unknown;
+  };
 }
 import {
   bridgeOrderIdentityError,
@@ -572,9 +584,22 @@ export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5P
       //    call, a provider-side mutation, or an uncertain outcome.
       const identityRefusal = bridgeOrderIdentityError(request?.clientOrderId);
       if (identityRefusal) throw identityRefusal;
+      // 1b. B1 — authorization verification: when composition wired the
+      //     authorization service, consume it now (single-use, exact binding,
+      //     TTL). When not wired, only presence is checked (legacy M8.4 tests).
+      //     The check is before health/symbol/idempotency/transport, so no
+      //     provider call is reachable without a valid authorization.
+      if (!request.authorizationId) throw new ExecutionProviderError('validation', 'MT5 orders require a server-issued execution authorization');
+      if (options.authorization) {
+        try {
+          await options.authorization.consumeAuthorization(request.authorizationId, request);
+        } catch (e) {
+          if (e instanceof ExecutionProviderError) throw e;
+          throw new ExecutionProviderError('validation', 'MT5 execution authorization verification failed');
+        }
+      }
       // 2. §7/§26 (B5): explicit readiness, resolved by the shared resolver.
       await requireAvailable();
-      if (!request.authorizationId) throw new ExecutionProviderError('validation', 'MT5 orders require a server-issued execution authorization');
       const brokerSymbol = config.symbols.get(request.symbol);
       if (!brokerSymbol) throw new ExecutionProviderError('invalid_symbol', `No explicit MT5 symbol mapping exists for ${request.symbol}`);
       const row = await transport.symbol(brokerSymbol).catch((e) => { throw normalizeMT5Error(e, 'instrument lookup'); });

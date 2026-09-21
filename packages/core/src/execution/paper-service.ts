@@ -53,6 +53,11 @@ import type { SimulatorMarketPriceSource } from './paper-market.js';
 import { reconcileOrderState, reconcilePositionState } from './reconciliation.js';
 import { assertOrderTransition } from './order-machine.js';
 import { evaluateExecutionGates } from './gates.js';
+import { runFinalSafetyFence } from './composition-fence.js';
+import type {
+  AuthorizationExecutionContext,
+  ExecutionAuthorizationService,
+} from './authorization.js';
 
 /**
  * M8.3 — the paper execution simulator service.
@@ -97,6 +102,79 @@ export interface PaperExecutionServiceDeps {
   audit: AuditService;
   /** Lazily resolved so the provider can be constructed after this service. */
   provider: () => ExecutionProvider | undefined;
+  /**
+   * B1 (M6) — the B1 execution authorization service, shared with the
+   * execution composition. Required ONLY by the composed paper entry
+   * (`executeComposedEntry`), which consumes a B1 authorization instead of
+   * minting a paper authorization: the composed flow has exactly one
+   * authorization authority (B1), never two. The direct `simulate()` flow is
+   * unchanged and never touches this dependency.
+   */
+  b1Authorization?: Pick<ExecutionAuthorizationService, 'consumeAuthorization' | 'peekAuthorization'>;
+}
+
+/**
+ * B1 (M6) — input for the composed paper entry.
+ *
+ * The composition has already snapshotted the caller, loaded the profile and
+ * setup, built the server-side decision, evaluated risk (holding reservation
+ * R), passed the 18 gates, persisted the execution request, minted the B1
+ * authorization, and passed the final fence. Nothing here is trusted: the
+ * paper service re-verifies ownership, rebuilds the decision from the
+ * persisted setup, validates the cited risk approval, re-runs the final
+ * fence with fresh reads, re-evaluates the paper simulation gates, verifies
+ * the B1 binding, and only then consumes the B1 authorization and fills.
+ */
+export interface ComposedPaperEntryInput {
+  /** The B1 authorization id minted by the composition for this mutation. */
+  b1AuthorizationId: string;
+  /** Expected B1 execution context, from the composition's snapshot. */
+  context: AuthorizationExecutionContext;
+  userId: string;
+  executionProfileId: string;
+  setupId: string;
+  /** The stable execution identity hash (== composition idempotencyKey). */
+  baseHash: string;
+  clientOrderId: string;
+  orderIdempotencyKey: string;
+  attempt: number;
+  /** The composition's server-built decision (re-verified against the setup). */
+  decision: ExecutionDecisionInput;
+  /** Position size from the cited risk approval (re-verified). */
+  quantity: number;
+  /**
+   * Exposure verdict from the cited risk approval. Part of the R1 verdict
+   * the paper service validates as cited (same evaluation, same reservation
+   * hold) — the approval was exposure-checked at evaluation time and the
+   * live reservation proves the hold persists.
+   */
+  exposureWithinLimits: boolean;
+  /** Effective minimum RR the risk engine applied (null ⇒ platform floor). */
+  effectiveMinRr: number | null;
+  /** The approved risk decision whose reservation R this attempt holds. */
+  riskDecisionId: string;
+  nowMs?: number;
+  meta?: Pick<AuditEntry, 'ip' | 'userAgent'>;
+}
+
+export type ComposedPaperEntryResult =
+  | {
+      status: 'filled';
+      providerOrderId: string;
+      orderId: string;
+      filledQuantity: number;
+      averagePrice: number | null;
+      attempt: number;
+    }
+  | { status: 'replayed'; providerOrderId: string; orderId: string; attempt: number }
+  | { status: 'rejected'; reason: string; attempt: number };
+
+export interface ComposedPaperEntryIdentity {
+  clientOrderId: string;
+  orderIdempotencyKey: string;
+  attempt: number;
+  /** Set when a live (non-failed) order already exists for this identity. */
+  liveOrder: { orderId: string; providerOrderId: string } | null;
 }
 
 export interface PaperExecutionServiceOptions {
@@ -889,6 +967,23 @@ export class PaperExecutionService {
       );
     }
 
+    // The fill pipeline below is shared with the B1 composed paper entry
+    // (`executeComposedEntry`), which enforces the B1 authorization instead
+    // of a paper authorization and then runs this same transaction.
+    return this.runFillTransaction(authorization);
+  }
+
+  /**
+   * The ONLY transaction that can turn an authorized paper order into a fill.
+   *
+   * Shared verbatim by the direct `submitAuthorizedOrder` flow (paper
+   * authorization, M8.3) and the B1 composed entry (B1 authorization, M6):
+   * idempotent replay of an existing order, advisory-lock serialization,
+   * deterministic failure modes, fill, commit — or rollback with an
+   * integrity finding on failure. Callers must have already consumed (or
+   * verified, for replays) exactly one authorization for this bundle.
+   */
+  private async runFillTransaction(authorization: PaperAuthorization): Promise<ExecutionSubmitOrderOutcome> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -990,6 +1085,494 @@ export class PaperExecutionService {
     } finally {
       client.release();
     }
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* B1 (M6) — composed paper entry (B1 authorization, no second authority)  */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Derive the deterministic paper order identity for a composed entry.
+   *
+   * Read-only: mirrors the direct flow's attempt derivation (a previously
+   * failed attempt retries under a NEW deterministic attempt index). The
+   * composition calls this BEFORE minting the B1 authorization so the B1
+   * binding covers the exact paper identity; `executeComposedEntry`
+   * re-derives and re-validates it before filling (TOCTOU backstop), and the
+   * unique constraints serialize concurrent twins.
+   */
+  async deriveComposedEntryIdentity(args: {
+    userId: string;
+    executionProfileId: string;
+    setupId: string;
+    baseHash: string;
+  }): Promise<ComposedPaperEntryIdentity> {
+    if (!isUuid(args.userId) || !isUuid(args.executionProfileId) || !isUuid(args.setupId)) {
+      throw Errors.invalidInput('Composed paper entry requires valid user, profile, and setup identities');
+    }
+    if (!isIdentityHash(args.baseHash)) {
+      throw Errors.invalidInput('Composed paper entry requires a 64-hex identity hash');
+    }
+    const firstId = paperClientOrderId(args.baseHash, 'entry');
+    const existing = await this.pool.query<OrderRow>(
+      'SELECT * FROM execution_orders WHERE client_order_id = $1',
+      [firstId],
+    );
+    const existingOrder = existing.rows[0];
+    if (existingOrder && existingOrder.status !== 'failed' && existingOrder.status !== 'rejected') {
+      const ids = composedEntryIdsForAttempt(args.baseHash, 1);
+      return {
+        ...ids,
+        attempt: 1,
+        liveOrder: { orderId: existingOrder.id, providerOrderId: existingOrder.id },
+      };
+    }
+    const attempt = existingOrder
+      ? (await this.failedAttemptCount(args.userId, args.executionProfileId, args.setupId)) + 1
+      : 1;
+    return { ...composedEntryIdsForAttempt(args.baseHash, attempt), attempt, liveOrder: null };
+  }
+
+  /**
+   * Execute a paper entry composed by the B1 execution composition.
+   *
+   * This is the M6 paper handoff: the operation is ACTUALLY handed to the
+   * paper simulator (same fill pipeline as the direct flow), and the B1
+   * authorization is consumed here — never stranded, never bypassed. There
+   * is exactly one authorization authority on this path: the B1 service. No
+   * paper authorization is minted (the internal fill bundle is constructed
+   * from verified inputs, never authorized through the paper map).
+   *
+   * Verification order (all fail closed, all release the cited risk
+   * reservation exactly once via `finally` — H4):
+   *   1. scalar validation; 2. profile (owner-scoped, paper, enabled);
+   *   3. setup reload + owner check + server-built decision rebuild, compared
+   *      field-for-field with the presented decision;
+   *   4. cited risk approval (owner/profile/setup/engine/prices binding,
+   *      outcome approved, quantity match) + live reservation;
+   *   5. final safety fence with fresh reads (H5, shared implementation);
+   *   6. instrument spec + server market price + paper simulation gates;
+   *   7. B1 binding verification (peek + exact request/context compare);
+   *   8. existing-order check (live ⇒ replay without consuming; stale ⇒
+   *      reject) + attempt re-derivation;
+   *   9. B1 consumption (single-use) + shared fill transaction.
+   */
+  async executeComposedEntry(args: ComposedPaperEntryInput): Promise<ComposedPaperEntryResult> {
+    const nowMs = args.nowMs ?? Date.now();
+    if (!isUuid(args.userId) || !isUuid(args.executionProfileId) || !isUuid(args.setupId)) {
+      throw Errors.invalidInput('Composed paper entry requires valid user, profile, and setup identities');
+    }
+    if (!isUuid(args.riskDecisionId)) {
+      throw Errors.invalidInput('Composed paper entry requires a valid risk decision identity');
+    }
+    if (typeof args.b1AuthorizationId !== 'string' || args.b1AuthorizationId.length === 0) {
+      throw Errors.invalidInput('Composed paper entry requires a B1 authorization id');
+    }
+    if (!isIdentityHash(args.baseHash)) {
+      throw Errors.invalidInput('Composed paper entry requires a 64-hex identity hash');
+    }
+    if (!Number.isInteger(args.attempt) || args.attempt < 1 || args.attempt > 10_000) {
+      throw Errors.invalidInput('Composed paper entry requires a valid attempt index');
+    }
+    if (typeof args.clientOrderId !== 'string' || args.clientOrderId.length === 0 || args.clientOrderId.length > 128) {
+      throw Errors.invalidInput('Composed paper entry requires a valid client order id');
+    }
+    if (!isIdentityHash(args.orderIdempotencyKey)) {
+      throw Errors.invalidInput('Composed paper entry requires a valid order idempotency key');
+    }
+    if (typeof args.quantity !== 'number' || !Number.isFinite(args.quantity) || !(args.quantity > 0)) {
+      throw Errors.invalidInput('Composed paper entry requires a finite positive quantity');
+    }
+    if (typeof args.exposureWithinLimits !== 'boolean') {
+      throw Errors.invalidInput('Composed paper entry requires an exposure verdict');
+    }
+    if (args.effectiveMinRr !== null && (typeof args.effectiveMinRr !== 'number' || !Number.isFinite(args.effectiveMinRr))) {
+      throw Errors.invalidInput('Composed paper entry requires a valid effective minimum RR');
+    }
+    const b1 = this.deps.b1Authorization;
+    if (!b1) {
+      throw Errors.internal('Composed paper entry requires the B1 authorization service');
+    }
+
+    // H4 — the cited reservation is released exactly once on EVERY exit
+    // path: after a durable fill (the open position counts toward exposure
+    // directly), after a replay (the existing position already counts), and
+    // after any rejection or failure (the attempt is abandoned and holds no
+    // exposure). A crash between fill-commit and release is bounded by the
+    // reservation TTL (reclaimed, fail-safe over-count direction).
+    let released = false;
+    const release = async (): Promise<void> => {
+      if (released) return;
+      released = true;
+      await this.deps.risk.releaseReservation(args.riskDecisionId);
+    };
+
+    try {
+      // 2. Profile — owner-scoped (masked 404), paper only, enabled.
+      const profileRes = await this.pool.query<{
+        id: string;
+        enabled: boolean;
+        environment: string;
+        provider_slug: string;
+      }>(
+        `SELECT id, enabled, environment, provider_slug FROM execution_profiles
+          WHERE id = $1 AND user_id = $2`,
+        [args.executionProfileId, args.userId],
+      );
+      const profile = profileRes.rows[0];
+      if (!profile) throw Errors.notFound('Execution profile not found');
+      if (profile.provider_slug !== 'paper' || profile.environment !== 'paper') {
+        return { status: 'rejected', reason: 'composed paper entry requires a paper execution profile', attempt: args.attempt };
+      }
+      if (profile.enabled !== true) {
+        return { status: 'rejected', reason: 'execution profile is disabled', attempt: args.attempt };
+      }
+
+      // 3. Setup reload + owner check + server-built decision rebuild.
+      const setupRes = await this.pool.query<SetupRow>(
+        `SELECT st.id AS setup_id, st.state, st.direction, st.as_of_ms,
+                st.entry_price, st.stop_loss_price, st.tp1_price, st.quality_score,
+                st.strategy_version_id, v.strategy_id, s.user_id AS owner,
+                i.id AS instrument_id, i.asset_class, i.symbol,
+                rc.min_quality_score,
+                (SELECT tf.timeframe FROM strategy_timeframes tf
+                  WHERE tf.version_id = st.strategy_version_id AND tf.role = 'setup' LIMIT 1) AS setup_timeframe,
+                (SELECT tf.timeframe FROM strategy_timeframes tf
+                  WHERE tf.version_id = st.strategy_version_id AND tf.role = 'entry' LIMIT 1) AS entry_timeframe
+           FROM setups st
+           JOIN strategy_versions v ON v.id = st.strategy_version_id
+           JOIN strategies s ON s.id = v.strategy_id
+           JOIN instruments i ON i.id = st.instrument_id
+           LEFT JOIN strategy_risk_config rc ON rc.version_id = st.strategy_version_id
+          WHERE st.id = $1`,
+        [args.setupId],
+      );
+      const setup = setupRes.rows[0];
+      if (!setup || setup.owner !== args.userId) throw Errors.notFound('Setup not found');
+      const rebuilt = buildServerExecutionDecision({
+        setupId: setup.setup_id,
+        strategyId: setup.strategy_id,
+        strategyVersionId: setup.strategy_version_id,
+        assetClass: setup.asset_class,
+        symbol: setup.symbol,
+        direction: setup.direction,
+        state: setup.state,
+        asOfMs: Number(setup.as_of_ms),
+        entryPrice: numOrNull(setup.entry_price),
+        stopLossPrice: numOrNull(setup.stop_loss_price),
+        tp1Price: numOrNull(setup.tp1_price),
+        qualityScore: setup.quality_score,
+        minQualityScore: setup.min_quality_score,
+        timeframe: setup.setup_timeframe ?? setup.entry_timeframe,
+      });
+      if (!rebuilt.ok) {
+        return { status: 'rejected', reason: rebuilt.reason, attempt: args.attempt };
+      }
+      if (!sameExecutionDecision(rebuilt.decision, args.decision)) {
+        return { status: 'rejected', reason: 'composed decision does not match the persisted setup', attempt: args.attempt };
+      }
+      const decision = rebuilt.decision;
+
+      // 4. Cited risk approval: binding + approved outcome + quantity match +
+      // live reservation. The composition's OWN risk evaluation is the
+      // operative approval — it is validated here, never re-evaluated (a
+      // second evaluation would double-reserve against the same exposure).
+      const cited = await this.validateCitedDecision({
+        userId: args.userId,
+        executionProfileId: profile.id,
+        setupId: setup.setup_id,
+        decision,
+        riskDecisionId: args.riskDecisionId,
+        nowMs,
+      });
+      if (cited.kind === 'not_found') {
+        return { status: 'rejected', reason: 'risk decision was not found for this account', attempt: args.attempt };
+      }
+      if (cited.kind === 'rejected') {
+        return { status: 'rejected', reason: cited.reason, attempt: args.attempt };
+      }
+      const approval = await this.loadCitedRiskApproval(args.riskDecisionId);
+      if (!approval || approval.outcome !== 'approved') {
+        return { status: 'rejected', reason: 'cited risk decision is not an approval', attempt: args.attempt };
+      }
+      if (approval.positionSize === null || Math.abs(approval.positionSize - args.quantity) > 1e-9) {
+        return { status: 'rejected', reason: 'composed quantity does not match the cited risk approval', attempt: args.attempt };
+      }
+      const reservation = await this.deps.risk.getActiveReservation({
+        riskDecisionId: args.riskDecisionId,
+        executionProfileId: profile.id,
+        nowMs,
+      });
+      if (!reservation) {
+        return { status: 'rejected', reason: 'risk reservation lapsed before the paper fill', attempt: args.attempt };
+      }
+
+      // 5. Final safety fence with fresh reads (H5 — shared implementation).
+      // This is the closest linearization point to the fill: anything that
+      // changed after the composition's own fence is caught here.
+      const fence = await runFinalSafetyFence(
+        {
+          pool: this.pool,
+          automation: this.deps.automation,
+          killSwitches: this.deps.killSwitches,
+          authorization: b1,
+          risk: this.deps.risk,
+        },
+        {
+          userId: args.userId,
+          executionProfileId: profile.id,
+          strategyId: setup.strategy_id,
+          setupId: setup.setup_id,
+          providerSlug: 'paper',
+          environment: 'paper',
+          accountRef: null,
+          brokerServerRef: null,
+          riskDecisionId: args.riskDecisionId,
+          authorizationId: args.b1AuthorizationId,
+          nowMs,
+        },
+      );
+      if (!fence.ok) {
+        return { status: 'rejected', reason: fence.reason, attempt: args.attempt };
+      }
+
+      // 6. Instrument spec + server market price + paper simulation gates.
+      const spec = await this.loadInstrumentSpec(setup.asset_class, setup.symbol);
+      const market = await this.deps.market.latestPrice({
+        instrumentId: setup.instrument_id,
+        timeframe: decision.timeframe,
+        nowMs,
+      });
+      const provider = this.deps.provider();
+      const health = provider ? await provider.health() : null;
+      const killSwitches = await this.deps.killSwitches.anyActive({
+        userId: args.userId,
+        strategyId: decision.strategyId,
+        executionProfileId: profile.id,
+      });
+      const gate = evaluatePaperSimulationGates({
+        authenticated: true,
+        authorized: true,
+        profile: { enabled: profile.enabled, environment: profile.environment },
+        killSwitches: {
+          global: killSwitches.global,
+          user: killSwitches.user,
+          strategy: killSwitches.strategy,
+          profile: killSwitches.profile,
+        },
+        providerHealth: health
+          ? { healthy: health.healthy, configured: provider?.configured ?? false }
+          : null,
+        decision,
+        setup: { id: setup.setup_id, direction: setup.direction, state: setup.state },
+        riskDecision: {
+          outcome: approval.outcome,
+          reason: approval.reason,
+          decisionId: approval.id,
+          engineVersion: approval.engineVersion,
+          positionSize: approval.positionSize,
+          rr: approval.rr,
+          exposureWithinLimits: args.exposureWithinLimits,
+        },
+        effectiveMinRr: args.effectiveMinRr,
+        instrumentSpec: spec,
+        fillPrice: market.ok ? market.price.price : null,
+        marketPrice: market.ok
+          ? { price: market.price.price, ageMs: market.price.ageMs, thresholdMs: market.price.thresholdMs }
+          : null,
+        marketPriceError: market.ok ? null : market.reason,
+      });
+      if (!gate.passed) {
+        return { status: 'rejected', reason: gate.reason ?? 'paper simulation refused', attempt: args.attempt };
+      }
+      if (!market.ok) {
+        // Unreachable (the freshness gate precedes this), but never assume.
+        return { status: 'rejected', reason: market.reason, attempt: args.attempt };
+      }
+
+      // 7. B1 binding verification (H1): peek + exact request/context
+      // compare WITHOUT consuming. Consumption happens exactly once, at fill.
+      const side: OrderSide = decision.direction === 'long' ? 'buy' : 'sell';
+      const request: ExecutionSubmitOrderRequest = {
+        clientOrderId: args.clientOrderId,
+        idempotencyKey: args.orderIdempotencyKey,
+        authorizationId: args.b1AuthorizationId,
+        assetClass: decision.assetClass,
+        symbol: decision.symbol,
+        side,
+        orderType: 'market',
+        quantity: args.quantity,
+        requestedPrice: null,
+        stopLossPrice: decision.stopLossPrice,
+        takeProfitPrice: decision.takeProfitPrice,
+      };
+      const peeked = b1.peekAuthorization(args.b1AuthorizationId);
+      if (!peeked || !sameB1Binding(peeked, request, args.context)) {
+        return {
+          status: 'rejected',
+          reason: peeked
+            ? 'composed paper request does not match its B1 authorization'
+            : 'B1 authorization was revoked or expired before the paper fill',
+          attempt: args.attempt,
+        };
+      }
+
+      // 8. Existing-order check + attempt re-derivation (TOCTOU backstop for
+      // the pre-mint derivation; unique constraints serialize twins).
+      const presented = await this.pool.query<OrderRow>(
+        'SELECT * FROM execution_orders WHERE client_order_id = $1',
+        [args.clientOrderId],
+      );
+      const presentedOrder = presented.rows[0];
+      if (presentedOrder && presentedOrder.status !== 'failed' && presentedOrder.status !== 'rejected') {
+        // A live order already holds this identity: replay it WITHOUT
+        // consuming the B1 authorization (no second mutation is possible —
+        // reuse of the same authorization replays identically).
+        return {
+          status: 'replayed',
+          providerOrderId: presentedOrder.id,
+          orderId: presentedOrder.id,
+          attempt: args.attempt,
+        };
+      }
+      const rederived = await this.deriveComposedEntryIdentity({
+        userId: args.userId,
+        executionProfileId: profile.id,
+        setupId: setup.setup_id,
+        baseHash: args.baseHash,
+      });
+      if (
+        rederived.clientOrderId !== args.clientOrderId ||
+        rederived.orderIdempotencyKey !== args.orderIdempotencyKey ||
+        rederived.attempt !== args.attempt
+      ) {
+        return {
+          status: 'rejected',
+          reason: 'stale composed identity: the paper attempt index moved; derive a fresh identity',
+          attempt: args.attempt,
+        };
+      }
+
+      // 9. Consume the B1 authorization exactly once, then fill. A
+      // consumption failure fails closed before any financial state.
+      try {
+        b1.consumeAuthorization(args.b1AuthorizationId, request, args.context);
+      } catch (err) {
+        return {
+          status: 'rejected',
+          reason: err instanceof Error ? err.message : 'B1 authorization consumption failed',
+          attempt: args.attempt,
+        };
+      }
+      const price = market.price;
+      const bundle: PaperAuthorization = {
+        // Internal fill bundle, constructed from verified inputs — never
+        // minted into the paper authorization map (single B1 authority).
+        id: args.b1AuthorizationId,
+        userId: args.userId,
+        executionProfileId: profile.id,
+        setupId: setup.setup_id,
+        instrumentId: setup.instrument_id,
+        assetClass: setup.asset_class as AssetClass,
+        symbol: setup.symbol,
+        side,
+        kind: 'entry',
+        quantity: args.quantity,
+        clientOrderId: args.clientOrderId,
+        idempotencyKey: args.orderIdempotencyKey,
+        decision,
+        riskDecisionId: args.riskDecisionId,
+        engineVersion: approval.engineVersion,
+        positionId: null,
+        positionKey: args.baseHash,
+        referencePrice: price.price,
+        referencePriceMs: price.timeMs,
+        spec: spec as InstrumentRiskSpec,
+        timeframe: decision.timeframe,
+        createdMs: nowMs,
+        consumed: false,
+      };
+      let outcome: ExecutionSubmitOrderOutcome;
+      try {
+        outcome = await this.runFillTransaction(bundle);
+      } catch (err) {
+        if (isExecutionProviderError(err)) {
+          return { status: 'rejected', reason: err.message, attempt: args.attempt };
+        }
+        if (err instanceof PaperIntegrityError) {
+          return {
+            status: 'rejected',
+            reason: `simulated execution failed an integrity check (${err.findings.join(', ')})`,
+            attempt: args.attempt,
+          };
+        }
+        throw err;
+      }
+      if (outcome.status !== 'accepted') {
+        return { status: 'rejected', reason: 'paper order was not filled', attempt: args.attempt };
+      }
+      const receipt = outcome.receipt as Record<string, unknown> | undefined;
+      if (receipt?.replay === true) {
+        // A concurrent twin filled between step 8 and the fill transaction:
+        // the shared pipeline serialized onto its order — replay, no double
+        // fill (the B1 authorization was consumed, but it authorized exactly
+        // this one mutation identity, which now exists exactly once).
+        return {
+          status: 'replayed',
+          providerOrderId: outcome.providerOrderId ?? '',
+          orderId: outcome.providerOrderId ?? '',
+          attempt: args.attempt,
+        };
+      }
+      return {
+        status: 'filled',
+        providerOrderId: outcome.providerOrderId ?? '',
+        orderId: outcome.providerOrderId ?? '',
+        filledQuantity: outcome.filledQuantity ?? args.quantity,
+        averagePrice: outcome.averagePrice ?? null,
+        attempt: args.attempt,
+      };
+    } finally {
+      await release();
+    }
+  }
+
+  /**
+   * Load the cited risk approval row for the composed entry. The binding
+   * (owner/profile/setup/engine/prices) is proven by `validateCitedDecision`;
+   * this loader additionally proves the outcome is an approval and returns
+   * the approved economics the fill must match.
+   */
+  private async loadCitedRiskApproval(riskDecisionId: string): Promise<{
+    id: string;
+    outcome: 'approved' | 'rejected';
+    reason: string;
+    engineVersion: string;
+    positionSize: number | null;
+    rr: number | null;
+  } | null> {
+    const res = await this.pool.query<{
+      id: string;
+      outcome: 'approved' | 'rejected';
+      reason: string;
+      engine_version: string;
+      position_size: string | null;
+      rr: string | null;
+    }>(
+      `SELECT id, outcome, reason, engine_version, position_size, rr
+         FROM risk_decisions WHERE id = $1`,
+      [riskDecisionId],
+    );
+    const row = res.rows[0];
+    if (!row) return null;
+    return {
+      id: row.id,
+      outcome: row.outcome,
+      reason: row.reason,
+      engineVersion: row.engine_version,
+      positionSize: row.position_size === null ? null : Number(row.position_size),
+      rr: row.rr === null ? null : Number(row.rr),
+    };
   }
 
   private async insertOrder(
@@ -2378,6 +2961,120 @@ const POSITION_QUERY = `
 
 function hashIdentity(identity: string): string {
   return createHash('sha256').update(identity, 'utf8').digest('hex');
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const IDENTITY_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+function isIdentityHash(value: unknown): value is string {
+  return typeof value === 'string' && IDENTITY_HASH_PATTERN.test(value);
+}
+
+/**
+ * B1 (M6) — deterministic paper order identity for a composed attempt.
+ * Mirrors the direct flow's scheme exactly: attempt 1 uses the canonical
+ * entry identity; retries use the `-rN` suffix with the same hash input.
+ */
+function composedEntryIdsForAttempt(
+  baseHash: string,
+  attempt: number,
+): { clientOrderId: string; orderIdempotencyKey: string } {
+  if (attempt === 1) {
+    return {
+      clientOrderId: paperClientOrderId(baseHash, 'entry'),
+      orderIdempotencyKey: orderIdempotencyKey(baseHash, 'entry', 1),
+    };
+  }
+  return {
+    clientOrderId: `ve-${baseHash.slice(0, 20)}-r${attempt}`,
+    orderIdempotencyKey: orderIdempotencyKey(baseHash, 'entry', attempt),
+  };
+}
+
+/**
+ * B1 (M6) — field-for-field decision comparison for the composed entry.
+ * The composition's presented decision must equal the paper service's own
+ * server-built rebuild from the persisted setup; any drift fails closed.
+ */
+function sameExecutionDecision(a: ExecutionDecisionInput, b: ExecutionDecisionInput): boolean {
+  return (
+    a.strategyId === b.strategyId &&
+    a.strategyVersionId === b.strategyVersionId &&
+    a.setupId === b.setupId &&
+    a.action === b.action &&
+    a.assetClass === b.assetClass &&
+    a.symbol === b.symbol &&
+    a.timeframe === b.timeframe &&
+    a.direction === b.direction &&
+    a.entryPrice === b.entryPrice &&
+    a.stopLossPrice === b.stopLossPrice &&
+    a.takeProfitPrice === b.takeProfitPrice &&
+    a.expectedRr === b.expectedRr &&
+    a.qualityScore === b.qualityScore &&
+    a.minQualityScore === b.minQualityScore &&
+    a.asOfMs === b.asOfMs
+  );
+}
+
+/**
+ * B1 (M6/H1) — verify-only B1 binding comparison for the composed entry:
+ * the presented paper request and the expected execution context must match
+ * the peeked B1 authorization exactly (same rule `consumeAuthorization`
+ * enforces, without consuming). Replays verify but never consume.
+ */
+function sameB1Binding(
+  peeked: {
+    clientOrderId: string;
+    idempotencyKey: string;
+    symbol: string;
+    side: 'buy' | 'sell';
+    quantity: number;
+    assetClass: string;
+    orderType: string;
+    stopLossPrice: number | null;
+    takeProfitPrice: number | null;
+    requestedPrice: number | null;
+    userId: string;
+    executionProfileId: string;
+    providerSlug: string;
+    environment: 'paper' | 'demo';
+    accountRef: string | null;
+    brokerServerRef: string | null;
+    setupId: string | null;
+    riskDecisionId: string | null;
+  },
+  request: ExecutionSubmitOrderRequest,
+  context: AuthorizationExecutionContext,
+): boolean {
+  const priceMatches = (x: number | null, y: number | null): boolean => {
+    if (x === null && y === null) return true;
+    if (x === null || y === null) return false;
+    return Math.abs(x - y) <= 1e-9;
+  };
+  return (
+    peeked.clientOrderId === request.clientOrderId &&
+    peeked.idempotencyKey === request.idempotencyKey &&
+    peeked.symbol === request.symbol &&
+    peeked.side === request.side &&
+    Math.abs(peeked.quantity - request.quantity) <= 1e-9 &&
+    peeked.assetClass === request.assetClass &&
+    peeked.orderType === request.orderType &&
+    priceMatches(peeked.stopLossPrice, request.stopLossPrice ?? null) &&
+    priceMatches(peeked.takeProfitPrice, request.takeProfitPrice ?? null) &&
+    priceMatches(peeked.requestedPrice, request.requestedPrice ?? null) &&
+    peeked.userId === context.userId &&
+    peeked.executionProfileId === context.executionProfileId &&
+    peeked.providerSlug === context.providerSlug &&
+    peeked.environment === context.environment &&
+    peeked.accountRef === context.accountRef &&
+    peeked.brokerServerRef === context.brokerServerRef &&
+    peeked.setupId === context.setupId &&
+    peeked.riskDecisionId === context.riskDecisionId
+  );
 }
 
 function orderIdempotencyKey(hash: string, kind: PaperOrderKind, attempt: number): string {
