@@ -175,6 +175,18 @@ export {
   type SubmitOnceResult,
 } from './provider-mutations.js';
 
+/* B1 — authorization/composition layer (authorization + composition) */
+export {
+  ExecutionAuthorizationService,
+  type ExecutionAuthorization,
+  type ExecutionAuthorizationServiceOptions,
+} from './authorization.js';
+export {
+  ExecutionCompositionService,
+  type ExecutionCompositionInput,
+  type ExecutionCompositionResult,
+} from './composition.js';
+
 /* B2 — the single canonical provider-submit boundary.
  * Wires the existing Gate 9 ledger (prepareSubmit → SubmitBarrier →
  * executeSubmit → consumeSubmitBarrier → provider call) onto the

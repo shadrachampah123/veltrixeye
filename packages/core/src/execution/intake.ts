@@ -206,7 +206,7 @@ export class ExecutionIntakeService {
       executionProfileId: profile.id,
     });
     const provider = this.deps.providers.get(profile.provider_slug);
-    const providerHealth = provider ? await provider.health() : null;
+    const rawHealth = provider ? await provider.health().catch(() => null) : null;
 
     // M8.2: the risk engine is the ONLY source of a risk decision. The
     // result is persisted under an advisory lock; a client boolean is never
@@ -217,6 +217,47 @@ export class ExecutionIntakeService {
       decision,
       reserveOnApprove: true,
     });
+
+    // B1 — server-resolved broker/account authorization (not client claims).
+    // Paper is always authorized (internal). For broker, provider must exist
+    // and describe() must match the persisted profile binding exactly.
+    let brokerAuthorized = false;
+    let accountAuthorized = false;
+    if (provider) {
+      try {
+        const described = provider.describe() as Record<string, unknown>;
+        const describedId = typeof described.id === 'string' ? described.id : null;
+        const describedEnv = typeof described.environment === 'string' ? described.environment : null;
+        const describedAccount = typeof described.accountRef === 'string' ? described.accountRef : null;
+        const describedServer = typeof described.server === 'string' ? described.server : null;
+
+        // For paper, always authorized. For broker demo, require exact binding.
+        if (profile.provider_slug === 'paper') {
+          brokerAuthorized = true;
+          accountAuthorized = true;
+        } else {
+          // Need to fetch full profile row with account_ref/broker_server for binding check
+          const fullProfile = await this.pool.query<{ account_ref: string | null; broker_server: string | null }>(
+            `SELECT account_ref, broker_server FROM execution_profiles WHERE id = $1`,
+            [profile.id],
+          );
+          const persistedAccount = fullProfile.rows[0]?.account_ref ?? null;
+          const persistedServer = fullProfile.rows[0]?.broker_server ?? null;
+          const slugMatches = describedId === profile.provider_slug;
+          const envMatches = describedEnv === profile.environment;
+          const accountMatches = (describedAccount ?? null) === (persistedAccount ?? null);
+          const serverMatches = (describedServer ?? null) === (persistedServer ?? null);
+          brokerAuthorized = Boolean(slugMatches && envMatches && serverMatches);
+          accountAuthorized = Boolean(slugMatches && envMatches && accountMatches && serverMatches);
+        }
+      } catch {
+        brokerAuthorized = false;
+        accountAuthorized = false;
+      }
+    } else if (profile.provider_slug === 'paper') {
+      brokerAuthorized = true;
+      accountAuthorized = true;
+    }
 
     const gate = evaluateExecutionGates({
       authenticated: true, // enforced by the API layer before this service runs
@@ -246,10 +287,10 @@ export class ExecutionIntakeService {
       },
       minRr: risk.effectiveMinRr,
       exposureWithinLimits: risk.exposureWithinLimits,
-      providerHealth,
-      environmentSafe: profile.environment === 'paper',
-      brokerAuthorized: profile.provider_slug === 'paper',
-      accountAuthorized: profile.provider_slug === 'paper',
+      providerHealth: rawHealth ? { healthy: Boolean((rawHealth as { healthy?: boolean }).healthy) } : null,
+      environmentSafe: profile.environment !== 'live' && (profile.environment === 'paper' || profile.environment === 'demo'),
+      brokerAuthorized,
+      accountAuthorized,
     });
 
     const accepted = gate.passed;

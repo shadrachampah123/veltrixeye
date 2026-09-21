@@ -346,7 +346,7 @@ describe('m8.1 safety gates (contract level)', () => {
       },
       {
         name: 'environment not paper',
-        override: { profile: { enabled: true, environment: 'demo' } },
+        override: { profile: { enabled: true, environment: 'live' as any } },
         gate: 'profile_enabled',
       },
       {
