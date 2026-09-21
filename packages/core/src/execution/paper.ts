@@ -87,8 +87,12 @@ export function createPaperExecutionProvider(options?: {
 
     describe(): Record<string, unknown> {
       // Operator-safe view: paper holds no credential by design.
+      // `environment` is declared so the canonical submit boundary can bind
+      // the durable authorization to this provider instance (B2): paper is
+      // always `paper`; it declares no `accountRef` and no broker `server`.
       return {
         id: PAPER_EXECUTION_PROVIDER_ID,
+        environment: 'paper',
         modes: capabilities.modes,
         orderTypes: capabilities.orderTypes,
         configured: Boolean(simulator),

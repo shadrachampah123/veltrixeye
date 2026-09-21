@@ -221,8 +221,20 @@ export interface ExecutionSubmitOrderRequest {
 }
 
 export interface ExecutionSubmitOrderOutcome {
-  providerOrderId: string;
-  status: 'accepted' | 'rejected';
+  /**
+   * The provider-side order identity. `null` when the provider never produced
+   * one (e.g. an explicit rejection without a ticket, or an outcome whose
+   * provider state could not be established). Callers must never substitute an
+   * internal identifier (such as an intent id) for this field.
+   */
+  providerOrderId: string | null;
+  /**
+   * `uncertain` is part of the closed vocabulary: a provider outcome that could
+   * not be durably established is NEVER projected as `accepted` (nor laundered
+   * into `rejected`). Callers must treat `uncertain` as "unknown — reconciliation
+   * required", never as a fill.
+   */
+  status: 'accepted' | 'rejected' | 'uncertain';
   filledQuantity?: number;
   averagePrice?: number | null;
   /** Provider receipt, already scrubbed of anything sensitive. */

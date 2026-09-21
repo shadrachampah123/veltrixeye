@@ -17,6 +17,60 @@ import {
   type ExecutionSubmitOrderRequest,
   type OrderType,
 } from '@veltrixeye/contracts';
+import { canonicalMutationRequestHash, type SubmitBarrier } from './provider-mutations.js';
+
+/**
+ * B2 — Gate 9 barrier precondition for the M8.4 boundary.
+ *
+ * When the production composition wires `createMT5ExecutionProvider` with a
+ * `gate9.consumeAuthorization` predicate, the legacy `submitOrder` boundary
+ * refuses every request that has not produced a fresh, single-use Gate 9
+ * `SubmitBarrier`. The predicate runs BEFORE any pre-flight check, BEFORE the
+ * health call, BEFORE the symbol lookup, BEFORE the idempotency lookup and
+ * BEFORE `transport.submitOrder`. Without it, the transport call is
+ * unreachable.
+ *
+ * The `SubmitBarrier` shape is exactly the Gate 9 barrier
+ * (`ProviderMutationLedger.prepareSubmit()` mints and `executeSubmit()`
+ * consumes). The predicate is the composition-side adapter that returns the
+ * consumed barrier; returning `null` (or throwing) refuses the request.
+ *
+ * Existing M8.4 unit tests pass without this option and continue to exercise
+ * the legacy pre-flight behaviour. Production wiring (a separate, separately
+ * reviewed step) supplies it.
+ */
+export interface Gate9BarrierPredicate {
+  /**
+   * Returns the consumed Gate 9 `SubmitBarrier` if and only if the canonical
+   * submit dispatcher has durably consumed one for THIS exact mutation
+   * identity (client order id + idempotency key + canonical request hash)
+   * and it has not already been presented. Returns `null` to refuse; throws
+   * to refuse.
+   *
+   * Compositions should wire `createSubmitBarrierHandoff()` (B2): the
+   * dispatcher arms the handoff immediately after the ledger's single-use
+   * CAS commits, and this predicate presents the barrier at most once. A
+   * predicate that merely returns a stored barrier object is insufficient:
+   * a consumed barrier must never authorize a second mutation.
+   */
+  consumeAuthorization(request: ExecutionSubmitOrderRequest): SubmitBarrier | null | Promise<SubmitBarrier | null>;
+}
+
+export interface MT5ProviderOptions {
+  /**
+   * When supplied, the legacy `submitOrder` boundary refuses every request
+   * for which `gate9.consumeAuthorization` does not return a Gate 9
+   * `SubmitBarrier` that (a) was durably consumed by the canonical
+   * dispatcher for THIS exact mutation identity, and (b) has not already
+   * been presented to this provider instance. The check is consulted FIRST
+   * (before identity, readiness, symbol, idempotency and transport
+   * validation), re-verifies the barrier's identity against the request, and
+   * refuses a replayed presentation. The legacy direct call to
+   * `transport.submitOrder` cannot bypass it. Wire
+   * `createSubmitBarrierHandoff()` from the canonical boundary.
+   */
+  readonly gate9?: Gate9BarrierPredicate;
+}
 import {
   bridgeOrderIdentityError,
   bridgeQuoteError,
@@ -313,9 +367,16 @@ function normalizePosition(row: MT5PositionSnapshot, canonical: string): Executi
   };
 }
 
-export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5ProviderConfig): ExecutionProvider {
+export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5ProviderConfig, options: MT5ProviderOptions = {}): ExecutionProvider {
   const capabilities: ExecutionProviderCapabilities = { modes: ['demo'], orderTypes: ['market', 'limit', 'stop'] };
   const now = config.now ?? Date.now;
+  // B2 remediation (F1): a barrier presented to this provider instance
+  // authorizes exactly one submit. The set is in-process presentation state —
+  // it authorizes nothing by itself; the durable single-use guarantee remains
+  // the Gate 9 ledger's CAS. A barrier already presented here (same mutation
+  // identity + request hash) is refused, so a consumed barrier can never
+  // authorize a second mutation through this boundary.
+  const presentedBarriers = new Set<string>();
   const canonicalFor = (providerSymbol: string) => [...config.symbols].find(([, value]) => value === providerSymbol)?.[0] ?? providerSymbol;
   const policy = { maxQuoteAgeMs: config.maxQuoteAgeMs, clockSkewMs: config.clockSkewMs };
   const requireAvailable = async (): Promise<void> => {
@@ -425,6 +486,86 @@ export function createMT5ExecutionProvider(transport: MT5Transport, config: MT5P
       return rows;
     },
     async submitOrder(request: ExecutionSubmitOrderRequest): Promise<ExecutionSubmitOrderOutcome> {
+      // 0. B2 — Gate 9 barrier precondition. When the production composition
+      //    has supplied a `gate9.consumeAuthorization` predicate, the legacy
+      //    direct boundary refuses every request that has not produced a
+      //    freshly-consumed Gate 9 `SubmitBarrier`. The check is intentionally
+      //    the FIRST thing in this method — before identity, before readiness,
+      //    before the symbol lookup, before the idempotency lookup, and before
+      //    `transport.submitOrder`. Without a barrier, no transport call is
+      //    reachable through this entry point.
+      //
+      //    The predicate is the canonical dispatcher's adapter over
+      //    `ProviderMutationLedger.executeSubmit(barrier, …)`. The barrier it
+      //    returns has already been consumed by the ledger's M2 single-use CAS
+      //    and cannot authorize a second provider call (Gate 9 barrier
+      //    semantics; see `m10-gate9-barrier-consumption.test.ts`). The check
+      //    is fail-closed: a thrown predicate refuses the request.
+      if (options.gate9) {
+        // 0a. Present a barrier: the predicate may return one only if the
+        //     canonical dispatcher has durably consumed it (F1).
+        let barrier: SubmitBarrier | null = null;
+        try {
+          barrier = await options.gate9.consumeAuthorization(request);
+        } catch {
+          throw new ExecutionProviderError(
+            'unavailable',
+            'MT5 submit requires a Gate 9 submit barrier; none was provided',
+          );
+        }
+        if (!barrier || barrier.providerCallPermitted !== true) {
+          throw new ExecutionProviderError(
+            'unavailable',
+            'MT5 submit requires a Gate 9 submit barrier; none was provided',
+          );
+        }
+        // 0b. B2 remediation (F1): the barrier object is untrusted input.
+        //     Re-derive the canonical identity of THIS request and refuse any
+        //     barrier that is not for this exact mutation — same client order
+        //     identity, same idempotency identity, same exact request hash.
+        //     A barrier minted for a different mutation can never pass here.
+        const clientId = typeof request?.clientOrderId === 'string' ? request.clientOrderId : null;
+        const idemKey = typeof request?.idempotencyKey === 'string' ? request.idempotencyKey : null;
+        if (!clientId || !idemKey || barrier.clientOrderId !== clientId || barrier.idempotencyKey !== idemKey) {
+          throw new ExecutionProviderError(
+            'unavailable',
+            'MT5 submit barrier does not match this mutation identity; no provider call is permitted',
+          );
+        }
+        let requestHash: string;
+        try {
+          requestHash = canonicalMutationRequestHash({
+            clientOrderId: clientId,
+            idempotencyKey: idemKey,
+            canonicalRequest: request,
+          });
+        } catch {
+          throw new ExecutionProviderError(
+            'unavailable',
+            'MT5 submit barrier could not be verified against this request; no provider call is permitted',
+          );
+        }
+        if (barrier.requestHash !== requestHash) {
+          throw new ExecutionProviderError(
+            'unavailable',
+            'MT5 submit barrier does not match this request; no provider call is permitted',
+          );
+        }
+        // 0c. B2 remediation (F1): single-use per provider instance. Once a
+        //     barrier has authorized a submit through this boundary, it can
+        //     never authorize another — including a replay of the same
+        //     identity. A retry requires a fresh durable barrier through the
+        //     canonical dispatcher (and, per Gate 9 M3, a fresh mutation
+        //     identity under fresh authorization).
+        const presentationKey = `${clientId}\u0000${idemKey}\u0000${requestHash}`;
+        if (presentedBarriers.has(presentationKey)) {
+          throw new ExecutionProviderError(
+            'unavailable',
+            'MT5 submit barrier was already presented to this provider; no second mutation is authorized',
+          );
+        }
+        presentedBarriers.add(presentationKey);
+      }
       // 1. §11 (B2): the durable client order identity is the FIRST check,
       //    ahead of the health call, the symbol lookup and the idempotency
       //    lookup. A malformed identity therefore cannot produce a provider

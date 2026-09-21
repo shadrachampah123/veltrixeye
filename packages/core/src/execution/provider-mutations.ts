@@ -195,6 +195,25 @@ export interface MutationReservationRecord {
   version: number;
 }
 
+/**
+ * Read-only projection of a durable provider receipt (`execution_provider_receipts`).
+ * Added for the B2 canonical submit boundary: a duplicate resolution that
+ * resolves onto a `confirmed` / `rejected` intent reports the REAL provider
+ * order id from this row — never an internal intent id. `providerOrderId` is
+ * `null` whenever the provider never produced one (e.g. a rejection without a
+ * ticket); callers must not substitute another identifier.
+ */
+export interface ProviderReceiptRecord {
+  id: string;
+  intentId: string;
+  providerOrderId: string | null;
+  outcome: ProviderMutationOutcome;
+  statusUncertain: boolean;
+  identityVerified: boolean;
+  evidence: string | null;
+  observedAt: Date;
+}
+
 /** The durable proof that the pre-call barrier committed. */
 export interface SubmitBarrier {
   intentId: string;
@@ -491,6 +510,42 @@ export class ProviderMutationLedger {
       [intentId],
     );
     return rows[0] ? toReservationRecord(rows[0]) : null;
+  }
+
+  /**
+   * Durable receipt for an intent (B2). Read-only: no state changes. Returns
+   * the most recent receipt row for the intent, or `null` when none exists
+   * (e.g. the outcome was never persisted durably).
+   */
+  async getReceipt(intentId: string): Promise<ProviderReceiptRecord | null> {
+    const { rows } = await this.pool.query<{
+      id: string;
+      intent_id: string;
+      provider_order_id: string | null;
+      outcome: ProviderMutationOutcome;
+      status_uncertain: boolean;
+      identity_verified: boolean;
+      evidence: string | null;
+      observed_at: Date;
+    }>(
+      `SELECT id, intent_id, provider_order_id, outcome, status_uncertain, identity_verified, evidence, observed_at
+         FROM execution_provider_receipts
+        WHERE intent_id = $1
+        ORDER BY observed_at DESC
+        LIMIT 1`,
+      [intentId],
+    );
+    if (!rows[0]) return null;
+    return {
+      id: rows[0].id,
+      intentId: rows[0].intent_id,
+      providerOrderId: rows[0].provider_order_id,
+      outcome: rows[0].outcome,
+      statusUncertain: rows[0].status_uncertain,
+      identityVerified: rows[0].identity_verified,
+      evidence: rows[0].evidence,
+      observedAt: rows[0].observed_at,
+    };
   }
 
   /* ---------------------------------------------------------------------- */

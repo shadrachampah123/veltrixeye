@@ -589,7 +589,10 @@ export class PaperExecutionService {
       }
     }
 
-    if (!outcome || outcome.status === 'rejected') {
+    // Fail closed on anything that is not a verified acceptance: a rejected
+    // order is refused, and an `uncertain` outcome (unknown provider state)
+    // must never be treated as a fill.
+    if (!outcome || outcome.status !== 'accepted') {
       return this.refuse({
         userId: args.userId,
         profileId: profile.id,
