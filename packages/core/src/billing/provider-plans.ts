@@ -414,7 +414,11 @@ export class BillingProviderPlanStore {
   /** The active epoch for a key, or a typed failure. Never a fallback. */
   async findActive(key: BillingProviderPlanKey): Promise<BillingProviderPlan> {
     const { rows } = await this.db.query(
-      `SELECT * FROM billing_provider_plans
+      `SELECT id, provider, mode, catalogue_plan, billing_interval, payment_currency,
+              payment_amount_minor, payment_amount_exponent, provider_plan_id,
+              provider_plan_reference, fx_rate_version_id, pricing_policy_version,
+              catalogue_version, status, valid_from, retired_at, retired_reason
+         FROM billing_provider_plans
         WHERE provider = $1 AND mode = $2 AND catalogue_plan = $3
           AND billing_interval = $4 AND payment_currency = $5
         ORDER BY valid_from DESC`,
