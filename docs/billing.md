@@ -11,11 +11,15 @@
 > production activation and no Starter selling. `GET /api/billing/me` remains
 > the only billing route.
 >
-> **Account capabilities are NOT verified.** Whether this account can transact
-> in **GHS** (AC1) or run **GHS recurring** subscriptions (AC2) is unverified, so
-> no plan has been provisioned with the provider, no recurring end-to-end run
-> has happened (AC5/AC7) and this repository makes no claim about either. See
-> [paystack-provider-contract.md](./paystack-provider-contract.md) §7.
+> **Account capabilities are only partially verified.** Whether this account
+> can transact in **GHS** (AC1) or run **GHS recurring** subscriptions (AC2) is
+> unverified, and no recurring end-to-end run has happened (AC7). The account's
+> **GHS test-plan capability** has since been verified from operator-reported
+> Dashboard evidence (a GHS 2.00 monthly test plan — capability evidence only,
+> never an epoch), but none of the four production-shaped Pro/Elite ×
+> monthly/annual sandbox plans exist yet, so AC5 is not fully cleared and no
+> plan has been registered locally. See
+> [paystack-provider-contract.md](./paystack-provider-contract.md) §7 and §7.1.
 >
 > PR1 (merged, `ab27948`) established the authoritative commercial catalogue;
 > PR2 (merged) added the canonical billing contracts, the provider seam and
@@ -333,7 +337,7 @@ in [paystack-provider-contract.md](./paystack-provider-contract.md).
 
 | Item | Why |
 | --- | --- |
-| Provisioning Pro/Elite sandbox plans | **AC5** unverified — no plan IDs exist yet, so nothing may be sold |
+| Provisioning Pro/Elite sandbox plans | **AC5** partially verified — GHS test-plan **capability** is confirmed (contract §7.1), but the four production-shaped plan IDs do not exist yet, so nothing may be sold. The GHS 2.00 test plan is capability evidence only and is never registered |
 | GHS recurring end-to-end | **AC7** unverified |
 | Checkout route / UI | Out of scope; the adapter's `initializeCheckout` is unreachable from HTTP |
 | Webhook receiver + signature processing | Out of scope. `normalizeEvent` is unimplemented because event **payload shapes** are not verified — documented event names are not enough to guess them |
@@ -457,8 +461,8 @@ records the gap instead of expanding into entitlement work.
   `billing_provider_events`; migration 0032 adds the FX/plan/snapshot state and
   the immutable subscription price lock. Every one of those columns is `NULL` or
   at its inert default on every existing row, and **no route, worker or client
-  can write them yet** — the adapter is unreachable from HTTP, and plan
-  provisioning is blocked by AC5.
+  can write them yet** — the adapter is unreachable from HTTP, and no plan
+  has been provisioned (AC5 capability verified, four plan IDs pending).
 - **FX publishing is an operator action, not a feature.** `billing_fx_rate_versions`
   is written by the ops path that lands in a later PR; PR3 ships the authority,
   the resolution rules and the tests, not a rate feed and not an admin endpoint.
@@ -478,8 +482,14 @@ Roughly in order; each is its own PR and may be re-scoped.
 3. ~~**USD→GHS pricing + FX authority**~~ — **delivered by PR3** (migration
    `0032`, `fx-rate-versions.ts`, `pricing.ts`, `provider-plans.ts`).
 4. **Plan provisioning** — Pro/Elite × monthly/annual sandbox plans, registered
-   as local epochs. **Blocked by AC5**: do not provision until the account's GHS
-   plan capability is verified.
+   as local epochs. **GHS plan capability verified** (contract §7.1), so this
+   milestone may begin; it is **not started**. Prerequisites before any of the
+   four plans is created: (a) a published `billing_fx_rate_versions` row, since
+   every plan amount is derived from the catalogue USD price through that
+   version — no FX version, no plan amount; (b) a decided provisioning path
+   that keeps `PUT`/`POST /plan` out of `packages/providers/paystack` (the
+   source assertion forbids plan mutation there). The GHS 2.00 test plan is
+   capability evidence only and is **never** registered as an epoch.
 5. **Checkout / payment initialization route** — server-side initialization
    behind `initializeCheckout`, plus its route and UI. Not before AC1/AC2/AC5/AC7.
 6. **Webhook receiver + security** — signature verification
