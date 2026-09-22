@@ -118,11 +118,12 @@ amount when the epoch is registered**:
 
 #### Implementation boundary — what D-9 does not ship yet
 
-- The **epoch-derived pricing entry point is a later core implementation PR.**
-  D-9 is the decision; the code that derives a plan-bound snapshot from an
-  active epoch does not exist yet.
-- Until it does, the existing plan-bound checkout **fails closed** rather than
-  silently repricing an old epoch: no active epoch ⇒ `plan_not_registered`; an
+- The **epoch-derived pricing entry point is `priceFromProviderPlanEpoch`**
+  (`packages/core/src/billing/pricing.ts`). D-9 is the decision; that function
+  is the implementation: it derives a plan-bound snapshot from an active epoch
+  without re-rating it.
+- Plan-bound checkout **fails closed** rather than silently repricing an old
+  epoch: no active epoch ⇒ `plan_not_registered`; an
   epoch that does not authorize the requested amount exactly ⇒ `plan_mismatch`
   (`assertProviderPlanMatches`). A refusal is the intended behaviour here, not a
   gap to be worked around.
@@ -513,12 +514,14 @@ while everything below remains true at the **product** level:
   `billing_pricing_snapshots` likewise have no writer wired to a route; the FX
   versions are published by an operator/ops path (a later PR), never by a client
   or a market feed.
-- **No epoch-derived pricing entry point.** Nothing derives a plan-bound pricing
-  snapshot from an active `billing_provider_plans` epoch yet (D-9): a plan-bound
+- **No epoch-derived pricing callers yet.** `priceFromProviderPlanEpoch`
+  (`packages/core/src/billing/pricing.ts`) derives a plan-bound pricing
+  snapshot from an active `billing_provider_plans` epoch (D-9), and a plan-bound
   checkout **fails closed** (`plan_not_registered` / `plan_mismatch`) rather
-  than silently repricing an old epoch. No epoch has been registered, so there
-  is nothing to derive from — and the 15-minute freshness rule (D-3) is a rule
-  about *new* pricing instants, not about an epoch already registered.
+  than silently repricing an old epoch. No epoch has been registered and no
+  route calls the entry point yet, so there is nothing to derive from — and the
+  15-minute freshness rule (D-3) is a rule about *new* pricing instants, not
+  about an epoch already registered.
 - **No billing UI and no pricing UI change** (`apps/web` is untouched; the plan
   comparison still renders the PR1 catalogue).
 - **No notification change** (M9.1/M9.2 untouched).

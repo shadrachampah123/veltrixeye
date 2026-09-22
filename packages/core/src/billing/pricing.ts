@@ -14,8 +14,15 @@ import { BILLING_CATALOGUE_VERSION, cataloguePriceMinor, unmappedCommercialPlans
 import {
   BILLING_FX_POLICY,
   BILLING_PRICING_POLICY_VERSION,
+  parseFxRateVersion,
+  toBillingFxSnapshot,
   type BillingFxPolicy,
 } from './fx-rate-versions.js';
+import {
+  BillingProviderPlanError,
+  assertProviderPlanRetirable,
+  parseProviderPlan,
+} from './provider-plans.js';
 
 /**
  * Billing PR3 — the pure USD→payment-currency pricing boundary.
@@ -348,6 +355,151 @@ export function isPricingSnapshotQuotable(snapshot: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Epoch-derived pricing (D-9)                                                */
+/* -------------------------------------------------------------------------- */
+
+export interface PriceFromProviderPlanEpochInput {
+  /**
+   * The locally AUTHORIZED provider-plan epoch to derive from. Validated
+   * internally (`parseProviderPlan`): anything this build does not fully
+   * understand is refused, and a retired epoch never authorizes a new snapshot.
+   */
+  epoch: unknown;
+  /**
+   * The FX rate version the epoch pins (`epoch.fxRateVersionId`). Validated
+   * internally (`parseFxRateVersion`); its facts become the snapshot's
+   * disclosed FX facts. It is NOT required to be fresh (D-9): an epoch whose
+   * FX version is hours old is still valid — what is invalid is deriving a
+   * NEW amount from it, which this function never does.
+   */
+  fxVersion: unknown;
+  /**
+   * The instant the snapshot is recorded at (injected — nothing here reads a
+   * clock). Carried as `computedAt` only: freshness is deliberately NOT
+   * evaluated (D-9). A stale rate is never priced from because no rate is
+   * priced from here at all — the epoch's frozen amount is reused verbatim.
+   */
+  asOf: Date;
+  /** Our own reference for the intended purchase, when one exists. */
+  providerReference?: string | null;
+}
+
+/**
+ * DERIVE A PLAN-BOUND PRICING SNAPSHOT FROM THE ACTIVE PROVIDER-PLAN EPOCH
+ * (D-9) — the epoch-derived pricing entry point.
+ *
+ * A plan-bound checkout does not price from a live rate. It reuses the GHS
+ * amount the active epoch froze at registration, together with the epoch's FX
+ * facts (the rate, version and time the epoch was registered at), the epoch's
+ * provider plan identifier and the epoch's pricing-policy version. The
+ * commercial USD amount comes from the catalogue (D-5) and from nowhere else.
+ *
+ * What is checked (all deterministic, all from the inputs themselves):
+ *  - the epoch is fully understood (`parseProviderPlan`) and `active` — a
+ *    retired epoch is history and never authorizes a new snapshot;
+ *  - the FX version is fully understood (`parseFxRateVersion`) and IS the
+ *    version the epoch pins — any other version is a mismatch, never a
+ *    substitute;
+ *  - the plan is sellable and the catalogue carries a positive integer amount
+ *    for it (D-5);
+ *  - the produced snapshot satisfies the canonical contract AND the arithmetic
+ *    identity (`verifyPricingSnapshot`): the epoch's frozen amount must equal
+ *    `half_up(catalogueUsdMinor × epochRate)` exactly, or the derivation is
+ *    refused — never recomputed, never rounded into agreement (D-1, D-2).
+ *
+ * What is deliberately NOT checked: freshness. The 15-minute rule (D-3)
+ * governs NEW one-off pricing and NEW epoch registration — never an
+ * already-registered epoch. A later FX version therefore never reprices this
+ * snapshot: it reaches customers only through a NEW epoch bound to a NEW
+ * provider plan.
+ *
+ * The result passes the plan-bound checkout guard
+ * (`assertProviderPlanMatches` against this epoch) by construction, and its
+ * deterministic idempotency key (`pricingIdempotencyKey`) is stable across
+ * repeated derivations from the same epoch.
+ *
+ * Pure and deterministic: no I/O, no network, no clock, no randomness, no
+ * provider call.
+ */
+export function priceFromProviderPlanEpoch(
+  input: PriceFromProviderPlanEpochInput,
+): BillingPricingSnapshot {
+  const epoch = parseProviderPlan(input.epoch);
+  // A retired epoch is history: retirement is one-way and a retired epoch can
+  // never authorize a new charge or a new snapshot.
+  assertProviderPlanRetirable(epoch);
+
+  const fxVersion = parseFxRateVersion(input.fxVersion);
+  if (fxVersion.id !== epoch.fxRateVersionId) {
+    throw new BillingProviderPlanError(
+      'mismatch',
+      `The FX version ${fxVersion.id} is not the version the provider-plan epoch ${epoch.id} ` +
+        `was registered under (${epoch.fxRateVersionId}). A plan-bound snapshot carries the epoch's ` +
+        'FX facts and nothing else: fail closed.',
+    );
+  }
+
+  if (!(input.asOf instanceof Date) || !Number.isFinite(input.asOf.getTime())) {
+    throw new BillingPricingError(
+      'invalid_input',
+      'A finite snapshot instant is required to derive a plan-bound pricing snapshot.',
+    );
+  }
+
+  // A plan that cannot be sold cannot be snapshotted. Sellability is decided by
+  // the catalogue authority, so an unsellable plan is refused here rather than
+  // derived and refused later.
+  if (unmappedCommercialPlans().includes(epoch.cataloguePlan)) {
+    throw new BillingPricingError(
+      'invalid_input',
+      `The plan "${epoch.cataloguePlan}" is not sellable (no internal plan value exists for it), ` +
+        'so no plan-bound snapshot can be derived for it.',
+    );
+  }
+
+  // The commercial amount — and the only place it can come from.
+  const usdMinor = cataloguePriceMinor(epoch.cataloguePlan, epoch.interval);
+  if (!Number.isSafeInteger(usdMinor) || usdMinor <= 0) {
+    throw new BillingPricingError(
+      'invalid_input',
+      `The catalogue amount for ${epoch.cataloguePlan}/${epoch.interval} is not a positive integer amount.`,
+    );
+  }
+
+  // The epoch's FX facts are the disclosed FX facts — not a live rate.
+  const fx = toBillingFxSnapshot(fxVersion);
+
+  const snapshot: BillingPricingSnapshot = {
+    commercialCurrency: BILLING_CURRENCY,
+    commercialAmountMinor: usdMinor,
+    catalogueVersion: BILLING_CATALOGUE_VERSION,
+    cataloguePlan: epoch.cataloguePlan,
+    interval: epoch.interval,
+    payment: {
+      paymentCurrency: epoch.paymentCurrency,
+      // The FROZEN epoch amount, reused verbatim. It is never recomputed from
+      // a later FX version, a later catalogue change or a later epoch (D-1).
+      paymentAmountMinor: toSafeMinor(epoch.paymentAmountMinor, 'The epoch amount'),
+      paymentAmountExponent: epoch.paymentAmountExponent,
+    },
+    fx,
+    providerPlanId: epoch.providerPlanId,
+    providerReference: input.providerReference ?? null,
+    // The policy the epoch amount was derived under: the plan-bound checkout
+    // guard requires the snapshot and the epoch to agree on it exactly.
+    pricingPolicyVersion: epoch.pricingPolicyVersion,
+    computedAt: input.asOf.toISOString(),
+  };
+
+  // Fail closed unless the snapshot is BOTH canonically valid AND
+  // arithmetically identical to the epoch derivation
+  // (`epochAmount == half_up(catalogueUsdMinor × epochRate)`, at or above the
+  // documented minimum). This is an identity check on already-authorized facts,
+  // not a re-price: a mismatch refuses, it never recomputes.
+  return verifyPricingSnapshot(snapshot);
 }
 
 /* -------------------------------------------------------------------------- */
