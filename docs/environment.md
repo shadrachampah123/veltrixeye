@@ -40,6 +40,8 @@ git-ignored and never contain values you would commit.
 | `TWELVE_DATA_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-request upstream timeout. |
 | `TWELVE_DATA_MAX_RPM` | int 1–10000 | `50` | Client-side upstream cap (keep under plan credits/min). |
 | `TWELVE_DATA_CRYPTO_EXCHANGE` | string 1–32 | `Binance` | Pinned crypto venue (defines the stored series — don't change casually). |
+| `PAYSTACK_SECRET_KEY` | secret, ≤256 chars, **must start with `sk_test_`** | *(empty = billing unavailable)* | Billing PR3. **Sandbox only**: a live key (`sk_live_`) or a public key (`pk_*`) fails the boot — no deployment can move live money by setting a variable. Empty ⇒ the Paystack provider is **not registered** (the registry stays empty and a caller fails loudly) — fail closed, never a half-configured provider. **Server-side only**: never in the repo, an image, a log, a response or the database. |
+| `PAYSTACK_TIMEOUT_MS` | int 1000–60000 | `15000` | Per-request timeout for the single Paystack HTTP attempt. There is **no retry** (Paystack documents retries for webhooks, not for outbound calls) and no configurable base URL: the adapter talks to `https://api.paystack.co` and nothing else. |
 | `SMTP_HOST` | string | *(empty = email delivery unavailable)* | M7.3 email channel. Empty (with `NOTIFICATION_FROM`) ⇔ the SMTP adapter reports unconfigured and jobs are recorded `unavailable`, never `delivered`. |
 | `SMTP_PORT` | int 1–65535 | `587` | 587 = submission + STARTTLS (required), 465 = implicit TLS. |
 | `SMTP_SECURE` | `auto` \| `always` \| `never` | `auto` | `auto` = implicit TLS on port 465 only; STARTTLS is mandatory otherwise. |
@@ -177,10 +179,11 @@ See [deployment.md](./deployment.md) for the full production runbook.
 
 ## Secrets policy
 
-- The service needs up to **four** secrets: the `DATABASE_URL` credentials,
+- The service needs up to **five** secrets: the `DATABASE_URL` credentials,
   the `TWELVE_DATA_API_KEY` provider key (server-side only — it travels in
   upstream query strings by vendor design, so it must never reach logs or
-  browsers), and — once delivery is switched on — `SMTP_PASS` and
+  browsers), `PAYSTACK_SECRET_KEY` (sandbox/test-mode only; refused unless it
+  starts with `sk_test_`), and — once delivery is switched on — `SMTP_PASS` and
   `NOTIFICATION_WORKER_TOKEN`. Session tokens are server-side (random per
   session, stored hashed) — no JWT secret is required.
 - Delivery credentials never leave the API process: they are read at boot, held
@@ -192,6 +195,12 @@ See [deployment.md](./deployment.md) for the full production runbook.
 - **No invented production credentials.** Real values are injected by the
   operator at deploy time; the code contains no stand-in production
   values. See [security.md](./security.md).
+- **Billing credentials are sandbox-only by construction.** The billing
+  configuration exposes exactly two variables (above), the Paystack adapter
+  refuses any key that is not a `sk_test_` test key before it can build a
+  request, reports `live: false`, and never includes a credential in
+  `describe()`. Billing is not a live-payment path: no checkout route exists.
+  See [paystack-provider-contract.md](./paystack-provider-contract.md).
 
 ## M8.4 MT5 boundary
 

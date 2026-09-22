@@ -14,7 +14,7 @@ import {
   MAX_NOTIFICATION_BATCH_SIZE,
 } from '@veltrixeye/contracts';
 import type { SmtpEmailConfig as SmtpEmailConfigShape } from '@veltrixeye/core';
-import { validateExecutionTransportConfig } from '@veltrixeye/core';
+import { BILLING_FX_POLICY, validateExecutionTransportConfig } from '@veltrixeye/core';
 import { DEFAULT_TRUSTED_PROXIES, parseTrustedProxies } from './trust-proxy.js';
 
 /**
@@ -241,6 +241,35 @@ const envSchema = z.object({
    * paper simulation and any future intake, nothing more.
    */
   EXECUTION_GLOBAL_KILL_SWITCH: boolEnv(false),
+
+  /* ---------------------------------------------------------------------- */
+  /* Billing PR3 — Paystack SANDBOX (GHS payment currency)                    */
+  /* ---------------------------------------------------------------------- */
+  /**
+   * Paystack SANDBOX (test-mode) secret key for provider-backed billing.
+   *
+   *  - Empty ⇒ no billing provider is registered at all: no customer
+   *    provisioning, no payment initialization, no charge path. Billing is
+   *    simply unavailable (fail closed) — it is not an error state.
+   *  - Only a TEST key (`sk_test_…`) is accepted. A live key, a public key or
+   *    any other shape is refused AT BOOT, so no deployment can move live money
+   *    through this build by setting a variable. Live activation is a
+   *    deliberate future change (code + schema + credentials), never a config
+   *    accident.
+   *  - Server-side only: the key never leaves the API process, is never logged
+   *    (see the adapter's `describe()`), never reaches a browser and is never
+   *    stored in the database.
+   */
+  PAYSTACK_SECRET_KEY: z
+    .string()
+    .max(256)
+    .default('')
+    .refine((value) => value === '' || value.startsWith('sk_test_'), {
+      message:
+        'must be empty or a Paystack SANDBOX test key starting with "sk_test_" — live and public keys are refused',
+    }),
+  /** Per-request timeout for Paystack calls (ms). */
+  PAYSTACK_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60000).default(15000),
 });
 
 /** Email-channel configuration passed to the SMTP provider adapter. */
@@ -282,6 +311,35 @@ export interface NotificationConfig {
   retention: { deliveredRetentionDays: number; failedRetentionDays: number };
 }
 
+/**
+ * Billing configuration (PR3). Derived once at boot and handed to the billing
+ * composition, which registers the provider ONLY when it is usable.
+ *
+ * Note what is deliberately NOT here: an FX rate, a price, a provider plan id,
+ * a provider base URL or a "live mode" switch. Rates and plan mappings are
+ * server-side DATA with their own authority (migration 0032), the catalogue is
+ * code, and the provider host is a constant in the adapter — a deployment
+ * cannot choose any of them.
+ */
+export interface BillingConfig {
+  /** The only billing provider (`paystack`). */
+  provider: 'paystack';
+  /** Sandbox mode. Pinned `true` in this build. */
+  sandbox: true;
+  /** Never `true` in this build: live credentials are refused at boot. */
+  live: false;
+  /** True when a usable sandbox key is configured. */
+  enabled: boolean;
+  /** Per-request timeout for provider calls (ms). */
+  timeoutMs: number;
+  /** Commercial (catalogue) currency. Always USD. */
+  commercialCurrency: 'USD';
+  /** Payment currency customers are charged in (Ghana). */
+  paymentCurrency: 'GHS';
+  /** Approved maximum FX rate age at pricing time, in seconds. */
+  fxMaxAgeSeconds: number;
+}
+
 export interface ScannerConfig {
   enabled: boolean;
   intervalMs: number;
@@ -304,6 +362,7 @@ export type AppConfig = z.infer<typeof envSchema> & {
   trustedProxies: string[];
   notification: NotificationConfig;
   scanner: ScannerConfig;
+  billing: BillingConfig;
 };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -383,6 +442,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxRetries: values.SCANNER_MAX_RETRIES,
       retryBaseMs: values.SCANNER_RETRY_BASE_MS,
       retryMaxMs: values.SCANNER_RETRY_MAX_MS,
+    },
+    billing: {
+      provider: 'paystack',
+      sandbox: true,
+      live: false,
+      enabled: values.PAYSTACK_SECRET_KEY !== '',
+      timeoutMs: values.PAYSTACK_TIMEOUT_MS,
+      commercialCurrency: 'USD',
+      paymentCurrency: 'GHS',
+      fxMaxAgeSeconds: BILLING_FX_POLICY.maxAgeSeconds,
     },
   };
 }

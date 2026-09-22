@@ -5,6 +5,8 @@ import {
   BILLING_PROVIDER,
   billingEventIdempotencyCanonicalString,
   billingIntervalSchema,
+  billingPaymentAmountSchema,
+  billingPricingSnapshotSchema,
   billingPlanIdentity,
   billingPlanPrice,
   commercialPlanIdSchema,
@@ -123,9 +125,15 @@ export const billingCustomerCreateRequestSchema = z
 export type BillingCustomerCreateRequest = z.infer<typeof billingCustomerCreateRequestSchema>;
 
 /**
- * Initialize a checkout for a catalogue plan. The amount is NOT carried here:
- * it is resolved from the authoritative catalogue by the adapter, so no caller
- * can state a price.
+ * Initialize a checkout for a catalogue plan.
+ *
+ * The PRICE is still never carried as a bare number and never supplied by the
+ * caller as a choice: the amount a provider is allowed to charge arrives as
+ * `pricing` — an authorized pricing snapshot produced by the server-side
+ * pricing boundary (`pricing.ts`), which resolved the commercial amount from
+ * the authoritative catalogue and the payment amount through the authorized FX
+ * version. An adapter that cannot see that snapshot must refuse (PR3's Paystack
+ * adapter does: it never prices and never converts).
  */
 export const billingCheckoutRequestSchema = z
   .object({
@@ -134,6 +142,13 @@ export const billingCheckoutRequestSchema = z
     plan: z.object({ cataloguePlan: commercialPlanIdSchema, interval: billingIntervalSchema }).strict(),
     /** Our own transaction reference (surfaced back by the provider). */
     reference: z.string().trim().min(1).max(190),
+    /**
+     * PR3: the ALREADY-AUTHORIZED pricing snapshot (commercial USD amount +
+     * payment-currency amount + FX rate/version). Optional for backward
+     * compatibility with PR2 callers; an adapter that requires an amount MUST
+     * fail closed when it is absent rather than resolve a price itself.
+     */
+    pricing: billingPricingSnapshotSchema.optional(),
     idempotencyKey: sha256HexSchema,
     /** Where the provider returns the customer after payment. */
     callbackUrl: z.string().url().max(2048),
@@ -156,6 +171,14 @@ export const billingCheckoutSessionSchema = z
     /** Catalogue-resolved amount, in integer minor units (USD cents). */
     amountMinor: z.number().int().nonnegative(),
     currency: z.literal(BILLING_CURRENCY),
+    /**
+     * PR3: the PAYMENT amount the provider was asked to charge (payment
+     * currency, integer minor units). `amountMinor` above stays the COMMERCIAL
+     * amount; this is what the customer actually pays.
+     */
+    payment: billingPaymentAmountSchema.nullable().optional(),
+    /** PR3: the authorized pricing snapshot this session was initialized from. */
+    pricing: billingPricingSnapshotSchema.nullable().optional(),
     idempotencyKey: sha256HexSchema,
     initializedAt: isoDateTime,
   })

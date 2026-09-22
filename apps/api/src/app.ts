@@ -57,6 +57,7 @@ import {
   ExecutionCompositionService,
   type ProviderRegistry,
   type NotificationProviderRegistry,
+  type BillingProviderRegistry,
   type DeliveryRetryPolicy,
   type ExecutionProviderRegistry,
 } from '@veltrixeye/core';
@@ -70,6 +71,7 @@ import { backtestRoutes } from './routes/backtests.js';
 import { alertRoutes } from './routes/alerts.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { billingRoutes } from './routes/billing.js';
+import { composeBillingProvider, type BillingCompositionStatus } from './billing-composition.js';
 import { scannerRoutes } from './routes/scanner.js';
 import {
   executionRoutes,
@@ -94,6 +96,15 @@ export interface AppContext {
   backtests: BacktestService;
   alerts: AlertService;
   scanner: ScannerService;
+  /**
+   * Billing PR3: the billing-provider registry (the only billing-provider-aware
+   * object). It is EMPTY unless a sandbox Paystack key is configured — see
+   * `composeBillingProvider` — so a caller that reaches for a billing provider
+   * gets a loud failure instead of a half-configured integration. `status`
+   * records why, without secrets, for boot logs and operators.
+   */
+  billingProviders: BillingProviderRegistry;
+  billingComposition: BillingCompositionStatus;
   /** M7.3: channel → provider adapter registry (the only provider-aware object). */
   notificationProviders: NotificationProviderRegistry;
   /** M7.3: durable outbox — writes/reads `notification_deliveries`. */
@@ -407,6 +418,14 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     },
   });
 
+  // Billing PR3 — Paystack SANDBOX composition. Registered only when the
+  // configuration carries a usable test key; transient data (a fresh FX rate,
+  // an active plan epoch) deliberately does not gate registration, because a
+  // rate that ages out must never unregister a provider. Data-dependent
+  // decisions fail closed per call instead (stale rate → refuse to price,
+  // epoch mismatch → refuse to charge).
+  const billing = composeBillingProvider(pool, config);
+
   return {
     pool,
     users: new UserService(pool),
@@ -432,6 +451,8 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     alerts,
     // M7.5: live scanner
     scanner,
+    billingProviders: billing.registry,
+    billingComposition: billing.status,
     notificationProviders,
     notifications,
     preferences,

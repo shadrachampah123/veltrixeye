@@ -1,17 +1,26 @@
 # Billing (in progress)
 
-> **PR2 (this change) adds the billing persistence model (migration `0031`),
-> the canonical billing contracts and the Paystack provider SEAM. Nothing here
-> takes a payment.**
+> **PR3 (this change) adds provider-neutral USD→GHS pricing, the immutable FX /
+> provider-plan / pricing-snapshot state (migration `0032`), and a SANDBOX
+> Paystack adapter.** Nothing here takes a live payment.
 >
-> **No Paystack API integration exists yet.** There is no Paystack API call, no
-> HTTP request of any kind, no checkout, no payment initialization, no billing
-> portal, no webhook route, no webhook signature verification, no subscription
-> synchronization, no credential and no API-key change. The only billing route
-> remains the read-only `GET /api/billing/me` that has existed since M7.4.
+> **What PR3 does NOT do:** there is no checkout route and no checkout UI, no
+> `apps/web` change, no webhook receiver, no webhook signature processing, no
+> subscription synchronization, no billing portal, no refund/proration/dunning
+> execution, no notification, no live payment, no production credential, no
+> production activation and no Starter selling. `GET /api/billing/me` remains
+> the only billing route.
+>
+> **Account capabilities are NOT verified.** Whether this account can transact
+> in **GHS** (AC1) or run **GHS recurring** subscriptions (AC2) is unverified, so
+> no plan has been provisioned with the provider, no recurring end-to-end run
+> has happened (AC5/AC7) and this repository makes no claim about either. See
+> [paystack-provider-contract.md](./paystack-provider-contract.md) §7.
 >
 > PR1 (merged, `ab27948`) established the authoritative commercial catalogue;
-> PR2 changes no price, no plan limit and no commercial definition.
+> PR2 (merged) added the canonical billing contracts, the provider seam and
+> migration `0031_provider_billing.sql`. PR3 changes no price and no
+> entitlement: `canAccessAutomation` stays `false` for every plan.
 
 ## Decisions (operator-confirmed)
 
@@ -23,8 +32,17 @@
 | Production credentials | Not present; a later billing PR |
 | Render plan | **Free** — unchanged by billing work |
 | Billing webhook / signature security | Later billing PRs (not PR2) |
-| Migration 0031 | **Created in PR2** — `0031_provider_billing.sql`; migrations 0001–0030 stay byte-identical |
-| Paystack API integration | **None.** PR2 defines the provider seam only (no call, no route, no credential) |
+| Migration 0031 | **Created in PR2** — `0031_provider_billing.sql`; migrations 0001–0030 stay byte-identical (now pinned by SHA-256 in the PR3 suite too) |
+| Payment currency | **GHS.** The customer pays the GHS equivalent of the USD catalogue price; the catalogue stays USD |
+| FX authority | **Server-controlled and versioned** (`billing_fx_rate_versions`). Never browser-supplied, never a market feed, never Paystack |
+| FX freshness | **≤ 15 minutes** at pricing time (`pr3-usd-ghs-v1` policy). Older ⇒ refuse to start a new payment |
+| Rounding | **One half-up step**, integer/BigInt only, on the final conversion. No floats anywhere in the billing path |
+| Recurring GHS amount | **Locked at subscription creation** (`subscriptions.locked_pricing_snapshot_id`, immutable by trigger). A rate or catalogue change never reprices an existing subscriber |
+| Refunds | Use the amount **actually charged**. A refund never re-rates |
+| Disclosure | USD price (prominent) + exact GHS amount + rate, version and time. GHS is shown before payment |
+| Migration 0032 | **Created in PR3** — `0032_billing_fx_and_pricing.sql`; migrations 0001–0031 are byte-identical |
+| Paystack API integration | **Sandbox seam only, three of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout`). No checkout route, no live key, `implemented: false` |
+| Provider plan mutation | **Never.** `PUT /plan` is never called; a price change is a NEW epoch + a NEW provider plan, and the previous epoch is retired locally |
 | Entitlements / execution | **Unchanged.** `canAccessAutomation` stays `false` for every plan |
 
 ## Authoritative commercial catalogue
@@ -210,6 +228,119 @@ Nothing reads or writes these tables in PR2: there is no receiver, no worker
 and no scheduler. `subscriptions_sync_required_idx` exists so a later
 synchronization PR does not need another migration.
 
+## Pricing in GHS (PR3 — migration `0032_billing_fx_and_pricing.sql`)
+
+The catalogue is USD and stays USD. What a customer **pays** is the GHS
+equivalent of the USD price, computed on the server from an FX version an
+operator published. Four pieces make that safe.
+
+### 1. The FX authority — `billing_fx_rate_versions`
+
+Append-only and immutable: one row per published rate version, expressed as an
+exact scaled integer (`rate = fx_rate_scaled / 10^fx_rate_scale`; 12.5 GHS/USD is
+`12500000 @ 6`). There is no float column anywhere in the pricing path.
+
+- `UNIQUE (base, quote, effective_from)` — one rate per pair per instant. Two
+  versions effective at the same moment are a **contradiction**, not a choice:
+  the resolver refuses to guess.
+- `captured_at <= effective_from` — a version can never be **back-dated**, so a
+  past payment can never be repriced by a later insertion.
+- A published version is **never edited and never deleted** (trigger, SQLSTATE
+  `27000`). A correction is a new version with a later `effective_from`.
+- Provenance is canonical (`db | ops | import | config`) and credential-shaped
+  labels are refused outright.
+
+`packages/core/src/billing/fx-rate-versions.ts` resolves the newest version
+effective at or before the requested instant, refuses a version older than
+`BILLING_FX_POLICY.maxAgeSeconds` (900 s), refuses an ambiguous set, and never
+touches the network. The clock is injected.
+
+### 2. The pricing boundary — `pricing.ts`
+
+One implementation, integer-only:
+
+```
+payable = (2·usdMinor·rateScaled + 10^scale) / (2·10^scale)     // half-up, one step
+```
+
+- The USD amount comes from the **catalogue** (`cataloguePriceMinor`) and from
+  nowhere else: no price literal is restated in the pricing module, and a source
+  assertion proves it.
+- An unsellable plan (Starter) and a below-minimum amount (documented GHS
+  minimum ₵0.10 = 10 pesewas) are refused — never rounded up into a charge.
+- A stale, future-dated, foreign or malformed FX snapshot refuses to price.
+- `verifyPricingSnapshot()` validates an **existing** snapshot **without**
+  re-rating it: ageing a rate never invalidates an amount a customer already
+  authorized (D-1/D-4/D-8), and a provider-reported amount that differs from the
+  authorized one — in either direction — is an incident.
+- `pricingIdempotencyKey()` derives a deterministic 64-hex local key, so the
+  same decision always collapses onto the same row (`UNIQUE idempotency_key`).
+
+### 3. Provider-plan epochs — `billing_provider_plans`
+
+An epoch maps a commercial (plan, interval) to the exact GHS plan a provider
+charges in, pinned to the FX version and pricing/catalogue versions it came from.
+
+- ONE **active** epoch per (provider, mode, plan, interval, currency) — a second
+  active epoch is a database conflict, never "newest wins".
+- Sandbox only (`mode = 'test'`), GHS only, **Pro/Elite only** (Starter is not
+  sellable), amount ≥ ₵0.10.
+- Everything that defines *what is charged* is **immutable**; the only permitted
+  change is `active → retired`, it is one-way, and epochs are never deleted.
+- `assertProviderPlanMatches` (core) compares an epoch against an authorized
+  snapshot on provider, mode, plan, interval, currency + exponent, exact amount,
+  provider plan identifier, FX version, pricing policy and active status — and
+  the Paystack adapter calls exactly that function, so there is one
+  implementation of the rule.
+
+### 4. The lock — `subscriptions.locked_pricing_snapshot_id`
+
+`billing_pricing_snapshots` records ONE pricing decision (USD amount, GHS
+amount, FX facts, rounding mode, policy/catalogue versions, local idempotency
+key) and is append-only: it is evidence of what was quoted and charged. A
+snapshot's FX facts must be **exactly** those of the version it references
+(BEFORE INSERT trigger), and it can never be updated or deleted.
+
+A sold, provider-backed subscription carries that snapshot in
+`subscriptions.locked_pricing_snapshot_id`, written **at creation** and
+**immutable afterwards** — not to a newer snapshot, not to another amount, not
+to `NULL`. The database refuses a late lock too: the price is written when the
+subscription is created, or the subscription has no price.
+
+`subscriptions.currency` and `CHECK (currency = 'USD')` are untouched: the
+**commercial** currency stays USD, and the lock's scope guard only *reads* it.
+
+### 5. The sandbox adapter and its composition
+
+`packages/providers/paystack` implements three documented operations
+(`findCustomer`, `createCustomer`, `initializeCheckout`) against
+`https://api.paystack.co`, accepts **`sk_test_` keys only**, performs exactly one
+HTTP attempt (no retry, no idempotency header — Paystack documents neither for
+outbound calls), prices nothing and converts nothing. Everything else rejects
+with `PaystackNotImplementedError`, and `implemented` stays **`false`**.
+
+`apps/api/src/billing-composition.ts` registers the adapter **only** when a
+sandbox key is configured; with no key the registry stays empty, so a caller
+that reaches for billing gets a loud failure rather than a half-configured
+provider. Registration depends on stable prerequisites only — a rate ageing out
+after 15 minutes must not unregister the provider; data-dependent decisions are
+made per call and fail closed there.
+
+Details, including the exact documented facts and the two documented 404s, are
+in [paystack-provider-contract.md](./paystack-provider-contract.md).
+
+### What PR3 deliberately leaves undone
+
+| Item | Why |
+| --- | --- |
+| Provisioning Pro/Elite sandbox plans | **AC5** unverified — no plan IDs exist yet, so nothing may be sold |
+| GHS recurring end-to-end | **AC7** unverified |
+| Checkout route / UI | Out of scope; the adapter's `initializeCheckout` is unreachable from HTTP |
+| Webhook receiver + signature processing | Out of scope. `normalizeEvent` is unimplemented because event **payload shapes** are not verified — documented event names are not enough to guess them |
+| Subscription read/verify/sync | No verified subscription read operation, and synchronization is out of scope |
+| Cancellation | The documented disable operation needs the subscription code **and** its `email_token`, which this build does not persist |
+| Refunds, proration, dunning | Out of scope |
+
 ## Provider seam (PR2 — boundary only)
 
 | Layer | File | Role |
@@ -266,23 +397,33 @@ and `grantsExecution` to `false` at the type level: synchronization moves
 status, period and cancellation state, never the plan value and never an
 execution capability.
 
-## What PR2 does NOT implement
+## What is still NOT implemented (PR2 scope, updated by PR3)
 
-Explicitly absent — each is a later PR, and none of them may enable execution:
+Explicitly absent — each is a later PR, and none of them may enable execution.
+PR3 changed two bullets: a **sandbox** Paystack client now exists (three
+documented operations, test keys only, one attempt per call, no route), and
+migration 0032 gives the pricing state a writer path through core modules —
+while everything below remains true at the **product** level:
 
-- **No Paystack API integration.** No HTTP call, no client, no endpoint, no
-  retry/timeout policy.
-- **No checkout** and no payment initialization (no route, no redirect, no
-  session handling).
+- **No checkout** and no payment initialization **route**: no endpoint, no
+  redirect, no session handling, no UI. `initializeCheckout` exists on the
+  adapter but nothing in `apps/api` can call it from HTTP; there is no customer
+  provisioning flow either, so `billing_customers` has no writer yet.
 - **No billing portal** and no customer self-serve surface.
 - **No webhook route, no webhook processing, no signature verification**, no
   replay protection beyond the ledger's idempotency keys, no rate limiting.
 - **No subscription synchronization** — no worker, scheduler, queue claim or
-  writer for the new columns.
+  writer for the PR2 columns. `billing_provider_events` and
+  `billing_fx_rate_versions` / `billing_provider_plans` /
+  `billing_pricing_snapshots` likewise have no writer wired to a route; the FX
+  versions are published by an operator/ops path (a later PR), never by a client
+  or a market feed.
 - **No billing UI and no pricing UI change** (`apps/web` is untouched; the plan
   comparison still renders the PR1 catalogue).
 - **No notification change** (M9.1/M9.2 untouched).
-- **No credential, API key, environment, `render.yaml` or Vercel change.**
+- **No production credential, no live key, no `render.yaml` or Vercel change.**
+  Two sandbox-only environment variables exist (`PAYSTACK_SECRET_KEY`,
+  `PAYSTACK_TIMEOUT_MS`); a live key is refused at boot.
 - **No execution change**: B1, B2, Gate 9, the M10 transport, paper execution,
   MT5/Exness and broker integration are untouched; no new execution permission
   exists; `canAccessAutomation` remains `false` for `free`, `pro` and
@@ -308,46 +449,56 @@ records the gap instead of expanding into entitlement work.
   documents local development values; production secrets are set in the
   platform (Render/Vercel) and never in Git. See
   [environment.md](./environment.md) and [security.md](./security.md).
-- **Provider columns exist but are still unused.** Migration 0014 added
-  `subscriptions.provider`, `provider_customer_id` and `provider_subscription_id`;
-  migration 0031 adds the rest of the provider-backed model (interval,
-  catalogue identity, canonical provider state, cancellation and
-  synchronization bookkeeping) plus `billing_customers` and
-  `billing_provider_events`. **Nothing writes them yet**: every new column is
-  `NULL` or at its inert default on every existing row, and the first writer
-  lands with a later billing PR.
+- **No provider-backed billing row has ever been written in production.**
+  Migration 0014 added `subscriptions.provider`, `provider_customer_id` and
+  `provider_subscription_id`; migration 0031 added the rest of the
+  provider-backed model (interval, catalogue identity, canonical provider state,
+  cancellation and synchronization bookkeeping) plus `billing_customers` and
+  `billing_provider_events`; migration 0032 adds the FX/plan/snapshot state and
+  the immutable subscription price lock. Every one of those columns is `NULL` or
+  at its inert default on every existing row, and **no route, worker or client
+  can write them yet** — the adapter is unreachable from HTTP, and plan
+  provisioning is blocked by AC5.
+- **FX publishing is an operator action, not a feature.** `billing_fx_rate_versions`
+  is written by the ops path that lands in a later PR; PR3 ships the authority,
+  the resolution rules and the tests, not a rate feed and not an admin endpoint.
 
-## Later billing PRs (explicitly NOT in PR2)
+## Later billing PRs
 
-Roughly in order; each is its own PR and may be re-scoped. PR2 delivered the
-persistence model, the contracts and the seam, so each of these can now be
-implemented behind an existing boundary without another schema change:
+Roughly in order; each is its own PR and may be re-scoped.
 
 1. ~~**Migration 0031**~~ — **delivered by PR2**
-   (`0031_provider_billing.sql`), except the internal plan value needed to sell
-   Starter, which is an entitlement change and stays deferred (see
-   "Prerequisite discovered, deliberately not started").
-2. **Paystack adapter** — implement `BillingProvider` against the sandbox API
-   and register it in `BillingProviderRegistry`; sandbox keys only, no secrets
-   in source control.
-3. **Paystack checkout / payment initialization** — server-side initialization
-   behind `initializeCheckout`, plus its route.
-4. **Webhook receiver + security** — signature verification, replay/idempotency
+   (`0031_provider_billing.sql`).
+2. ~~**Paystack adapter**~~ — **partially delivered by PR3**: the sandbox
+   adapter implements the three documented operations it can (customer create /
+   fetch, transaction initialize) and fails closed on the rest. The customer
+   provisioning flow (persisting `billing_customers`) still lands with a later PR
+   because it needs a route/worker, and every remaining operation needs either a
+   verified read operation or the out-of-scope webhook/sync work.
+3. ~~**USD→GHS pricing + FX authority**~~ — **delivered by PR3** (migration
+   `0032`, `fx-rate-versions.ts`, `pricing.ts`, `provider-plans.ts`).
+4. **Plan provisioning** — Pro/Elite × monthly/annual sandbox plans, registered
+   as local epochs. **Blocked by AC5**: do not provision until the account's GHS
+   plan capability is verified.
+5. **Checkout / payment initialization route** — server-side initialization
+   behind `initializeCheckout`, plus its route and UI. Not before AC1/AC2/AC5/AC7.
+6. **Webhook receiver + security** — signature verification
+   (`x-paystack-signature`, HMAC-SHA512 of the raw body), replay/idempotency
    protection (the `billing_provider_events` ledger already exists), rate
-   limiting, audit and redaction, following the existing webhook hardening in
-   M9.1/M9.2.
-5. **Verification + subscription synchronization** — reconcile provider state
+   limiting, audit and redaction. Requires verified event payload shapes.
+7. **Verification + subscription synchronization** — reconcile provider state
    into `subscriptions` through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`
-   (status, period, cancellation) without letting the provider widen any
-   entitlement.
-6. **Customer / subscription creation and billing portal** — provider customer
-   records (`billing_customers`) and self-serve portal.
-7. **UI** — checkout and portal surfaces in `apps/web` (today the plan
-   comparison is display-only).
-8. **Starter entitlement decision** — internal plan value, limits, and the
-   mapping widening described above.
-9. **Production credentials + go-live** only after the above, and only on the
-   existing Render Free deployment unless the plan decision changes.
+   without letting the provider widen any entitlement. Requires a verified
+   subscription read operation and a verified status vocabulary.
+8. **Customer provisioning flow and billing portal** — persisting
+   `billing_customers` and a self-serve portal.
+9. **Web UI** — checkout and portal surfaces in `apps/web`.
+10. **Starter entitlement decision** — internal plan value, limits, and the
+    mapping widening described above.
+11. **Refunds / proration / dunning execution** — each its own PR, each using
+    the amount actually charged (never a re-rate).
+12. **Production credentials + go-live** only after all of the above, and only
+    on the existing Render Free deployment unless the plan decision changes.
 
-None of these steps may enable execution. Automation, live execution and
-broker execution stay OFF regardless of billing state.
+None of these steps may enable execution. Automation, live execution and broker
+execution stay OFF regardless of billing state.

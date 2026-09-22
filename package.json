@@ -22,8 +22,8 @@
     "api:start": "npm run start --workspace @veltrixeye/api",
     "web:dev": "npm run dev --workspace @veltrixeye/web",
     "web:build": "npm run build --workspace @veltrixeye/web",
-    "test": "npm run test --workspace @veltrixeye/contracts && npm run test --workspace @veltrixeye/core && npm run test --workspace @veltrixeye/provider-twelve-data && npm run test --workspace @veltrixeye/api && npm run test --workspace @veltrixeye/web",
-    "typecheck": "npm run typecheck --workspace @veltrixeye/contracts && npm run typecheck --workspace @veltrixeye/core && npm run typecheck --workspace @veltrixeye/provider-twelve-data && npm run typecheck --workspace @veltrixeye/api && npm run typecheck --workspace @veltrixeye/web",
+    "test": "npm run test --workspace @veltrixeye/contracts && npm run test --workspace @veltrixeye/core && npm run test --workspace @veltrixeye/provider-twelve-data && npm run test --workspace @veltrixeye/provider-paystack && npm run test --workspace @veltrixeye/api && npm run test --workspace @veltrixeye/web",
+    "typecheck": "npm run typecheck --workspace @veltrixeye/contracts && npm run typecheck --workspace @veltrixeye/core && npm run typecheck --workspace @veltrixeye/provider-twelve-data && npm run typecheck --workspace @veltrixeye/provider-paystack && npm run typecheck --workspace @veltrixeye/api && npm run typecheck --workspace @veltrixeye/web",
     "lint": "eslint .",
     "build": "npm run api:build && npm run web:build"
   },
