@@ -268,6 +268,15 @@ const envSchema = z.object({
       message:
         'must be empty or a Paystack SANDBOX test key starting with "sk_test_" — live and public keys are refused',
     }),
+  /** Public browser origin. Empty disables checkout; never inferred from a request. */
+  PUBLIC_APPLICATION_ORIGIN: z.string().trim().max(2048).default('').refine((value) => {
+    if (value === '') return true;
+    try {
+      const url = new URL(value);
+      return url.protocol === 'https:' && url.username === '' && url.password === '' &&
+        url.pathname === '/' && url.search === '' && url.hash === '';
+    } catch { return false; }
+  }, { message: 'must be empty or an HTTPS application origin without credentials, path, query or fragment' }),
   /** Per-request timeout for Paystack calls (ms). */
   PAYSTACK_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60000).default(15000),
 });

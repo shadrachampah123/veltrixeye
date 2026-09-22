@@ -2,12 +2,14 @@ import type pg from 'pg';
 import { BILLING_PROVIDER } from '@veltrixeye/contracts';
 import {
   PaystackNotImplementedError,
+  PaystackAdapterError,
   createPaystackProvider,
   type PaystackCustomerDirectory,
   type PaystackPlanDirectory,
 } from '@veltrixeye/provider-paystack';
 import {
   createBillingProviderRegistry,
+  BillingCheckoutService,
   isBillingProviderPlanError,
   parseProviderPlan,
   type BillingProviderPlan,
@@ -42,8 +44,8 @@ import type { AppConfig } from './config.js';
  *     build does not fully understand raises rather than degrading into a
  *     permissive default.
  *
- * No route, no checkout endpoint, no webhook receiver and no billing portal is
- * introduced here. `GET /api/billing/me` remains the only billing route.
+ * PR-C also composes checkout orchestration. No webhook receiver, customer
+ * provisioning or billing portal is introduced here.
  */
 
 export interface BillingCompositionStatus {
@@ -162,3 +164,32 @@ export function composeBillingProvider(db: pg.Pool, config: AppConfig): BillingC
 
 /** Re-exported so callers/tests can assert the fail-closed plan posture. */
 export { PaystackNotImplementedError, isBillingProviderPlanError };
+
+/** Fixed existing page: this is a return location, not a payment confirmation handler. */
+export function billingCheckoutCallbackUrl(config: AppConfig): string | null {
+  const origin = config.PUBLIC_APPLICATION_ORIGIN;
+  if (!origin) return null;
+  // Defense in depth for hand-built configurations; loadConfig validates at boot.
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== 'https:' || url.username || url.password ||
+        url.pathname !== '/' || url.search || url.hash) return null;
+    return new URL('/settings', url.origin).toString();
+  } catch { return null; }
+}
+
+export function composeBillingCheckout(
+  db: pg.Pool, providers: BillingProviderRegistry, config: AppConfig,
+): BillingCheckoutService {
+  const customers = paystackCustomerDirectory(db);
+  return new BillingCheckoutService({
+    db, providers, callbackUrl: billingCheckoutCallbackUrl(config),
+    async requireExistingCustomer(userId) {
+      const customer = await customers.find(userId);
+      if (!customer?.email || !customer.providerCustomerCode?.trim()) {
+        throw new PaystackAdapterError('customer_not_provisioned',
+          'Checkout refused: customer_not_provisioned. An existing local Paystack customer identity is required.');
+      }
+    },
+  });
+}

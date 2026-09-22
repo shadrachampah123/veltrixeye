@@ -404,12 +404,14 @@ describe('billing PR2 — entitlement safety', () => {
     assert.ok(!SEAM_CODE.includes('entitlements.js'), 'the seam does not import the entitlement module');
   });
 
-  it('adds no billing route: the only one is the pre-existing read-only entitlement read', () => {
+  it('permits only PR-C checkout alongside the pre-existing entitlement read', () => {
     const routesDir = path.join(REPO_ROOT, 'apps', 'api', 'src', 'routes');
     const billingRoute = readFileSync(path.join(routesDir, 'billing.ts'), 'utf8');
     assert.match(billingRoute, /app\.get\('\/api\/billing\/me'/, 'GET /api/billing/me still exists');
-    assert.doesNotMatch(billingRoute, /app\.(post|put|patch|delete)\s*\(/, 'no write route was added');
-    assert.doesNotMatch(billingRoute, /checkout|portal|webhook|paystack|provider/i, 'no billing flow was wired');
+    const writes = [...billingRoute.matchAll(/app\.(post|put|patch|delete)\s*\(\s*'([^']+)'/g)]
+      .map((match) => [match[1], match[2]]);
+    assert.deepEqual(writes, [['post', '/api/billing/checkout']], 'only PR-C checkout may write');
+    assert.doesNotMatch(billingRoute, /portal|webhook/i, 'portal and webhook remain prohibited');
 
     const withBillingPath = readdirSync(routesDir).filter((file) => /\/api\/billing\//.test(readFileSync(path.join(routesDir, file), 'utf8')));
     assert.deepEqual(withBillingPath, ['billing.ts'], 'no other route file exposes a billing path');
