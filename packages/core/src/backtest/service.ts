@@ -18,7 +18,7 @@ import type { StrategyService } from '../strategies/strategies.js';
 import type { CandleStore } from '../market-data/candles.js';
 import { requiredWindows } from '../strategies/evaluation/service.js';
 import { runBacktest } from './engine.js';
-import { getEntitlements } from '../billing/entitlements.js';
+import { resolveEntitlements } from '../billing/entitlement-resolution.js';
 import type { UserPlan } from '@veltrixeye/contracts';
 import { computeConfigHash, isValidConfigHash } from './canonical.js';
 
@@ -254,12 +254,14 @@ export class BacktestService {
       await client.query('BEGIN');
 
       // M7.4 Atomic entitlement enforcement
-      const entitlementRes = await client.query(`
-        SELECT plan, status FROM subscriptions WHERE user_id = $1 FOR UPDATE
+      // `provider` is read for the fail-closed entitlement gate: a
+      // provider-backed row is an unconfirmed checkout, never a purchase.
+      const entitlementRes = await client.query<{ plan: string; status: string; provider: string | null }>(`
+        SELECT plan, status, provider FROM subscriptions WHERE user_id = $1 FOR UPDATE
       `, [args.userId]);
       
-      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active' };
-      const entitlements = getEntitlements(subRow.plan as UserPlan, subRow.status);
+      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active', provider: null };
+      const entitlements = resolveEntitlements(subRow.plan as UserPlan, subRow.status, subRow.provider);
       const maxBacktests = entitlements.maxBacktestsPerMonth;
       
       const countRes = await client.query(

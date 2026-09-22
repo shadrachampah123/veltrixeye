@@ -493,6 +493,73 @@ and `grantsExecution` to `false` at the type level: synchronization moves
 status, period and cancellation state, never the plan value and never an
 execution capability.
 
+## Read-side entitlement hardening — provider-backed rows fail closed
+
+Checkout initialization (`BillingCheckoutService`, `POST /api/billing/checkout`)
+INSERTs the subscription row **before any money moves**:
+
+```sql
+INSERT INTO subscriptions (…, status, provider, provider_state, locked_pricing_snapshot_id)
+VALUES (…, 'active', 'paystack', 'pending', <snapshot>)
+```
+
+`status = 'active'` is the authoritative 0014 lifecycle value and `plan` is the
+internal value the requested commercial plan maps onto (`pro` / `premium`). Read
+through `getEntitlements(plan, status)` alone, that row therefore looked exactly
+like a paid subscription — while nothing had been charged. This build has **no
+payment-confirmation authority**: no webhook receiver, no signature
+verification, no transaction verification (see the list below). An initialized
+checkout is not a payment, and no `provider_state` value can make it one.
+
+### The rule
+
+| Subscription row | Entitlements |
+| --- | --- |
+| `provider IS NULL` (every historical row) | `getEntitlements(plan, status)` — **unchanged** |
+| `provider IS NOT NULL` (any checkout row) | `FREE_ENTITLEMENTS` — regardless of `status` or `provider_state` |
+
+### The implementation
+
+- **`packages/core/src/billing/entitlement-resolution.ts`** — one function,
+  `resolveEntitlements(plan, status, provider)`. It is the only place the
+  `provider` column may influence an entitlement, and it can only ever narrow
+  one. `provider` is a required third argument compared with `!== null`, so a
+  reader that forgets to SELECT the column resolves to free, never to paid.
+- **`packages/core/src/billing/entitlements.ts`** — unchanged and still
+  provider-agnostic. It only gained `export` on the existing
+  `FREE_ENTITLEMENTS`, so the resolver returns *that* object instead of
+  restating a second matrix. `getEntitlements(plan, status)` keeps its exact
+  signature.
+- **Every production entitlement reader** now selects `provider` and calls the
+  resolver: `getBillingState`, `StrategyService.createStrategy`,
+  `SetupService.insertOrGetSetup`, `AlertService.generateAlert`,
+  `BacktestService.createBacktest`, `ScannerService.getEligibleStrategies`, the
+  three scanner route gates (`health` / `runs` / `trigger`) and
+  `AutomationService.readState`.
+- **`GET /api/billing/me`** additionally publishes `providerStatus`:
+  `{ provider, providerState, paymentConfirmed }`. The first two are the stored
+  columns as **display information**; `paymentConfirmed` is pinned to
+  `z.literal(false)` the same way the sync result pins `grantsExecution`, so a
+  confirmed payment is unrepresentable in this build. The subscription's
+  authoritative `plan` and `status` are still reported exactly as stored — the
+  response does not lie about the row, it stops implying that the row is paid.
+- **`apps/web` `SubscriptionPanel`** renders that state: a provider-backed row
+  is badged with its provider state plus "unconfirmed" and carries an explicit
+  "Payment not confirmed" notice. No button, link, portal or checkout surface
+  was added.
+
+### What this deliberately does not do
+
+No migration (the schema already carries everything needed), no Paystack
+change, no webhook, no verification, no confirmation, no pricing or pricing-lock
+change, no change to the checkout INSERT shape, no change to
+`PUBLIC_APPLICATION_ORIGIN` or any production configuration, no change to
+`users.plan`, and no change to any execution safety gate. `canAccessAutomation`
+remains `false` for every plan, every status and every provider.
+
+Removing the gate is the job of the confirmation authority in step 6/7 below —
+not of a display layer, and not of a provider state.
+
 ## What is still NOT implemented (PR2 scope, updated by PR3)
 
 Explicitly absent — each is a later PR, and none of them may enable execution.

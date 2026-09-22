@@ -17,7 +17,7 @@ import type { EvaluationService } from '../strategies/evaluation/service.js';
 import type { CandleStore } from '../market-data/candles.js';
 import { assertTransition } from './machine.js';
 import { detectionLevels } from './levels.js';
-import { getEntitlements } from '../billing/entitlements.js';
+import { resolveEntitlements } from '../billing/entitlement-resolution.js';
 import type { UserPlan } from '@veltrixeye/contracts';
 
 /**
@@ -275,11 +275,13 @@ export class SetupService {
       await client.query('BEGIN');
 
       // M7.4 Atomic entitlement enforcement
-      const entitlementRes = await client.query(`
-        SELECT plan, status FROM subscriptions WHERE user_id = $1 FOR UPDATE
+      // `provider` is read for the fail-closed entitlement gate: a
+      // provider-backed row is an unconfirmed checkout, never a purchase.
+      const entitlementRes = await client.query<{ plan: string; status: string; provider: string | null }>(`
+        SELECT plan, status, provider FROM subscriptions WHERE user_id = $1 FOR UPDATE
       `, [args.userId]);
-      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active' };
-      const entitlements = getEntitlements(subRow.plan as UserPlan, subRow.status);
+      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active', provider: null };
+      const entitlements = resolveEntitlements(subRow.plan as UserPlan, subRow.status, subRow.provider);
       const maxSetups = entitlements.maxSavedSetups;
       
       const countRes = await client.query(`

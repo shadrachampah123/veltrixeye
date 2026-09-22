@@ -12,6 +12,11 @@ import type { UserPlan } from '@veltrixeye/contracts';
  *
  * `canAccessAutomation` is `false` for every plan and must stay that way: the
  * commercial catalogue cannot grant execution capability.
+ *
+ * This module is deliberately provider-agnostic: it reads `plan` + `status` and
+ * nothing else. The read-side gate that decides whether a subscription row is
+ * allowed to reach this matrix at all lives beside it, in
+ * `./entitlement-resolution.ts`.
  */
 
 export interface Entitlements {
@@ -25,7 +30,12 @@ export interface Entitlements {
   canAccessAutomation: boolean; // M8 future
 }
 
-const FREE_ENTITLEMENTS: Entitlements = {
+/**
+ * The free tier, exported so the read-side resolver in
+ * `./entitlement-resolution.ts` can return THIS object instead of restating a
+ * second matrix. There is exactly one definition of every tier.
+ */
+export const FREE_ENTITLEMENTS: Entitlements = {
   maxStrategies: 100,
   maxBacktestsPerMonth: 100,
   maxAlertsPerMonth: 1000,

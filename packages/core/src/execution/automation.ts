@@ -1,7 +1,8 @@
 import type pg from 'pg';
 import type { AutomationStatusDto, UserPlan } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
-import { getEntitlements, type Entitlements } from '../billing/entitlements.js';
+import { type Entitlements } from '../billing/entitlements.js';
+import { resolveEntitlements } from '../billing/entitlement-resolution.js';
 import type { AuditService } from '../audit.js';
 import type { KillSwitchService } from './kill-switch.js';
 
@@ -117,8 +118,13 @@ export class AutomationService {
 
   /** Raw state used by the gate layer (entitlement + switch, no kill checks). */
   async readState(userId: string): Promise<{ entitlements: Entitlements; automationEnabled: boolean }> {
-    const res = await this.pool.query<{ plan: string; status: string; automation_enabled: boolean }>(
-      `SELECT sub.plan, sub.status, u.automation_enabled
+    // `sub.provider` is read for the fail-closed entitlement gate: a
+    // provider-backed subscription row is an unconfirmed checkout, not a
+    // purchase, and resolves to the free tier.
+    const res = await this.pool.query<{
+      plan: string; status: string; provider: string | null; automation_enabled: boolean;
+    }>(
+      `SELECT sub.plan, sub.status, sub.provider, u.automation_enabled
        FROM users u
        LEFT JOIN subscriptions sub ON sub.user_id = u.id
        WHERE u.id = $1`,
@@ -128,6 +134,9 @@ export class AutomationService {
     if (!row) throw Errors.notFound('User not found');
     const plan = (row.plan ?? 'free') as UserPlan;
     const status = row.status ?? 'active';
-    return { entitlements: getEntitlements(plan, status), automationEnabled: row.automation_enabled };
+    return {
+      entitlements: resolveEntitlements(plan, status, row.provider),
+      automationEnabled: row.automation_enabled,
+    };
   }
 }
