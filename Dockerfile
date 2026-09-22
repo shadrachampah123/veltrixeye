@@ -34,6 +34,7 @@ COPY package.json package-lock.json ./
 COPY packages/contracts/package.json packages/contracts/
 COPY packages/core/package.json packages/core/
 COPY packages/providers/twelve-data/package.json packages/providers/twelve-data/
+COPY packages/providers/paystack/package.json packages/providers/paystack/
 COPY apps/api/package.json apps/api/
 COPY apps/web/package.json apps/web/
 RUN npm ci --omit=dev --workspace @veltrixeye/api
@@ -61,6 +62,8 @@ COPY --chown=node:node packages/core/package.json packages/core/package.json
 COPY --chown=node:node packages/core/src packages/core/src
 COPY --chown=node:node packages/providers/twelve-data/package.json packages/providers/twelve-data/package.json
 COPY --chown=node:node packages/providers/twelve-data/src packages/providers/twelve-data/src
+COPY --chown=node:node packages/providers/paystack/package.json packages/providers/paystack/package.json
+COPY --chown=node:node packages/providers/paystack/src packages/providers/paystack/src
 COPY --chown=node:node apps/api/package.json apps/api/package.json
 COPY --chown=node:node apps/api/tsconfig.json apps/api/tsconfig.json
 COPY --chown=node:node apps/api/src apps/api/src
