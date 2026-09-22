@@ -1,5 +1,6 @@
 export * from './catalogue.js';
 export * from './entitlements.js';
+export * from './entitlement-resolution.js';
 export * from './fx-rate-versions.js';
 export * from './pricing.js';
 export * from './provider-plans.js';

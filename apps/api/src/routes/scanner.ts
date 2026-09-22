@@ -4,7 +4,7 @@ import {
   scannerTriggerRequestSchema,
   type UserPlan,
 } from '@veltrixeye/contracts';
-import { Errors, getEntitlements } from '@veltrixeye/core';
+import { Errors, resolveEntitlements } from '@veltrixeye/core';
 import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
@@ -37,12 +37,14 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
     const { user } = req as AuthenticatedRequest;
 
     // Check entitlement server-side
-    const billing = await ctx.pool.query<{ plan: string; status: string }>(
-      `SELECT plan, status FROM subscriptions WHERE user_id = $1`,
+    // `provider` is read for the fail-closed entitlement gate: a provider-backed
+    // row is an unconfirmed checkout and never buys scanner access.
+    const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null }>(
+      `SELECT plan, status, provider FROM subscriptions WHERE user_id = $1`,
       [user.id],
     );
-    const sub = billing.rows[0] ?? { plan: 'free', status: 'active' };
-    const entitlements = getEntitlements(sub.plan as UserPlan, sub.status);
+    const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null };
+    const entitlements = resolveEntitlements(sub.plan as UserPlan, sub.status, sub.provider);
     if (!entitlements.canAccessScanner) {
       throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
     }
@@ -57,12 +59,14 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
     if (!ok) return;
     const { user } = req as AuthenticatedRequest;
 
-    const billing = await ctx.pool.query<{ plan: string; status: string }>(
-      `SELECT plan, status FROM subscriptions WHERE user_id = $1`,
+    // `provider` is read for the fail-closed entitlement gate: a provider-backed
+    // row is an unconfirmed checkout and never buys scanner access.
+    const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null }>(
+      `SELECT plan, status, provider FROM subscriptions WHERE user_id = $1`,
       [user.id],
     );
-    const sub = billing.rows[0] ?? { plan: 'free', status: 'active' };
-    const entitlements = getEntitlements(sub.plan as UserPlan, sub.status);
+    const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null };
+    const entitlements = resolveEntitlements(sub.plan as UserPlan, sub.status, sub.provider);
     if (!entitlements.canAccessScanner) {
       throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
     }
@@ -85,12 +89,14 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       if (!ok) return;
       const { user } = req as AuthenticatedRequest;
 
-      const billing = await ctx.pool.query<{ plan: string; status: string }>(
-        `SELECT plan, status FROM subscriptions WHERE user_id = $1`,
+      // `provider` is read for the fail-closed entitlement gate: a provider-backed
+      // row is an unconfirmed checkout and never buys scanner access.
+      const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null }>(
+        `SELECT plan, status, provider FROM subscriptions WHERE user_id = $1`,
         [user.id],
       );
-      const sub = billing.rows[0] ?? { plan: 'free', status: 'active' };
-      const entitlements = getEntitlements(sub.plan as UserPlan, sub.status);
+      const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null };
+      const entitlements = resolveEntitlements(sub.plan as UserPlan, sub.status, sub.provider);
       if (!entitlements.canAccessScanner) {
         throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
       }

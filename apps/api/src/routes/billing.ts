@@ -42,6 +42,10 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
     const dto: BillingStateDto = {
       subscription: state.subscription,
       entitlements: state.entitlements,
+      // Display-only provider state: it tells the client whether the row came
+      // from a provider checkout, and `paymentConfirmed` is pinned false
+      // because no confirmation authority exists. It grants nothing.
+      providerStatus: state.providerStatus,
     };
     
     return reply.send(dto);

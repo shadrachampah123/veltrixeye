@@ -26,19 +26,40 @@ export function SubscriptionPanel({ billing }: { billing: BillingStateDto | null
 
   const ent = billing.entitlements;
   const sub = billing.subscription;
+  // A provider-backed row is a CHECKOUT, not a purchase. `paymentConfirmed` is
+  // pinned false by the API (no confirmation authority exists), and the server
+  // has already resolved the row to the free tier — so the panel must never
+  // present its `status: active` as a confirmed paid subscription. Display
+  // only: this component grants nothing and cannot change any limit.
+  const providerStatus = billing.providerStatus;
+  const awaitingConfirmation =
+    providerStatus?.provider != null && !providerStatus.paymentConfirmed;
 
   return (
     <Card>
       <CardHeader
         title="Subscription & Entitlements"
         subtitle="Plan foundations — server-authoritative, no client-side bypass"
-        actions={<Badge tone={sub.status === 'active' ? 'success' : 'warning'}>{sub.status}</Badge>}
+        actions={
+          awaitingConfirmation ? (
+            <Badge tone="warning">{providerStatus.providerState ?? 'pending'} · unconfirmed</Badge>
+          ) : (
+            <Badge tone={sub.status === 'active' ? 'success' : 'warning'}>{sub.status}</Badge>
+          )
+        }
       />
       <div className="space-y-5 px-5 py-4">
         <div className="flex items-center gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-signal-600/20 text-signal-400 font-semibold">{sub.plan.slice(0, 2).toUpperCase()}</div>
           <div>
-            <div className="text-sm font-semibold capitalize text-ink-50">{sub.plan} plan</div>
+            <div className="text-sm font-semibold capitalize text-ink-50">
+              {sub.plan} plan
+              {awaitingConfirmation ? (
+                <span className="ml-2 text-[11px] font-normal normal-case text-amber-450">
+                  awaiting payment confirmation
+                </span>
+              ) : null}
+            </div>
             <div className="text-xs text-ink-400">
               {sub.currentPeriodEnd ? `Renews ${formatDateTime(sub.currentPeriodEnd)}` : 'No renewal date'} · {BRAND.name} {BRAND.version}
             </div>
@@ -61,6 +82,15 @@ export function SubscriptionPanel({ billing }: { billing: BillingStateDto | null
             <FeatureRow label="Automation (M8)" enabled={ent.canAccessAutomation} note="Automation remains OFF by default — safety preserved" />
           </div>
         </div>
+
+        {awaitingConfirmation ? (
+          <div className="rounded-md border border-amber-450/30 bg-amber-450/10 px-3 py-2.5 text-[11px] leading-snug text-ink-300">
+            <strong className="text-amber-450">Payment not confirmed:</strong> this {sub.plan} subscription was
+            created by a {providerStatus.provider ?? 'billing provider'} checkout and the provider last reported{' '}
+            &ldquo;{providerStatus.providerState ?? 'pending'}&rdquo;. A provider state is never treated as a
+            payment, so the free-plan limits shown above are what the server enforces until a confirmation exists.
+          </div>
+        ) : null}
 
         <div className="rounded-md border border-amber-450/20 bg-amber-450/5 px-3 py-2.5 text-[11px] leading-snug text-ink-400">
           <strong className="text-amber-450">Entitlement foundation:</strong> All limits are enforced server-side. The UI never grants access — it only displays what the API returns. M8.7 safety controls (drawdown protection, kill-switch, automation OFF) remain active regardless of plan.
