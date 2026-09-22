@@ -205,8 +205,53 @@ anywhere in code or documentation:
 | --- | --- | --- |
 | AC1 | Whether this account can transact in **GHS** | Nothing GHS can be enabled for real customers until verified |
 | AC2 | Whether this account can do **GHS recurring** subscriptions | Recurring GHS is the product requirement; unverified |
-| AC5 | Whether Pro/Elite × monthly/annual sandbox **plan IDs** exist | No plan may be provisioned or sold without them |
+| AC5 | Whether Pro/Elite × monthly/annual sandbox **plan IDs** exist | No plan may be provisioned or sold without them. **Capability layer verified** (see §7.1); the four production-shaped plan IDs still do not exist |
 | AC7 | Whether a sandbox **GHS recurring** end-to-end run completes | No recurring-E2E readiness claim without it |
+
+### 7.1 Account-specific evidence: GHS test-plan capability (operator-reported)
+
+The following is **operator-reported Paystack Dashboard evidence**, recorded
+here verbatim. It was created manually in the Dashboard (test mode) — not by
+this repository, not by the adapter, and not by any code path. It has not been
+re-read through the API (`GET /plan/:code`) from this repository.
+
+| Field | Value |
+| --- | --- |
+| Plan name | `VeltrixEye Pro Monthly Test` |
+| Plan code | `PLN_u0l4961hhipl6ek` |
+| Currency | **GHS** |
+| Amount | GHS 2.00 (200 pesewas) |
+| Interval | `monthly` |
+| Max number of payments | 1 |
+| Status | Active |
+| Environment | **Test / sandbox** (`domain: test`) |
+| Created | 2026-09-22 18:15 (operator's local time) |
+| Source | Paystack Dashboard → Plans, reported by the operator |
+
+**What this establishes — and only this:**
+
+- This account's integration **can create an Active plan in GHS, in test
+  mode, with a monthly interval**. That is the account-level "GHS plan
+  capability" named as the blocker for the plan-provisioning milestone in
+  [billing.md](./billing.md).
+
+**What it does NOT establish:**
+
+- AC1 — no GHS transaction has been executed against this account.
+- AC2 — no customer authorization, subscription or recurring charge exists;
+  a plan with `max payments = 1` is a single-invoice plan, not a recurring
+  cycle.
+- AC7 — no end-to-end run has occurred.
+- The `annually` interval, or any Elite plan, on this account.
+- AC5 in full: **none** of the four production-shaped sandbox plans
+  (Pro/Elite × monthly/annual) exist yet.
+
+**This plan MUST NOT be registered as a `billing_provider_plans` epoch.** It is
+capability evidence only. Its amount (GHS 2.00) is not the FX-derived Pro
+monthly price, no `billing_fx_rate_versions` row exists to pin it to, and its
+`max payments = 1` contradicts an open-ended subscription epoch;
+`assertProviderPlanMatches` would (correctly) refuse it. Nothing may quote,
+sell or initialize a checkout against this plan code.
 | F1–F11 | Plan-change timing, re-authorization, in-flight checkout, session expiry, plan-currency mutability, post-failure status, charge-authorization-as-dunning, full event strings, status vocabulary, GHS capability, Ghanaian regulatory posture | Each is undocumented; each is handled by failing closed |
 
 International-payment support (the Dashboard → Preferences request flow, the
