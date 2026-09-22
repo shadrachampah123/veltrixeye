@@ -68,6 +68,18 @@ async function main(): Promise<void> {
     console.warn('[api] TWELVE_DATA_API_KEY is not set — market-data ingestion is unavailable (502)');
   }
 
+  // Billing PR3 — Paystack SANDBOX. Logged WITHOUT credentials: `describe()`
+  // carries the host, mode, live flag and implemented operations only. A key
+  // that is absent is a normal state (billing simply unavailable), not an
+  // error, and a key that is not a test key stops the boot in `loadConfig`.
+  if (ctx.billingComposition.registered) {
+    console.info(
+      `[api] billing provider registered: ${JSON.stringify(ctx.billingComposition.describe ?? {})}`,
+    );
+  } else {
+    console.warn(`[api] billing is unavailable — ${ctx.billingComposition.reason}`);
+  }
+
   // M7.3 — notification delivery. Log the channel state WITHOUT credentials:
   // `describe()` is the provider's operator-safe view (host/port/from only,
   // never the SMTP password). Unconfigured is a normal state, not an error:

@@ -17,6 +17,7 @@ export * from './users.js';
 export * from './errors.js';
 export * from './billing.js';
 export * from './billing-catalogue.js';
+export * from './billing-payment.js';
 export * from './billing-provider.js';
 export * from './scanner.js';
 export * from './execution.js';

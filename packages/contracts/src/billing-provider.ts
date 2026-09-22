@@ -12,6 +12,7 @@ import {
   type PlanPrice,
 } from './billing-catalogue.js';
 import { subscriptionStatusSchema, type SubscriptionStatus } from './billing.js';
+import { billingPaymentAmountSchema, billingPricingSnapshotSchema } from './billing-payment.js';
 import { userPlanSchema } from './users.js';
 
 /**
@@ -78,41 +79,32 @@ export const BILLING_PROVIDER_OPERATIONS = [
 export type BillingProviderOperation = (typeof BILLING_PROVIDER_OPERATIONS)[number];
 export const billingProviderOperationSchema = z.enum(BILLING_PROVIDER_OPERATIONS);
 
-/** SHA-256 hex — the format used for every billing hash/idempotency key. */
-export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
-export const sha256HexSchema = z.string().regex(SHA256_HEX_RE);
-
 /**
- * Credential-shaped material. A provider REFERENCE is an identifier
- * (`cus_…`, `sub_…`, a transaction reference) — never a key, token or
- * password. Reference values matching this pattern are rejected, mirroring the
- * database-level posture in migration 0031 (and 0029 for execution receipts).
+ * PR3: the shared billing primitives (hashing, credential-shaped rejection and
+ * provider-reference bounds) live in `./billing-refs.ts` so that
+ * `./billing-payment.ts` can use them without a circular import. They are
+ * imported for local use AND re-exported, so this module's public API is
+ * exactly what it was in PR2.
  */
-export const BILLING_CREDENTIAL_SHAPED_RE =
-  /(password|passwd|token|secret|api[_-]?key|authorization|private[_-]?key|credential|bearer)/i;
+import {
+  BILLING_CREDENTIAL_SHAPED_RE,
+  billingIsoDateTimeSchema,
+  billingUuidSchema,
+  providerEventReferenceSchema,
+  providerReferenceSchema,
+  sha256HexSchema,
+} from './billing-refs.js';
 
-/** A provider-side identifier for a customer/subscription/plan. */
-export const providerReferenceSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(128)
-  .refine((value) => !BILLING_CREDENTIAL_SHAPED_RE.test(value), {
-    message: 'a provider reference must be an identifier, never credential-shaped material',
-  });
+export {
+  BILLING_CREDENTIAL_SHAPED_RE,
+  providerEventReferenceSchema,
+  providerReferenceSchema,
+  SHA256_HEX_RE,
+  sha256HexSchema,
+} from './billing-refs.js';
 
-/** A provider-side reference carried by an event/transaction (wider bound). */
-export const providerEventReferenceSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(190)
-  .refine((value) => !BILLING_CREDENTIAL_SHAPED_RE.test(value), {
-    message: 'a provider reference must be an identifier, never credential-shaped material',
-  });
-
-const isoDateTime = z.string().datetime();
-const uuid = z.string().uuid();
+const isoDateTime = billingIsoDateTimeSchema;
+const uuid = billingUuidSchema;
 
 /* -------------------------------------------------------------------------- */
 /* Canonical vocabularies (the only ones that ever reach the database)        */
@@ -398,6 +390,13 @@ export const providerSubscriptionStateSchema = z
     cataloguePlan: commercialPlanIdSchema.nullable(),
     interval: billingIntervalSchema.nullable(),
     currency: z.literal(BILLING_CURRENCY).nullable(),
+    /**
+     * PR3: the provider-reported PAYMENT amount for a subscription that is
+     * charged in a payment currency (Ghana: GHS). `currency` above stays the
+     * COMMERCIAL currency; this is the amount actually charged, in payment
+     * minor units, normalized behind the seam.
+     */
+    payment: billingPaymentAmountSchema.nullable().optional(),
     currentPeriodStart: isoDateTime.nullable(),
     currentPeriodEnd: isoDateTime.nullable(),
     cancelAtPeriodEnd: z.boolean(),
@@ -461,6 +460,14 @@ export const billingSubscriptionStateSchema = z
     cataloguePlan: commercialPlanIdSchema.nullable(),
     interval: billingIntervalSchema.nullable(),
     currency: z.literal(BILLING_CURRENCY),
+    /**
+     * PR3: the LOCKED pricing snapshot this subscription was sold under
+     * (commercial USD amount + payment GHS amount + FX rate/version/time +
+     * rounding). Present only for provider-backed, payment-currency
+     * subscriptions; `null`/absent for everything else. A locked snapshot is
+     * never recomputed (D-1 = A, D-8).
+     */
+    pricing: billingPricingSnapshotSchema.nullable().optional(),
     /** AUTHORITATIVE lifecycle status (migration 0014 vocabulary). */
     status: subscriptionStatusSchema,
     catalogueVersion: z.string().min(1).max(64).nullable(),
@@ -649,6 +656,12 @@ export const billingEventDataSchema = z
     cancellationReason: billingCancellationReasonSchema.nullable(),
     amountMinor: z.number().int().nonnegative().nullable(),
     currency: z.literal(BILLING_CURRENCY).nullable(),
+    /**
+     * PR3: the payment-currency amount this event reports (GHS pesewas for the
+     * Ghana flow), when the delivery carries one. A receipt fact only — never a
+     * price source.
+     */
+    payment: billingPaymentAmountSchema.nullable().optional(),
     failureReason: z.string().min(1).max(600).nullable(),
   })
   .strict()

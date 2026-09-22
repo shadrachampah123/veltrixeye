@@ -7,7 +7,11 @@
  *    RENAME, no data rewrite, no redefinition of an earlier object);
  *  - migrations 0001–0030 are byte-identical (recorded SHA-256 for 0001, 0014
  *    and 0030 — identity/audit, the subscription table 0031 extends, and the
- *    previous tip);
+ *    previous tip); 0031 itself is now pinned the same way (PR3 re-scoped the
+ *    "newest migration" assertion to the PR2 step, exactly as the Gate 9 M3
+ *    suite re-scoped the 0029 tip assertion when 0030 arrived: 0031 is the
+ *    newest migration OF THIS STEP, later migrations must be the recorded ones,
+ *    and the runner still verifies every applied checksum);
  *  - existing users keep their `free | pro | premium` plan values and every
  *    pre-existing column/default/constraint of `subscriptions` (0014);
  *  - persisted provider state is constrained to the canonical vocabulary, the
@@ -39,7 +43,17 @@ const RECORDED_SHA256: Readonly<Record<string, string>> = Object.freeze({
   '0001_identity_and_audit.sql': '7bf309682a639ab3b04bd72698d481f996ea07f98fafa59a5f726fe1a9943cf9',
   '0014_subscriptions_and_entitlements.sql': '133cc73c27fe99ba23f78ecda65b526c36a0f3f1e8319252562941c69f79f810',
   '0030_provider_mutation_lineage_invariants.sql': '979015990c2bbf38d4d4f5ec246f328cbfe7f1833aac2472f5b5ad209985ea5a',
+  // Pinned when Billing PR3 added 0032: from that point on, 0031 is history and
+  // must never change either (the PR3 suite re-checks the same value).
+  '0031_provider_billing.sql': 'e43cf29aabc107a2985152b517560c872f8cafd2f7ebede01cffd5f555424a28',
 });
+/**
+ * Migrations that legitimately appear AFTER this step's tip. Naming them here
+ * is what keeps "nothing unexpected appears after 0031" a real assertion: a new
+ * migration must be added to this list deliberately, by the change that
+ * introduces it.
+ */
+const LATER_MIGRATIONS = ['0032_billing_fx_and_pricing.sql'] as const;
 /** Columns `subscriptions` had before 0031 (migration 0014). */
 const SUBSCRIPTION_COLUMNS_0014 = [
   'id',
@@ -203,7 +217,7 @@ after(async () => {
 });
 
 describe('Billing PR2 — 0031 file conventions', () => {
-  test('0031 is the next migration, uniquely named, and 0001-0030 are byte-identical', () => {
+  test('0031 is the newest migration of the PR2 step, uniquely named, and 0001-0030 are byte-identical', () => {
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((file) => /^\d{4}_.+\.sql$/.test(file))
       .sort();
@@ -213,12 +227,27 @@ describe('Billing PR2 — 0031 file conventions', () => {
       assert.ok(versions.includes(expected), `migration ${String(expected).padStart(4, '0')} exists`);
     }
     assert.equal(files.filter((file) => file.startsWith('0031_')).length, 1, 'exactly one 0031 migration');
-    assert.equal(files.at(-1), MIGRATION_0031, '0031 is the newest migration');
-    assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 31).length,
-      0,
-      'nothing is numbered after 0031',
+
+    // Re-scoped when PR3 arrived (same precedent as the Gate 9 M3 suite, which
+    // re-scoped its 0029 tip assertion when 0030 landed): 0031 must still be the
+    // newest migration OF THIS STEP, and the only migrations after it are the
+    // ones recorded in LATER_MIGRATIONS.
+    const filesUpTo31 = files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) <= 31);
+    assert.equal(filesUpTo31.at(-1), MIGRATION_0031, '0031 is the newest migration of the PR2 step');
+    assert.deepEqual(
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 31),
+      [...LATER_MIGRATIONS],
+      'nothing unexpected is numbered after 0031',
     );
+    for (const later of LATER_MIGRATIONS) {
+      const version = Number(/^(\d{4})_/.exec(later)?.[1]);
+      assert.equal(files.filter((file) => file.startsWith(`${later.slice(0, 4)}_`)).length, 1, `exactly one ${later}`);
+      assert.equal(
+        files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) === version).length,
+        1,
+        `${later} is uniquely numbered`,
+      );
+    }
 
     for (const [file, expected] of Object.entries(RECORDED_SHA256)) {
       assert.equal(
