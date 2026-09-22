@@ -11,6 +11,13 @@
 > production activation and no Starter selling. `GET /api/billing/me` remains
 > the only billing route.
 >
+> **This change is documentation only.** It records the billing pricing
+> decisions **D-1 … D-9** (below) — including **D-9, provider-plan epoch
+> pricing** — and tightens the plan-provisioning prerequisites. It changes no
+> code, no migration, no schema, no test, no provider, no API route and no
+> configuration; it publishes no FX rate, registers no provider-plan epoch and
+> creates no Paystack plan.
+>
 > **Account capabilities are only partially verified.** Whether this account
 > can transact in **GHS** (AC1) or run **GHS recurring** subscriptions (AC2) is
 > unverified, and no recurring end-to-end run has happened (AC7). The account's
@@ -48,6 +55,86 @@
 | Paystack API integration | **Sandbox seam only, three of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout`). No checkout route, no live key, `implemented: false` |
 | Provider plan mutation | **Never.** `PUT /plan` is never called; a price change is a NEW epoch + a NEW provider plan, and the previous epoch is retired locally |
 | Entitlements / execution | **Unchanged.** `canAccessAutomation` stays `false` for every plan |
+
+## Pricing decisions (D-1 … D-9)
+
+The pricing rules the billing path obeys, numbered so that other documents,
+migrations and code comments can cite one rule instead of restating it. Each
+entry names a **refusal** as often as it names a computation.
+
+| # | Decision |
+| --- | --- |
+| **D-1** | A subscription's price is **locked at creation** and is never recomputed from a later FX version, a later catalogue change or a later provider-plan change |
+| **D-2** | Pricing uses **exactly one half-up rounding step**, in integer/BigInt arithmetic. No float, and no second rounding anywhere in the path |
+| **D-3** | A **new** price may only use an FX version captured no more than **15 minutes** before the pricing instant (`BILLING_FX_POLICY.maxAgeSeconds = 900`). Older ⇒ refuse. A stale rate is never priced from |
+| **D-4** | A **pending** checkout keeps the amount already quoted to the customer. FX freshness does not reprice it |
+| **D-5** | The **USD catalogue is the only source of catalogue prices**. No price literal is restated in the pricing path and none is derived at runtime |
+| **D-6** | A **refund never re-rates** the original purchase; it uses the amount actually charged |
+| **D-7** | Local pricing and idempotency decisions are **deterministic** — the same inputs collapse onto the same snapshot row and the same `idempotency_key` |
+| **D-8** | Locked-subscription verification **never re-rates**. An FX version ageing out does not change a locked amount |
+| **D-9** | **Provider-plan epoch pricing** — an epoch freezes its GHS amount at registration. See below |
+
+**D-3 is a freshness rule for pricing *instants* only**: creating a new one-off
+price, or registering a new provider-plan epoch. It is not a rule that keeps
+re-validating an amount a customer has already been shown (D-4), an amount a
+provider plan is already registered at (D-9), or an amount already locked to a
+subscription (D-1, D-8).
+
+### D-9 — Provider-plan epoch pricing
+
+A Paystack provider-plan epoch (`billing_provider_plans`) **freezes its GHS
+amount when the epoch is registered**:
+
+- The amount is fixed **at registration**, from an FX version that is **fresh at
+  registration time** — no more than 900 seconds old (D-3).
+- `amount = half_up(catalogue USD minor amount × epoch FX rate)` — one half-up
+  step, integer arithmetic (D-2, D-5).
+- The epoch amount is **immutable after registration**. The schema refuses the
+  edit, and nothing in the billing path recomputes it.
+- **A later FX version does not invalidate or reprice an existing active
+  epoch.** A new rate is a reason to *consider* a new epoch, never a reason to
+  change an old one.
+- **Plan-bound checkout derives its pricing snapshot from the active
+  provider-plan epoch** — the epoch's amount, the epoch's FX version and the
+  epoch's FX facts.
+- **The epoch's FX facts are the disclosed FX facts** for that plan-bound
+  checkout: the rate, version and time the epoch was registered at — not a live
+  rate.
+- A **new provider plan plus a new epoch** is required only when an operator
+  **deliberately** changes the price: retire the epoch (`active → retired`,
+  one-way) and register a new one bound to a new provider plan.
+- **Existing locked subscriptions are never repriced** (D-1, D-8) — not by a
+  later FX version, not by a new epoch, and not by retiring the epoch they were
+  sold under.
+
+**The governing recurring-plan invariant:**
+
+> The GHS amount a Paystack plan charges is fixed at the moment the epoch is
+> registered, equals `half_up(catalogueUsdMinor × epochRate)` computed under a
+> then-fresh FX version, and is thereafter the only amount that may be quoted,
+> initialized, locked or verified for that epoch. It changes only by retiring
+> the epoch and registering a new one bound to a new provider plan; it is never
+> recomputed from a later FX version.
+
+#### Implementation boundary — what D-9 does not ship yet
+
+- The **epoch-derived pricing entry point is a later core implementation PR.**
+  D-9 is the decision; the code that derives a plan-bound snapshot from an
+  active epoch does not exist yet.
+- Until it does, the existing plan-bound checkout **fails closed** rather than
+  silently repricing an old epoch: no active epoch ⇒ `plan_not_registered`; an
+  epoch that does not authorize the requested amount exactly ⇒ `plan_mismatch`
+  (`assertProviderPlanMatches`). A refusal is the intended behaviour here, not a
+  gap to be worked around.
+- The **15-minute freshness rule applies to NEW one-off pricing and to NEW
+  provider-plan epoch registration** — never to an already-registered epoch at
+  checkout time. An epoch whose FX version is now hours old is still valid; what
+  is invalid is *deriving a new amount* from it.
+- The existing **GHS 2.00 test plan `PLN_u0l4961hhipl6ek` is capability evidence
+  only and must NEVER be registered as a `billing_provider_plans` epoch**
+  ([paystack-provider-contract.md](./paystack-provider-contract.md) §7.1). Its
+  amount is not FX-derived, no FX version exists to pin it to, and its
+  single-invoice shape contradicts a recurring epoch.
 
 ## Authoritative commercial catalogue
 
@@ -296,6 +383,10 @@ charges in, pinned to the FX version and pricing/catalogue versions it came from
   provider plan identifier, FX version, pricing policy and active status — and
   the Paystack adapter calls exactly that function, so there is one
   implementation of the rule.
+- **The amount an epoch freezes at registration — and why a later FX version
+  never changes it — is D-9.** An epoch's FX facts are the FX facts disclosed on
+  a plan-bound checkout, and plan-bound checkout derives its snapshot from the
+  active epoch rather than re-rating it. See *Pricing decisions (D-1 … D-9)*.
 
 ### 4. The lock — `subscriptions.locked_pricing_snapshot_id`
 
@@ -422,6 +513,12 @@ while everything below remains true at the **product** level:
   `billing_pricing_snapshots` likewise have no writer wired to a route; the FX
   versions are published by an operator/ops path (a later PR), never by a client
   or a market feed.
+- **No epoch-derived pricing entry point.** Nothing derives a plan-bound pricing
+  snapshot from an active `billing_provider_plans` epoch yet (D-9): a plan-bound
+  checkout **fails closed** (`plan_not_registered` / `plan_mismatch`) rather
+  than silently repricing an old epoch. No epoch has been registered, so there
+  is nothing to derive from — and the 15-minute freshness rule (D-3) is a rule
+  about *new* pricing instants, not about an epoch already registered.
 - **No billing UI and no pricing UI change** (`apps/web` is untouched; the plan
   comparison still renders the PR1 catalogue).
 - **No notification change** (M9.1/M9.2 untouched).
@@ -483,13 +580,32 @@ Roughly in order; each is its own PR and may be re-scoped.
    `0032`, `fx-rate-versions.ts`, `pricing.ts`, `provider-plans.ts`).
 4. **Plan provisioning** — Pro/Elite × monthly/annual sandbox plans, registered
    as local epochs. **GHS plan capability verified** (contract §7.1), so this
-   milestone may begin; it is **not started**. Prerequisites before any of the
-   four plans is created: (a) a published `billing_fx_rate_versions` row, since
-   every plan amount is derived from the catalogue USD price through that
-   version — no FX version, no plan amount; (b) a decided provisioning path
-   that keeps `PUT`/`POST /plan` out of `packages/providers/paystack` (the
-   source assertion forbids plan mutation there). The GHS 2.00 test plan is
-   capability evidence only and is **never** registered as an epoch.
+   milestone may begin; it is **not started**. Prerequisites, **all** of them
+   before any of the four plans is created:
+   - **(a) An authoritative FX version must exist first** — a published
+     `billing_fx_rate_versions` row. Every plan amount is derived from the
+     catalogue USD price through that version: no FX version, no plan amount
+     (D-3, D-9).
+   - **(b) One FX version for all four plans.** The four production-shaped plans
+     must use amounts derived from the **same** FX version used for epoch
+     registration, so the four epoch amounts are mutually consistent and every
+     epoch pins the **same FX version ID**.
+   - **(c) The four plans are exactly:** **Pro Monthly**, **Pro Annual**,
+     **Elite Monthly**, **Elite Annual** — **GHS**, **test mode**, intervals
+     `monthly` / `annually`.
+   - **(d) No invoice / payment-count cap** on the production-shaped plans. The
+     GHS 2.00 evidence plan is `max payments = 1`; a recurring epoch is
+     open-ended, and a capped plan cannot be registered as one.
+   - **(e) Each registered epoch references that same FX version ID and the
+     plan's real `PLN_` code** — the code Paystack actually issued, never a
+     placeholder and never the throwaway plan's.
+   - **(f) A provisioning path that keeps `PUT`/`POST /plan` out of
+     `packages/providers/paystack`.** The adapter **must not** gain `/plan`
+     mutation capability (the source assertion forbids plan mutation there);
+     provisioning happens outside the adapter, and the adapter only ever reads
+     against a locally registered epoch.
+   - **(g) The throwaway GHS 2.00 plan remains excluded** — capability evidence
+     only, **never** registered as an epoch.
 5. **Checkout / payment initialization route** — server-side initialization
    behind `initializeCheckout`, plus its route and UI. Not before AC1/AC2/AC5/AC7.
 6. **Webhook receiver + security** — signature verification
