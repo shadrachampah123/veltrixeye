@@ -152,6 +152,14 @@ no personal data, no amount the provider did not receive in `amount`).
 epoch has been proven to authorize exactly that amount (§4 below and
 `assertProviderPlanMatches` in core).
 
+For a **plan-bound** charge the amount sent is the **frozen epoch amount** — the
+GHS amount fixed when the epoch was registered ([billing.md](./billing.md) D-9) —
+and the FX facts disclosed with that checkout are the **epoch's** FX facts, not
+a live rate. The adapter never re-rates an existing epoch from a later FX
+version: it holds no rate and no catalogue amount, and it does no arithmetic
+(§5). A later rate reaches a customer only through a **new** epoch bound to a
+**new** provider plan, never by mutating this one.
+
 Outcome handling: a documented provider rejection returns `status: 'failed'`; an
 unknown outcome (transport error, timeout, unreadable response) returns
 `status: 'unavailable'`. **Neither is an initialization**, and neither is ever
@@ -180,6 +188,14 @@ email we sent is `response_conflict`.
   `BillingPricingSnapshot` (USD catalogue amount + GHS payable amount + FX
   version + rounding mode) and sends exactly
   `paymentAmountMinor` in GHS pesewas; it refuses to proceed without it.
+- **Plan-bound checkout uses the epoch's frozen amount.** When the charge is
+  plan-bound, `paymentAmountMinor` is the amount the active
+  `billing_provider_plans` epoch was **registered** at, and the epoch's FX
+  version is the FX fact disclosed with it. The adapter never re-rates an
+  existing epoch from a later FX version — `PUT /plan` is never called, and the
+  15-minute FX freshness rule applies to **new** one-off pricing and to **new**
+  epoch registration, not to an epoch that is already registered
+  ([billing.md](./billing.md) D-9).
 - A provider-reported amount or currency that differs from the authorized
   snapshot in **any** way is an incident (`amount_mismatch`), for both
   under-charges and over-charges.
@@ -205,7 +221,7 @@ anywhere in code or documentation:
 | --- | --- | --- |
 | AC1 | Whether this account can transact in **GHS** | Nothing GHS can be enabled for real customers until verified |
 | AC2 | Whether this account can do **GHS recurring** subscriptions | Recurring GHS is the product requirement; unverified |
-| AC5 | Whether Pro/Elite × monthly/annual sandbox **plan IDs** exist | No plan may be provisioned or sold without them. **Capability layer verified** (see §7.1); the four production-shaped plan IDs still do not exist |
+| AC5 | Whether Pro/Elite × monthly/annual sandbox **plan IDs** exist | No plan may be provisioned or sold without them. **Capability layer verified** (see §7.1); the four production-shaped plan IDs still do not exist (see §7.2) |
 | AC7 | Whether a sandbox **GHS recurring** end-to-end run completes | No recurring-E2E readiness claim without it |
 
 ### 7.1 Account-specific evidence: GHS test-plan capability (operator-reported)
@@ -251,7 +267,38 @@ capability evidence only. Its amount (GHS 2.00) is not the FX-derived Pro
 monthly price, no `billing_fx_rate_versions` row exists to pin it to, and its
 `max payments = 1` contradicts an open-ended subscription epoch;
 `assertProviderPlanMatches` would (correctly) refuse it. Nothing may quote,
-sell or initialize a checkout against this plan code.
+sell or initialize a checkout against this plan code. It is **not** one of the
+four production-shaped plans in §7.2 and is not a substitute for any of them.
+
+### 7.2 The four production-shaped plans (still missing)
+
+AC5 is cleared only when these four exist, and each is registered locally as an
+epoch. Nothing here has been created yet.
+
+| Plan | Interval | Currency | Mode |
+| --- | --- | --- | --- |
+| Pro Monthly | `monthly` | **GHS** | **test** |
+| Pro Annual | `annually` | **GHS** | **test** |
+| Elite Monthly | `monthly` | **GHS** | **test** |
+| Elite Annual | `annually` | **GHS** | **test** |
+
+Requirements, all of them ([billing.md](./billing.md) D-9 and its roadmap item):
+
+- **No invoice / payment-count cap** on any of the four. The GHS 2.00 evidence
+  plan is `max payments = 1`; these are open-ended recurring plans.
+- **One FX version for all four.** Each plan's GHS amount must be
+  `half_up(catalogueUsdMinor × epochRate)` under the **same** published
+  `billing_fx_rate_versions` version, and each registered epoch must reference
+  **that same FX version ID**.
+- Each epoch references the plan's **real `PLN_` code** — the code Paystack
+  actually issued, never a placeholder.
+- **The adapter must not gain `/plan` mutation capability.** `POST`/`PUT /plan`
+  stays out of `packages/providers/paystack` (the source assertion forbids plan
+  mutation there), so the four plans are provisioned outside the adapter and the
+  adapter only ever reads against a registered epoch.
+- **The throwaway GHS 2.00 plan stays excluded** — capability evidence only,
+  never registered as an epoch.
+
 | F1–F11 | Plan-change timing, re-authorization, in-flight checkout, session expiry, plan-currency mutability, post-failure status, charge-authorization-as-dunning, full event strings, status vocabulary, GHS capability, Ghanaian regulatory posture | Each is undocumented; each is handled by failing closed |
 
 International-payment support (the Dashboard → Preferences request flow, the
@@ -263,6 +310,8 @@ is likewise an **account capability**, not a code path.
 No checkout route, no checkout UI, no `apps/web` change, no webhook receiver, no
 signature processing, no subscription synchronization, no billing portal, no
 refund/proration/dunning execution, no notifications, no live payment, no
-production credential, no production activation, no Starter selling, no Gate 9
-work, no broker execution and no trading logic. See
-[billing.md](./billing.md) for the billing roadmap.
+production credential, no production activation, no Starter selling, no
+provider-plan epoch registration, no epoch-derived pricing entry point, no
+`/plan` mutation, no FX publication, no Gate 9 work, no broker execution and no
+trading logic. The GHS 2.00 test plan is not registered as an epoch. See
+[billing.md](./billing.md) for the billing roadmap and for decisions D-1 … D-9.
