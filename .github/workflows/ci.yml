@@ -56,6 +56,20 @@ jobs:
           set -eux
           npm run typecheck
 
+      - name: Verify Dockerfile includes Paystack workspace (regression for PR #46 fix)
+        run: |
+          set -eux
+          echo "Checking Dockerfile for Paystack workspace packaging..."
+          grep -F "packages/providers/paystack/package.json" Dockerfile
+          grep -F "packages/providers/paystack/src" Dockerfile
+          echo "Dockerfile contains Paystack entries"
+          echo "Checking Node resolution of @veltrixeye/provider-paystack..."
+          node -e "const p = require.resolve('@veltrixeye/provider-paystack'); console.log('resolved', p)"
+          echo "Checking package files exist..."
+          test -f packages/providers/paystack/package.json
+          test -f packages/providers/paystack/src/index.ts
+          echo "Paystack workspace present and resolvable"
+
       - name: Test (all workspaces, including safety) with retry for known flaky concurrency test
         id: test
         run: |
