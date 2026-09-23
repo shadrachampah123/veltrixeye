@@ -4,12 +4,14 @@
 > `packages/providers/paystack` does, and — more importantly — what is
 > deliberately NOT done because the provider does not publish it.**
 >
-> Nothing in this repository takes a live payment. There is no checkout route,
-> no webhook receiver, no subscription synchronization, no billing portal, no
-> production credential and no live activation. The sandbox adapter is
-> registered by `apps/api` **only** when a sandbox key is configured, and it
-> reports itself as `live: false` with `implemented: false` while seam
-> operations remain unimplemented.
+> Nothing in this repository takes a live payment. `POST /api/billing/checkout`
+> exists, but it only *initializes* a sandbox checkout through the
+> `transaction/initialize` operation below — it never verifies or confirms a
+> payment. There is no checkout UI, no webhook receiver, no subscription
+> synchronization, no billing portal, no production credential and no live
+> activation. The sandbox adapter is registered by `apps/api` **only** when a
+> sandbox key is configured, and it reports itself as `live: false` with
+> `implemented: false` while seam operations remain unimplemented.
 >
 > **Every statement about Paystack below is taken from Paystack's official
 > documentation** (`paystack.com/docs/*`, `support.paystack.com`). Where the
@@ -273,7 +275,12 @@ four production-shaped plans in §7.2 and is not a substitute for any of them.
 ### 7.2 The four production-shaped plans (still missing)
 
 AC5 is cleared only when these four exist, and each is registered locally as an
-epoch. Nothing here has been created yet.
+epoch. Nothing here has been created yet. **The registration path is now code:**
+Step 4 (`packages/core/src/billing/provisioning.ts`) validates the whole
+four-plan batch and registers it atomically outside the adapter — see the
+*Sandbox plan provisioning (Step 4)* runbook in
+[billing.md](./billing.md). What remains is the separately-authorized operator
+run (dashboard plan creation + FX publication + one registration call).
 
 | Plan | Interval | Currency | Mode |
 | --- | --- | --- | --- |
@@ -282,13 +289,15 @@ epoch. Nothing here has been created yet.
 | Elite Monthly | `monthly` | **GHS** | **test** |
 | Elite Annual | `annually` | **GHS** | **test** |
 
-Requirements, all of them ([billing.md](./billing.md) D-9 and its roadmap item):
+Requirements, all of them ([billing.md](./billing.md) D-9 and its roadmap item) —
+each is enforced by the Step 4 workflow before anything is written:
 
 - **No invoice / payment-count cap** on any of the four. The GHS 2.00 evidence
   plan is `max payments = 1`; these are open-ended recurring plans.
 - **One FX version for all four.** Each plan's GHS amount must be
   `half_up(catalogueUsdMinor × epochRate)` under the **same** published
-  `billing_fx_rate_versions` version, and each registered epoch must reference
+  `billing_fx_rate_versions` version (fresh: within 900 s of the registration
+  instant, already effective), and each registered epoch must reference
   **that same FX version ID**.
 - Each epoch references the plan's **real `PLN_` code** — the code Paystack
   actually issued, never a placeholder.
@@ -297,7 +306,8 @@ Requirements, all of them ([billing.md](./billing.md) D-9 and its roadmap item):
   mutation there), so the four plans are provisioned outside the adapter and the
   adapter only ever reads against a registered epoch.
 - **The throwaway GHS 2.00 plan stays excluded** — capability evidence only,
-  never registered as an epoch.
+  never registered as an epoch. The provisioning workflow refuses it before any
+  write (`excluded_provider_plan`), independently of checkout's own refusal.
 
 | F1–F11 | Plan-change timing, re-authorization, in-flight checkout, session expiry, plan-currency mutability, post-failure status, charge-authorization-as-dunning, full event strings, status vocabulary, GHS capability, Ghanaian regulatory posture | Each is undocumented; each is handled by failing closed |
 

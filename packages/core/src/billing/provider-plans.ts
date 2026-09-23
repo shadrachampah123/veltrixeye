@@ -395,6 +395,13 @@ export interface RegisterProviderPlanInput {
   interval: BillingInterval;
   paymentCurrency: BillingPaymentCurrency;
   paymentAmountMinor: bigint;
+  /**
+   * The catalogue USD amount (minor units) the payment amount was derived
+   * from. REQUIRED — migration 0032 stores it (`catalogue_amount_minor`,
+   * NOT NULL) so an epoch always records both sides of its own derivation
+   * and can be audited against the catalogue version it pins.
+   */
+  catalogueAmountMinor: bigint;
   providerPlanId: string;
   providerPlanReference?: string | null;
   fxRateVersionId: string;
@@ -405,9 +412,20 @@ export interface RegisterProviderPlanInput {
   provider?: string;
 }
 
+/**
+ * READ/WRITE PROJECTION RULE (Step 4 repair): every statement that returns an
+ * epoch row to the parser projects EXACTLY the domain columns — never the
+ * full row. The durable table additionally carries `catalogue_amount_minor`
+ * and the `created_at` / `updated_at` audit columns, and the strict row
+ * parser refuses any shape it does not fully understand, so a full-row
+ * RETURNING would turn a valid epoch into a hard failure. Durable audit columns stay queryable
+ * through direct SQL; the statement projections below (the lookup SELECT and
+ * both RETURNING clauses) must stay textually identical — the Step 4 suite
+ * asserts that.
+ */
 export class BillingProviderPlanStore {
   constructor(
-    private readonly db: Pool,
+    private readonly db: Pick<Pool, 'query'>,
     private readonly policyVersion: string = BILLING_PRICING_POLICY_VERSION,
   ) {}
 
@@ -437,7 +455,12 @@ export class BillingProviderPlanStore {
    * Register a NEW epoch. The amount must already have been produced by
    * `./pricing.ts`; a second active epoch for the same key is refused by the
    * database's partial unique index (surfaced as a conflict, never repaired
-   * automatically).
+   * automatically, never upserted and never retired implicitly).
+   *
+   * The INSERT records BOTH sides of the derivation: the catalogue USD amount
+   * (`catalogue_amount_minor`, required — migration 0032 declares it NOT NULL)
+   * and the exact payment-currency amount, alongside the FX version, pricing
+   * policy and catalogue version they were derived under.
    */
   async register(input: RegisterProviderPlanInput): Promise<BillingProviderPlan> {
     if (input.cataloguePlan === 'starter') {
@@ -453,16 +476,28 @@ export class BillingProviderPlanStore {
     if (input.paymentAmountMinor <= 0n) {
       throw new BillingProviderPlanError('invalid', 'A provider-plan amount must be strictly positive.');
     }
+    if (input.catalogueAmountMinor <= 0n) {
+      throw new BillingProviderPlanError(
+        'invalid',
+        'A provider-plan epoch must record the strictly positive catalogue amount it was derived from.',
+      );
+    }
 
     try {
+      // The RETURNING projection matches the strict epoch parser exactly:
+      // a full-row RETURNING would additionally yield catalogue_amount_minor
+      // and the created_at/updated_at audit columns, which the parser refuses by design.
       const { rows } = await this.db.query(
         `INSERT INTO billing_provider_plans
            (provider, mode, catalogue_plan, billing_interval, payment_currency,
             payment_amount_minor, payment_amount_exponent, provider_plan_id,
             provider_plan_reference, fx_rate_version_id, pricing_policy_version,
-            catalogue_version, status, valid_from)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'active', COALESCE($13, now()))
-         RETURNING *`,
+            catalogue_version, catalogue_amount_minor, status, valid_from)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'active', COALESCE($14, now()))
+         RETURNING id, provider, mode, catalogue_plan, billing_interval, payment_currency,
+                   payment_amount_minor, payment_amount_exponent, provider_plan_id,
+                   provider_plan_reference, fx_rate_version_id, pricing_policy_version,
+                   catalogue_version, status, valid_from, retired_at, retired_reason`,
         [
           input.provider ?? BILLING_PROVIDER,
           input.mode ?? 'test',
@@ -476,6 +511,7 @@ export class BillingProviderPlanStore {
           input.fxRateVersionId,
           input.pricingPolicyVersion ?? this.policyVersion,
           input.catalogueVersion,
+          input.catalogueAmountMinor.toString(),
           input.validFrom ?? null,
         ],
       );
@@ -500,11 +536,16 @@ export class BillingProviderPlanStore {
    * never rewrite what a customer was charged.
    */
   async retire(planId: string, reason: string): Promise<BillingProviderPlan> {
+    // Same explicit projection as register(): a full-row RETURNING would
+    // surface the durable audit columns the strict epoch parser refuses.
     const { rows } = await this.db.query(
       `UPDATE billing_provider_plans
           SET status = 'retired', retired_at = now(), retired_reason = $2
         WHERE id = $1
-        RETURNING *`,
+        RETURNING id, provider, mode, catalogue_plan, billing_interval, payment_currency,
+                  payment_amount_minor, payment_amount_exponent, provider_plan_id,
+                  provider_plan_reference, fx_rate_version_id, pricing_policy_version,
+                  catalogue_version, status, valid_from, retired_at, retired_reason`,
       [planId, reason],
     );
     if (rows.length === 0) {
