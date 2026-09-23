@@ -258,10 +258,19 @@ describe('Billing PR3 — the epoch store is fail-closed and parameterized', () 
   test('it never interpolates a value into SQL, and never mutates pricing columns', () => {
     // Every statement uses bound parameters.
     assert.doesNotMatch(source, /db\.query\(\s*`[^`]*\$\{/s, 'no value is interpolated into SQL');
-    // The only UPDATE in the store moves the lifecycle.
-    const updates = source.match(/UPDATE billing_provider_plans[\s\S]*?RETURNING \*/g) ?? [];
+    // Registration records the catalogue amount the epoch was derived from
+    // (Step 4 repair: catalogue_amount_minor is NOT NULL in migration 0032,
+    // so omitting it made every registration fail at write time).
+    const inserts = source.match(/INSERT INTO billing_provider_plans[\s\S]*?RETURNING[\s\S]*?retired_reason/g) ?? [];
+    assert.equal(inserts.length, 1, 'exactly one INSERT statement exists');
+    assert.match(inserts[0]!, /catalogue_amount_minor/, 'the INSERT persists catalogue_amount_minor');
+    assert.doesNotMatch(inserts[0]!, /RETURNING \*/, 'the INSERT projects the parser-compatible columns, never *');
+    // The only UPDATE in the store moves the lifecycle — and, since the Step 4
+    // repair, returns the same explicit projection instead of RETURNING *.
+    const updates = source.match(/UPDATE billing_provider_plans[\s\S]*?RETURNING[\s\S]*?retired_reason/g) ?? [];
     assert.equal(updates.length, 1, 'exactly one UPDATE statement exists');
     assert.match(updates[0]!, /SET status = 'retired', retired_at = now\(\), retired_reason = \$2/);
+    assert.doesNotMatch(updates[0]!, /RETURNING \*/, 'retirement projects the parser-compatible columns, never *');
     assert.doesNotMatch(updates[0]!, /payment_amount_minor\s*=/);
     assert.doesNotMatch(updates[0]!, /provider_plan_id\s*=/);
   });
@@ -276,6 +285,7 @@ describe('Billing PR3 — the epoch store is fail-closed and parameterized', () 
           interval: 'monthly',
           paymentCurrency: 'GHS',
           paymentAmountMinor: 15_000n,
+          catalogueAmountMinor: 15_000n,
           providerPlanId: 'PLN_starter',
           fxRateVersionId: FX_VERSION_ID,
           catalogueVersion: 'billing-catalogue-1',

@@ -199,8 +199,10 @@ See [deployment.md](./deployment.md) for the full production runbook.
   configuration exposes exactly two variables (above), the Paystack adapter
   refuses any key that is not a `sk_test_` test key before it can build a
   request, reports `live: false`, and never includes a credential in
-  `describe()`. Billing is not a live-payment path: no checkout route exists.
-  See [paystack-provider-contract.md](./paystack-provider-contract.md).
+  `describe()`. Billing is not a live-payment path: `POST /api/billing/checkout`
+  exists, but it initializes **sandbox** checkouts only and never confirms a
+  payment (no webhook, no verification path — the session can never upgrade an
+  entitlement). See [paystack-provider-contract.md](./paystack-provider-contract.md).
 
 ## M8.4 MT5 boundary
 

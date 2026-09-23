@@ -4,12 +4,15 @@
 > provider-plan / pricing-snapshot state (migration `0032`), and a SANDBOX
 > Paystack adapter.** Nothing here takes a live payment.
 >
-> **What PR3 does NOT do:** there is no checkout route and no checkout UI, no
-> `apps/web` change, no webhook receiver, no webhook signature processing, no
-> subscription synchronization, no billing portal, no refund/proration/dunning
-> execution, no notification, no live payment, no production credential, no
-> production activation and no Starter selling. `GET /api/billing/me` remains
-> the only billing route.
+> **Current billing surface:** two session-authenticated billing routes exist —
+> `GET /api/billing/me` (read-only state) and `POST /api/billing/checkout`
+> (PR-C: sandbox checkout initialization against a registered epoch and an
+> operator-published FX rate; it writes a pending provider-backed row and an
+> immutable pricing lock, and it never *confirms* a payment). There is still no
+> checkout UI and no `apps/web` billing change, no webhook receiver, no webhook
+> signature processing, no subscription synchronization, no billing portal, no
+> refund/proration/dunning execution, no notification, no live payment, no
+> production credential, no production activation and no Starter selling.
 >
 > **This change is documentation only.** It records the billing pricing
 > decisions **D-1 … D-9** (below) — including **D-9, provider-plan epoch
@@ -52,7 +55,7 @@
 | Refunds | Use the amount **actually charged**. A refund never re-rates |
 | Disclosure | USD price (prominent) + exact GHS amount + rate, version and time. GHS is shown before payment |
 | Migration 0032 | **Created in PR3** — `0032_billing_fx_and_pricing.sql`; migrations 0001–0031 are byte-identical |
-| Paystack API integration | **Sandbox seam only, three of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout`). No checkout route, no live key, `implemented: false` |
+| Paystack API integration | **Sandbox seam only, three of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout`). `POST /api/billing/checkout` initializes sandbox checkouts through the third operation (PR-C); no live key, `implemented: false` |
 | Provider plan mutation | **Never.** `PUT /plan` is never called; a price change is a NEW epoch + a NEW provider plan, and the previous epoch is retired locally |
 | Entitlements / execution | **Unchanged.** `canAccessAutomation` stays `false` for every plan |
 
@@ -429,9 +432,9 @@ in [paystack-provider-contract.md](./paystack-provider-contract.md).
 
 | Item | Why |
 | --- | --- |
-| Provisioning Pro/Elite sandbox plans | **AC5** partially verified — GHS test-plan **capability** is confirmed (contract §7.1), but the four production-shaped plan IDs do not exist yet, so nothing may be sold. The GHS 2.00 test plan is capability evidence only and is never registered |
+| Provisioning Pro/Elite sandbox plans | **AC5** partially verified — GHS test-plan **capability** is confirmed (contract §7.1), and the Step 4 provisioning **workflow** now exists (`provisioning.ts`), but the four production-shaped plan IDs do not exist yet, so nothing may be sold. The GHS 2.00 test plan is capability evidence only and is never registered |
 | GHS recurring end-to-end | **AC7** unverified |
-| Checkout route / UI | Out of scope; the adapter's `initializeCheckout` is unreachable from HTTP |
+| Checkout UI | Out of scope — the checkout **route** now exists (PR-C: `POST /api/billing/checkout`, reaching `initializeCheckout` for sandbox sessions only); no web surface drives it |
 | Webhook receiver + signature processing | Out of scope. `normalizeEvent` is unimplemented because event **payload shapes** are not verified — documented event names are not enough to guess them |
 | Subscription read/verify/sync | No verified subscription read operation, and synchronization is out of scope |
 | Cancellation | The documented disable operation needs the subscription code **and** its `email_token`, which this build does not persist |
@@ -560,34 +563,44 @@ remains `false` for every plan, every status and every provider.
 Removing the gate is the job of the confirmation authority in step 6/7 below —
 not of a display layer, and not of a provider state.
 
-## What is still NOT implemented (PR2 scope, updated by PR3)
+## What is still NOT implemented (PR2 scope, updated through PR-C and Step 4)
 
 Explicitly absent — each is a later PR, and none of them may enable execution.
-PR3 changed two bullets: a **sandbox** Paystack client now exists (three
-documented operations, test keys only, one attempt per call, no route), and
-migration 0032 gives the pricing state a writer path through core modules —
+PR3 added the **sandbox** Paystack client (three documented operations, test
+keys only, one attempt per call) and migration 0032's pricing state; PR-C wired
+sandbox checkout initialization; Step 4 added the plan-provisioning workflow —
 while everything below remains true at the **product** level:
 
-- **No checkout** and no payment initialization **route**: no endpoint, no
-  redirect, no session handling, no UI. `initializeCheckout` exists on the
-  adapter but nothing in `apps/api` can call it from HTTP; there is no customer
-  provisioning flow either, so `billing_customers` has no writer yet.
+- **No payment *confirmation* authority and no checkout UI**: `POST
+  /api/billing/checkout` now initializes sandbox checkouts (PR-C), but nothing
+  confirms a payment — no webhook, no verification, no sync — so a
+  provider-backed subscription stays execution-inert (`paymentConfirmed` is
+  pinned `false`; the hardening sweep pins the same), and there is no UI, no
+  redirect handling beyond the callback configuration, and no customer
+  provisioning flow, so `billing_customers` still has no writer wired to a
+  route.
 - **No billing portal** and no customer self-serve surface.
 - **No webhook route, no webhook processing, no signature verification**, no
   replay protection beyond the ledger's idempotency keys, no rate limiting.
 - **No subscription synchronization** — no worker, scheduler, queue claim or
-  writer for the PR2 columns. `billing_provider_events` and
-  `billing_fx_rate_versions` / `billing_provider_plans` /
-  `billing_pricing_snapshots` likewise have no writer wired to a route; the FX
-  versions are published by an operator/ops path (a later PR), never by a client
-  or a market feed.
-- **No epoch-derived pricing callers yet.** `priceFromProviderPlanEpoch`
-  (`packages/core/src/billing/pricing.ts`) derives a plan-bound pricing
-  snapshot from an active `billing_provider_plans` epoch (D-9), and a plan-bound
-  checkout **fails closed** (`plan_not_registered` / `plan_mismatch`) rather
-  than silently repricing an old epoch. No epoch has been registered and no
-  route calls the entry point yet, so there is nothing to derive from — and the
-  15-minute freshness rule (D-3) is a rule about *new* pricing instants, not
+  writer for the PR2 columns. `billing_provider_events` has no writer wired to
+  a route; `billing_fx_rate_versions` / `billing_provider_plans` /
+  `billing_pricing_snapshots` are written through core modules only (FX
+  publication and Step 4 epoch registration are operator-driven local actions,
+  checkout snapshot/lock writes ride the checkout request) — never by a
+  client, a market feed or the provider.
+- **Epoch-derived pricing now has one caller — and four unprovisioned plans.**
+  `priceFromProviderPlanEpoch` (`packages/core/src/billing/pricing.ts`) derives
+  a plan-bound pricing snapshot from an active `billing_provider_plans` epoch
+  (D-9), and `BillingCheckoutService` calls exactly that entry point per
+  checkout; the Step 4 provisioning workflow
+  (`packages/core/src/billing/provisioning.ts`) validates and registers those
+  epochs, but **no epoch has been registered yet** — the four sandbox plans and
+  the authoritative FX version remain operator inputs — so the route fails
+  closed (`plan_not_registered`) until they exist. A plan-bound checkout
+  **fails closed** (`plan_not_registered` / `plan_mismatch`) rather than
+  silently repricing an old epoch, and the 15-minute freshness rule (D-3) is a
+  rule about *new* pricing instants (registration and rate publication), not
   about an epoch already registered.
 - **No billing UI and no pricing UI change** (`apps/web` is untouched; the plan
   comparison still renders the PR1 catalogue).
@@ -627,12 +640,16 @@ records the gap instead of expanding into entitlement work.
   cancellation and synchronization bookkeeping) plus `billing_customers` and
   `billing_provider_events`; migration 0032 adds the FX/plan/snapshot state and
   the immutable subscription price lock. Every one of those columns is `NULL` or
-  at its inert default on every existing row, and **no route, worker or client
-  can write them yet** — the adapter is unreachable from HTTP, and no plan
-  has been provisioned (AC5 capability verified, four plan IDs pending).
+  at its inert default on every existing row: the provider-backed subscription
+  the checkout route writes is provider-unconfirmed by construction
+  (`paymentConfirmed` is not a column an operator can set), and no plan
+  has been provisioned (AC5 capability verified, four plan IDs pending — the
+  Step 4 runbook below).
 - **FX publishing is an operator action, not a feature.** `billing_fx_rate_versions`
-  is written by the ops path that lands in a later PR; PR3 ships the authority,
-  the resolution rules and the tests, not a rate feed and not an admin endpoint.
+  is append-only and written through `BillingFxRateVersionStore.publish()` —
+  called out-of-band by an operator (the Step 4 runbook includes the call), by
+  direct operator approval only; PR3 shipped the authority, the resolution
+  rules and the tests, not a rate feed and not an admin endpoint.
 
 ## Later billing PRs
 
@@ -649,9 +666,15 @@ Roughly in order; each is its own PR and may be re-scoped.
 3. ~~**USD→GHS pricing + FX authority**~~ — **delivered by PR3** (migration
    `0032`, `fx-rate-versions.ts`, `pricing.ts`, `provider-plans.ts`).
 4. **Plan provisioning** — Pro/Elite × monthly/annual sandbox plans, registered
-   as local epochs. **GHS plan capability verified** (contract §7.1), so this
-   milestone may begin; it is **not started**. Prerequisites, **all** of them
-   before any of the four plans is created:
+   as local epochs. **Partially delivered by Step 4 (this PR):** the local
+   provisioning workflow now exists —
+   `packages/core/src/billing/provisioning.ts` validates the whole four-plan
+   batch against the operator-selected FX version and registers the four
+   immutable epochs atomically, completely outside the adapter. **GHS plan
+   capability is verified** (contract §7.1), so the only thing between here and
+   a provisioned state is the separately-authorized operator run below
+   (dashboard plan creation + FX publication + one registration call). Its
+   prerequisites, **all** of them before any of the four plans is created:
    - **(a) An authoritative FX version must exist first** — a published
      `billing_fx_rate_versions` row. Every plan amount is derived from the
      catalogue USD price through that version: no FX version, no plan amount
@@ -673,11 +696,18 @@ Roughly in order; each is its own PR and may be re-scoped.
      `packages/providers/paystack`.** The adapter **must not** gain `/plan`
      mutation capability (the source assertion forbids plan mutation there);
      provisioning happens outside the adapter, and the adapter only ever reads
-     against a locally registered epoch.
+     against a locally registered epoch. **Delivered now** (Step 4 module;
+     source-pinned).
    - **(g) The throwaway GHS 2.00 plan remains excluded** — capability evidence
-     only, **never** registered as an epoch.
-5. **Checkout / payment initialization route** — server-side initialization
-   behind `initializeCheckout`, plus its route and UI. Not before AC1/AC2/AC5/AC7.
+     only, **never** registered as an epoch. The Step 4 workflow refuses it
+     (`excluded_provider_plan`), independently of checkout's own refusal.
+
+   The separately-authorized operator run is documented as a runbook in
+   *Sandbox plan provisioning (Step 4)* below.
+5. ~~**Checkout / payment initialization route**~~ — **delivered by PR-C**:
+   `POST /api/billing/checkout` (server-side initialization behind
+   `initializeCheckout`, session-authenticated, epoch- and lock-bound). The
+   checkout **UI** and AC1/AC2/AC5/AC7 remain open.
 6. **Webhook receiver + security** — signature verification
    (`x-paystack-signature`, HMAC-SHA512 of the raw body), replay/idempotency
    protection (the `billing_provider_events` ledger already exists), rate
@@ -698,3 +728,107 @@ Roughly in order; each is its own PR and may be re-scoped.
 
 None of these steps may enable execution. Automation, live execution and broker
 execution stay OFF regardless of billing state.
+
+## Sandbox plan provisioning (Step 4)
+
+**Status: the workflow exists; the run has not happened.** No sandbox plan is
+provisioned and no FX rate is published in the deployed environment. This
+section is the runbook for the separately-authorized operator run that
+registers the four sandbox epochs; executing it is an explicit operational
+decision, never implied by this repository.
+
+Step 4 adds `packages/core/src/billing/provisioning.ts` — the **outside-adapter**
+workflow that registers the four production-shaped sandbox plans
+(paystack-provider-contract.md §7.2) as local `billing_provider_plans` epochs.
+It also repairs `BillingProviderPlanStore.register()` (migration 0032 declares
+`catalogue_amount_minor` NOT NULL, so registration must persist it) and keeps
+every store projection parser-compatible (the strict epoch parser refuses the
+durable audit columns a full-row `RETURNING` would add; both `RETURNING`
+clauses and the lookup `SELECT` project the explicit column list).
+
+**What the workflow guarantees before anything is written**
+
+- The batch is exactly **Pro Monthly, Pro Annual, Elite Monthly, Elite Annual**
+  — Starter and every other combination is refused; nothing is priced "new".
+- Exactly **one operator-selected FX version** is used: the workflow reads the
+  durable `billing_fx_rate_versions` row by id — never "latest", never a newer
+  row, never a constructed or fixture rate. It must be USD→GHS, `half_up`,
+  already effective at the registration instant, and fresh
+  (`registration_time − captured_at ≤ 900 s`, inclusive at 900; 901 s is
+  refused). An id that does not exist is `missing`, not a promotion.
+- Each plan's GHS amount is **derived, never taken from evidence**:
+  `half_up(catalogue USD minor × FX rate)` via
+  `computePaymentAmountMinor`/`cataloguePriceMinor` — the two existing
+  authorities. Evidence confirms the derivation; it can never override it.
+  Anything below Paystack's documented GHS minimum (10 pesewas) is refused.
+- Evidence must show **test mode**, **GHS**, minor-unit exponent 2, the
+  explicit provider interval for the local period (`monthly` → `monthly`,
+  `annual` → `annually`), an **uncapped** recurring plan (a payment-count cap
+  — including the evidence plan's `max payments = 1` — is refused), and a
+  genuine, non-placeholder `PLN_…` code, unique within the batch.
+- The GHS 2.00 capability-evidence plan (§7.1, assembled in code so no source
+  file carries the literal) is refused at batch admission
+  (`excluded_provider_plan`) — an independent second refusal on top of
+  checkout's `forbidden_plan`. It can never become an epoch.
+- Only after the **whole** batch validates does anything persist: the four
+  `register()` calls run inside **one transaction**; a write-time conflict
+  (combination already active, or a provider code already registered anywhere)
+  rolls the entire batch back. Nothing is upserted, nothing is retired
+  automatically, no partial batch can exist.
+- The module contains no transport, no credential and no environment read, it
+  never publishes FX and never retires an epoch (source-pinned in tests).
+
+**Runbook (operator, separately authorized — sandbox only)**
+
+1. **Agree the inputs before touching anything.** This run needs: (a) the four
+   plan amounts, derived from the catalogue
+   (`billing-catalogue.ts` — Pro $39/mo, Pro $390/yr, Elite $99/mo,
+   Elite $990/yr) through ONE published FX version — not a rate typed into a
+   dashboard; and (b) the four real provider codes the dashboard issues.
+2. **Confirm authorization and environment.** This run uses **test/sandbox
+   mode only** (`sk_test_` elsewhere; this module reads no key at all). Live
+   mode is refused by the code and forbidden here.
+3. **Publish the FX version first.** Insert the operator-approved USD→GHS rate
+   via `BillingFxRateVersionStore.publish({ fxRateScaled, fxRateScale, effectiveFrom, capturedAt, source: 'ops', … })`
+   with `effective_from = captured_at`. Registration must run within
+   **900 seconds** of `captured_at`.
+4. **Create the four plans in the Paystack Dashboard** (manual, test
+   environment — the adapter never mutates plans): plan names for Pro/Elite ×
+   monthly/annual, currency **GHS**, interval **monthly**/**annually**, **no
+   invoice/payment-count limit**, amount **exactly** the derived GHS figure.
+   Record each `PLN_…` code as issued.
+5. **Verify the exclusion.** If any recorded code equals the §7.1
+   capability-evidence plan, STOP — that plan is never an epoch.
+6. **Assemble evidence** — one entry per plan with: `cataloguePlan`,
+   `interval`, `providerInterval` (the mapping above), `providerPlanId`
+   (real code), `paymentCurrency: 'GHS'`, `paymentAmountMinor` (the derived
+   amount as an integer), `paymentAmountExponent: 2`, `mode: 'test'`,
+   `paymentCountCap: 'uncapped'`, and an `evidenceReference` provenance label
+   (e.g. the dashboard/ticket reference — never a credential).
+7. **Register.** Call
+   `BillingPlanProvisioningService.registerSandboxPlanEpochs({ fxRateVersionId, evidence })`.
+   On success it returns the four epochs in matrix order, all `active`, all
+   pinning the same `fx_rate_version_id`.
+8. **On ANY refusal, stop.** A `BillingProvisioningError` reason
+   (`invalid_evidence`, `plan_matrix`, `interval_mismatch`, `mode_mismatch`,
+   `currency_mismatch`, `exponent_mismatch`, `cap_mismatch`, `amount_mismatch`,
+   `below_minimum`, `invalid_provider_plan`, `excluded_provider_plan`,
+   `duplicate_combination`, `duplicate_provider_plan`, `shared_fx_violation`,
+   `invalid_instant`) or `BillingFxError` (`missing` / `stale` / `invalid` /
+   `unsupported_currency`) means **nothing was written**. Fix the *input*
+   (evidence or FX selection) and rerun the whole batch — never retry the same
+   input in a loop.
+9. **On a conflict (`billing_provider_plan_unusable`, reason `conflict`)
+   stop likewise.** Inspect `billing_provider_plans` read-only; if an epoch
+   must be replaced, that is a **separate, explicitly approved** retirement —
+   never part of provisioning.
+10. **After a successful run, verify the four rows** (`SELECT ... FROM
+    billing_provider_plans WHERE status = 'active'`): exactly the four
+    combinations, one shared `fx_rate_version_id`, test mode, GHS, the derived
+    amounts and the real `PLN_…` codes. Checkout then works end-to-end for
+    those combinations (PR-C) with amounts frozen by the epochs — a later FX
+    publication never reprices them (D-9).
+
+Registration does not notify anyone, synchronize anything or confirm any
+payment: it only makes the four epochs *selectable* by checkout. AC5 clears
+when these four epochs exist **and** the dashboard plans match them.
