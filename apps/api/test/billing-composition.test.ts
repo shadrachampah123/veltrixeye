@@ -21,7 +21,14 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { loadConfig, type AppConfig } from '../src/config.js';
-import { composeBillingProvider, paystackCustomerDirectory, paystackPlanDirectory } from '../src/billing-composition.js';
+import {
+  composeBillingProvider,
+  composeBillingWebhookReceiver,
+  paystackCustomerDirectory,
+  paystackPlanDirectory,
+} from '../src/billing-composition.js';
+import { parsePaystackWebhookAllowList } from '../src/webhook-allowlist.js';
+import { BillingWebhookReceiver } from '@veltrixeye/core';
 
 const BASE = { NODE_ENV: 'test', DATABASE_URL: 'postgres://test:test@127.0.0.1:5432/test' };
 const TEST_KEY = 'sk_test_0123456789abcdef0123456789abcdef01234567';
@@ -49,6 +56,12 @@ describe('Billing PR3 — configuration', () => {
       commercialCurrency: 'USD',
       paymentCurrency: 'GHS',
       fxMaxAgeSeconds: 900,
+      // Step 5.2: the webhook receiver defaults pin the provider's DOCUMENTED
+      // source addresses and a conservative per-IP delivery budget.
+      webhook: {
+        allowedIps: parsePaystackWebhookAllowList(''),
+        rateLimitMax: 30,
+      },
     });
   });
 
@@ -114,6 +127,28 @@ describe('Billing PR3 — composition fails closed', () => {
       () => composeBillingProvider(poolDouble([]) as never, handBuilt),
       (error: unknown) => /sandbox \(test-mode\)/i.test(String((error as Error).message)),
     );
+  });
+});
+
+describe('Billing Step 5.2 — webhook receiver composition', () => {
+  test('with no key, no receiver exists — so the route cannot exist either', () => {
+    const composition = composeBillingProvider(poolDouble([]) as never, config());
+    const receiver = composeBillingWebhookReceiver(poolDouble([]) as never, composition.registry, config());
+    assert.equal(receiver, null);
+  });
+
+  test('with a sandbox key, the receiver exists and is wired to the same registry', () => {
+    const cfg = config({ PAYSTACK_SECRET_KEY: TEST_KEY });
+    const composition = composeBillingProvider(poolDouble([]) as never, cfg);
+    const receiver = composeBillingWebhookReceiver(poolDouble([]) as never, composition.registry, cfg);
+    assert.ok(receiver instanceof BillingWebhookReceiver);
+  });
+
+  test('a hand-built "enabled" flag without a key still composes no receiver', () => {
+    const handBuilt = { ...config(), billing: { ...config().billing, enabled: true } } as AppConfig;
+    const composition = composeBillingProvider(poolDouble([]) as never, handBuilt);
+    const receiver = composeBillingWebhookReceiver(poolDouble([]) as never, composition.registry, handBuilt);
+    assert.equal(receiver, null, 'an empty key is its own authority: nothing may receive deliveries');
   });
 });
 

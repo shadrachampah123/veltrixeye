@@ -64,7 +64,9 @@ const checkout = (cookie: string, payload: object = PRO_MONTHLY, headers: Record
 test('requires authentication; preserves other prohibited routes', async () => {
   const result = await checkout('');
   assert.equal(result.statusCode, 401);
-  for (const path of ['portal', 'webhook', 'customer', 'callback']) {
+  // `webhook` is no longer prohibited: Billing Step 5.2 registered the secure
+  // receiver at that path (see test/billing-webhook.test.ts).
+  for (const path of ['portal', 'customer', 'callback']) {
     assert.equal((await app.inject({ method: 'POST', url: `/api/billing/${path}` })).statusCode, 404);
   }
   assert.equal(calls.length, 0);

@@ -586,14 +586,29 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
       'checkout still never resolves an entitlement');
   });
 
-  it('adds no webhook, verification or confirmation surface', () => {
+  it('receipt is still not confirmation: the Step 5.2 receiver grants nothing', () => {
     const billingRoute = read(REPO_ROOT, 'apps', 'api', 'src', 'routes', 'billing.ts');
-    // Code only: the route legitimately *documents* that no confirmation
-    // authority exists, and prose must not satisfy (or trip) the check.
-    assert.doesNotMatch(codeOnly(billingRoute), /webhook|verify|confirm/i);
+    // Code only: prose must not satisfy (or trip) the checks. The route file
+    // still contains NO confirmation/verification authority of its own.
+    assert.doesNotMatch(codeOnly(billingRoute), /verify|confirm/i);
     const writes = [...billingRoute.matchAll(/app\.(post|put|patch|delete)\s*\(\s*'([^']+)'/g)]
       .map((match) => [match[1], match[2]]);
     assert.deepEqual(writes, [['post', '/api/billing/checkout']], 'no new billing write route');
+
+    // Billing Step 5.2 added the webhook RECEIVER at exactly one sanctioned
+    // place (apps/api/src/billing-webhook.ts + core's billing/webhook.ts) —
+    // and it must still be receipt-only: no entitlement, no status change, no
+    // confirmation and no execution grant anywhere near it.
+    const receiverRoute = read(REPO_ROOT, 'apps', 'api', 'src', 'billing-webhook.ts');
+    const receiverCore = read(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'webhook.ts');
+    for (const source of [receiverRoute, receiverCore]) {
+      assert.doesNotMatch(source, /resolveEntitlements|getEntitlements|FREE_ENTITLEMENTS/);
+      assert.doesNotMatch(source, /UPDATE\s+subscriptions/i, 'the receiver never moves a subscription');
+      assert.doesNotMatch(source, /canAccessAutomation|grantsExecution:\s*true/);
+    }
+    const billingState = read(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'subscriptions.ts');
+    assert.match(billingState, /paymentConfirmed/, 'a confirmed payment is still unrepresentable');
+
     const paystackDir = path.join(REPO_ROOT, 'packages', 'providers', 'paystack', 'src');
     for (const entry of readdirSync(paystackDir, { withFileTypes: true })) {
       if (!entry.isFile() || !entry.name.endsWith('.ts')) continue;

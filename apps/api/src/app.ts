@@ -58,6 +58,7 @@ import {
   type ProviderRegistry,
   type NotificationProviderRegistry,
   type BillingProviderRegistry,
+  type BillingWebhookReceiver,
   type DeliveryRetryPolicy,
   type ExecutionProviderRegistry,
 } from '@veltrixeye/core';
@@ -71,7 +72,11 @@ import { backtestRoutes } from './routes/backtests.js';
 import { alertRoutes } from './routes/alerts.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { billingRoutes } from './routes/billing.js';
-import { composeBillingProvider, type BillingCompositionStatus } from './billing-composition.js';
+import {
+  composeBillingProvider,
+  composeBillingWebhookReceiver,
+  type BillingCompositionStatus,
+} from './billing-composition.js';
 import { scannerRoutes } from './routes/scanner.js';
 import {
   executionRoutes,
@@ -105,6 +110,13 @@ export interface AppContext {
    */
   billingProviders: BillingProviderRegistry;
   billingComposition: BillingCompositionStatus;
+  /**
+   * Billing Step 5.2: the secure webhook receiver (signature verification,
+   * seam normalization, local subject resolution and the ledger write).
+   * `null` when no sandbox key is configured — the webhook route then simply
+   * does not exist (404), the same fail-closed posture as the registry.
+   */
+  billingWebhook: BillingWebhookReceiver | null;
   /** M7.3: channel → provider adapter registry (the only provider-aware object). */
   notificationProviders: NotificationProviderRegistry;
   /** M7.3: durable outbox — writes/reads `notification_deliveries`. */
@@ -425,6 +437,10 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   // decisions fail closed per call instead (stale rate → refuse to price,
   // epoch mismatch → refuse to charge).
   const billing = composeBillingProvider(pool, config);
+  // Billing Step 5.2 — the secure webhook receiver. Exists only when the
+  // provider is registered (a sandbox key is configured); with no key the
+  // route does not exist, so nothing half-configured is reachable.
+  const billingWebhook = composeBillingWebhookReceiver(pool, billing.registry, config);
 
   return {
     pool,
@@ -453,6 +469,7 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
     scanner,
     billingProviders: billing.registry,
     billingComposition: billing.status,
+    billingWebhook,
     notificationProviders,
     notifications,
     preferences,

@@ -8,11 +8,16 @@
 > `GET /api/billing/me` (read-only state) and `POST /api/billing/checkout`
 > (PR-C: sandbox checkout initialization against a registered epoch and an
 > operator-published FX rate; it writes a pending provider-backed row and an
-> immutable pricing lock, and it never *confirms* a payment). There is still no
-> checkout UI and no `apps/web` billing change, no webhook receiver, no webhook
-> signature processing, no subscription synchronization, no billing portal, no
+> immutable pricing lock, and it never *confirms* a payment) — plus the
+> Step 5.2 **secure webhook receiver** `POST /api/billing/webhook`
+> (signature-verified, rate-limited, source-IP allow-listed; it records ONE
+> `billing_provider_events` row per verified delivery and nothing else).
+> There is still no checkout UI and no `apps/web` billing change, no
+> subscription synchronization, no billing portal, no
 > refund/proration/dunning execution, no notification, no live payment, no
 > production credential, no production activation and no Starter selling.
+> **Receipt is still not confirmation**: the receiver records deliveries; it
+> confirms no payment, changes no subscription status and grants nothing.
 >
 > **This change is documentation only.** It records the billing pricing
 > decisions **D-1 … D-9** (below) — including **D-9, provider-plan epoch
@@ -55,7 +60,7 @@
 | Refunds | Use the amount **actually charged**. A refund never re-rates |
 | Disclosure | USD price (prominent) + exact GHS amount + rate, version and time. GHS is shown before payment |
 | Migration 0032 | **Created in PR3** — `0032_billing_fx_and_pricing.sql`; migrations 0001–0031 are byte-identical |
-| Paystack API integration | **Sandbox seam only, four of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout` — provider calls — plus `normalizeEvent`, a pure local normalization of delivered events). `POST /api/billing/checkout` initializes sandbox checkouts through the third operation (PR-C); no webhook receiver exists, so nothing can deliver an event yet. No live key, `implemented: false` |
+| Paystack API integration | **Sandbox seam only, four of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout` — provider calls — plus `normalizeEvent`, a pure local normalization of delivered events). `POST /api/billing/checkout` initializes sandbox checkouts through the third operation (PR-C); the Step 5.2 receiver (`POST /api/billing/webhook`) verifies deliveries and records them in `billing_provider_events` — it confirms nothing. No live key, `implemented: false` |
 | Provider plan mutation | **Never.** `PUT /plan` is never called; a price change is a NEW epoch + a NEW provider plan, and the previous epoch is retired locally |
 | Entitlements / execution | **Unchanged.** `canAccessAutomation` stays `false` for every plan |
 
@@ -319,9 +324,14 @@ collapses onto one row:
   deleted** (trigger) — a crash or a cleanup job cannot erase evidence of an
   unapplied provider event.
 
-Nothing reads or writes these tables in PR2: there is no receiver, no worker
-and no scheduler. `subscriptions_sync_required_idx` exists so a later
-synchronization PR does not need another migration.
+In PR2 nothing read or wrote these tables. Since **Step 5.2**,
+`billing_provider_events` has exactly ONE writer — the secure webhook
+receiver (`POST /api/billing/webhook`), which appends `received` rows and
+never processes them onwards. `billing_customers` still has no route-wired
+writer, no worker and no scheduler apply events, and the subscription
+synchronization columns stay at their inert defaults.
+`subscriptions_sync_required_idx` exists so a later synchronization PR does
+not need another migration.
 
 ## Pricing in GHS (PR3 — migration `0032_billing_fx_and_pricing.sql`)
 
@@ -417,9 +427,11 @@ subscription is created, or the subscription has no price.
 HTTP attempt (no retry, no idempotency header — Paystack documents neither for
 outbound calls), prices nothing and converts nothing. It also implements
 `normalizeEvent` (Step 5.1) as a **pure** function over the four event payloads
-Paystack publishes — no transport, no clock, no database, and nothing to receive
-a delivery yet. Everything else rejects with `PaystackNotImplementedError`, and
-`implemented` stays **`false`**.
+Paystack publishes — no transport, no clock, no database. Since Step 5.2 the
+**receiver that delivers to it exists outside the adapter**
+(`apps/api/src/billing-webhook.ts` + `packages/core/src/billing/webhook.ts`),
+so the package itself remains receiver-free by a pinned test. Everything else
+rejects with `PaystackNotImplementedError`, and `implemented` stays **`false`**.
 
 `apps/api/src/billing-composition.ts` registers the adapter **only** when a
 sandbox key is configured; with no key the registry stays empty, so a caller
@@ -438,8 +450,8 @@ in [paystack-provider-contract.md](./paystack-provider-contract.md).
 | Provisioning Pro/Elite sandbox plans | **AC5** partially verified — GHS test-plan **capability** is confirmed (contract §7.1), and the Step 4 provisioning **workflow** now exists (`provisioning.ts`), but the four production-shaped plan IDs do not exist yet, so nothing may be sold. The GHS 2.00 test plan is capability evidence only and is never registered |
 | GHS recurring end-to-end | **AC7** unverified |
 | Checkout UI | Out of scope — the checkout **route** now exists (PR-C: `POST /api/billing/checkout`, reaching `initializeCheckout` for sandbox sessions only); no web surface drives it |
-| Webhook receiver + signature processing | Out of scope. `normalizeEvent` **is now implemented** (Step 5.1: the four events whose payload shapes Paystack publishes, contract §2.1), but nothing receives a delivery — no route, no raw body, no `x-paystack-signature` verification, no ledger write. The normalizer is unreachable from the network until step 6b below lands |
-| Subscription read/verify/sync | No verified subscription read operation, and synchronization is out of scope |
+| ~~Webhook receiver + signature processing~~ | **Delivered by Step 5.2** (`POST /api/billing/webhook`): `x-paystack-signature` verification (HMAC-SHA512 over the RAW body, constant-time), a documented source-IP allow-list, per-IP rate limiting, local subject resolution, and exactly one `billing_provider_events` row per verified delivery (replays collapse; refused deliveries are kept as `unrecognized` evidence). **Receipt only** — no confirmation, no synchronization, no entitlement effect (step 6b below) |
+| Subscription read/verify/sync | No verified subscription read operation, and synchronization is out of scope. The receiver records events; nothing applies them to `subscriptions` yet |
 | Cancellation | The documented disable operation needs the subscription code **and** its `email_token`, which this build does not persist |
 | Refunds, proration, dunning | Out of scope |
 
@@ -513,9 +525,11 @@ VALUES (…, 'active', 'paystack', 'pending', <snapshot>)
 internal value the requested commercial plan maps onto (`pro` / `premium`). Read
 through `getEntitlements(plan, status)` alone, that row therefore looked exactly
 like a paid subscription — while nothing had been charged. This build has **no
-payment-confirmation authority**: no webhook receiver, no signature
-verification, no transaction verification (see the list below). An initialized
-checkout is not a payment, and no `provider_state` value can make it one.
+payment-confirmation authority**: the Step 5.2 webhook receiver *records*
+deliveries (with `x-paystack-signature` verification), but recording is not
+confirming — there is no transaction verification and nothing that applies a
+recorded event to an entitlement (see the list below). An initialized checkout
+is not a payment, and no `provider_state` value can make it one.
 
 ### The rule
 
@@ -557,10 +571,11 @@ checkout is not a payment, and no `provider_state` value can make it one.
 ### What this deliberately does not do
 
 No migration (the schema already carries everything needed), no Paystack
-change, no webhook, no verification, no confirmation, no pricing or pricing-lock
-change, no change to the checkout INSERT shape, no change to
-`PUBLIC_APPLICATION_ORIGIN` or any production configuration, no change to
-`users.plan`, and no change to any execution safety gate. `canAccessAutomation`
+change, no confirmation, no pricing or pricing-lock change, no change to the
+checkout INSERT shape, no change to `PUBLIC_APPLICATION_ORIGIN` or any
+production configuration, no change to `users.plan`, and no change to any
+execution safety gate. (The Step 5.2 webhook receiver, which landed later,
+only *records* deliveries — it never applies one.) `canAccessAutomation`
 remains `false` for every plan, every status and every provider.
 
 Removing the gate is the job of the confirmation authority in step 6/7 below —
@@ -572,23 +587,30 @@ Explicitly absent — each is a later PR, and none of them may enable execution.
 PR3 added the **sandbox** Paystack client (three documented operations, test
 keys only, one attempt per call) and migration 0032's pricing state; PR-C wired
 sandbox checkout initialization; Step 4 added the plan-provisioning workflow;
-Step 5.1 added the verified webhook event contract and normalizer (still with no
-receiver) — while everything below remains true at the **product** level:
+Step 5.1 added the verified webhook event contract and normalizer; **Step 5.2
+added the secure webhook receiver** (`POST /api/billing/webhook`: signature
+verification, source-IP allow-list, rate limiting, subject resolution and the
+ledger write — receipt only) — while everything below remains true at the
+**product** level:
 
 - **No payment *confirmation* authority and no checkout UI**: `POST
-  /api/billing/checkout` now initializes sandbox checkouts (PR-C), but nothing
-  confirms a payment — no webhook, no verification, no sync — so a
-  provider-backed subscription stays execution-inert (`paymentConfirmed` is
-  pinned `false`; the hardening sweep pins the same), and there is no UI, no
-  redirect handling beyond the callback configuration, and no customer
-  provisioning flow, so `billing_customers` still has no writer wired to a
-  route.
+  /api/billing/checkout` now initializes sandbox checkouts (PR-C), and the
+  Step 5.2 receiver now **records** provider deliveries — but recording is
+  not confirming: no transaction verification, no sync — so a provider-backed
+  subscription stays execution-inert (`paymentConfirmed` is pinned `false`;
+  the hardening sweep pins the same), and there is no UI, no redirect
+  handling beyond the callback configuration, and no customer provisioning
+  flow, so `billing_customers` still has no writer wired to a route.
 - **No billing portal** and no customer self-serve surface.
-- **No webhook route, no webhook processing, no signature verification**, no
-  replay protection beyond the ledger's idempotency keys, no rate limiting.
+- **No webhook-driven state change.** The receiver writes
+  `billing_provider_events` rows (`received`) and never touches
+  `subscriptions`, entitlements or any execution gate. A recorded
+  `payment.succeeded` row is a provider-reported receipt awaiting a later
+  synchronization step, not an applied payment.
 - **No subscription synchronization** — no worker, scheduler, queue claim or
-  writer for the PR2 columns. `billing_provider_events` has no writer wired to
-  a route; `billing_fx_rate_versions` / `billing_provider_plans` /
+  writer for the PR2 columns. `billing_provider_events` is written ONLY by
+  the Step 5.2 receiver (and never processed onwards yet);
+  `billing_fx_rate_versions` / `billing_provider_plans` /
   `billing_pricing_snapshots` are written through core modules only (FX
   publication and Step 4 epoch registration are operator-driven local actions,
   checkout snapshot/lock writes ride the checkout request) — never by a
@@ -733,13 +755,31 @@ Roughly in order; each is its own PR and may be re-scoped.
      [paystack-provider-contract.md](./paystack-provider-contract.md) §2.1.
      **Receipt is still not confirmation, and normalization still grants
      nothing.**
-   - **(b) Webhook receiver + security — NOT BUILT.** Signature verification
-     (`x-paystack-signature`, HMAC-SHA512 of the **raw** body, constant-time
-     compare), raw-body handling, replay/idempotency protection against the
-     existing `billing_provider_events` ledger, local subject resolution before
-     any insert, rate limiting, provider IP allow-list, audit and redaction.
-     Until this exists, `normalizeEvent` is reachable only from tests and from
-     server-side code that already holds a verified delivery.
+   - **(b) Webhook receiver + security — DELIVERED (Step 5.2).**
+     `POST /api/billing/webhook` (registered ONLY when a sandbox key is
+     configured — with no key the endpoint does not exist). In request order:
+     per-IP rate limit (`PAYSTACK_WEBHOOK_RATE_LIMIT_MAX`, default 30/min);
+     the documented provider source-IP allow-list
+     (`PAYSTACK_WEBHOOK_ALLOWED_IPS`, defaulting to the three addresses the
+     provider documents, `/0` refused); raw-body capture scoped to the route;
+     `x-paystack-signature` verification (HMAC-SHA512 of the **raw** body
+     keyed by the sandbox secret key, constant-time compare) BEFORE any
+     parsing; seam normalization (Step 5.1); local subject resolution against
+     `billing_customers` / `subscriptions` / the checkout-reference
+     derivation — a disagreement binds NOTHING; and exactly one
+     `billing_provider_events` row per delivery, replays collapsing via the
+     0031 UNIQUE `idempotency_key`. A verified delivery the receiver must
+     refuse (unparseable body, or a payload the seam refuses) is kept as an
+     `unrecognized` row with a sanitized `failure_reason` and answered 400,
+     so the provider's documented retry schedule surfaces it. **What it still
+     is not:** not a payment confirmation, not a transaction verification,
+     not a synchronization — `subscriptions` is never written, no entitlement
+     changes, `paymentConfirmed` stays unrepresentable, and nothing here can
+     grant execution. Payloads are never stored or logged (hash only). The
+     receiver lives in `apps/api/src/billing-webhook.ts` (transport) and
+     `packages/core/src/billing/webhook.ts` (security pipeline + ledger); the
+     Step 5.1 package test still pins `packages/providers/paystack` free of
+     any receiver.
 7. **Verification + subscription synchronization** — reconcile provider state
    into `subscriptions` through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`
    without letting the provider widen any entitlement. Requires a verified
