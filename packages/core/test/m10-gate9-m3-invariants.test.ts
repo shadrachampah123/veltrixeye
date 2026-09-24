@@ -1164,12 +1164,14 @@ describe('Gate 9 Step 3c (M3) — structural duplicate-mutation and retry invari
 
       // B's insert must wait for A's outcome (unique index), then fail once A commits.
       let settled = false;
-      const second = rawIntent(b, { userId, profileId, orderId, status: 'prepared' }).finally(() => { settled = true; });
+      const second = rawIntent(b, { userId, profileId, orderId, status: 'prepared' })
+        .then(() => null, (e: unknown) => e)
+        .finally(() => { settled = true; });
       const blocked = await waitUntilBlocked(1, 'transactionid');
       assert.equal(blocked, 1, 'the second insert is blocked behind the first transaction');
       assert.equal(settled, false);
       await a.query('COMMIT');
-      const error = await second.then(() => null, (e: unknown) => e);
+      const error = await second;
       assert.ok(error, 'the second live mutation was refused');
       assert.equal(sqlState(error), '23505');
       assert.equal(constraintOf(error), 'execution_provider_intents_order_live_uniq');
