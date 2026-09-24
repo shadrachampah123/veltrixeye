@@ -1,0 +1,88 @@
+{
+  "fixture": "charge-success-one-off",
+  "event": "charge.success",
+  "supported": true,
+  "canonicalEventType": "payment.succeeded",
+  "provenance": {
+    "sources": [
+      "https://paystack.com/docs/payments/payment-channels/ — \"Pay with Transfer\" → Receiving notifications: a charge.success delivery whose \"plan\" is an EMPTY object (a charge that is not plan-bound)",
+      "https://docs-v1.paystack.com/docs/events — \"Structure of an event object\""
+    ],
+    "verifiedFieldNames": [
+      "event",
+      "data.domain",
+      "data.status",
+      "data.reference",
+      "data.amount",
+      "data.currency",
+      "data.paid_at",
+      "data.created_at",
+      "data.channel",
+      "data.customer.customer_code",
+      "data.plan (empty object when the charge is not plan-bound)"
+    ],
+    "adaptedValues": "Pinned to prove that a plan-bound charge is NOT required: the published payload carries \"plan\": {} for a one-off charge, and the normalizer reads no plan field at all. Values adapted to the sandbox GHS flow as in charge-success-plan-bound.json.",
+    "neverRead": ["data.authorization", "data.customer.email", "data.ip_address", "data.metadata"]
+  },
+  "body": {
+    "event": "charge.success",
+    "data": {
+      "id": 3104021988,
+      "domain": "test",
+      "status": "success",
+      "reference": "ve-chk-fixture-0003",
+      "amount": 12500,
+      "message": null,
+      "gateway_response": "Approved",
+      "paid_at": "2026-09-22T10:15:02.000Z",
+      "created_at": "2026-09-22T10:14:40.000Z",
+      "channel": "mobile_money",
+      "currency": "GHS",
+      "ip_address": null,
+      "metadata": "",
+      "fees_breakdown": null,
+      "log": null,
+      "fees": 125,
+      "fees_split": null,
+      "authorization": {
+        "authorization_code": "AUTH_DO_NOT_PERSIST_0002",
+        "bin": "008XXX",
+        "last4": "X553",
+        "exp_month": "09",
+        "exp_year": "2027",
+        "channel": "mobile_money",
+        "card_type": "transfer",
+        "bank": null,
+        "country_code": "GH",
+        "brand": "Managed Account",
+        "reusable": false,
+        "signature": null,
+        "account_name": null
+      },
+      "customer": {
+        "id": 138496675,
+        "first_name": null,
+        "last_name": null,
+        "email": "do-not-persist@example.com",
+        "customer_code": "CUS_fixture0000001",
+        "phone": null,
+        "metadata": null,
+        "risk_action": "default",
+        "international_format_phone": null
+      },
+      "plan": {},
+      "subaccount": {},
+      "split": {},
+      "order_id": null,
+      "paidAt": "2026-09-22T10:15:02.000Z",
+      "requested_amount": 12500,
+      "pos_transaction_data": null,
+      "source": {
+        "type": "api",
+        "source": "merchant_api",
+        "entry_point": "charge",
+        "identifier": null
+      }
+    }
+  }
+}

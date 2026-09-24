@@ -55,7 +55,7 @@
 | Refunds | Use the amount **actually charged**. A refund never re-rates |
 | Disclosure | USD price (prominent) + exact GHS amount + rate, version and time. GHS is shown before payment |
 | Migration 0032 | **Created in PR3** — `0032_billing_fx_and_pricing.sql`; migrations 0001–0031 are byte-identical |
-| Paystack API integration | **Sandbox seam only, three of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout`). `POST /api/billing/checkout` initializes sandbox checkouts through the third operation (PR-C); no live key, `implemented: false` |
+| Paystack API integration | **Sandbox seam only, four of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout` — provider calls — plus `normalizeEvent`, a pure local normalization of delivered events). `POST /api/billing/checkout` initializes sandbox checkouts through the third operation (PR-C); no webhook receiver exists, so nothing can deliver an event yet. No live key, `implemented: false` |
 | Provider plan mutation | **Never.** `PUT /plan` is never called; a price change is a NEW epoch + a NEW provider plan, and the previous epoch is retired locally |
 | Entitlements / execution | **Unchanged.** `canAccessAutomation` stays `false` for every plan |
 
@@ -411,12 +411,15 @@ subscription is created, or the subscription has no price.
 
 ### 5. The sandbox adapter and its composition
 
-`packages/providers/paystack` implements three documented operations
+`packages/providers/paystack` implements three documented provider operations
 (`findCustomer`, `createCustomer`, `initializeCheckout`) against
 `https://api.paystack.co`, accepts **`sk_test_` keys only**, performs exactly one
 HTTP attempt (no retry, no idempotency header — Paystack documents neither for
-outbound calls), prices nothing and converts nothing. Everything else rejects
-with `PaystackNotImplementedError`, and `implemented` stays **`false`**.
+outbound calls), prices nothing and converts nothing. It also implements
+`normalizeEvent` (Step 5.1) as a **pure** function over the four event payloads
+Paystack publishes — no transport, no clock, no database, and nothing to receive
+a delivery yet. Everything else rejects with `PaystackNotImplementedError`, and
+`implemented` stays **`false`**.
 
 `apps/api/src/billing-composition.ts` registers the adapter **only** when a
 sandbox key is configured; with no key the registry stays empty, so a caller
@@ -435,7 +438,7 @@ in [paystack-provider-contract.md](./paystack-provider-contract.md).
 | Provisioning Pro/Elite sandbox plans | **AC5** partially verified — GHS test-plan **capability** is confirmed (contract §7.1), and the Step 4 provisioning **workflow** now exists (`provisioning.ts`), but the four production-shaped plan IDs do not exist yet, so nothing may be sold. The GHS 2.00 test plan is capability evidence only and is never registered |
 | GHS recurring end-to-end | **AC7** unverified |
 | Checkout UI | Out of scope — the checkout **route** now exists (PR-C: `POST /api/billing/checkout`, reaching `initializeCheckout` for sandbox sessions only); no web surface drives it |
-| Webhook receiver + signature processing | Out of scope. `normalizeEvent` is unimplemented because event **payload shapes** are not verified — documented event names are not enough to guess them |
+| Webhook receiver + signature processing | Out of scope. `normalizeEvent` **is now implemented** (Step 5.1: the four events whose payload shapes Paystack publishes, contract §2.1), but nothing receives a delivery — no route, no raw body, no `x-paystack-signature` verification, no ledger write. The normalizer is unreachable from the network until step 6b below lands |
 | Subscription read/verify/sync | No verified subscription read operation, and synchronization is out of scope |
 | Cancellation | The documented disable operation needs the subscription code **and** its `email_token`, which this build does not persist |
 | Refunds, proration, dunning | Out of scope |
@@ -568,8 +571,9 @@ not of a display layer, and not of a provider state.
 Explicitly absent — each is a later PR, and none of them may enable execution.
 PR3 added the **sandbox** Paystack client (three documented operations, test
 keys only, one attempt per call) and migration 0032's pricing state; PR-C wired
-sandbox checkout initialization; Step 4 added the plan-provisioning workflow —
-while everything below remains true at the **product** level:
+sandbox checkout initialization; Step 4 added the plan-provisioning workflow;
+Step 5.1 added the verified webhook event contract and normalizer (still with no
+receiver) — while everything below remains true at the **product** level:
 
 - **No payment *confirmation* authority and no checkout UI**: `POST
   /api/billing/checkout` now initializes sandbox checkouts (PR-C), but nothing
@@ -659,7 +663,8 @@ Roughly in order; each is its own PR and may be re-scoped.
    (`0031_provider_billing.sql`).
 2. ~~**Paystack adapter**~~ — **partially delivered by PR3**: the sandbox
    adapter implements the three documented operations it can (customer create /
-   fetch, transaction initialize) and fails closed on the rest. The customer
+   fetch, transaction initialize), normalizes delivered events locally
+   (Step 5.1) and fails closed on the rest. The customer
    provisioning flow (persisting `billing_customers`) still lands with a later PR
    because it needs a route/worker, and every remaining operation needs either a
    verified read operation or the out-of-scope webhook/sync work.
@@ -708,10 +713,33 @@ Roughly in order; each is its own PR and may be re-scoped.
    `POST /api/billing/checkout` (server-side initialization behind
    `initializeCheckout`, session-authenticated, epoch- and lock-bound). The
    checkout **UI** and AC1/AC2/AC5/AC7 remain open.
-6. **Webhook receiver + security** — signature verification
-   (`x-paystack-signature`, HMAC-SHA512 of the raw body), replay/idempotency
-   protection (the `billing_provider_events` ledger already exists), rate
-   limiting, audit and redaction. Requires verified event payload shapes.
+6. **Webhook events** — split in two, because the provider-contract half could
+   be built on published evidence while the network half cannot be built safely
+   without it:
+   - **(a) Verified event contract + normalizer — DELIVERED (Step 5.1).**
+     `packages/providers/paystack/src/events.ts` pins the supported vocabulary
+     (`charge.success`, `subscription.create`, `invoice.update`,
+     `invoice.payment_failed`), the canonical mapping, the documented
+     occurrence instants, the status→lifecycle-state table and the
+     failure-detail sanitizer; `normalizeEvent` implements the seam operation as
+     a **pure** function (no transport, no clock, no directory, no database, no
+     mutation). Repository-pinned delivery fixtures with per-field provenance
+     live in `packages/providers/paystack/test/fixtures/webhook/`. Events whose
+     payload shapes Paystack does **not** publish (`subscription.disable`,
+     `subscription.not_renew`, `subscription.enable`, `charge.failed`), and
+     `invoice.create` and `subscription.expiring_cards` (verified payloads with
+     no faithful canonical mapping), are recorded as **unsupported** and
+     normalize to `unrecognized` rather than being guessed. See
+     [paystack-provider-contract.md](./paystack-provider-contract.md) §2.1.
+     **Receipt is still not confirmation, and normalization still grants
+     nothing.**
+   - **(b) Webhook receiver + security — NOT BUILT.** Signature verification
+     (`x-paystack-signature`, HMAC-SHA512 of the **raw** body, constant-time
+     compare), raw-body handling, replay/idempotency protection against the
+     existing `billing_provider_events` ledger, local subject resolution before
+     any insert, rate limiting, provider IP allow-list, audit and redaction.
+     Until this exists, `normalizeEvent` is reachable only from tests and from
+     server-side code that already holds a verified delivery.
 7. **Verification + subscription synchronization** — reconcile provider state
    into `subscriptions` through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`
    without letting the provider widen any entitlement. Requires a verified

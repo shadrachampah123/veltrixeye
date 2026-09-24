@@ -168,7 +168,7 @@ const expectReason = (reason: string) => (error: unknown) => {
 describe('Paystack provider — honest capability reporting', () => {
   test('implemented is false and live is false, and describe() lists what really works', () => {
     const { provider } = build({});
-    assert.equal(provider.implemented, false, 'three of eight seam operations are implemented');
+    assert.equal(provider.implemented, false, 'four of eight seam operations are implemented');
     assert.equal(provider.live, false);
     assert.equal(provider.id, 'paystack');
 
@@ -182,9 +182,13 @@ describe('Paystack provider — honest capability reporting', () => {
         'verifySubscription',
         'synchronizeSubscription',
         'cancelSubscription',
-        'normalizeEvent',
       ],
     });
+    // Event normalization is covered by provider-events.test.ts; this build
+    // still receives nothing, verifies no signature and confirms no payment.
+    assert.deepEqual((described.events as Record<string, unknown>)['receiver'], 'none');
+    assert.deepEqual((described.events as Record<string, unknown>)['confirmsPayment'], false);
+    assert.deepEqual((described.events as Record<string, unknown>)['grantsExecution'], false);
     assert.equal(JSON.stringify(described).includes(TEST_KEY), false);
   });
 
@@ -218,10 +222,6 @@ describe('Paystack provider — honest capability reporting', () => {
           idempotencyKey: 'a'.repeat(64),
           requestedAt: '2026-09-22T09:00:00.000Z',
         }),
-      PaystackNotImplementedError,
-    );
-    await assert.rejects(
-      () => provider.normalizeEvent({ provider: 'paystack', payload: {}, receivedAt: '2026-09-22T09:00:00.000Z' }),
       PaystackNotImplementedError,
     );
 

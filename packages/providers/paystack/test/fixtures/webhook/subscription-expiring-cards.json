@@ -1,0 +1,57 @@
+{
+  "fixture": "subscription-expiring-cards",
+  "event": "subscription.expiring_cards",
+  "supported": false,
+  "reason": "Published payload whose data is an ARRAY of cards about to expire (not an object). It carries no payment outcome, no subscription state change the platform can map, and card expiry detail is credential-shaped material this build must never ingest, so it is reported as the canonical `unrecognized` event with no subject and no data.",
+  "canonicalEventType": "unrecognized",
+  "provenance": {
+    "sources": [
+      "https://paystack.com/docs/payments/subscriptions/ — \"Listen for subscription events\" → Expiring Cards: the full payload, whose data is an array of {expiry_date, description, brand, subscription, customer}"
+    ],
+    "verifiedFieldNames": [
+      "event",
+      "data (ARRAY)",
+      "data[].expiry_date",
+      "data[].description",
+      "data[].brand",
+      "data[].subscription.status",
+      "data[].subscription.subscription_code",
+      "data[].subscription.email_token",
+      "data[].subscription.amount",
+      "data[].subscription.cron_expression",
+      "data[].subscription.next_payment_date",
+      "data[].customer.first_name",
+      "data[].customer.last_name",
+      "data[].customer.email",
+      "data[].customer.customer_code",
+      "data[].customer.risk_action"
+    ],
+    "adaptedValues": "Field names, nesting and types are exactly as published; values adapted to the sandbox GHS flow. Pinned so a structural outlier (array data) is proven to normalize to `unrecognized` without crashing, and so card expiry detail is proven never to enter the canonical result.",
+    "neverRead": ["data[].expiry_date / brand / description (card detail)", "data[].subscription.email_token", "data[].customer.email"]
+  },
+  "body": {
+    "event": "subscription.expiring_cards",
+    "data": [
+      {
+        "expiry_date": "2026-10-01",
+        "description": "Card ending 4081 expires on 2026-10-01",
+        "brand": "Visa",
+        "subscription": {
+          "status": "active",
+          "subscription_code": "SUB_fixture0000001",
+          "email_token": "DONOTPERSISTemailtoken01",
+          "amount": 48750,
+          "cron_expression": "0 0 22 * *",
+          "next_payment_date": "2026-10-22T00:00:00.000Z"
+        },
+        "customer": {
+          "first_name": "Fixture",
+          "last_name": "Trader",
+          "email": "do-not-persist@example.com",
+          "customer_code": "CUS_fixture0000001",
+          "risk_action": "default"
+        }
+      }
+    ]
+  }
+}

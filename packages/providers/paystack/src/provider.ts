@@ -4,7 +4,10 @@ import {
   BILLING_PAYMENT_AMOUNT_EXPONENT,
   BILLING_PROVIDER,
   billingCustomerIdentitySchema,
+  billingEventCategory,
   billingPricingSnapshotSchema,
+  providerEventIdentitySchema,
+  providerEventReferenceSchema,
   type BillingCustomerIdentity,
   type BillingPricingSnapshot,
   type BillingProviderId,
@@ -21,7 +24,11 @@ import {
   billingCheckoutSessionSchema,
   billingCustomerCreateRequestSchema,
   billingCustomerQuerySchema,
+  billingEventIdempotencyKey,
+  billingEventPayloadHash,
+  billingProviderRawEventSchema,
   isBillingProviderPlanError,
+  parseNormalizedBillingEvent,
   providerPlanExpectationFromSnapshot,
   verifyPricingSnapshot,
   type BillingProviderPlan,
@@ -42,6 +49,12 @@ import {
   paystackUnauthorizedAmount,
 } from './errors.js';
 import {
+  PAYSTACK_CANONICAL_EVENT_TYPES,
+  PAYSTACK_SUPPORTED_EVENTS,
+  PAYSTACK_UNSUPPORTED_EVENT_REASONS,
+  normalizePaystackEventPayload,
+} from './events.js';
+import {
   PAYSTACK_LIVE,
   PaystackClient,
   type PaystackClientConfig,
@@ -60,6 +73,20 @@ import {
  *  - `initializeCheckout`   → `POST /transaction/initialize` (documented), using
  *                             an ALREADY-AUTHORIZED amount: the adapter never
  *                             prices, never converts and never invents one.
+ *  - `normalizeEvent`       → NO provider call: a pure function of a delivered
+ *                             webhook payload (`./events.ts`). It normalizes
+ *                             only the four events whose payload shapes the
+ *                             provider publishes (`charge.success`,
+ *                             `subscription.create`, `invoice.update`,
+ *                             `invoice.payment_failed`); every other event name
+ *                             becomes the canonical `unrecognized` event, and a
+ *                             supported event with a malformed payload is
+ *                             refused. It performs no verification, no
+ *                             confirmation and no I/O. THERE IS STILL NO
+ *                             WEBHOOK RECEIVER: nothing in this repository
+ *                             accepts a delivery, verifies a signature or
+ *                             persists an event — that is the next step, and it
+ *                             is what will call this normalizer.
  *
  * ---------------------------------------------------------------------------
  * WHAT IT DELIBERATELY DOES NOT IMPLEMENT (and why)
@@ -73,15 +100,17 @@ import {
  *  - `cancelSubscription`: cancellation is documented as requiring BOTH the
  *    subscription code and the subscription's email token, and no build here
  *    persists that token (there is no subscription writer yet). Rather than
- *    guess a cancellation path — the provider also documents a
- *    `PUT /plan` update whose default cancels or reprices existing
- *    subscriptions — cancellation FAILS CLOSED with an explicit reason.
- *  - `normalizeEvent`: irrelevant without a webhook receiver (excluded from this
- *    change), and the payload shapes of provider events are not among the
- *    verified facts, so no event is normalized here. FAILS CLOSED.
+ *    guess a cancellation path — the provider also documents a plan-update
+ *    operation whose default cancels or reprices existing subscriptions —
+ *    cancellation FAILS CLOSED with an explicit reason. Note that the events
+ *    which would report a cancellation (`subscription.disable`,
+ *    `subscription.not_renew`) are likewise NOT normalized: their payload
+ *    shapes are not published, so this build cannot report a cancellation from
+ *    an event either.
  *
  * `implemented` therefore stays `false`, honestly: the adapter makes real
- * provider calls for the three operations above and refuses the rest.
+ * provider calls for three of the eight seam operations and normalizes events
+ * locally for a fourth; the remaining four refuse.
  *
  * ---------------------------------------------------------------------------
  * FAIL-CLOSED RULES ENFORCED HERE
@@ -104,6 +133,15 @@ import {
  *     retry is performed, and local deterministic idempotency keys stay with
  *     the caller (`./pricing.ts` / migration 0032).
  *  7. No raw provider payload is stored, logged, or embedded in an error.
+ *  8. A delivered event is normalized only against a PUBLISHED payload shape
+ *     (`./events.ts`). An event name whose shape is not published becomes the
+ *     canonical `unrecognized` event; a supported event with a missing,
+ *     mis-typed, self-contradictory or non-sandbox payload is refused. Event
+ *     identity (payload hash + idempotency key) is derived deterministically by
+ *     core, never invented here.
+ *  9. Normalizing an event is not confirming a payment, not verifying a
+ *     subscription and not resolving a local subject: it grants nothing, and
+ *     `grantsExecution` stays pinned `false` by the canonical contract.
  *
  * The adapter holds no database access: the two local directories below are
  * supplied by composition (apps/api), so this package cannot read or write
@@ -155,11 +193,15 @@ const PAYSTACK_OPERATIONS = [
 ] as const;
 export type PaystackOperation = (typeof PAYSTACK_OPERATIONS)[number];
 
-/** Operations this adapter really performs (documented provider operations). */
+/**
+ * Operations this adapter really performs: three documented provider calls, and
+ * one purely local normalization of delivered event payloads.
+ */
 export const PAYSTACK_IMPLEMENTED_OPERATIONS: readonly PaystackOperation[] = [
   'findCustomer',
   'createCustomer',
   'initializeCheckout',
+  'normalizeEvent',
 ] as const;
 
 /** Operations that fail closed, with the reason, for operators. */
@@ -169,7 +211,6 @@ export const PAYSTACK_UNIMPLEMENTED_REASONS: Readonly<Record<string, string>> = 
   synchronizeSubscription: 'subscription synchronization is out of scope for this change',
   cancelSubscription:
     'cancellation is documented as needing the subscription code AND its email token, which this build does not persist',
-  normalizeEvent: 'no webhook receiver exists and event payload shapes are not verified',
 });
 
 export class PaystackNotImplementedError extends PaystackAdapterError {
@@ -241,6 +282,21 @@ export class PaystackBillingProvider implements BillingProvider {
         unimplemented: PAYSTACK_OPERATIONS.filter(
           (operation) => !PAYSTACK_IMPLEMENTED_OPERATIONS.includes(operation),
         ),
+      },
+      /**
+       * Operator-facing summary of the event contract. `receiver: 'none'` is
+       * the honest state of this build: the normalizer exists, nothing accepts
+       * a delivery yet, and normalizing one would neither confirm a payment nor
+       * grant anything.
+       */
+      events: {
+        receiver: 'none',
+        signatureVerification: 'none',
+        confirmsPayment: false,
+        grantsExecution: false,
+        supported: [...PAYSTACK_SUPPORTED_EVENTS],
+        canonicalEventTypes: PAYSTACK_CANONICAL_EVENT_TYPES,
+        unsupported: Object.keys(PAYSTACK_UNSUPPORTED_EVENT_REASONS),
       },
     };
   }
@@ -599,8 +655,119 @@ export class PaystackBillingProvider implements BillingProvider {
     return Promise.reject(new PaystackNotImplementedError('cancelSubscription'));
   }
 
-  normalizeEvent(_request: BillingProviderRawEvent): Promise<NormalizedBillingEvent> {
-    return Promise.reject(new PaystackNotImplementedError('normalizeEvent'));
+  /* ------------------------------------------------------------------------ */
+  /* Event normalization (pure: no transport, no clock, no directory, no DB)   */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Normalize one delivered provider event onto the canonical contract.
+   *
+   * This is a PURE function of the seam request: it opens no socket, reads no
+   * clock, consults neither injected directory and touches no database. It is
+   * the seam the (still unwritten) webhook receiver will call after it has
+   * verified a delivery's signature — signature verification, raw-body
+   * handling, rate limiting and persistence all belong to that receiver, not
+   * here.
+   *
+   * What it guarantees:
+   *  - a supported event (`charge.success`, `subscription.create`,
+   *    `invoice.update`, `invoice.payment_failed`) is validated against its
+   *    published payload shape and mapped onto canonical event types, subject
+   *    references and sanitized data;
+   *  - a supported event whose payload is missing a required field, carries a
+   *    wrong type, contradicts itself, reports a non-sandbox domain or quotes a
+   *    currency/amount this build does not understand is REFUSED with a typed
+   *    error — it is never silently downgraded to `unrecognized`;
+   *  - any other event name (unverified, out of scope or invented) becomes the
+   *    canonical `unrecognized` event with no subject and no data, so it can be
+   *    recorded without asserting anything;
+   *  - identity is deterministic: the payload hash and the idempotency key are
+   *    derived by core's single implementation of the canonical rule, so two
+   *    deliveries of the same event produce the same key and collapse onto one
+   *    ledger row;
+   *  - nothing provider-shaped crosses back: the raw body is dropped (only its
+   *    hash survives), provider card/authorization/email-token fields are never
+   *    read, and the result is re-validated by the canonical `.strict()`
+   *    contract with `grantsExecution` pinned `false`.
+   *
+   * WHAT THIS IS NOT: it is not a payment confirmation, not a transaction
+   * verification, not a subscription synchronization and not a local subject
+   * resolution (`subject.userId`, `subject.subscriptionId` and
+   * `subject.billingCustomerId` are always null here — resolving them is the
+   * receiver's job, against the local directories).
+   */
+  async normalizeEvent(request: BillingProviderRawEvent): Promise<NormalizedBillingEvent> {
+    const parsedRequest = billingProviderRawEventSchema.safeParse(request);
+    if (!parsedRequest.success) {
+      throw paystackInvalidRequest(
+        'normalizeEvent was called with a delivery that is not canonical (provider, payload and receivedAt are required).',
+      );
+    }
+    const delivery = parsedRequest.data;
+
+    // Paystack deliveries publish no event id, so this is normally absent and
+    // identity rests on the payload hash. When a caller does supply one it must
+    // still be a reference-shaped identifier, never credential-shaped material.
+    const providerEventId = this.eventReference(delivery.providerEventId);
+
+    // Pure normalization: canonical facts, or a typed refusal.
+    const facts = normalizePaystackEventPayload(delivery.payload);
+
+    // Deterministic identity. Core owns both derivations (one implementation of
+    // the rule, already covered by core's tests); the payload is hashed, never
+    // carried onwards.
+    const payloadHash = billingEventPayloadHash(delivery.payload);
+    const idempotencyInput = {
+      provider: this.id,
+      providerEventId,
+      eventType: facts.eventType,
+      occurredAt: facts.occurredAt,
+      payloadHash,
+    };
+    const identity = providerEventIdentitySchema.safeParse({
+      ...idempotencyInput,
+      idempotencyKey: billingEventIdempotencyKey(idempotencyInput),
+      receivedAt: delivery.receivedAt,
+    });
+    if (!identity.success) {
+      throw new PaystackAdapterError(
+        'unexpected_response',
+        `The delivery could not be given a canonical event identity at: ${[...new Set(
+          identity.error.issues.map((issue) => issue.path.join('.') || '<root>'),
+        )].join(', ')}. Nothing was normalized.`,
+      );
+    }
+
+    try {
+      // Re-validated by the canonical contract before crossing back over the
+      // seam: `.strict()` rejects any provider-shaped field, the category must
+      // follow the event type, and `grantsExecution` can only be `false`.
+      return parseNormalizedBillingEvent({
+        identity: identity.data,
+        category: billingEventCategory(facts.eventType),
+        subject: facts.subject,
+        data: facts.data,
+        grantsExecution: false,
+      });
+    } catch (error) {
+      throw new PaystackAdapterError(
+        'unexpected_response',
+        'The normalized event did not satisfy the canonical contract, so no provider detail crosses the seam.',
+        { cause: error },
+      );
+    }
+  }
+
+  /** A caller-supplied provider event id must be reference-shaped. */
+  private eventReference(value: string | null | undefined): string | null {
+    if (value === undefined || value === null) return null;
+    const parsed = providerEventReferenceSchema.safeParse(value);
+    if (!parsed.success) {
+      throw paystackInvalidRequest(
+        'A provider event id must be a reference-shaped identifier of at most 190 characters; the value supplied is not one, so the delivery is refused before any payload is read.',
+      );
+    }
+    return parsed.data;
   }
 }
 

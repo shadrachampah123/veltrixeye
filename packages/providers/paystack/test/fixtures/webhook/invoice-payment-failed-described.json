@@ -1,0 +1,82 @@
+{
+  "fixture": "invoice-payment-failed-described",
+  "event": "invoice.payment_failed",
+  "supported": true,
+  "canonicalEventType": "invoice.failed",
+  "provenance": {
+    "sources": [
+      "https://docs-v1.paystack.com/docs/events — \"Structure of an event object\" (invoice.payment_failed payload; data.description is a documented field of the invoice object)",
+      "https://paystack.com/docs/payments/subscriptions/ — \"Handling subscription payment issues\": the invoice object's \"status field set to failed, and a description field, with more information about what went wrong when attempting to charge the card\", with the published example value \"Insufficient Funds\""
+    ],
+    "verifiedFieldNames": [
+      "event",
+      "data.domain",
+      "data.invoice_code",
+      "data.amount",
+      "data.period_start",
+      "data.period_end",
+      "data.status",
+      "data.paid",
+      "data.paid_at",
+      "data.description (the documented carrier of what went wrong)",
+      "data.authorization",
+      "data.subscription.status",
+      "data.subscription.subscription_code",
+      "data.subscription.email_token",
+      "data.customer.customer_code",
+      "data.transaction",
+      "data.created_at"
+    ],
+    "adaptedValues": "Identical in shape to invoice-payment-failed.json, with the provider's OWN published failure text in data.description. This is the only place a provider-authored failure sentence is mapped into the canonical contract, as data.failureReason — bounded and sanitized.",
+    "neverRead": ["data.subscription.email_token", "data.authorization"]
+  },
+  "body": {
+    "event": "invoice.payment_failed",
+    "data": {
+      "domain": "test",
+      "invoice_code": "INV_fixture0000004",
+      "amount": 48750,
+      "period_start": "2026-11-22T00:00:00.000Z",
+      "period_end": "2026-12-22T00:00:00.000Z",
+      "status": "failed",
+      "paid": false,
+      "paid_at": null,
+      "description": "Insufficient Funds",
+      "authorization": {
+        "authorization_code": "AUTH_DO_NOT_PERSIST_0001",
+        "bin": "408408",
+        "last4": "4081",
+        "exp_month": "12",
+        "exp_year": "2030",
+        "channel": "card",
+        "card_type": "visa ",
+        "bank": "TEST BANK",
+        "country_code": "GH",
+        "brand": "visa",
+        "reusable": true,
+        "signature": "SIG_DO_NOT_PERSIST_0001"
+      },
+      "subscription": {
+        "status": "attention",
+        "subscription_code": "SUB_fixture0000001",
+        "email_token": "DONOTPERSISTemailtoken01",
+        "amount": 48750,
+        "cron_expression": "0 0 22 * *",
+        "next_payment_date": "2026-12-22T00:00:00.000Z",
+        "open_invoice": "INV_fixture0000004"
+      },
+      "customer": {
+        "id": 6910995,
+        "first_name": null,
+        "last_name": null,
+        "email": "do-not-persist@example.com",
+        "customer_code": "CUS_fixture0000001",
+        "phone": null,
+        "metadata": null,
+        "risk_action": "default"
+      },
+      "transaction": {},
+      "created_at": "2026-11-22T00:00:05.000Z"
+    }
+  }
+}
