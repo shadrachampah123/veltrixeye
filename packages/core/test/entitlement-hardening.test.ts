@@ -593,7 +593,21 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     assert.doesNotMatch(codeOnly(billingRoute), /verify|confirm/i);
     const writes = [...billingRoute.matchAll(/app\.(post|put|patch|delete)\s*\(\s*'([^']+)'/g)]
       .map((match) => [match[1], match[2]]);
-    assert.deepEqual(writes, [['post', '/api/billing/checkout']], 'no new billing write route');
+    // Later-billing-PR #7 added exactly ONE sanctioned write route: the
+    // verification + synchronization trigger. Nothing else.
+    assert.deepEqual(writes, [['post', '/api/billing/checkout'], ['post', '/api/billing/sync']],
+      'no billing write route beyond checkout + the PR #7 sync trigger');
+
+    // The PR #7 sync service may move status only through the canonical
+    // mapping — it never writes `plan`, never resolves an entitlement and
+    // never grants execution.
+    const syncCore = codeOnly(read(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'sync.ts'));
+    assert.doesNotMatch(syncCore, /resolveEntitlements|getEntitlements|FREE_ENTITLEMENTS/);
+    assert.doesNotMatch(syncCore, /canAccessAutomation|grantsExecution:\s*true/);
+    const setClauses = [...syncCore.matchAll(/UPDATE\s+subscriptions\s+SET([\s\S]*?)WHERE/gi)];
+    assert.equal(setClauses.length, 1, 'exactly one subscriptions UPDATE');
+    assert.doesNotMatch(setClauses[0]![1]!, /\bplan\b/, 'sync never writes plan');
+    assert.match(syncCore, /SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE/);
 
     // Billing Step 5.2 added the webhook RECEIVER at exactly one sanctioned
     // place (apps/api/src/billing-webhook.ts + core's billing/webhook.ts) —

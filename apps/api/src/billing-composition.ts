@@ -10,6 +10,7 @@ import {
 import {
   createBillingProviderRegistry,
   BillingCheckoutService,
+  BillingSubscriptionSyncService,
   BillingWebhookReceiver,
   isBillingProviderPlanError,
   parseProviderPlan,
@@ -211,4 +212,20 @@ export function composeBillingCheckout(
       }
     },
   });
+}
+
+/**
+ * Later-billing-PR #7 — compose subscription verification + synchronization.
+ *
+ * Always composed (like checkout): with no registered provider the service
+ * refuses with `provider_not_registered` and writes nothing. It reaches the
+ * adapter only through the seam's `verifySubscription` (the documented
+ * transaction-verify read) and owns the database write itself; the adapter
+ * still never touches the database. The webhook receiver does NOT use it —
+ * receipt stays receipt-only.
+ */
+export function composeBillingSync(
+  db: pg.Pool, providers: BillingProviderRegistry,
+): BillingSubscriptionSyncService {
+  return new BillingSubscriptionSyncService({ db, providers });
 }

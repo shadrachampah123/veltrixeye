@@ -301,6 +301,7 @@ describe('the verified Paystack event vocabulary', () => {
       'findCustomer',
       'createCustomer',
       'initializeCheckout',
+      'verifySubscription',
       'normalizeEvent',
     ]);
     const unimplemented = provider.describe()['operations'] as {
@@ -311,7 +312,6 @@ describe('the verified Paystack event vocabulary', () => {
     assert.ok(!unimplemented.unimplemented.includes('normalizeEvent'));
     assert.deepEqual(unimplemented.unimplemented, [
       'findSubscription',
-      'verifySubscription',
       'synchronizeSubscription',
       'cancelSubscription',
     ]);

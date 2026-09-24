@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
 import {
   BILLING_CREDENTIAL_SHAPED_RE,
@@ -206,8 +206,9 @@ export type BillingProviderEventRecordOutcome = 'recorded' | 'replayed';
  * construction: the INSERT conflicts on the UNIQUE `idempotency_key` and does
  * nothing, so two deliveries of the same event collapse onto one row and the
  * second call reports `replayed` instead of inserting. Nothing here ever
- * updates or deletes a row — processing state transitions belong to a later
- * synchronization step.
+ * updates or deletes a row — processing state transitions belong to
+ * synchronization (`claimReceivedBillingProviderEvents` /
+ * `settleBillingProviderEvents` below, called only by `./sync.ts`).
  */
 export class BillingProviderEventStore {
   constructor(private readonly db: Pool) {}
@@ -248,6 +249,101 @@ export class BillingProviderEventStore {
       ? { id: null, outcome: 'replayed', idempotencyKey: row.idempotencyKey }
       : { id: inserted.id, outcome: 'recorded', idempotencyKey: row.idempotencyKey };
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Ledger processing transitions (used by synchronization, never the receiver) */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Later-billing-PR #7: the ONLY processing-state transitions of the ledger.
+ *
+ * The receiver above never calls these — receipt stays receipt-only and every
+ * row it writes is `received`. `BillingSubscriptionSyncService`
+ * (`./sync.ts`) claims the `received` rows bound to one subscription inside
+ * its own transaction and settles them exactly once:
+ *
+ *   received → processed   the row's subject was covered by an applied,
+ *                          verified synchronization;
+ *   received → ignored     the row asserted nothing applicable (an
+ *                          `unrecognized` row, or a verified state that
+ *                          cannot be applied without review);
+ *   received → failed      the verified provider view conflicted with the
+ *                          local identity, so nothing was applied.
+ *
+ * Only the processing columns move (`status`, `processed_at`, and a
+ * `failure_reason` when the row has none); migration 0031's trigger keeps every
+ * identity column immutable, and a settled row is never re-settled (the
+ * UPDATE is guarded on `status = 'received'`). No payload is read or written:
+ * the ledger never had one.
+ */
+export const BILLING_PROVIDER_EVENT_CLAIM_LIMIT = 64;
+
+export interface ClaimedBillingProviderEvent {
+  id: string;
+  idempotencyKey: string;
+  eventType: BillingEventType;
+}
+
+export type SettledBillingProviderEventState = 'processed' | 'ignored' | 'failed';
+
+/**
+ * Lock (FOR UPDATE SKIP LOCKED) up to `BILLING_PROVIDER_EVENT_CLAIM_LIMIT`
+ * `received` rows bound to one (subscription, user) pair, oldest first. MUST be
+ * called inside the caller's transaction; a concurrent claimer skips rows
+ * already locked instead of double-processing them.
+ */
+export async function claimReceivedBillingProviderEvents(
+  client: PoolClient,
+  subject: { subscriptionId: string; userId: string },
+): Promise<ClaimedBillingProviderEvent[]> {
+  const subscriptionId = z.string().uuid().parse(subject.subscriptionId);
+  const userId = z.string().uuid().parse(subject.userId);
+  const { rows } = await client.query<{ id: string; idempotency_key: string; event_type: string }>(
+    `SELECT id, idempotency_key, event_type
+       FROM billing_provider_events
+      WHERE subscription_id = $1 AND user_id = $2 AND status = 'received'
+      ORDER BY received_at ASC, created_at ASC
+      LIMIT ${BILLING_PROVIDER_EVENT_CLAIM_LIMIT}
+      FOR UPDATE SKIP LOCKED`,
+    [subscriptionId, userId],
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    idempotencyKey: sha256HexSchema.parse(row.idempotency_key),
+    eventType: billingEventTypeSchema.parse(row.event_type),
+  }));
+}
+
+/**
+ * Settle claimed rows: `received → processed | ignored | failed`, stamped with
+ * `processedAt`. A row that already carries a failure reason (a refused
+ * delivery) keeps it; otherwise the supplied reason is stored, sanitized
+ * exactly like receiver refusals. Returns the number of rows moved.
+ */
+export async function settleBillingProviderEvents(
+  client: PoolClient,
+  input: {
+    ids: readonly string[];
+    state: SettledBillingProviderEventState;
+    processedAt: string;
+    failureReason: string | null;
+  },
+): Promise<number> {
+  if (input.ids.length === 0) return 0;
+  const ids = z.array(z.string().uuid()).max(BILLING_PROVIDER_EVENT_CLAIM_LIMIT).parse(input.ids);
+  const state = z.enum(['processed', 'ignored', 'failed']).parse(input.state);
+  const processedAt = isoDateTime.parse(input.processedAt);
+  const reason = input.failureReason === null ? null : sanitizeBillingWebhookFailureReason(input.failureReason);
+  const result = await client.query(
+    `UPDATE billing_provider_events
+        SET status = $2,
+            processed_at = $3,
+            failure_reason = COALESCE(failure_reason, $4)
+      WHERE id = ANY($1::uuid[]) AND status = 'received'`,
+    [ids, state, processedAt, reason],
+  );
+  return result.rowCount ?? 0;
 }
 
 /* -------------------------------------------------------------------------- */

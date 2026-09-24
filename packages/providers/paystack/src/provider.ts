@@ -4,6 +4,9 @@ import {
   BILLING_PAYMENT_AMOUNT_EXPONENT,
   BILLING_PROVIDER,
   billingCustomerIdentitySchema,
+  billingPaymentAmountSchema,
+  billingPaymentCurrencySchema,
+  providerSubscriptionStateSchema,
   billingEventCategory,
   billingPricingSnapshotSchema,
   providerEventIdentitySchema,
@@ -27,6 +30,7 @@ import {
   billingEventIdempotencyKey,
   billingEventPayloadHash,
   billingProviderRawEventSchema,
+  billingSubscriptionVerifyRequestSchema,
   isBillingProviderPlanError,
   parseNormalizedBillingEvent,
   providerPlanExpectationFromSnapshot,
@@ -73,6 +77,16 @@ import {
  *  - `initializeCheckout`   → `POST /transaction/initialize` (documented), using
  *                             an ALREADY-AUTHORIZED amount: the adapter never
  *                             prices, never converts and never invents one.
+ *  - `verifySubscription`   → `GET  /transaction/verify/:reference` (documented,
+ *                             Later-billing-PR #7): the ONLY provider read this
+ *                             build performs for a subscription. It verifies
+ *                             OUR checkout reference and reports what the
+ *                             provider documents for it (customer, amount,
+ *                             currency). The published verify response carries
+ *                             NO subscription status and NO subscription code,
+ *                             so the lifecycle state it reports is always the
+ *                             canonical `unknown` (manual review) — never a
+ *                             state inferred from a transaction status.
  *  - `normalizeEvent`       → NO provider call: a pure function of a delivered
  *                             webhook payload (`./events.ts`). It normalizes
  *                             only the four events whose payload shapes the
@@ -91,12 +105,14 @@ import {
  * ---------------------------------------------------------------------------
  * WHAT IT DELIBERATELY DOES NOT IMPLEMENT (and why)
  * ---------------------------------------------------------------------------
- *  - `findSubscription` / `verifySubscription`: the platform's verified facts
- *    do not include a subscription READ operation. Reading a subscription is
- *    therefore left unimplemented rather than guessed, and FAILS CLOSED.
- *  - `synchronizeSubscription`: excluded from this change (no subscription
- *    synchronization), and it needs verified provider state that does not exist
- *    yet.
+ *  - `findSubscription`: the platform's verified facts do not include a
+ *    subscription READ operation (no subscription fetch is used, and a
+ *    subscription identifier alone cannot be verified). Finding a subscription
+ *    is therefore left unimplemented rather than guessed, and FAILS CLOSED.
+ *  - `synchronizeSubscription`: synchronization is performed by core's
+ *    `BillingSubscriptionSyncService`, which owns the database write, the
+ *    canonical status mapping and the ledger transitions. The adapter holds no
+ *    database access and never applies state, so this operation FAILS CLOSED.
  *  - `cancelSubscription`: cancellation is documented as requiring BOTH the
  *    subscription code and the subscription's email token, and no build here
  *    persists that token (there is no subscription writer yet). Rather than
@@ -109,8 +125,8 @@ import {
  *    an event either.
  *
  * `implemented` therefore stays `false`, honestly: the adapter makes real
- * provider calls for three of the eight seam operations and normalizes events
- * locally for a fourth; the remaining four refuse.
+ * provider calls for four of the eight seam operations and normalizes events
+ * locally for a fifth; the remaining three refuse.
  *
  * ---------------------------------------------------------------------------
  * FAIL-CLOSED RULES ENFORCED HERE
@@ -194,21 +210,37 @@ const PAYSTACK_OPERATIONS = [
 export type PaystackOperation = (typeof PAYSTACK_OPERATIONS)[number];
 
 /**
- * Operations this adapter really performs: three documented provider calls, and
- * one purely local normalization of delivered event payloads.
+ * Operations this adapter really performs: four documented provider calls
+ * (customer fetch, customer create, transaction initialize and the
+ * transaction-verify read), and one purely local normalization of delivered
+ * event payloads.
  */
 export const PAYSTACK_IMPLEMENTED_OPERATIONS: readonly PaystackOperation[] = [
   'findCustomer',
   'createCustomer',
   'initializeCheckout',
+  'verifySubscription',
   'normalizeEvent',
 ] as const;
 
+/**
+ * The canonical lifecycle state a transaction verification reports. The
+ * provider's published verify response documents a TRANSACTION status only —
+ * no subscription status and no subscription code — so there is no provider
+ * subscription status to map through `PAYSTACK_LIFECYCLE_STATE_FOR_STATUS`.
+ * A missing status fails closed to `unknown`, which the canonical contract
+ * defines as never changing authoritative state and always requiring review.
+ * A transaction status (for example `success`) is never promoted to a
+ * subscription state: that relationship is not published.
+ */
+export const PAYSTACK_VERIFIED_TRANSACTION_LIFECYCLE_STATE = 'unknown' as const;
+
 /** Operations that fail closed, with the reason, for operators. */
 export const PAYSTACK_UNIMPLEMENTED_REASONS: Readonly<Record<string, string>> = Object.freeze({
-  findSubscription: 'the platform has no verified subscription read operation',
-  verifySubscription: 'the platform has no verified subscription read operation',
-  synchronizeSubscription: 'subscription synchronization is out of scope for this change',
+  findSubscription:
+    'the platform has no verified subscription read operation (only the transaction-verify read, used by verifySubscription)',
+  synchronizeSubscription:
+    'synchronization is performed by core (BillingSubscriptionSyncService); the adapter never applies state',
   cancelSubscription:
     'cancellation is documented as needing the subscription code AND its email token, which this build does not persist',
 });
@@ -260,9 +292,10 @@ export class PaystackBillingProvider implements BillingProvider {
   readonly id: BillingProviderId = BILLING_PROVIDER;
   readonly name = 'paystack-sandbox';
   /**
-   * Honest capability flag. The seam defines eight operations; three are
-   * implemented against documented endpoints, so this is `false` until the rest
-   * are — callers must treat a non-implemented provider as unavailable.
+   * Honest capability flag. The seam defines eight operations; four are
+   * implemented against documented endpoints (plus local event
+   * normalization), so this is `false` until the rest are — callers must treat
+   * a non-implemented provider as unavailable.
    */
   readonly implemented = false;
   readonly live = PAYSTACK_LIVE;
@@ -282,6 +315,19 @@ export class PaystackBillingProvider implements BillingProvider {
         unimplemented: PAYSTACK_OPERATIONS.filter(
           (operation) => !PAYSTACK_IMPLEMENTED_OPERATIONS.includes(operation),
         ),
+      },
+      /**
+       * Operator-facing summary of the verification read (Later-billing-PR #7):
+       * the documented transaction-verify operation, which reports no
+       * subscription status, so every verified state is `unknown` (review).
+       * It confirms nothing to an entitlement and grants nothing.
+       */
+      verification: {
+        operation: 'transaction.verify',
+        subscriptionRead: 'none',
+        reportedLifecycleState: PAYSTACK_VERIFIED_TRANSACTION_LIFECYCLE_STATE,
+        grantsEntitlements: false,
+        grantsExecution: false,
       },
       /**
        * Operator-facing summary of the event contract. `receiver: 'none'` is
@@ -632,15 +678,115 @@ export class PaystackBillingProvider implements BillingProvider {
   }
 
   /* ------------------------------------------------------------------------ */
+  /* Verification (documented transaction-verify read only)                    */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Verify the provider's view of a checkout, through the ONE documented read:
+   * `GET /transaction/verify/:reference`.
+   *
+   * What it guarantees:
+   *  - a canonical request carrying OUR transaction reference is required; a
+   *    request with only a provider subscription identifier is refused before
+   *    any call (there is no documented subscription read to use it with);
+   *  - exactly one provider call, no retry; transport/provider failures surface
+   *    as the client's typed errors (unknown outcome, never a default);
+   *  - the provider must echo OUR reference (a different one is a conflict)
+   *    and report the sandbox domain (anything else is refused);
+   *  - the amount is used exactly as reported, in a supported payment currency
+   *    with its documented exponent — never converted, never re-rated;
+   *  - the reported lifecycle state is ALWAYS `unknown`: the published verify
+   *    response carries no subscription status, and a transaction status is
+   *    never promoted to a subscription state;
+   *  - no cancellation, period, plan or catalogue fact is asserted (none is
+   *    published on this response), and no card/authorization field is read;
+   *  - the result is re-validated by the canonical `.strict()` contract, so
+   *    nothing provider-shaped crosses the seam, and nothing is retained.
+   */
+  async verifySubscription(request: BillingSubscriptionVerifyRequest): Promise<ProviderSubscriptionState> {
+    const parsed = billingSubscriptionVerifyRequestSchema.safeParse(request);
+    if (!parsed.success) {
+      throw paystackInvalidRequest('verifySubscription was called with a request that is not canonical.');
+    }
+    const reference = parsed.data.providerReference ?? null;
+    if (reference === null) {
+      throw paystackInvalidRequest(
+        'verifySubscription needs the checkout transaction reference: the provider publishes no subscription read, ' +
+          'so a subscription identifier alone cannot be verified. Nothing was called.',
+      );
+    }
+
+    const verified = await this.client.verifyTransaction(reference);
+
+    if (verified.reference !== reference) {
+      throw new PaystackAdapterError(
+        'reference_conflict',
+        'The provider verified a different reference than the one requested. ' +
+          'The result is not treated as this checkout: this is a conflict requiring review.',
+      );
+    }
+    if (verified.domain !== 'test') {
+      throw new PaystackAdapterError(
+        'response_conflict',
+        'The provider reported a non-sandbox transaction domain; this build is sandbox-only, so the verification is refused.',
+      );
+    }
+
+    const currency = billingPaymentCurrencySchema.safeParse(verified.currency);
+    const payment = currency.success
+      ? billingPaymentAmountSchema.safeParse({
+          paymentCurrency: currency.data,
+          paymentAmountMinor: verified.amountMinor,
+          paymentAmountExponent: BILLING_PAYMENT_AMOUNT_EXPONENT[currency.data],
+        })
+      : null;
+    if (payment === null || !payment.success) {
+      throw new PaystackAdapterError(
+        'unexpected_response',
+        'The provider reported an amount or currency this build does not understand for the verified transaction. ' +
+          'Nothing is assumed from it.',
+      );
+    }
+
+    const state = providerSubscriptionStateSchema.safeParse({
+      provider: this.id,
+      state: PAYSTACK_VERIFIED_TRANSACTION_LIFECYCLE_STATE,
+      providerSubscriptionId: null,
+      providerSubscriptionCode: null,
+      providerCustomerId: verified.providerCustomerId,
+      providerCustomerCode: verified.providerCustomerCode,
+      providerPlanId: null,
+      providerReference: verified.reference,
+      cataloguePlan: null,
+      interval: null,
+      currency: null,
+      payment: payment.data,
+      currentPeriodStart: null,
+      currentPeriodEnd: null,
+      cancelAtPeriodEnd: false,
+      cancelAt: null,
+      cancelledAt: null,
+      cancellationReason: null,
+      sourceEventIdempotencyKey: null,
+      observedAt: this.client.now().toISOString(),
+    });
+    if (!state.success) {
+      throw new PaystackAdapterError(
+        'unexpected_response',
+        `The verified transaction could not be normalized onto the canonical provider state at: ${[
+          ...new Set(state.error.issues.map((issue) => issue.path.join('.') || '<root>')),
+        ].join(', ')}.`,
+      );
+    }
+    return state.data;
+  }
+
+  /* ------------------------------------------------------------------------ */
   /* Operations this adapter refuses (fail closed, never guessed)              */
   /* ------------------------------------------------------------------------ */
 
   findSubscription(_request: BillingSubscriptionQuery): Promise<ProviderSubscriptionState | null> {
     return Promise.reject(new PaystackNotImplementedError('findSubscription'));
-  }
-
-  verifySubscription(_request: BillingSubscriptionVerifyRequest): Promise<ProviderSubscriptionState> {
-    return Promise.reject(new PaystackNotImplementedError('verifySubscription'));
   }
 
   synchronizeSubscription(

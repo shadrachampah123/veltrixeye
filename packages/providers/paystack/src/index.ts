@@ -7,6 +7,7 @@ export {
   type PaystackCustomerRecord,
   type PaystackFetchFn,
   type PaystackInitializedTransaction,
+  type PaystackVerifiedTransaction,
 } from './client.js';
 
 export {
@@ -20,6 +21,7 @@ export {
 export {
   PAYSTACK_IMPLEMENTED_OPERATIONS,
   PAYSTACK_UNIMPLEMENTED_REASONS,
+  PAYSTACK_VERIFIED_TRANSACTION_LIFECYCLE_STATE,
   PaystackBillingProvider,
   PaystackNotImplementedError,
   createPaystackProvider,
