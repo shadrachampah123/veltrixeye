@@ -10,6 +10,7 @@ import {
 import {
   createBillingProviderRegistry,
   BillingCheckoutService,
+  BillingCustomerService,
   BillingSubscriptionSyncService,
   BillingWebhookReceiver,
   isBillingProviderPlanError,
@@ -46,8 +47,9 @@ import type { AppConfig } from './config.js';
  *     build does not fully understand raises rather than degrading into a
  *     permissive default.
  *
- * PR-C also composes checkout orchestration. No webhook receiver, customer
- * provisioning or billing portal is introduced here.
+ * PR-C also composes checkout orchestration; Billing Step 6 composes customer
+ * provisioning (`composeBillingCustomers`) — the only production writer of
+ * `billing_customers`. No billing portal is introduced here.
  */
 
 export interface BillingCompositionStatus {
@@ -228,4 +230,22 @@ export function composeBillingSync(
   db: pg.Pool, providers: BillingProviderRegistry,
 ): BillingSubscriptionSyncService {
   return new BillingSubscriptionSyncService({ db, providers });
+}
+
+/**
+ * Billing Step 6 (roadmap item 8a) — compose customer provisioning.
+ *
+ * Always composed (like checkout and sync): with no registered provider the
+ * service still answers an already-provisioned local customer, and otherwise
+ * refuses with `provider_not_registered` and writes nothing. It reaches the
+ * adapter only through the seam's `findCustomer` / `createCustomer` and owns
+ * the `billing_customers` write itself; the adapter still never touches the
+ * database. The row it writes is exactly what `composeBillingCheckout`'s
+ * `requireExistingCustomer` (above) reads through `paystackCustomerDirectory`.
+ * It changes no subscription, no entitlement and no execution gate.
+ */
+export function composeBillingCustomers(
+  db: pg.Pool, providers: BillingProviderRegistry,
+): BillingCustomerService {
+  return new BillingCustomerService({ db, providers });
 }

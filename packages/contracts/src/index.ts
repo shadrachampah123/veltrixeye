@@ -19,6 +19,7 @@ export * from './billing.js';
 export * from './billing-catalogue.js';
 export * from './billing-payment.js';
 export * from './billing-provider.js';
+export * from './billing-customer.js';
 export * from './scanner.js';
 export * from './execution.js';
 export * from './paper-execution.js';

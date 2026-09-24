@@ -404,7 +404,7 @@ describe('billing PR2 — entitlement safety', () => {
     assert.ok(!SEAM_CODE.includes('entitlements.js'), 'the seam does not import the entitlement module');
   });
 
-  it('permits only PR-C checkout, the PR #7 sync route and the Step 5.2 webhook receiver', () => {
+  it('permits only PR-C checkout, the PR #7 sync route, the Step 6 customer route and the Step 5.2 webhook receiver', () => {
     const routesDir = path.join(REPO_ROOT, 'apps', 'api', 'src', 'routes');
     const billingRoute = readFileSync(path.join(routesDir, 'billing.ts'), 'utf8');
     assert.match(billingRoute, /app\.get\('\/api\/billing\/me'/, 'GET /api/billing/me still exists');
@@ -412,8 +412,8 @@ describe('billing PR2 — entitlement safety', () => {
       .map((match) => [match[1], match[2]]);
     assert.deepEqual(
       writes,
-      [['post', '/api/billing/checkout'], ['post', '/api/billing/sync']],
-      'only PR-C checkout and the Later-billing-PR #7 sync route may write inline',
+      [['post', '/api/billing/checkout'], ['post', '/api/billing/sync'], ['post', '/api/billing/customer']],
+      'only PR-C checkout, the Later-billing-PR #7 sync route and the Billing Step 6 customer route may write inline',
     );
     assert.doesNotMatch(billingRoute, /portal/i, 'the portal remains prohibited');
     // Billing Step 5.2: the webhook receiver is wired through exactly one

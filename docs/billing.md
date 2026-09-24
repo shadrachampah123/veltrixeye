@@ -609,8 +609,10 @@ ledger write — receipt only) — while everything below remains true at the
   not confirming: no transaction verification, no sync — so a provider-backed
   subscription stays execution-inert (`paymentConfirmed` is pinned `false`;
   the hardening sweep pins the same), and there is no UI, no redirect
-  handling beyond the callback configuration, and no customer provisioning
-  flow, so `billing_customers` still has no writer wired to a route.
+  handling beyond the callback configuration. `billing_customers` now has
+  exactly one writer — the Billing Step 6 customer provisioning flow
+  (`POST /api/billing/customer`, see below) — which records provider customer
+  identity only and grants nothing.
 - **No billing portal** and no customer self-serve surface.
 - **No webhook-driven state change.** The receiver writes
   `billing_provider_events` rows (`received`) and never touches
@@ -802,6 +804,9 @@ Roughly in order; each is its own PR and may be re-scoped.
    subscription lifecycle state still requires a documented source for one.
 8. **Customer provisioning flow and billing portal** — persisting
    `billing_customers` and a self-serve portal.
+   - **8a. Customer provisioning — delivered by Billing Step 6 (sandbox
+     only)**; see *Customer provisioning (Billing Step 6)* below.
+   - 8b. Billing portal — not started.
 9. **Web UI** — checkout and portal surfaces in `apps/web`.
 10. **Starter entitlement decision** — internal plan value, limits, and the
     mapping widening described above.
@@ -812,6 +817,23 @@ Roughly in order; each is its own PR and may be re-scoped.
 
 None of these steps may enable execution. Automation, live execution and broker
 execution stay OFF regardless of billing state.
+
+## Customer provisioning (Billing Step 6)
+
+**Status: delivered, sandbox only. It grants nothing.** No migration: it writes
+the existing 0031 `billing_customers` table.
+
+| Layer | File | Role |
+| --- | --- | --- |
+| Contract | `packages/contracts/src/billing-customer.ts` | `BillingCustomerProvisioningResult`: outcome (`created` / `linked` / `already_provisioned`), `status: 'provisioned'`, email, `provisionedAt`, `checkoutReady: true`; `entitlementsChanged` and `grantsExecution` pinned `z.literal(false)`. No provider identifier, row id or user id is returned. |
+| Service | `packages/core/src/billing/customers.ts` | `BillingCustomerService.ensureCustomer(userId)`: reads the account email from `users`; an existing `provisioned` row with a code is returned with no provider call; `suspended` / `unavailable`, a code-less `provisioned` row or a placeholder whose email disagrees are refused (operator review); otherwise `findCustomer` → (only if none) `createCustomer` through the seam, strict identity validation (same user, same email, `provisioned`, carries a customer code, no key-shaped identifier), then ONE conditional `INSERT … ON CONFLICT (provider, user_id) DO UPDATE … WHERE status = 'unprovisioned'`. In-process single-flight per user; the 0031 unique indexes arbitrate across instances (first writer wins, the loser returns the winner). Every refusal writes nothing. |
+| Composition | `apps/api/src/billing-composition.ts` | `composeBillingCustomers(db, registry)`. The row it writes is what checkout's existing `requireExistingCustomer` reads. |
+| Route | `apps/api/src/routes/billing.ts` | `POST /api/billing/customer` — session-authenticated, no body (the subject and email are always the session user's), per-IP limit `BILLING_CUSTOMER_RATE_LIMIT_MAX = 10`/min. Refusals: `409 conflict` for local-state reasons (`customer_not_provisionable`, `customer_identity_incomplete`, `customer_identity_conflict`, `account_unavailable`), `502 provider_unavailable` otherwise (`provider_not_registered`, `provider_unavailable`, `provider_response_unusable`). |
+
+What it deliberately does not do: it never touches `subscriptions`, `users`,
+entitlements, pricing, the webhook ledger or any execution gate; the
+provider→FREE gate and `paymentConfirmed` are unchanged; there is no billing
+portal, no checkout UI and no email-change synchronization.
 
 ## Verification + synchronization (Later-billing-PR #7)
 
