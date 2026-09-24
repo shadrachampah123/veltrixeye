@@ -90,6 +90,12 @@ remaining items are listed at the bottom.
   never to make stopping harder than acting — arming and emergency stop are
   idempotent, and reads (`GET /api/execution/safety*`) are unlimited beyond
   the global cap.
+- `POST /api/billing/webhook`: **30/min per IP** (Billing Step 5.2 —
+  `PAYSTACK_WEBHOOK_RATE_LIMIT_MAX`). Far above the provider's documented
+  delivery/retry cadence, far below the global cap, so an unsigned flood
+  stops here before it spends any database work. The route additionally sits
+  behind a source-IP allow-list and an HMAC signature check (see the billing
+  webhook section below).
 - All are per-IP limits configured in `apps/api/src/app.ts` (global) and
   the route modules (per-route overrides); the auth, evaluate, detect, alert
   generation and alert acknowledgement limits each have a dedicated 429
@@ -139,6 +145,42 @@ proxy list**. The list is therefore a security boundary:
   `TRUSTED_PROXY_CIDRS` restore per-browser attribution. Details and the
   operational checklist:
   [environment.md](./environment.md#client-ip-attribution-trusted_proxy_cidrs).
+
+## Billing webhook receiver (Step 5.2)
+
+`POST /api/billing/webhook` is the only network path into the billing event
+normalizer, and it is unauthenticated by session **by design** — the provider
+cannot hold a session. Its authentication is the signature, and it is layered:
+
+- **Existence is the first gate.** The route is registered only when a sandbox
+  key is configured; with no key the endpoint is a 404, never a half-configured
+  surface. There is nothing to probe and nothing to brute-force.
+- **Rate limit** (per non-spoofable `req.ip`, see above) bounds unsigned
+  floods before they spend database work.
+- **Source-IP allow-list** admits only the provider's documented delivery
+  addresses by default (`PAYSTACK_WEBHOOK_ALLOWED_IPS` widens it per
+  deployment; `/0` is refused at boot). Defence in depth — the signature is
+  the authority.
+- **Signature over the RAW body.** `x-paystack-signature` is hex HMAC-SHA512
+  keyed by the sandbox secret key, verified against the exact received bytes
+  with a constant-time compare, **before** the body is parsed. Missing,
+  malformed and wrong signatures collapse to one identical 401 that echoes
+  nothing.
+- **Redaction at rest.** Only canonical identity fields and a SHA-256 payload
+  hash are persisted (migration 0031); the raw payload is never stored or
+  logged. Refusal reasons are sanitized to one line, bounded to 600 chars and
+  replaced whole when credential-shaped (the column CHECK is the backstop).
+- **Idempotent by construction.** A replayed delivery collapses onto the
+  existing ledger row via the UNIQUE idempotency key; it is acknowledged, not
+  re-applied. Receipt is **not** confirmation: the receiver writes
+  `billing_provider_events` (`received`) and never touches `subscriptions`,
+  entitlements or an execution gate.
+
+The receiver lives in `apps/api/src/billing-webhook.ts` (transport) and
+`packages/core/src/billing/webhook.ts` (signature → parse → normalize →
+resolve → persist) — deliberately outside `packages/providers/paystack`,
+which a pinned test keeps free of any receiver. Full detail:
+[paystack-provider-contract.md](./paystack-provider-contract.md) §2.2.
 
 ## Audit log
 

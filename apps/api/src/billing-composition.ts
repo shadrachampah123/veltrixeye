@@ -10,6 +10,7 @@ import {
 import {
   createBillingProviderRegistry,
   BillingCheckoutService,
+  BillingWebhookReceiver,
   isBillingProviderPlanError,
   parseProviderPlan,
   type BillingProviderPlan,
@@ -176,6 +177,24 @@ export function billingCheckoutCallbackUrl(config: AppConfig): string | null {
         url.pathname !== '/' || url.search || url.hash) return null;
     return new URL('/settings', url.origin).toString();
   } catch { return null; }
+}
+
+/**
+ * Billing Step 5.2 — compose the secure webhook receiver.
+ *
+ * Returns `null` (and the route simply does not exist) when no sandbox key is
+ * configured: the same fail-closed posture as the provider registration
+ * above. The receiver gets the SAME injected secret key the adapter was
+ * registered with — signature verification and outbound authorization are
+ * two uses of one credential — plus the registry (it reaches the adapter's
+ * `normalizeEvent` only through the seam) and the database (ledger writes
+ * and local subject resolution; the adapter itself still never touches it).
+ */
+export function composeBillingWebhookReceiver(
+  db: pg.Pool, providers: BillingProviderRegistry, config: AppConfig,
+): BillingWebhookReceiver | null {
+  if (!config.billing.enabled || config.PAYSTACK_SECRET_KEY === '') return null;
+  return new BillingWebhookReceiver({ db, providers, secretKey: config.PAYSTACK_SECRET_KEY });
 }
 
 export function composeBillingCheckout(

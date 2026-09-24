@@ -30,3 +30,22 @@ export {
   type PaystackPlanDirectory,
   type PaystackProviderConfig,
 } from './provider.js';
+
+/**
+ * The verified webhook event contract (Billing Step 5.1). Exported so the
+ * receiver that lands next — and only that receiver — can dispatch on the same
+ * pinned vocabulary instead of restating provider event names anywhere else.
+ */
+export {
+  PAYSTACK_CANONICAL_EVENT_TYPES,
+  PAYSTACK_LIFECYCLE_STATE_FOR_STATUS,
+  PAYSTACK_SUPPORTED_EVENTS,
+  PAYSTACK_UNSUPPORTED_EVENT_REASONS,
+  PAYSTACK_WITHHELD_FAILURE_DETAIL,
+  isPaystackSupportedEvent,
+  normalizePaystackEventPayload,
+  paystackLifecycleState,
+  sanitizePaystackFailureDetail,
+  type PaystackEventFacts,
+  type PaystackSupportedEvent,
+} from './events.js';

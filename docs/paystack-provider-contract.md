@@ -7,11 +7,27 @@
 > Nothing in this repository takes a live payment. `POST /api/billing/checkout`
 > exists, but it only *initializes* a sandbox checkout through the
 > `transaction/initialize` operation below — it never verifies or confirms a
-> payment. There is no checkout UI, no webhook receiver, no subscription
-> synchronization, no billing portal, no production credential and no live
-> activation. The sandbox adapter is registered by `apps/api` **only** when a
-> sandbox key is configured, and it reports itself as `live: false` with
-> `implemented: false` while seam operations remain unimplemented.
+> payment. There is no checkout UI, no subscription synchronization, no
+> billing portal, no production credential and no live activation. The
+> sandbox adapter is registered by `apps/api` **only** when a sandbox key is
+> configured, and it reports itself as `live: false` with `implemented: false`
+> while seam operations remain unimplemented.
+>
+> **The provider event contract DOES now exist (§2.1)**: `normalizeEvent` maps a
+> delivered Paystack event onto the canonical billing event contract for the
+> four events whose payload shapes Paystack publishes. It is a pure function —
+> it receives nothing, verifies no signature, reads no clock, writes no ledger
+> row, confirms no payment and grants nothing.
+>
+> **The secure webhook receiver now exists too (§2.2, Billing Step 5.2)**:
+> `POST /api/billing/webhook` verifies `x-paystack-signature` over the raw
+> body, admits only the provider's documented source addresses, rate-limits
+> per IP, normalizes through the seam and records exactly one
+> `billing_provider_events` row per delivery. It lives OUTSIDE this package
+> (`apps/api` + `packages/core`), because a pinned test keeps this package
+> receiver-free. **Receipt is not confirmation**: the receiver records
+> deliveries; it confirms no payment, moves no subscription state and grants
+> nothing.
 >
 > **Every statement about Paystack below is taken from Paystack's official
 > documentation** (`paystack.com/docs/*`, `support.paystack.com`). Where the
@@ -43,9 +59,15 @@
 | Subscription prerequisites | Creating a subscription requires an existing customer authorization (card and direct debit documented) | Subscriptions guide |
 | Retry behaviour | **"Subscriptions aren't retried"** — a failed recurring charge is not retried by Paystack | Subscriptions guide |
 | Billing-cycle events | `subscription.create` → `invoice.create` → `charge.success` \| `invoice.payment_failed` → `invoice.update` | Subscriptions guide |
+| Webhook delivery body | A POST with a JSON body `{ event, data }`; the payload publishes **no event id** and **no signature inside the body** (the signature is the `x-paystack-signature` header) | Webhooks / Events |
+| Verified event payloads | Published, field-for-field payload shapes exist for `charge.success`, `subscription.create`, `invoice.update`, `invoice.payment_failed`, `invoice.create` and `subscription.expiring_cards` | Events / Subscriptions guide |
+| Subscription statuses | `active`, `non-renewing`, `attention`, `completed`, `cancelled` (the guide also writes `complete` for a finished subscription) | Subscriptions guide |
+| Invoice failure detail | `invoice.description` carries "more information about what went wrong when attempting to charge the card" | Subscriptions guide |
 | Billing day | A plan whose billing day is ≤ 28 bills on the same day; 29th–31st bill on the 28th | Subscriptions guide |
-| Webhook signature | `x-paystack-signature` = HMAC-SHA512 of the **raw** request body keyed by the secret key | Webhooks |
+| Webhook signature | `x-paystack-signature` = hex-encoded HMAC-SHA512 of the **raw** request body keyed by the secret key | Webhooks |
+| Webhook source IPs | The provider only calls webhooks from three documented addresses — `52.31.139.75`, `52.49.173.169`, `52.214.14.220` — the same set in test and live; a delivery from outside them "can safely be considered counterfeit" | Webhooks |
 | Webhook retries | Live: retries at 3-minute intervals (×4) then hourly for up to 72 h. Test: hourly for up to 10 h. 30-second timeout | Webhooks |
+| Webhook acknowledgement | The provider expects a prompt 2xx acknowledgement (inside the 30-second timeout); anything else enters the retry schedule above | Webhooks |
 | Refund | Partial refunds supported (`amount` ≤ original); statuses `pending`, `processing`, `processed`, `failed`, `needs-attention` | Refund API |
 | Test cards | Published test-card list (success, failure, refund-scenario, API-error, EFT, mobile money, dedicated virtual account) | Test payments |
 
@@ -57,6 +79,17 @@
   documented rule for what happens to existing subscribers if a plan changes.
 - **A provider status vocabulary.** The documentation lists lifecycle *events*,
   not an exhaustive set of transaction/subscription status strings.
+- **Payload shapes for several published event names.** `subscription.disable`,
+  `subscription.not_renew`, `subscription.enable` and `charge.failed` are named
+  in the documentation but **no payload shape is published for them**, so the
+  adapter does not normalize them (§2.1). An event *name* is not evidence about
+  an event *payload*, and inventing fields from a name is exactly the guesswork
+  this document forbids.
+- **A currency on an invoice event.** `invoice.*` payloads carry an `amount` but
+  no currency of their own; the only currency on them sits inside the
+  `transaction` object, which the provider documents as sometimes **empty**.
+- **An event identifier.** No published payload carries a provider event id, so
+  de-duplication cannot rely on one (§2.1).
 - **Subscription plan-change semantics** (in-place change vs new subscription,
   re-authorization, timing).
 - **Session/checkout expiry semantics** for an unused `authorization_url`.
@@ -83,7 +116,7 @@ below) implements it as follows:
 
 | Operation | State | Documented operation used |
 | --- | --- | --- |
-| `describe()` | **implemented** | `{ provider: 'paystack', baseUrl: 'https://api.paystack.co', mode: 'test', live: false, implemented: false, timeoutMs, operations: { implemented: [...], unimplemented: [...] } }` — the key is never included |
+| `describe()` | **implemented** | `{ provider: 'paystack', baseUrl: 'https://api.paystack.co', mode: 'test', live: false, implemented: false, timeoutMs, operations: { implemented: [...], unimplemented: [...] }, events: { receiver: 'none', signatureVerification: 'none', confirmsPayment: false, grantsExecution: false, supported: [...], canonicalEventTypes: {...}, unsupported: [...] } }` — the key is never included |
 | `findCustomer` | **implemented** | `GET /customer/:email_or_code` |
 | `createCustomer` | **implemented** | `POST /customer` |
 | `initializeCheckout` | **implemented** | `POST /transaction/initialize` |
@@ -91,19 +124,223 @@ below) implements it as follows:
 | `verifySubscription` | **not implemented** | same reason |
 | `synchronizeSubscription` | **not implemented** | subscription synchronization is out of scope for this change |
 | `cancelSubscription` | **not implemented** | the documented disable operation needs the subscription code **and** its `email_token`, which this build does not persist |
-| `normalizeEvent` | **not implemented** | no webhook receiver exists and event *payload shapes* are not verified — the documented event **names** are not enough to safely normalize a payload |
+| `normalizeEvent` | **implemented** (§2.1) | **no provider call** — a pure normalization of the delivered payload against the published shapes in `src/events.ts`. Since Step 5.2 the operation is reachable from the network through the secure receiver (§2.2), which verifies the signature BEFORE calling it; the receiver lives outside this package, which a pinned test keeps receiver-free |
 
 Consequences:
 
-- `implemented` stays **`false`** on purpose. The seam defines eight operations
-  and this build performs three; a caller must treat a non-implemented provider
-  as unavailable rather than assume the rest work.
+- `implemented` stays **`false`** on purpose. The seam defines eight operations:
+  this build makes real provider calls for three, normalizes events locally for
+  a fourth, and refuses the remaining four. A caller must treat a
+  non-implemented provider as unavailable rather than assume the rest work.
 - Unimplemented operations **reject with a typed error**; they never return a
   permissive default and never fall back to a different behaviour.
 - `PAYSTACK_IMPLEMENTED_OPERATIONS` and `PAYSTACK_UNIMPLEMENTED_REASONS` (both
   exported) are the single source of truth for the tables above, and a test
   asserts that every unimplemented operation rejects **without touching the
-  transport**.
+  transport** — as does `normalizeEvent`, which is asserted to perform no I/O at
+  all.
+
+### 2.1 The verified webhook event contract (`src/events.ts`)
+
+`normalizeEvent(request)` turns ONE delivered provider event into the canonical
+`NormalizedBillingEvent` (`packages/contracts/src/billing-provider.ts`). It is a
+**pure** function of the seam request: no transport, no clock, no directory, no
+database, no mutation of the payload. Two calls with the same request produce
+byte-identical results.
+
+**Supported events — the only four whose payload shapes Paystack publishes:**
+
+| Provider event | Canonical event type(s) | `occurredAt` | Subject references reported | Payment amount reported |
+| --- | --- | --- | --- | --- |
+| `charge.success` | `payment.succeeded` | `data.paid_at` (**required**) | `providerCustomerId` = `data.customer.customer_code`; `providerReference` = `data.reference`; `providerSubscriptionId` = **null** (a charge payload documents no subscription, and its `plan` object is *not* one) | `data.amount` + `data.currency`, validated against the canonical GHS exponent |
+| `subscription.create` | `subscription.created` | `data.created_at` (the payload carries both `createdAt` and `created_at` with **different** values; only the snake_case field every documented payload carries is used) | `providerCustomerId` = `data.customer.customer_code`; `providerSubscriptionId` = `data.subscription_code`; `providerReference` = **null** | `data.amount` with the currency read from `data.plan.currency` (the subscription amount has no currency of its own), cross-checked against `data.plan.amount` |
+| `invoice.update` | `invoice.processed` when `data.paid === true`, `invoice.failed` when `data.paid === false` — the provider documents this event as carrying "the final status of the invoice" and instructs the integrator to inspect the invoice object | `data.paid_at` when carried, else `data.created_at` | `providerCustomerId` = `data.customer.customer_code`; `providerSubscriptionId` = `data.subscription.subscription_code` (**required**); `providerReference` = `data.transaction.reference` when present, else **null** | **none** — an invoice documents no currency of its own, so no amount is asserted |
+| `invoice.payment_failed` | `invoice.failed` | as above | as above | **none**, as above |
+
+Subscription state comes only from the documented status vocabulary:
+`active → active`, `non-renewing → unsubscribed`, `cancelled → cancelled`,
+`completed → expired`. **`attention` deliberately maps to `unknown`**: the guide
+describes it as a retry state while also stating "subscriptions aren't retried",
+and `unknown` is the state that changes no authoritative subscription status and
+asks for review. Anything else is `unknown` too.
+
+**Intentionally unsupported events** (`PAYSTACK_UNSUPPORTED_EVENT_REASONS`, exported):
+
+| Provider event | Why it is not supported |
+| --- | --- |
+| `invoice.create` | Its payload **is** published and verified (pinned as a fixture), but the canonical vocabulary has **no "invoice created" event type**. Mapping it onto `invoice.processed`/`invoice.failed` would assert an outcome the delivery does not state, and redesigning the canonical vocabulary is out of scope for a provider change. It normalizes to `unrecognized`. |
+| `subscription.disable` | Event name published, **payload shape not published**. Its documented status (`complete`) also contradicts the status list. Unsupported until a payload is verified. |
+| `subscription.not_renew` | Event name published, **payload shape not published**. Unsupported until verified. |
+| `subscription.enable` | Not part of the published webhook vocabulary and no payload published. |
+| `subscription.expiring_cards` | Published payload whose `data` is an **array of expiring cards**: no payment outcome, no mappable subscription state, and card-expiry detail this build must never ingest. |
+| `charge.failed` | **Not in the published webhook vocabulary at all**; a failed recurring charge is documented to arrive as `invoice.payment_failed`. |
+
+Everything else the provider documents (`charge.dispute.*`, `refund.*`,
+`transfer.*`, `customeridentification.*`, `dedicatedaccount.*`,
+`paymentrequest.*`) is outside billing-event scope and normalizes to
+`unrecognized`.
+
+**Two different outcomes for two different problems:**
+
+- An event name this build does **not** support is **not an error**: it returns
+  the canonical `unrecognized` event with `occurredAt: null`, `subject: null`
+  and `data: null`, so a delivery can be recorded without asserting anything.
+- A **supported** event whose payload is missing a required field, carries a
+  wrong type, contradicts itself, reports a non-`test` domain, or quotes a
+  currency/amount this build does not understand **is** an error: a typed
+  `PaystackAdapterError` (`unexpected_response`, or `invalid_configuration` for
+  a non-sandbox domain, `invalid_request` for a malformed seam request). A
+  malformed payment or subscription fact is never silently downgraded to
+  `unrecognized`.
+
+**What the normalizer never reads, maps or persists:**
+
+- `data.subscription.email_token` — the provider's **cancellation credential**.
+  It appears in published invoice payloads; no code path in this package reads
+  it, and a fixture pins that supplying it (with any value) changes nothing.
+- `data.authorization` (authorization code, BIN, last4, expiry, signature) and
+  any card/brand/expiry detail — credential-shaped material.
+- `data.customer.email`, `first_name`, `last_name`, `phone`, and
+  `data.ip_address` — personal data the canonical contract has no field for.
+- `data.plan.plan_code`, `data.plan.interval`, `data.plan.name` — a provider
+  plan is **not** an authorization. `cataloguePlan` and `interval` are always
+  `null` from an event; only a locally registered plan epoch maps a provider
+  plan onto the catalogue.
+- `data.metadata`, `data.gateway_response`, `data.fees*`, `data.log`,
+  `data.next_payment_date` (the date of the *next* charge, not a period
+  boundary), and the camelCase `createdAt` twin.
+- **The raw body.** The payload is hashed (`identity.payloadHash`) and dropped;
+  the normalized event carries no envelope, no `payload`/`rawBody`/`body` field
+  and no provider-only key. Nothing is logged.
+
+**Failure detail.** The only provider-authored sentence ever mapped is
+`invoice.description` → `data.failureReason`, and only for a failed invoice. It
+is collapsed to one line, passed through the package redaction pass, hard-bounded
+to the durable 600-character limit, and — if it is *still* credential-shaped
+(`password`, `token`, `secret`, `api key`, `authorization`, `private key`,
+`credential`, `bearer`) — replaced **whole** by
+`PAYSTACK_WITHHELD_FAILURE_DETAIL` ("provider failure detail withheld"). A
+credential-shaped failure reason is therefore never produced, which is also what
+migration 0031's CHECK would refuse to store. Refusal messages are equally
+careful: they name the provider event and the **field path** (`data.paid_at`),
+never a payload value.
+
+**Identity and idempotency.** Derived by core, never invented here:
+`payloadHash = billingEventPayloadHash(body)` over the whole `{event, data}`
+envelope (canonical, key-sorted JSON, so delivery key order is irrelevant), and
+`idempotencyKey = billingEventIdempotencyKey({provider, providerEventId,
+eventType, occurredAt, payloadHash})`. `providerEventId` comes **only** from the
+seam request (Paystack payloads publish none) and must itself be
+reference-shaped. Two deliveries of the same event collapse onto one
+`billing_provider_events` row via migration 0031's unique key; two *different*
+payloads never do, including two `unrecognized` ones.
+
+**Local subject fields are always `null`.** `userId`, `subscriptionId` and
+`billingCustomerId` are resolved by the receiver against the local directories
+before anything is persisted; the durable ledger binds an event to its owner
+with a composite key that is either fully resolved or fully null.
+
+**Webhook receipt is NOT payment confirmation.** A normalized
+`payment.succeeded` or `invoice.processed` event is a *provider-reported
+receipt* of one delivery. It is not a transaction verification (the documented
+`GET /transaction/verify/:reference` read is not performed by this build), not a
+subscription synchronization, and not evidence that money settled — in sandbox,
+settlements are not processed at all.
+
+**Normalization can never grant execution.** `grantsExecution` is pinned
+`false` by the canonical contract (`z.literal(false)`), so no payload — however
+insistent — can produce a grant, and billing state is not an execution
+entitlement. Catalogue identity (`cataloguePlan`, `interval`) is likewise never
+derived from a payload.
+
+**Fixtures.** `packages/providers/paystack/test/fixtures/webhook/*.json` pin one
+delivery body per case. Each fixture records, beside the payload, the official
+page(s) it came from, the field names verified there, and how the values were
+adapted to this repository's sandbox GHS flow (placeholder codes, `domain:
+"test"`, and `DO_NOT_PERSIST` sentinels for every value the normalizer must
+never read). Published quirks are preserved deliberately — the empty
+`transaction` object, the `period_start` **after** `period_end`, the
+`createdAt`/`created_at` twins, the `email_token` on an invoice payload, the
+array-shaped `subscription.expiring_cards` data — so the tests exercise the real
+shapes rather than a tidied-up idea of them. One fixture is marked
+`synthetic: true`: an adversarial credential-shaped `description`, which no
+provider documentation contains, pinned so the redaction rule is tested against
+a file.
+
+### 2.2 The secure webhook receiver (Billing Step 5.2 — outside this package)
+
+The receiver is `POST /api/billing/webhook`, composed in `apps/api`
+(`src/billing-webhook.ts` route, `src/billing-composition.ts` wiring) on top
+of the receiver core in `packages/core/src/billing/webhook.ts`. It is the
+ONLY network path to `normalizeEvent`, and it exists outside
+`packages/providers/paystack` on purpose — the Step 5.1 test there pins the
+package free of any receiver, signature handling, raw body, route or
+persistence, and this step keeps that pin green.
+
+**Existence.** The route is registered ONLY when the sandbox adapter is
+registered (a `sk_test_` key is configured). With no key, nothing listens —
+the endpoint is a 404, never a half-configured surface. The adapter's own
+`describe().events.receiver` therefore still honestly reports `'none'`: the
+adapter has no receiver; the application does.
+
+**Request order (security-relevant, fixed):**
+
+1. **Rate limit** — per `req.ip`, `PAYSTACK_WEBHOOK_RATE_LIMIT_MAX`
+   deliveries per minute (default 30: far above the documented delivery and
+   retry cadence, far below the global API limit). `req.ip` is
+   non-client-controlled because Fastify's `trustProxy` is pinned to the real
+   infrastructure hops (`apps/api/src/trust-proxy.ts`).
+2. **Source-IP allow-list** — defence in depth. The default pins exactly the
+   three documented provider addresses above; `PAYSTACK_WEBHOOK_ALLOWED_IPS`
+   replaces or widens the list per deployment (loopback for local testing),
+   and a `/0` entry is refused at boot. A delivery outside the list is 403
+   before any processing; the signature check below remains the authority.
+3. **Signature** — `x-paystack-signature` is verified against the EXACT
+   received bytes (scoped raw-body parser; the body is not parsed or
+   re-serialized first): hex HMAC-SHA512 keyed by the same sandbox secret key
+   the adapter was registered with, compared constant-time
+   (`timingSafeEqual`). Missing, malformed and wrong signatures are one
+   identical 401; nothing about the body is examined before verification.
+4. **Normalization** — the verified body is JSON-parsed and handed to the
+   seam's `normalizeEvent` (§2.1), with the receipt instant captured at the
+   route. Paystack publishes no event id, so identity rests on the payload
+   hash exactly as §2.1 describes.
+5. **Local subject resolution** — BEFORE any insert, the receiver resolves
+   the reported references against local directories: a provider customer
+   id/code onto `billing_customers`, a provider subscription id onto
+   `subscriptions`, and our own checkout reference (`ve-chk-…`) onto the
+   subscription that locked the pricing snapshot the reference was derived
+   from (the same `billingCheckoutReference` function checkout uses). Any
+   disagreement binds NOTHING — the row is recorded with a fully-null
+   subject rather than a guessed owner. The ledger binds the
+   (subscription, user) pair or nothing (migration 0031); a user with no
+   subscription row is recorded unbound.
+6. **Ledger write** — exactly one `billing_provider_events` row per verified
+   delivery (`status: 'received'`, payload hash, canonical event type,
+   resolved subject). A replay collapses onto the existing row via the
+   UNIQUE `idempotency_key` and is acknowledged as such; the documented
+   retry schedule makes replays normal, never an error. There is no
+   signature timestamp in the documented scheme, so there is no freshness
+   window — replay safety IS the ledger's idempotency (§1 consequence 1).
+
+**Two outcomes for two different problems (mirrors §2.1).** An unsupported
+event name is acknowledged (2xx) and recorded `unrecognized` without a
+failure reason — the provider should not retry what will never change. A
+verified delivery the receiver must REFUSE (a body that is not JSON, or a
+supported event whose payload the seam refuses — missing field, wrong type,
+self-contradiction, non-`test` domain) is ALSO recorded `unrecognized`, with
+the refusal reason sanitized to one line, bounded to 600 characters and
+replaced whole when credential-shaped (0031's CHECK is the backstop) — but
+answered 400, so the provider's retries surface the incident. No refusal
+ever loses its evidence; nothing unverified ever gets one.
+
+**What the receiver never does.** It never stores or logs a payload (hash
+only — the §2.1 redaction posture, unchanged). It never writes
+`subscriptions`, never confirms a payment (`paymentConfirmed` stays
+unrepresentable), never resolves an entitlement and never touches an
+execution gate — a recorded `payment.succeeded` is a provider-reported
+receipt awaiting a later synchronization step, not an applied payment. It
+performs no outbound call of any kind (no transaction verification).
 
 ## 3. Transport posture (`src/client.ts`)
 
@@ -183,6 +420,15 @@ Notable mappings: a missing/inexact authorized amount is always
 unregistered plans are refusals, not warnings); a 5xx/timeout/unreadable body is
 `provider_unavailable`; a provider-reported customer whose email contradicts the
 email we sent is `response_conflict`.
+
+Event normalization (§2.1) uses three of the same reasons and no new ones:
+
+| Situation | Reason |
+| --- | --- |
+| The seam request itself is not canonical (no `provider`/`payload`/`receivedAt`, a non-ISO receipt instant, an extra field such as a raw body, or a `providerEventId` that is not a reference-shaped identifier) | `invalid_request` |
+| A delivery reports a domain other than `test` | `invalid_configuration` |
+| A **supported** event whose payload is missing a required field, mis-typed, self-contradictory (`charge.success` with a non-success status; a subscription whose plan amount disagrees with its own amount), or quotes a currency/amount this build cannot normalize | `unexpected_response` |
+| An **unsupported or unknown** event name | *no error* — the canonical `unrecognized` event |
 
 ## 5. Money rules the adapter obeys
 
@@ -317,11 +563,28 @@ is likewise an **account capability**, not a code path.
 
 ## 8. What this PR deliberately does not build
 
-No checkout route, no checkout UI, no `apps/web` change, no webhook receiver, no
-signature processing, no subscription synchronization, no billing portal, no
-refund/proration/dunning execution, no notifications, no live payment, no
-production credential, no production activation, no Starter selling, no
-provider-plan epoch registration, no epoch-derived pricing entry point, no
-`/plan` mutation, no FX publication, no Gate 9 work, no broker execution and no
-trading logic. The GHS 2.00 test plan is not registered as an epoch. See
-[billing.md](./billing.md) for the billing roadmap and for decisions D-1 … D-9.
+No checkout UI, no `apps/web` change, no subscription synchronization, no
+billing portal, no refund/proration/dunning execution, no notifications, no
+live payment, no production credential, no production activation, no Starter
+selling, no provider-plan epoch registration, no epoch-derived pricing entry
+point, no `/plan` mutation, no FX publication, no Gate 9 work, no broker
+execution and no trading logic. The GHS 2.00 test plan is not registered as
+an epoch. See [billing.md](./billing.md) for the billing roadmap and for
+decisions D-1 … D-9.
+
+The two billing steps since this list was written each changed one line of
+its meaning and none of its substance:
+
+- **§2.1 (Step 5.1)** — `normalizeEvent` is implemented as a pure function
+  of a verified delivery.
+- **§2.2 (Step 5.2)** — the secure receiver makes that operation reachable
+  from the network: `POST /api/billing/webhook`, with
+  `x-paystack-signature` verification over the raw body, the documented
+  source-IP allow-list, per-IP rate limiting and the
+  `billing_provider_events` write — implemented in `apps/api` and
+  `packages/core`, deliberately OUTSIDE this package. The package test still
+  asserts that the provider source itself contains no route, no raw-body
+  handling, no signature code, no allow-list, no rate limiting and no
+  persistence. And the substance is unchanged: receiving an event is still
+  not verifying a transaction, not confirming a payment, not synchronizing a
+  subscription and never an entitlement or execution effect.

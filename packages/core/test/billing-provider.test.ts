@@ -404,16 +404,25 @@ describe('billing PR2 — entitlement safety', () => {
     assert.ok(!SEAM_CODE.includes('entitlements.js'), 'the seam does not import the entitlement module');
   });
 
-  it('permits only PR-C checkout alongside the pre-existing entitlement read', () => {
+  it('permits only PR-C checkout plus the Step 5.2 webhook receiver', () => {
     const routesDir = path.join(REPO_ROOT, 'apps', 'api', 'src', 'routes');
     const billingRoute = readFileSync(path.join(routesDir, 'billing.ts'), 'utf8');
     assert.match(billingRoute, /app\.get\('\/api\/billing\/me'/, 'GET /api/billing/me still exists');
     const writes = [...billingRoute.matchAll(/app\.(post|put|patch|delete)\s*\(\s*'([^']+)'/g)]
       .map((match) => [match[1], match[2]]);
-    assert.deepEqual(writes, [['post', '/api/billing/checkout']], 'only PR-C checkout may write');
-    assert.doesNotMatch(billingRoute, /portal|webhook/i, 'portal and webhook remain prohibited');
+    assert.deepEqual(writes, [['post', '/api/billing/checkout']], 'only PR-C checkout may write inline');
+    assert.doesNotMatch(billingRoute, /portal/i, 'the portal remains prohibited');
+    // Billing Step 5.2: the webhook receiver is wired through exactly one
+    // sanctioned composition call — never as a second inline billing route.
+    assert.match(billingRoute, /registerBillingWebhookRoutes\(app, ctx, config\)/);
 
     const withBillingPath = readdirSync(routesDir).filter((file) => /\/api\/billing\//.test(readFileSync(path.join(routesDir, file), 'utf8')));
     assert.deepEqual(withBillingPath, ['billing.ts'], 'no other route file exposes a billing path');
+
+    // The receiver route itself lives in the ONE place Step 5.2 allows, and
+    // the route it registers is the documented webhook path — nothing else.
+    const receiver = readFileSync(path.join(REPO_ROOT, 'apps', 'api', 'src', 'billing-webhook.ts'), 'utf8');
+    assert.match(receiver, /'\/api\/billing\/webhook'/);
+    assert.doesNotMatch(receiver, /\/api\/billing\/(portal|checkout|customer|callback)'/);
   });
 });

@@ -1,0 +1,92 @@
+{
+  "fixture": "subscription-create",
+  "event": "subscription.create",
+  "supported": true,
+  "canonicalEventType": "subscription.created",
+  "provenance": {
+    "sources": [
+      "https://docs-v1.paystack.com/docs/events — \"Structure of an event object\": \"Below is the body of an event that was fired when we created a subscription\" (the full subscription.create payload)",
+      "https://paystack.com/docs/payments/subscriptions/ — \"Listen for subscription events\" (Subscription Created) and \"Using the create subscription endpoint\" (the subscription object's field set: status, subscription_code, amount, cron_expression, next_payment_date, open_invoice, plan, authorization, customer)",
+      "https://paystack.com/docs/payments/subscriptions/ — \"Understanding subscription statuses\" (the documented status vocabulary: active, non-renewing, attention, completed, cancelled)"
+    ],
+    "verifiedFieldNames": [
+      "event",
+      "data.domain",
+      "data.status",
+      "data.subscription_code",
+      "data.amount",
+      "data.cron_expression",
+      "data.next_payment_date",
+      "data.open_invoice",
+      "data.createdAt",
+      "data.plan.name",
+      "data.plan.plan_code",
+      "data.plan.description",
+      "data.plan.amount",
+      "data.plan.interval",
+      "data.plan.send_invoices",
+      "data.plan.send_sms",
+      "data.plan.currency",
+      "data.authorization",
+      "data.customer.first_name",
+      "data.customer.last_name",
+      "data.customer.email",
+      "data.customer.customer_code",
+      "data.customer.phone",
+      "data.customer.metadata",
+      "data.customer.risk_action",
+      "data.created_at"
+    ],
+    "adaptedValues": "Field names, nesting and types are exactly as published. Values adapted to the sandbox GHS flow. Two published quirks are preserved deliberately: (1) the payload carries BOTH createdAt and created_at with DIFFERENT values — the normalizer reads created_at only; (2) the customer object carries NO numeric id — the normalizer therefore never requires one and identifies the customer by customer_code.",
+    "neverRead": [
+      "data.authorization (card detail)",
+      "data.customer.email / first_name / last_name (personal data)",
+      "data.plan.interval and data.plan.plan_code (catalogue identity is never derived from a provider payload)",
+      "data.next_payment_date (the next charge date is not a period boundary)"
+    ]
+  },
+  "body": {
+    "event": "subscription.create",
+    "data": {
+      "domain": "test",
+      "status": "active",
+      "subscription_code": "SUB_fixture0000001",
+      "amount": 48750,
+      "cron_expression": "0 0 22 * *",
+      "next_payment_date": "2026-10-22T00:00:00.000Z",
+      "open_invoice": null,
+      "createdAt": "2026-09-22T09:05:20.000Z",
+      "plan": {
+        "name": "VeltrixEye Pro Monthly (fixture)",
+        "plan_code": "PLN_fixture0000pro1",
+        "description": null,
+        "amount": 48750,
+        "interval": "monthly",
+        "send_invoices": true,
+        "send_sms": true,
+        "currency": "GHS"
+      },
+      "authorization": {
+        "authorization_code": "AUTH_DO_NOT_PERSIST_0001",
+        "bin": "408408",
+        "last4": "4081",
+        "exp_month": "12",
+        "exp_year": "2030",
+        "card_type": "visa DEBIT",
+        "bank": "TEST BANK",
+        "country_code": "GH",
+        "brand": "visa"
+      },
+      "customer": {
+        "first_name": "Fixture",
+        "last_name": "Trader",
+        "email": "do-not-persist@example.com",
+        "customer_code": "CUS_fixture0000001",
+        "phone": "",
+        "metadata": {},
+        "risk_action": "default"
+      },
+      "created_at": "2026-09-22T09:05:21.000Z"
+    }
+  }
+}

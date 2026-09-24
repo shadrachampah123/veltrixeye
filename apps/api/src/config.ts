@@ -16,6 +16,10 @@ import {
 import type { SmtpEmailConfig as SmtpEmailConfigShape } from '@veltrixeye/core';
 import { BILLING_FX_POLICY, validateExecutionTransportConfig } from '@veltrixeye/core';
 import { DEFAULT_TRUSTED_PROXIES, parseTrustedProxies } from './trust-proxy.js';
+import {
+  parsePaystackWebhookAllowList,
+  type WebhookAllowListEntry,
+} from './webhook-allowlist.js';
 
 /**
  * Integer environment value with a range. An EMPTY string is treated as
@@ -268,6 +272,26 @@ const envSchema = z.object({
       message:
         'must be empty or a Paystack SANDBOX test key starting with "sk_test_" — live and public keys are refused',
     }),
+  /**
+   * Billing Step 5.2 — webhook SOURCE-IP ALLOW-LIST for
+   * `POST /api/billing/webhook` (comma- or whitespace-separated IPs/CIDRs).
+   *
+   * EMPTY (default) pins the provider's DOCUMENTED webhook source addresses
+   * (52.31.139.75, 52.49.173.169, 52.214.14.220 — the same set in test and
+   * live mode; docs/paystack-provider-contract.md §1): the receiver only
+   * admits deliveries from addresses the provider documents. Set it to widen
+   * or replace the list per deployment (e.g. loopback for local testing).
+   * A `/0` entry is refused at boot — it would disable the allow-list while
+   * pretending to have one. Defence in depth: the `x-paystack-signature`
+   * HMAC-SHA512 check remains the authority.
+   */
+  PAYSTACK_WEBHOOK_ALLOWED_IPS: z.string().max(2048).default(''),
+  /**
+   * Per-IP deliveries per minute accepted on the webhook route. Well above
+   * the provider's documented delivery/retry rate (hourly retries in test
+   * mode), well below the global API limit — an unsigned flood stops here.
+   */
+  PAYSTACK_WEBHOOK_RATE_LIMIT_MAX: intEnv(1, 1000, 30),
   /** Public browser origin. Empty disables checkout; never inferred from a request. */
   PUBLIC_APPLICATION_ORIGIN: z.string().trim().max(2048).default('').refine((value) => {
     if (value === '') return true;
@@ -347,6 +371,13 @@ export interface BillingConfig {
   paymentCurrency: 'GHS';
   /** Approved maximum FX rate age at pricing time, in seconds. */
   fxMaxAgeSeconds: number;
+  /** Step 5.2 — webhook receiver transport settings. */
+  webhook: {
+    /** Parsed source-IP allow-list (documented provider IPs by default). */
+    allowedIps: WebhookAllowListEntry[];
+    /** Per-IP deliveries per minute accepted on the webhook route. */
+    rateLimitMax: number;
+  };
 }
 
 export interface ScannerConfig {
@@ -392,6 +423,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     // Same fail-fast contract as the schema above: a malformed trust list must
     // stop the boot rather than silently change who may speak for the client.
     throw new Error(`Invalid environment configuration:\n  - TRUSTED_PROXY_CIDRS: ${(err as Error).message}`);
+  }
+  let webhookAllowedIps: WebhookAllowListEntry[];
+  try {
+    webhookAllowedIps = parsePaystackWebhookAllowList(result.data.PAYSTACK_WEBHOOK_ALLOWED_IPS);
+  } catch (err) {
+    // Same fail-fast contract: a malformed webhook allow-list must stop the
+    // boot rather than silently widen or narrow who may deliver events.
+    throw new Error(`Invalid environment configuration:\n  - PAYSTACK_WEBHOOK_ALLOWED_IPS: ${(err as Error).message}`);
   }
 
   const values = result.data;
@@ -461,6 +500,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       commercialCurrency: 'USD',
       paymentCurrency: 'GHS',
       fxMaxAgeSeconds: BILLING_FX_POLICY.maxAgeSeconds,
+      webhook: {
+        allowedIps: webhookAllowedIps,
+        rateLimitMax: values.PAYSTACK_WEBHOOK_RATE_LIMIT_MAX,
+      },
     },
   };
 }

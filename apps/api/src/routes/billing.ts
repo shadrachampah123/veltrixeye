@@ -8,11 +8,17 @@ import {
 } from '@veltrixeye/core';
 import { isPaystackAdapterError } from '@veltrixeye/provider-paystack';
 import { composeBillingCheckout } from '../billing-composition.js';
+import { registerBillingWebhookRoutes } from '../billing-webhook.js';
 import type { BillingStateDto } from '@veltrixeye/contracts';
 
 export async function billingRoutes(app: FastifyInstance, ctx: AppContext, config: AppConfig): Promise<void> {
   const requireAuth = createSessionAuth(config, ctx);
   const checkout = composeBillingCheckout(ctx.pool, ctx.billingProviders, config);
+
+  // Billing Step 5.2 — the secure webhook receiver route. Signature-verified,
+  // never session-authenticated; registered only when a billing provider
+  // exists (with no sandbox key the endpoint does not exist at all).
+  await registerBillingWebhookRoutes(app, ctx, config);
 
   app.post('/api/billing/checkout', async (req, reply) => {
     if (!await requireAuth(req, reply)) return;
