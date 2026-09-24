@@ -23,8 +23,8 @@ import {
  *    API (the fetch implementation is injected, and the test suite injects a
  *    stub that records calls instead of opening sockets);
  *  * calls only operations that appear in the provider's published API
- *    documentation: create customer, fetch customer, initialize transaction.
- *    Nothing else exists here — in particular there is NO plan creation, NO
+ *    documentation: create customer, fetch customer, initialize transaction
+ *    and verify transaction (a READ). Nothing else exists here — in particular there is NO plan creation, NO
  *    plan update, NO plan deletion, NO charge, NO refund, NO transfer and NO
  *    subscription-management call. Provider behaviour that is not documented is
  *    never guessed: it is left unimplemented and fails closed.
@@ -101,6 +101,61 @@ const initializeDataSchema = z
     reference: z.string().min(1).max(190),
   })
   .passthrough();
+
+/**
+ * The documented transaction-verify payload (`GET /transaction/verify/:reference`),
+ * restricted to the fields this build ACTS on. The provider publishes more
+ * (card authorization, fees, logs, IP address, metadata): none of it is read,
+ * typed, returned or retained here. In particular the `authorization` object is
+ * never touched — it carries reusable-charge material.
+ *
+ * Deliberately absent: any subscription status or subscription code. The
+ * provider's published verify response carries neither, so nothing here can
+ * report one (see docs/paystack-provider-contract.md §2).
+ */
+const verifyTransactionDataSchema = z
+  .object({
+    domain: z.string().min(1).max(16),
+    status: z.string().min(1).max(64),
+    reference: z.string().min(1).max(190),
+    amount: z.number().int(),
+    currency: z.string().min(1).max(8),
+    customer: z
+      .object({
+        id: z.union([z.number().int(), z.string().min(1).max(128)]).optional(),
+        customer_code: z.string().min(1).max(128).optional(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+/**
+ * The characters the provider documents for a transaction reference
+ * ("Only `-`, `.`, `=` and alphanumeric characters allowed"). Anything else is
+ * refused before a request is built, so a reference can never reshape the path.
+ */
+const PAYSTACK_REFERENCE_SHAPE = /^[A-Za-z0-9.=-]{1,190}$/;
+
+/**
+ * A verified transaction, as the provider reported it — documented fields only.
+ * `status` is the provider's own transaction status string, passed through
+ * verbatim: the provider does not publish an exhaustive transaction status
+ * vocabulary, so this client interprets none of it.
+ */
+export interface PaystackVerifiedTransaction {
+  /** The transaction reference the provider verified (should be ours). */
+  reference: string;
+  /** Provider transaction status, uninterpreted (e.g. the documented `success`). */
+  status: string;
+  /** Provider environment of the transaction (`test` in sandbox). */
+  domain: string;
+  /** Amount in the currency's minor unit, exactly as reported (never converted). */
+  amountMinor: number;
+  /** Currency code exactly as reported. */
+  currency: string;
+  providerCustomerId: string | null;
+  providerCustomerCode: string | null;
+}
 
 export interface PaystackCustomerRecord {
   /** Provider customer identifier (`id`), when the envelope carries one. */
@@ -306,6 +361,48 @@ export class PaystackClient {
       );
     }
     return { authorizationUrl: parsed.data.authorization_url, reference: parsed.data.reference };
+  }
+
+  /**
+   * Verify a transaction (documented: `GET /transaction/verify/:reference`).
+   *
+   * A pure READ: one attempt, no retry, nothing retained. Only the documented
+   * fields listed on `verifyTransactionDataSchema` are read; a response missing
+   * one of them (or carrying it with the wrong type) is a typed refusal, never
+   * a default. A 404 is never "no transaction": the documented-ambiguous 404
+   * classification applies, so an unknown reference is an error the caller
+   * must resolve, not an empty result.
+   */
+  async verifyTransaction(reference: string): Promise<PaystackVerifiedTransaction> {
+    const trimmed = reference.trim();
+    if (!PAYSTACK_REFERENCE_SHAPE.test(trimmed)) {
+      throw paystackInvalidRequest(
+        'A transaction reference made only of the documented characters (alphanumeric, "-", "." and "=") is required to verify a transaction.',
+      );
+    }
+
+    const data = await this.request('GET', `/transaction/verify/${encodeURIComponent(trimmed)}`);
+    const parsed = verifyTransactionDataSchema.safeParse(data);
+    if (!parsed.success) {
+      throw new PaystackAdapterError(
+        'unexpected_response',
+        `The provider transaction-verify response did not carry the documented fields this build requires (${[
+          ...new Set(parsed.error.issues.map((issue) => issue.path.join('.') || '<root>')),
+        ].join(', ')}).`,
+      );
+    }
+
+    const verified: PaystackVerifiedTransaction = {
+      reference: parsed.data.reference,
+      status: parsed.data.status,
+      domain: parsed.data.domain,
+      amountMinor: parsed.data.amount,
+      currency: parsed.data.currency,
+      providerCustomerId:
+        parsed.data.customer.id === undefined ? null : String(parsed.data.customer.id),
+      providerCustomerCode: parsed.data.customer.customer_code ?? null,
+    };
+    return verified;
   }
 
   /* ------------------------------------------------------------------------ */

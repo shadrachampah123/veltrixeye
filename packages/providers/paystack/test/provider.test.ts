@@ -168,7 +168,7 @@ const expectReason = (reason: string) => (error: unknown) => {
 describe('Paystack provider — honest capability reporting', () => {
   test('implemented is false and live is false, and describe() lists what really works', () => {
     const { provider } = build({});
-    assert.equal(provider.implemented, false, 'four of eight seam operations are implemented');
+    assert.equal(provider.implemented, false, 'five of eight seam operations are implemented');
     assert.equal(provider.live, false);
     assert.equal(provider.id, 'paystack');
 
@@ -179,10 +179,18 @@ describe('Paystack provider — honest capability reporting', () => {
       implemented: [...PAYSTACK_IMPLEMENTED_OPERATIONS],
       unimplemented: [
         'findSubscription',
-        'verifySubscription',
         'synchronizeSubscription',
         'cancelSubscription',
       ],
+    });
+    // Later-billing-PR #7: the verification read is the documented
+    // transaction-verify operation and reports no subscription state.
+    assert.deepEqual(described.verification, {
+      operation: 'transaction.verify',
+      subscriptionRead: 'none',
+      reportedLifecycleState: 'unknown',
+      grantsEntitlements: false,
+      grantsExecution: false,
     });
     // Event normalization is covered by provider-events.test.ts; this build
     // still receives nothing, verifies no signature and confirms no payment.
@@ -196,9 +204,12 @@ describe('Paystack provider — honest capability reporting', () => {
     const { provider, calls } = build({});
 
     await assert.rejects(() => provider.findSubscription({ provider: 'paystack', userId: USER_ID }), PaystackNotImplementedError);
+    // verifySubscription is implemented (Later-billing-PR #7) but, without a
+    // checkout reference, it refuses before any call: there is no documented
+    // subscription read to use a subscription identifier with.
     await assert.rejects(
-      () => provider.verifySubscription({ provider: 'paystack', userId: USER_ID, idempotencyKey: 'a'.repeat(64), requestedAt: '2026-09-22T09:00:00.000Z' }),
-      PaystackNotImplementedError,
+      () => provider.verifySubscription({ provider: 'paystack', userId: USER_ID, providerSubscriptionId: 'SUB_x', idempotencyKey: 'a'.repeat(64), requestedAt: '2026-09-22T09:00:00.000Z' }),
+      expectReason('invalid_request'),
     );
     await assert.rejects(
       () =>

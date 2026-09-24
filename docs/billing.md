@@ -4,18 +4,26 @@
 > provider-plan / pricing-snapshot state (migration `0032`), and a SANDBOX
 > Paystack adapter.** Nothing here takes a live payment.
 >
-> **Current billing surface:** two session-authenticated billing routes exist —
+> **Current billing surface:** three session-authenticated billing routes exist —
 > `GET /api/billing/me` (read-only state) and `POST /api/billing/checkout`
 > (PR-C: sandbox checkout initialization against a registered epoch and an
 > operator-published FX rate; it writes a pending provider-backed row and an
 > immutable pricing lock, and it never *confirms* a payment) — plus the
 > Step 5.2 **secure webhook receiver** `POST /api/billing/webhook`
 > (signature-verified, rate-limited, source-IP allow-listed; it records ONE
-> `billing_provider_events` row per verified delivery and nothing else).
-> There is still no checkout UI and no `apps/web` billing change, no
-> subscription synchronization, no billing portal, no
-> refund/proration/dunning execution, no notification, no live payment, no
-> production credential, no production activation and no Starter selling.
+> `billing_provider_events` row per verified delivery and nothing else) —
+> and the third, the Later-billing-PR #7 **verification + synchronization** route
+> `POST /api/billing/sync` (session-authenticated, no request body; it
+> verifies the caller's own checkout reference through the documented
+> transaction-verify read and applies the result only through
+> `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE` — see *Verification +
+> synchronization (Later-billing-PR #7)* below). The verify response publishes
+> no subscription status, so every Paystack-verified state is `unknown`
+> (manual review): no status moves and nothing is granted.
+> There is still no checkout UI and no `apps/web` billing change, no billing
+> portal, no refund/proration/dunning execution, no notification, no live
+> payment, no production credential, no production activation and no Starter
+> selling.
 > **Receipt is still not confirmation**: the receiver records deliveries; it
 > confirms no payment, changes no subscription status and grants nothing.
 >
@@ -273,7 +281,7 @@ no constraint and does not weaken the 0014 `plan`/`status` CHECKs.
 | Commercial identity | `catalogue_plan`, `billing_interval`, `currency`, `catalogue_version` | Which catalogue plan/interval a subscription was sold as. `currency` is pinned to `USD`; `catalogue_version` records `BILLING_CATALOGUE_VERSION`. **No price is stored** — the catalogue stays the only price source. |
 | Provider identity | `billing_customer_id` → `billing_customers`, `provider_plan_id`, `provider_subscription_code`, `provider_reference`, `provider_state` | Reference identifiers only. `provider_state` is the **canonical** provider-reported lifecycle (`unprovisioned`, `pending`, `active`, `trialing`, `past_due`, `cancelled`, `unsubscribed`, `expired`, `unknown`) — a provider-specific status word is normalized behind the seam before it can be stored. |
 | Period / cancellation | `cancel_at`, `cancelled_at`, `cancellation_reason` (with 0014's `current_period_start/end`, `cancel_at_period_end`) | Period coherence (`start < end`) and cancellation coherence are CHECK-enforced. |
-| Synchronization | `sync_state`, `last_sync_source`, `last_synced_at`, `sync_required`, `last_event_idempotency_key`, `state_version` | Bookkeeping for a later sync PR. Defaults are inert (`never_synced` / `none` / `false` / `1`); `state_version` cannot decrease (trigger), so a stale writer loses. |
+| Synchronization | `sync_state`, `last_sync_source`, `last_synced_at`, `sync_required`, `last_event_idempotency_key`, `state_version` | Bookkeeping, written since Later-billing-PR #7 by `BillingSubscriptionSyncService` only. Defaults are inert (`never_synced` / `none` / `false` / `1`); `state_version` cannot decrease (trigger), so a stale writer loses. |
 
 Invariants the database enforces:
 
@@ -325,13 +333,15 @@ collapses onto one row:
   unapplied provider event.
 
 In PR2 nothing read or wrote these tables. Since **Step 5.2**,
-`billing_provider_events` has exactly ONE writer — the secure webhook
-receiver (`POST /api/billing/webhook`), which appends `received` rows and
-never processes them onwards. `billing_customers` still has no route-wired
-writer, no worker and no scheduler apply events, and the subscription
-synchronization columns stay at their inert defaults.
-`subscriptions_sync_required_idx` exists so a later synchronization PR does
-not need another migration.
+`billing_provider_events` rows are appended by exactly ONE writer — the secure
+webhook receiver (`POST /api/billing/webhook`), which appends `received` rows
+and never processes them onwards. Since **Later-billing-PR #7**, the ONLY
+processing transitions (`received → processed | ignored | failed`) and the
+ONLY writes of the subscription synchronization columns come from
+`BillingSubscriptionSyncService` (`POST /api/billing/sync`); no worker or
+scheduler applies events. `billing_customers` still has no route-wired
+writer. `subscriptions_sync_required_idx` exists so a later scheduled
+synchronization does not need another migration — PR #7 needed none.
 
 ## Pricing in GHS (PR3 — migration `0032_billing_fx_and_pricing.sql`)
 
@@ -451,7 +461,7 @@ in [paystack-provider-contract.md](./paystack-provider-contract.md).
 | GHS recurring end-to-end | **AC7** unverified |
 | Checkout UI | Out of scope — the checkout **route** now exists (PR-C: `POST /api/billing/checkout`, reaching `initializeCheckout` for sandbox sessions only); no web surface drives it |
 | ~~Webhook receiver + signature processing~~ | **Delivered by Step 5.2** (`POST /api/billing/webhook`): `x-paystack-signature` verification (HMAC-SHA512 over the RAW body, constant-time), a documented source-IP allow-list, per-IP rate limiting, local subject resolution, and exactly one `billing_provider_events` row per verified delivery (replays collapse; refused deliveries are kept as `unrecognized` evidence). **Receipt only** — no confirmation, no synchronization, no entitlement effect (step 6b below) |
-| Subscription read/verify/sync | No verified subscription read operation, and synchronization is out of scope. The receiver records events; nothing applies them to `subscriptions` yet |
+| ~~Subscription read/verify/sync~~ | **Delivered by Later-billing-PR #7** (`POST /api/billing/sync`): verification through the documented `GET /transaction/verify/:reference` read, synchronization through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`. There is still **no subscription read** (`findSubscription` refused), and because the verify response publishes no subscription status every Paystack-verified state is `unknown` → manual review — no status moves, nothing is granted |
 | Cancellation | The documented disable operation needs the subscription code **and** its `email_token`, which this build does not persist |
 | Refunds, proration, dunning | Out of scope |
 
@@ -605,11 +615,14 @@ ledger write — receipt only) — while everything below remains true at the
 - **No webhook-driven state change.** The receiver writes
   `billing_provider_events` rows (`received`) and never touches
   `subscriptions`, entitlements or any execution gate. A recorded
-  `payment.succeeded` row is a provider-reported receipt awaiting a later
+  `payment.succeeded` row is a provider-reported receipt awaiting a
   synchronization step, not an applied payment.
-- **No subscription synchronization** — no worker, scheduler, queue claim or
-  writer for the PR2 columns. `billing_provider_events` is written ONLY by
-  the Step 5.2 receiver (and never processed onwards yet);
+- **Synchronization is on-demand and verified only** (Later-billing-PR #7) —
+  no worker, scheduler or background queue. The caller's own
+  `POST /api/billing/sync` is the only trigger; it settles that
+  subscription's `received` ledger rows and writes the PR2 bookkeeping
+  columns. `billing_provider_events` rows are appended ONLY by the Step 5.2
+  receiver;
   `billing_fx_rate_versions` / `billing_provider_plans` /
   `billing_pricing_snapshots` are written through core modules only (FX
   publication and Step 4 epoch registration are operator-driven local actions,
@@ -780,10 +793,13 @@ Roughly in order; each is its own PR and may be re-scoped.
      `packages/core/src/billing/webhook.ts` (security pipeline + ledger); the
      Step 5.1 package test still pins `packages/providers/paystack` free of
      any receiver.
-7. **Verification + subscription synchronization** — reconcile provider state
-   into `subscriptions` through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`
-   without letting the provider widen any entitlement. Requires a verified
-   subscription read operation and a verified status vocabulary.
+7. ~~**Verification + subscription synchronization**~~ — **delivered by
+   Later-billing-PR #7 (sandbox only)**; see *Verification + synchronization
+   (Later-billing-PR #7)* below. Verification uses the documented
+   transaction-verify read; there is still no subscription read, and the
+   verify response publishes no subscription status, so every
+   Paystack-verified state is `unknown` → manual review. Applying a real
+   subscription lifecycle state still requires a documented source for one.
 8. **Customer provisioning flow and billing portal** — persisting
    `billing_customers` and a self-serve portal.
 9. **Web UI** — checkout and portal surfaces in `apps/web`.
@@ -796,6 +812,53 @@ Roughly in order; each is its own PR and may be re-scoped.
 
 None of these steps may enable execution. Automation, live execution and broker
 execution stay OFF regardless of billing state.
+
+## Verification + synchronization (Later-billing-PR #7)
+
+**Status: delivered, sandbox only. It grants nothing.** Contract detail:
+[paystack-provider-contract.md](./paystack-provider-contract.md) §2.3.
+
+| Layer | File | Role |
+| --- | --- | --- |
+| Transport | `packages/providers/paystack/src/client.ts` | `verifyTransaction(reference)` → documented `GET /transaction/verify/:reference`; documented fields only (`domain`, `status`, `reference`, `amount`, `currency`, `customer.id`, `customer.customer_code`), one attempt, typed fail-closed errors, nothing retained. |
+| Adapter | `packages/providers/paystack/src/provider.ts` | `verifySubscription` built on that read. Requires OUR checkout reference; refuses a subscription-id-only request before any call; reports lifecycle state **`unknown`** always. `findSubscription`, `synchronizeSubscription`, `cancelSubscription` still refuse; `implemented` stays `false`. |
+| Sync | `packages/core/src/billing/sync.ts` | `BillingSubscriptionSyncService`: one verification per call, then ONE transaction that claims the subscription's `received` ledger rows, applies status ONLY through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE` guarded by `state_version`, writes the bookkeeping and settles the claimed rows. |
+| Ledger | `packages/core/src/billing/webhook.ts` | `claimReceivedBillingProviderEvents` / `settleBillingProviderEvents` — the only processing transitions; the receiver never calls them. |
+| Route | `apps/api/src/routes/billing.ts` | `POST /api/billing/sync` — session-authenticated, no body, per-IP limit `BILLING_SYNC_RATE_LIMIT_MAX = 10`/min, canonical `SubscriptionSyncResult` response, `provider_unavailable` refusal (nothing written) when no provider is registered or verification fails. |
+
+What it asserts, and what it deliberately does not:
+
+- **(a) Transaction verify is the read operation** — the only documented
+  provider read this build uses for a subscription.
+- **(b) No subscription GET** is used or implemented.
+- **(c) Undocumented statuses fail closed.** The verify response carries a
+  transaction status and **no subscription status**; a transaction status
+  (e.g. `success`) is never promoted to a subscription state. Every
+  Paystack-verified state is therefore `unknown`.
+- **(d) No cancellation is inferred** from unpublished shapes: no
+  cancellation, period or plan fact is read or written.
+- **(e) No paid grant.** Only `status` (via the canonical mapping, when one
+  exists), `provider_state` and the 0031 bookkeeping move; `plan` is never
+  written; the provider→FREE entitlement gate (`resolveEntitlements`) is
+  unchanged, `paymentConfirmed` stays `false`, and the result pins
+  `planChanged` / `entitlementsChanged` / `grantsExecution` to `false`.
+- **(f) The Step 4 operator run is still pending** (below): no epoch is
+  registered and no FX version is published in the deployed environment.
+
+Outcome table (the mapping is the contracts' single source of truth):
+
+| Verified state | Outcome | `status` | `sync_state` / `sync_required` | Bound `received` ledger rows |
+| --- | --- | --- | --- | --- |
+| `active`, `trialing`, `past_due`, `cancelled`, `unsubscribed`, `expired` | `updated` (or `unchanged` when already equal) | mapped value | `synced` / `false` | `processed` (`unrecognized` rows → `ignored`) |
+| `unprovisioned` | `ignored` | unchanged | `pending` / `false` | `ignored` |
+| `pending`, `unknown` (**every Paystack verification today**) | `requires_manual_review` | unchanged | `conflict` / `true` | `ignored` |
+| identity disagreement (reference, customer or subscription id) | `conflict` | unchanged (`provider_state` too) | `conflict` / `true` | `failed` |
+| a concurrent writer moved `state_version` first | `conflict` | unchanged | unchanged | untouched (`received`) |
+| verification failed / no provider | refused (`provider_unavailable`) | unchanged | unchanged | untouched (`received`) |
+
+No migration: every column and CHECK used here is from 0031. The webhook
+receiver is unchanged and stays receipt-only — it performs no verification and
+moves no state.
 
 ## Sandbox plan provisioning (Step 4)
 

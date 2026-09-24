@@ -7,8 +7,17 @@
 > Nothing in this repository takes a live payment. `POST /api/billing/checkout`
 > exists, but it only *initializes* a sandbox checkout through the
 > `transaction/initialize` operation below — it never verifies or confirms a
-> payment. There is no checkout UI, no subscription synchronization, no
-> billing portal, no production credential and no live activation. The
+> payment. There is no checkout UI, no billing portal, no production
+> credential and no live activation.
+>
+> **Verification + synchronization now exist too (§2.3, Later-billing-PR
+> #7)**: `POST /api/billing/sync` verifies the caller's own checkout reference
+> through the documented `GET /transaction/verify/:reference` read and
+> synchronizes the result through the canonical status mapping. Because the
+> published verify response carries **no subscription status**, every
+> verified state is `unknown` (manual review): no status moves, no paid
+> entitlement is granted, and the provider→FREE entitlement gate is
+> unchanged. The
 > sandbox adapter is registered by `apps/api` **only** when a sandbox key is
 > configured, and it reports itself as `live: false` with `implemented: false`
 > while seam operations remain unimplemented.
@@ -116,21 +125,22 @@ below) implements it as follows:
 
 | Operation | State | Documented operation used |
 | --- | --- | --- |
-| `describe()` | **implemented** | `{ provider: 'paystack', baseUrl: 'https://api.paystack.co', mode: 'test', live: false, implemented: false, timeoutMs, operations: { implemented: [...], unimplemented: [...] }, events: { receiver: 'none', signatureVerification: 'none', confirmsPayment: false, grantsExecution: false, supported: [...], canonicalEventTypes: {...}, unsupported: [...] } }` — the key is never included |
+| `describe()` | **implemented** | `{ provider: 'paystack', baseUrl: 'https://api.paystack.co', mode: 'test', live: false, implemented: false, timeoutMs, operations: { implemented: [...], unimplemented: [...] }, verification: { operation: 'transaction.verify', subscriptionRead: 'none', reportedLifecycleState: 'unknown', grantsEntitlements: false, grantsExecution: false }, events: { receiver: 'none', signatureVerification: 'none', confirmsPayment: false, grantsExecution: false, supported: [...], canonicalEventTypes: {...}, unsupported: [...] } }` — the key is never included |
 | `findCustomer` | **implemented** | `GET /customer/:email_or_code` |
 | `createCustomer` | **implemented** | `POST /customer` |
 | `initializeCheckout` | **implemented** | `POST /transaction/initialize` |
-| `findSubscription` | **not implemented** | no verified subscription *read* operation → `PaystackNotImplementedError` |
-| `verifySubscription` | **not implemented** | same reason |
-| `synchronizeSubscription` | **not implemented** | subscription synchronization is out of scope for this change |
+| `findSubscription` | **not implemented** | no verified subscription *read* operation (no subscription fetch is used) → `PaystackNotImplementedError` |
+| `verifySubscription` | **implemented** (§2.3, Later-billing-PR #7) | `GET /transaction/verify/:reference` — our checkout reference only; the reported lifecycle state is always `unknown` |
+| `synchronizeSubscription` | **not implemented** | synchronization is performed by core's `BillingSubscriptionSyncService` (§2.3), which owns the database write; the adapter never applies state |
 | `cancelSubscription` | **not implemented** | the documented disable operation needs the subscription code **and** its `email_token`, which this build does not persist |
 | `normalizeEvent` | **implemented** (§2.1) | **no provider call** — a pure normalization of the delivered payload against the published shapes in `src/events.ts`. Since Step 5.2 the operation is reachable from the network through the secure receiver (§2.2), which verifies the signature BEFORE calling it; the receiver lives outside this package, which a pinned test keeps receiver-free |
 
 Consequences:
 
 - `implemented` stays **`false`** on purpose. The seam defines eight operations:
-  this build makes real provider calls for three, normalizes events locally for
-  a fourth, and refuses the remaining four. A caller must treat a
+  this build makes real provider calls for four (customer fetch/create,
+  transaction initialize, transaction verify), normalizes events locally for a
+  fifth, and refuses the remaining three. A caller must treat a
   non-implemented provider as unavailable rather than assume the rest work.
 - Unimplemented operations **reject with a typed error**; they never return a
   permissive default and never fall back to a different behaviour.
@@ -243,9 +253,10 @@ with a composite key that is either fully resolved or fully null.
 **Webhook receipt is NOT payment confirmation.** A normalized
 `payment.succeeded` or `invoice.processed` event is a *provider-reported
 receipt* of one delivery. It is not a transaction verification (the documented
-`GET /transaction/verify/:reference` read is not performed by this build), not a
-subscription synchronization, and not evidence that money settled — in sandbox,
-settlements are not processed at all.
+`GET /transaction/verify/:reference` read is performed only by
+`verifySubscription` through `POST /api/billing/sync` — §2.3 — never by the
+receiver), not a subscription synchronization, and not evidence that money
+settled — in sandbox, settlements are not processed at all.
 
 **Normalization can never grant execution.** `grantsExecution` is pinned
 `false` by the canonical contract (`z.literal(false)`), so no payload — however
@@ -340,7 +351,74 @@ only — the §2.1 redaction posture, unchanged). It never writes
 unrepresentable), never resolves an entitlement and never touches an
 execution gate — a recorded `payment.succeeded` is a provider-reported
 receipt awaiting a later synchronization step, not an applied payment. It
-performs no outbound call of any kind (no transaction verification).
+performs no outbound call of any kind (no transaction verification) — this is
+unchanged by §2.3: the receiver never calls `verifySubscription` and never
+synchronizes.
+
+### 2.3 Verification + synchronization (Later-billing-PR #7 — sandbox only)
+
+**(a) Transaction verify is the read operation.** `verifySubscription` calls
+`GET /transaction/verify/:reference` (`PaystackClient.verifyTransaction`) — one
+attempt, no retry, nothing retained — with OUR checkout reference
+(`ve-chk-…`, derived by core from the locked pricing snapshot through the same
+`billingCheckoutReference` checkout uses). The reference must match the
+provider's documented character set (alphanumeric, `-`, `.`, `=`) and is
+percent-encoded into the path. Only documented fields are read: `domain`,
+`status`, `reference`, `amount`, `currency`, `customer.id`,
+`customer.customer_code`. The `authorization` object (reusable-charge
+material), fees, logs, IP address, metadata and email are never read, typed,
+returned or stored. The provider must echo our reference
+(`reference_conflict` otherwise) and report the `test` domain
+(`response_conflict` otherwise); an amount/currency this build cannot
+normalize is `unexpected_response`; a 404 is never "no transaction" (the
+documented-ambiguous 404 classification applies).
+
+**(b) There is no subscription read.** No subscription GET is used or
+implemented. `findSubscription` stays refused, and `verifySubscription`
+refuses — before any call — a request that carries only a provider
+subscription identifier (`invalid_request`).
+
+**(c) Undocumented statuses fail closed — and the verify response documents
+no subscription status at all.** The published verify response carries a
+*transaction* status (the sample shows `success`) and no subscription status
+or subscription code. There is therefore nothing to map through
+`PAYSTACK_LIFECYCLE_STATE_FOR_STATUS`, and a transaction status is **never**
+promoted to a subscription state (for example, `success` does not become
+`active`): that relationship is not published. Every verified state is the
+canonical `unknown` (`PAYSTACK_VERIFIED_TRANSACTION_LIFECYCLE_STATE`), which
+maps to no authoritative status and always requires manual review.
+
+**(d) No cancellation is inferred from unpublished shapes.** The verify
+response publishes no cancellation, period, plan or catalogue fact, so the
+verified state carries none (`cancelAtPeriodEnd: false`, `cancelledAt`,
+`cancelAt`, `cancellationReason`, periods, `providerPlanId`, catalogue plan
+all `null`), and synchronization never writes cancellation or period columns.
+`subscription.disable` / `subscription.not_renew` remain unsupported (§2.1).
+
+**(e) No paid grant.** Synchronization (`packages/core/src/billing/sync.ts`)
+moves only `status` (through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`, and only
+when a mapping exists), `provider_state` and the 0031 bookkeeping columns,
+guarded by `state_version` optimistic concurrency; it never writes `plan`. A
+provider-backed row still resolves to the free tier (`resolveEntitlements`,
+unchanged), `paymentConfirmed` stays pinned `false`, and the result pins
+`planChanged` / `entitlementsChanged` / `grantsExecution` to `false`. With the
+Paystack adapter the outcome is always `requires_manual_review`: the row is
+flagged (`sync_state = 'conflict'`, `sync_required = true`), its status is
+left exactly as it was, and the bound `received` ledger rows are settled
+`ignored`.
+
+**(f) The Step 4 operator run is still pending.** No sandbox plan epoch is
+registered and no FX version is published in the deployed environment
+([billing.md](./billing.md) Step 4 runbook), so no checkout can be initialized
+there yet, and nothing in this section changes that.
+
+The route is `POST /api/billing/sync`: session-authenticated (the subject is
+always the session user), accepts **no** request body, per-IP rate-limited
+through a route-level override of the global limiter (the webhook route's
+mechanism; `BILLING_SYNC_RATE_LIMIT_MAX = 10` per minute), and refuses as
+`provider_unavailable` — with nothing written — when no provider is registered
+(`provider_not_registered`) or the verification yields no usable provider view
+(`verification_unavailable`).
 
 ## 3. Transport posture (`src/client.ts`)
 
@@ -429,6 +507,17 @@ Event normalization (§2.1) uses three of the same reasons and no new ones:
 | A delivery reports a domain other than `test` | `invalid_configuration` |
 | A **supported** event whose payload is missing a required field, mis-typed, self-contradictory (`charge.success` with a non-success status; a subscription whose plan amount disagrees with its own amount), or quotes a currency/amount this build cannot normalize | `unexpected_response` |
 | An **unsupported or unknown** event name | *no error* — the canonical `unrecognized` event |
+
+Transaction verification (§2.3) likewise adds no new reason:
+
+| Situation | Reason |
+| --- | --- |
+| No checkout reference (only a subscription id), a non-canonical request, or a reference outside the documented character set | `invalid_request` (no call is made) |
+| The provider verifies a different reference than ours | `reference_conflict` |
+| The provider reports a domain other than `test` | `response_conflict` |
+| A documented field is missing or mis-typed, or the amount/currency cannot be normalized | `unexpected_response` |
+| Transport failure, timeout, 5xx | `provider_unavailable` |
+| A 404 (never "no transaction") | `ambiguous_not_found` / `provider_rejected` per the 404 table |
 
 ## 5. Money rules the adapter obeys
 
@@ -563,8 +652,7 @@ is likewise an **account capability**, not a code path.
 
 ## 8. What this PR deliberately does not build
 
-No checkout UI, no `apps/web` change, no subscription synchronization, no
-billing portal, no refund/proration/dunning execution, no notifications, no
+No checkout UI, no `apps/web` change, no billing portal, no refund/proration/dunning execution, no notifications, no
 live payment, no production credential, no production activation, no Starter
 selling, no provider-plan epoch registration, no epoch-derived pricing entry
 point, no `/plan` mutation, no FX publication, no Gate 9 work, no broker
@@ -588,3 +676,10 @@ its meaning and none of its substance:
   persistence. And the substance is unchanged: receiving an event is still
   not verifying a transaction, not confirming a payment, not synchronizing a
   subscription and never an entitlement or execution effect.
+- **§2.3 (Later-billing-PR #7)** — `verifySubscription` is implemented
+  through the documented transaction-verify read, and core synchronizes the
+  verified state through the canonical mapping (`POST /api/billing/sync`).
+  The substance is still unchanged: the verify response publishes no
+  subscription status, so every verified state is `unknown` (manual review) —
+  no status moves, no paid entitlement, no execution effect, and the webhook
+  receiver remains receipt-only.

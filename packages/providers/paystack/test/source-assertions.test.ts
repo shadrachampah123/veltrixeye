@@ -44,7 +44,7 @@ describe('Paystack package — no plan mutation, ever', () => {
     }
   });
 
-  test('the only request paths are the documented customer and transaction-initialize operations', () => {
+  test('the only request paths are the documented customer, transaction-initialize and transaction-verify operations', () => {
     const paths = new Set<string>();
     for (const file of FILES) {
       for (const match of source(file).matchAll(/['"`](\/[a-z][a-z/]*)['"`]/g)) {
@@ -52,6 +52,29 @@ describe('Paystack package — no plan mutation, ever', () => {
       }
     }
     assert.deepEqual([...paths].sort(), ['/customer', '/transaction/initialize']);
+
+    // Parameterized paths (template literals ending in an interpolation):
+    // exactly the documented customer fetch and the documented transaction
+    // verify read (Later-billing-PR #7). No subscription path of any kind.
+    const templated = new Set<string>();
+    for (const file of FILES) {
+      for (const match of source(file).matchAll(/`(\/[a-z][a-z/]*)\$\{/g)) {
+        templated.add(match[1]!);
+      }
+    }
+    assert.deepEqual([...templated].sort(), ['/customer/', '/transaction/verify/']);
+    assert.doesNotMatch(allSource(), /['"`]\/subscription/, 'no subscription request path exists');
+  });
+
+  test('the transaction-verify read is a GET with an encoded, shape-checked reference', () => {
+    const client = source('client.ts');
+    assert.match(client, /this\.request\('GET', `\/transaction\/verify\/\$\{encodeURIComponent\(trimmed\)\}`\)/);
+    assert.match(client, /PAYSTACK_REFERENCE_SHAPE\.test\(trimmed\)/);
+    // The documented authorization object carries reusable-charge material:
+    // the verify schema never reads it.
+    const verifySchema = /const verifyTransactionDataSchema = z[\s\S]*?\.passthrough\(\);\n/.exec(client)?.[0] ?? '';
+    assert.ok(verifySchema.length > 0, 'the verify schema is present');
+    assert.doesNotMatch(verifySchema, /authorization|last4|bin|signature|email_token/);
   });
 
   test('only GET and POST are ever sent', () => {
