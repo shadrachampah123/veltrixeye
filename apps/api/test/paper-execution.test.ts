@@ -573,7 +573,13 @@ describe('M8.3 paper API — refusals are fail-closed and auditable', () => {
     for (const plan of ['free', 'pro', 'premium'] as const) {
       const session = await registerUser();
       if (plan !== 'free') {
-        await pool.query('UPDATE subscriptions SET plan = $1 WHERE user_id = $2', [plan, session.user.id]);
+        // Model C: registration provisions no subscription row, so the fixture
+        // seeds the historical (provider IS NULL) paid row the plan override needs.
+        await pool.query(
+          `INSERT INTO subscriptions (user_id, plan, status) VALUES ($2, $1, 'active')
+           ON CONFLICT (user_id) DO UPDATE SET plan = EXCLUDED.plan`,
+          [plan, session.user.id],
+        );
       }
       const res = await postJson(session, '/api/execution/automation', { enabled: true });
       assert.equal(res.status, 403, `automation must stay OFF for ${plan}`);

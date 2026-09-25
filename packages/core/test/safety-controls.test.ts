@@ -567,7 +567,13 @@ describe('m8.6 automation switch — safety asymmetry', () => {
 
   test('the kill switch outranks every plan claim: armed ⇒ 409, cleared ⇒ entitlement decides', async () => {
     const user = await makeUser();
-    await pool.query('UPDATE subscriptions SET plan = $1 WHERE user_id = $2', ['premium', user.id]);
+    // Model C: registration provisions no subscription row, so the fixture
+    // seeds the historical (provider IS NULL) premium row this test claims.
+    await pool.query(
+      `INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'premium', 'active')
+       ON CONFLICT (user_id) DO UPDATE SET plan = EXCLUDED.plan`,
+      [user.id],
+    );
     await killSwitches.set('user', { targetId: user.id, active: true, reason: 'armed during incident' });
 
     await assert.rejects(

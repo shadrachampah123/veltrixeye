@@ -80,7 +80,13 @@ after(async () => {
 async function makeUser(plan: UserPlan = 'free'): Promise<{ id: string }> {
   const user = await users.create({ email: uniqueEmail(), passwordHash: 'x'.repeat(32), name: 'Risk Tester' });
   if (plan !== 'free') {
-    await pool.query('UPDATE subscriptions SET plan = $1 WHERE user_id = $2', [plan, user.id]);
+    // Model C: registration provisions no subscription row, so the fixture
+    // seeds the historical (provider IS NULL) paid row the plan override needs.
+    await pool.query(
+      `INSERT INTO subscriptions (user_id, plan, status) VALUES ($2, $1, 'active')
+       ON CONFLICT (user_id) DO UPDATE SET plan = EXCLUDED.plan`,
+      [plan, user.id],
+    );
   }
   return { id: user.id };
 }

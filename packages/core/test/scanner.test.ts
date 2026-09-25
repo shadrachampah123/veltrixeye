@@ -171,6 +171,19 @@ after(async () => {
   await stopDb?.();
 });
 
+/**
+ * Model C: registration (`UserService.create`) provisions no subscription row,
+ * and a missing row resolves to the free tier (no scanner access). This fixture
+ * seeds the historical (`provider IS NULL`) pro row the scanner tests need.
+ */
+async function makePro(userId: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'active')
+     ON CONFLICT (user_id) DO UPDATE SET plan = EXCLUDED.plan`,
+    [userId],
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Normalization
 // ---------------------------------------------------------------------------
@@ -402,7 +415,7 @@ describe('M7.5: Provider Failure Handling', () => {
     const email = uniqueEmail();
     const passwordHash = await hashPassword(PASSWORD);
     const user = await users.create({ email, passwordHash, name: 'Scanner Test' });
-    await pool.query(`UPDATE subscriptions SET plan = 'pro' WHERE user_id = $1`, [user.id]);
+    await makePro(user.id);
 
     // Create a simple strategy that would otherwise trigger
     const strategy = await strategies.createStrategy(user.id, { name: `Test Strat ${Date.now()}`, description: 'test' });
@@ -424,7 +437,7 @@ describe('M7.5: Provider Failure Handling', () => {
     const email = uniqueEmail();
     const passwordHash = await hashPassword(PASSWORD);
     const user = await users.create({ email, passwordHash, name: 'Recovery Test' });
-    await pool.query(`UPDATE subscriptions SET plan = 'pro' WHERE user_id = $1`, [user.id]);
+    await makePro(user.id);
 
     const strategy = await strategies.createStrategy(user.id, { name: `Recovery Strat ${Date.now()}`, description: 'test' });
 
@@ -468,7 +481,7 @@ describe('M7.5: Scanner Execution & Concurrency', () => {
     const email = uniqueEmail();
     const passwordHash = await hashPassword(PASSWORD);
     const user = await users.create({ email, passwordHash, name: 'Cursor Test' });
-    await pool.query(`UPDATE subscriptions SET plan = 'pro' WHERE user_id = $1`, [user.id]);
+    await makePro(user.id);
 
     const strategy = await strategies.createStrategy(user.id, { name: `Cursor Strat ${Date.now()}`, description: 'test' });
     const versionId = strategy.versions[0]!.id;
@@ -574,7 +587,7 @@ describe('M7.5: Observability', () => {
     const email = uniqueEmail();
     const passwordHash = await hashPassword(PASSWORD);
     const user = await users.create({ email, passwordHash, name: 'Obs Test' });
-    await pool.query(`UPDATE subscriptions SET plan = 'pro' WHERE user_id = $1`, [user.id]);
+    await makePro(user.id);
     const strategy = await strategies.createStrategy(user.id, { name: `Obs Strat ${Date.now()}`, description: 'test' });
 
     const result = await scanner.triggerScan({ strategyId: strategy.id, force: true });

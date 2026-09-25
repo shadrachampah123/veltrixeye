@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
-import { internalPlanForCommercialPlan } from '@veltrixeye/contracts';
+import { internalPlanForCommercialPlan, type BillingPricingSnapshot } from '@veltrixeye/contracts';
 import { BillingFxError, parseFxRateVersion } from './fx-rate-versions.js';
 import { priceFromProviderPlanEpoch, verifyPricingSnapshot } from './pricing.js';
 import { BillingProviderPlanStore, isBillingProviderPlanError, providerPlanKey } from './provider-plans.js';
@@ -86,7 +86,12 @@ export class BillingCheckoutService {
     if (rows[0]?.locked_pricing_snapshot_id === null) {
       throw new BillingCheckoutError('pricing_lock_required');
     }
-    let candidate: StoredBillingPricingSnapshot | null = null;
+    // The pricing DECISION for a row-less user is derived here (epoch + FX
+    // reads only) but is deliberately NOT persisted here: the snapshot row is
+    // written inside the subscription/lock transaction, on the same client, so
+    // the snapshot, the sold subscription and the immutable pricing lock are
+    // one atomic unit of work.
+    let candidate: BillingPricingSnapshot | null = null;
     if (rows.length === 0) {
       const plans = new BillingProviderPlanStore(db);
       const epoch = await plans.findActive(providerPlanKey(requested.cataloguePlan, requested.interval))
@@ -116,7 +121,9 @@ export class BillingCheckoutService {
         // checkout requests, not the globally deduplicated snapshot row.
         providerReference: null,
       });
-      candidate = await new BillingPricingSnapshotStore(db).create(snapshot);
+      // Pure decision, no write: `obtainLock` persists it inside the
+      // subscription/lock transaction it belongs to.
+      candidate = snapshot;
     }
 
     const locked = await this.obtainLock(userId, candidate);
@@ -135,25 +142,51 @@ export class BillingCheckoutService {
 
   private now(): Date { return (this.options.now ?? (() => new Date()))(); }
 
-  private async obtainLock(userId: string, candidate: StoredBillingPricingSnapshot | null): Promise<StoredBillingPricingSnapshot> {
+  /**
+   * Create the sold subscription and its immutable pricing lock — atomically
+   * with the pricing snapshot the lock points at.
+   *
+   * `candidate` is the pricing DECISION for a row-less user: already derived,
+   * not yet persisted. Its snapshot row is INSERTed here, inside this
+   * transaction and on this transaction's client, immediately before the
+   * subscription row that locks it. Snapshot, sold subscription and lock are
+   * therefore committed together or discarded together — a failure after the
+   * snapshot INSERT leaves no snapshot, no subscription and no lock behind.
+   */
+  private async obtainLock(userId: string, candidate: BillingPricingSnapshot | null): Promise<StoredBillingPricingSnapshot> {
     const client = await this.options.db.connect();
     try {
       await client.query('BEGIN');
       let row = await this.selectLock(client, userId);
       if (row === undefined) {
         if (candidate === null) throw new BillingCheckoutError('pricing_lock_required');
-        const s = candidate.snapshot;
+        // ATOMICITY SEAM: the snapshot INSERT rides this client/transaction.
+        // The subscription INSERT needs the snapshot id (the lock is a FK and
+        // migration 0032 makes it immutable at creation), so the snapshot is
+        // written first and the pair is protected by a savepoint: if this
+        // attempt loses the UNIQUE(user_id) race, or any later validation in
+        // this transaction refuses, the candidate snapshot goes with it.
+        await client.query('SAVEPOINT billing_pricing_snapshot');
+        const persisted = await new BillingPricingSnapshotStore(client).create(candidate);
+        const s = persisted.snapshot;
         const inserted = await client.query<SubscriptionLock>(
           `INSERT INTO subscriptions (user_id, plan, status, catalogue_plan, billing_interval,
              currency, provider, provider_plan_id, provider_state, locked_pricing_snapshot_id)
            VALUES ($1,$2,'active',$3,$4,'USD','paystack',$5,'pending',$6)
            ON CONFLICT (user_id) DO NOTHING RETURNING ${SUBSCRIPTION_COLUMNS}`,
           [userId, internalPlanForCommercialPlan(s.cataloguePlan), s.cataloguePlan,
-            s.interval, s.providerPlanId, candidate.id],
+            s.interval, s.providerPlanId, persisted.id],
         );
         // FOR UPDATE cannot lock an absent row. UNIQUE(user_id) arbitrates the
         // INSERT race; a fresh statement locks and reads the committed winner.
-        row = inserted.rows[0] ?? await this.selectLock(client, userId);
+        row = inserted.rows[0];
+        if (row === undefined) {
+          // Another checkout created the row: discard this attempt's candidate
+          // snapshot (it must never survive as an unlinked append-only row) and
+          // re-read the winner's committed lock.
+          await client.query('ROLLBACK TO SAVEPOINT billing_pricing_snapshot');
+          row = await this.selectLock(client, userId);
+        }
       }
       if (row === undefined || row.locked_pricing_snapshot_id === null) {
         throw new BillingCheckoutError('pricing_lock_required');
