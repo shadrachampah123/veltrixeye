@@ -412,8 +412,8 @@ describe('billing PR2 — entitlement safety', () => {
       .map((match) => [match[1], match[2]]);
     assert.deepEqual(
       writes,
-      [['post', '/api/billing/checkout'], ['post', '/api/billing/sync'], ['post', '/api/billing/customer']],
-      'only PR-C checkout, the Later-billing-PR #7 sync route and the Billing Step 6 customer route may write inline',
+      [['post', '/api/billing/checkout'], ['post', '/api/billing/sync'], ['post', '/api/billing/customer'], ['post', '/api/billing/verify']],
+      'only PR-C checkout, the Later-billing-PR #7 sync route, Billing Step 6 customer route and Billing Step 7 verify route may write inline',
     );
     assert.doesNotMatch(billingRoute, /portal/i, 'the portal remains prohibited');
     // Billing Step 5.2: the webhook receiver is wired through exactly one

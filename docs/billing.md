@@ -1,38 +1,42 @@
 # Billing (in progress)
 
-> **PR3 (this change) adds provider-neutral USD→GHS pricing, the immutable FX /
-> provider-plan / pricing-snapshot state (migration `0032`), and a SANDBOX
-> Paystack adapter.** Nothing here takes a live payment.
+> **Step 7 (this change) establishes durable payment evidence** (`billing_verified_transactions`, migration `0033`), and a sandbox transaction-verification + reconciliation boundary (`POST /api/billing/verify`). **Transaction verification through the documented `GET /transaction/verify/:reference` read is the confirmation authority for evidence.** `charge.success` remains a receipt/event signal and does not itself activate payment. **Exact amount/currency reconciliation is required** against the immutable pricing snapshot. **Payment evidence does NOT activate entitlements in Step 7.** The verification records evidence only — it changes no subscription plan, no provider lifecycle state, no automation and no execution. **Subscription lifecycle remains `unknown` for Paystack transaction verification** (the verified transaction status is never promoted to a subscription state). **Live Paystack remains prohibited** — sandbox/test only (`domain: test`, `sk_test_` keys). Production `GET /api/health/ready` is 32/32, but **production FX/provider-plan provisioning is NOT verified** — the previous audit established that production provisioning is not verified, and this change publishes no FX rate, registers no provider-plan epoch, creates no Paystack plan and provisions no production data.
 >
-> **Current billing surface:** three session-authenticated billing routes exist —
-> `GET /api/billing/me` (read-only state) and `POST /api/billing/checkout`
+> **Current billing surface:** four session-authenticated billing routes exist —
+> `GET /api/billing/me` (read-only state), `POST /api/billing/checkout`
 > (PR-C: sandbox checkout initialization against a registered epoch and an
 > operator-published FX rate; it writes a pending provider-backed row and an
-> immutable pricing lock, and it never *confirms* a payment) — plus the
-> Step 5.2 **secure webhook receiver** `POST /api/billing/webhook`
+> immutable pricing lock, and it never *confirms* a payment), `POST /api/billing/customer` (Billing Step 6: sandbox customer provisioning, idempotent) and the new `POST /api/billing/verify` (Step 7: sandbox transaction verification + reconciliation + durable evidence, empty body, per-IP rate-limited to 10/min) — plus the Step 5.2 **secure webhook receiver** `POST /api/billing/webhook`
 > (signature-verified, rate-limited, source-IP allow-listed; it records ONE
 > `billing_provider_events` row per verified delivery and nothing else) —
-> and the third, the Later-billing-PR #7 **verification + synchronization** route
+> and the Later-billing-PR #7 **verification + synchronization** route
 > `POST /api/billing/sync` (session-authenticated, no request body; it
 > verifies the caller's own checkout reference through the documented
 > transaction-verify read and applies the result only through
 > `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE` — see *Verification +
 > synchronization (Later-billing-PR #7)* below). The verify response publishes
 > no subscription status, so every Paystack-verified state is `unknown`
-> (manual review): no status moves and nothing is granted.
+> (manual review): no status moves and nothing is granted via sync.
+> **Step 7 `POST /api/billing/verify` likewise confirms NOTHING to entitlements:** it records one `billing_verified_transactions` row per verified checkout reference after exact reconciliation, and returns a structured `BillingPaymentVerificationResult` (`verified: true` with evidence, or `verified: false` with a typed failure reason). `paymentConfirmed` on `GET /api/billing/me` stays `false`, `grantsExecution` stays `false`, and `resolveEntitlements` stays provider→FREE.
 > There is still no checkout UI and no `apps/web` billing change, no billing
 > portal, no refund/proration/dunning execution, no notification, no live
 > payment, no production credential, no production activation and no Starter
 > selling.
-> **Receipt is still not confirmation**: the receiver records deliveries; it
-> confirms no payment, changes no subscription status and grants nothing.
+> **Receipt is still not confirmation**: the webhook receiver records deliveries; `POST /api/billing/sync` applies the canonical status mapping without confirming payment; `POST /api/billing/verify` records verified-transaction evidence after reconciliation — none of them changes subscription plan or grants execution.
 >
-> **This change is documentation only.** It records the billing pricing
-> decisions **D-1 … D-9** (below) — including **D-9, provider-plan epoch
-> pricing** — and tightens the plan-provisioning prerequisites. It changes no
-> code, no migration, no schema, no test, no provider, no API route and no
-> configuration; it publishes no FX rate, registers no provider-plan epoch and
-> creates no Paystack plan.
+> **Account capabilities are only partially verified.** Whether this account
+> can transact in **GHS** (AC1) or run **GHS recurring** subscriptions (AC2) is
+> unverified, and no recurring end-to-end run has happened (AC7). The account's
+> **GHS test-plan capability** has since been verified from operator-reported
+> Dashboard evidence (a GHS 2.00 monthly test plan — capability evidence only,
+> never an epoch), but none of the four production-shaped Pro/Elite ×
+> monthly/annual sandbox plans exist yet, so AC5 is not fully cleared and no
+> plan has been registered locally. See
+> [paystack-provider-contract.md](./paystack-provider-contract.md) §7 and §7.1.
+>
+> PR1 (merged, `ab27948`) established the authoritative commercial catalogue;
+> PR2 (merged) added the canonical billing contracts, the provider seam and
+> migration `0031_provider_billing.sql`; PR3 (merged) added USD→GHS pricing, FX authority, provider-plan epochs and the sandbox Paystack adapter. **Step 7 adds payment evidence only — it changes no price, no entitlement and no execution: `canAccessAutomation` stays `false` for every plan, `paymentConfirmed` stays `false`, and `grantsExecution`/`planChanged`/`entitlementsChanged` stay `false`.**
 >
 > **Account capabilities are only partially verified.** Whether this account
 > can transact in **GHS** (AC1) or run **GHS recurring** subscriptions (AC2) is
@@ -68,7 +72,8 @@
 | Refunds | Use the amount **actually charged**. A refund never re-rates |
 | Disclosure | USD price (prominent) + exact GHS amount + rate, version and time. GHS is shown before payment |
 | Migration 0032 | **Created in PR3** — `0032_billing_fx_and_pricing.sql`; migrations 0001–0031 are byte-identical |
-| Paystack API integration | **Sandbox seam only, four of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout` — provider calls — plus `normalizeEvent`, a pure local normalization of delivered events). `POST /api/billing/checkout` initializes sandbox checkouts through the third operation (PR-C); the Step 5.2 receiver (`POST /api/billing/webhook`) verifies deliveries and records them in `billing_provider_events` — it confirms nothing. No live key, `implemented: false` |
+| Migration 0033 | **Created in Step 7** — `0033_billing_payment_evidence.sql`; migrations 0001–0032 stay byte-identical — append-only `billing_verified_transactions` (durable payment evidence, Paystack sandbox only, integer minor units GHS exponent 2, unique provider ref + idempotency key, `evidence_hash`, no card/secrets, preserve redaction) |
+| Paystack API integration | **Sandbox seam only, five of eight operations** (`findCustomer`, `createCustomer`, `initializeCheckout`, `verifySubscription` (`GET /transaction/verify/:reference`) — provider calls — plus `normalizeEvent`, a pure local normalization of delivered events). `POST /api/billing/checkout` initializes sandbox checkouts through `initializeCheckout` (PR-C); the Step 5.2 receiver (`POST /api/billing/webhook`) verifies deliveries and records them in `billing_provider_events` — it confirms nothing; **Step 7 `POST /api/billing/verify` verifies the caller's own checkout reference through `verifySubscription` and reconciles it against the immutable pricing snapshot before recording durable evidence in `billing_verified_transactions` — it likewise confirms no payment to entitlements**. No live key, `implemented` stays `false` for `findSubscription`/`synchronizeSubscription`/`cancelSubscription` |
 | Provider plan mutation | **Never.** `PUT /plan` is never called; a price change is a NEW epoch + a NEW provider plan, and the previous epoch is retired locally |
 | Entitlements / execution | **Unchanged.** `canAccessAutomation` stays `false` for every plan |
 
@@ -834,6 +839,32 @@ What it deliberately does not do: it never touches `subscriptions`, `users`,
 entitlements, pricing, the webhook ledger or any execution gate; the
 provider→FREE gate and `paymentConfirmed` are unchanged; there is no billing
 portal, no checkout UI and no email-change synchronization.
+
+## Payment evidence + transaction reconciliation (Billing Step 7)
+
+**Status: delivered, sandbox (Paystack) only. It records evidence, it grants nothing.** No entitlements are activated and no execution is granted. `paymentConfirmed` on `GET /api/billing/me` stays `false`, and the verification result pins `grantsExecution` / `planChanged` / `entitlementsChanged` to `false`. The verification is confirmation-authority for evidence only — `charge.success` remains a receipt/event signal and is never treated as a payment activation.
+
+| Layer | File | Role |
+| --- | --- | --- |
+| Schema | `packages/core/src/db/migrations/0033_billing_payment_evidence.sql` | Append-only `billing_verified_transactions` (durable payment evidence). Paystack sandbox only (`provider = 'paystack'`, `provider_domain = 'test'`), integer minor units GHS/2 (`amount_minor` BIGINT > 0, `amount_exponent = 2`, `currency = 'GHS'`), unique provider reference (`provider_reference` UNIQUE) + idempotency key (`idempotency_key` UNIQUE `ve-` + deterministic checkout reference), `evidence_hash` (SHA-256 over canonical evidence), `provider_transaction_id` (`text`), `provider_status` (`text`), `paid_at` (`timestamptz`), `pricing_snapshot_id` FK, `subscription_id` FK, `user_id` FK, `customer_id` text, no card/secrets columns, redaction preserved (no PAN/expiry/CVV). Immutable by table design — no UPDATE/DELETE path. Prior migrations 0001–0032 stay byte-identical. |
+| Reconciliation | `packages/core/src/billing/payment-reconciliation.ts` | Pure deterministic reconciliation of a verified Paystack transaction against its immutable pricing snapshot. Reuses the two pricing authorities (`cataloguePriceMinor`, `computePaymentAmountMinor`) and the strict validators already used by checkout. Checks: requested reference equals provider reference, paystack provider + `test` domain, `success`/`failed`/`abandoned` mapped to `verified.providerStatus` (`unknown` otherwise, never promoted to a subscription lifecycle), currency is `GHS`, amount is integer > 0 minor units with exponent 2 and **exactly equals** `locked_pricing_snapshot.amount_minor` (exact equality — no tolerance, no currency conversion, no re-rating), `paid_at` is a valid ISO-8601 datetime when present, snapshot context (plan/combination, period, provider plan code, FX version) is present, and customer identity (customer_code binding) matches the subscription's customer when known. Returns `PaymentReconciliationResult` (`ok: true` or `ok: false` with typed `ReconciliationFailureReason` — `reference_mismatch`, `provider_mismatch`, `domain_mismatch`, `status_mismatch`, `currency_mismatch`, `amount_mismatch`, `exponent_mismatch`, `paid_at_unavailable`, `paid_at_invalid`, `snapshot_mismatch`, `customer_mismatch`, …) — no throw for reconciliation mismatches. |
+| Verified transactions store | `packages/core/src/billing/verified-transactions.ts` | Durable evidence store. `insertVerifiedTransaction({ tx, client? })` computes `idempotencyKey = ve-` + reference and `evidenceHash = sha256(canonicalJson({ provider, providerDomain, providerReference, amountMinor, amountExponent, currency, paidAt, pricingSnapshotId, subscriptionId, userId, customerId, providerTransactionId, providerStatus }))`, then conditional `INSERT … ON CONFLICT (idempotency_key) DO NOTHING` + `ON CONFLICT (provider_reference)` handling — concurrent callers are safe (first writer wins, the loser returns the winner). `findByReference` / `findByIdempotencyKey` readers. Conflicting amount/currency/snapshot evidence for the same reference is refused closed (`conflict`). |
+| Transaction verify parser | `packages/providers/paystack/src/provider.ts` | Extends `verifySubscription` (built on `GET /transaction/verify/:reference`) to capture `paid_at` (validated ISO-8601, nullable), `providerTransactionId` (`data.id` string), `providerTransactionStatus` (`data.status`), enforces **sandbox/test domain** (`data.domain === 'test'`), **expected reference equality**, **GHS** (`data.currency === 'GHS'`), **integer amount** (`data.amount` integer > 0, Paystack minor units, exponent 2), **customer identity** (`data.customer.customer_code` / `data.customer.id` presence). Lifecycle remains `unknown` (`SubscriptionLifecycleState`). No `charge.success` promotion, no plan publish. |
+| Confirmation service | `packages/core/src/billing/confirmation.ts` | `BillingPaymentConfirmationService.confirm(userId, { now? })` — narrow, evidence-only: (1) auth via caller-supplied `userId` (route supplies session user — the caller's OWN transaction only), (2) locate `subscriptions` + its `locked_pricing_snapshot_id` row (missing ⇒ structured `verified: false` / `snapshot_mismatch`, never a throw), (3) derive the deterministic checkout reference server-side from the snapshot (`buildCheckoutReference(snapshot.id)`, never client-supplied), (4) verify through the provider seam (`verifySubscription({ reference })`), (5) validate the verification payload (domain/test, reference, GHS, int amount, exponent 2, customer), (6) reconcile purely against the snapshot, (7) persist idempotently in `billing_verified_transactions` (idempotent replay returns the same `BillingVerifiedTransaction`), (8) return `BillingPaymentVerificationResult` (`verified: true` with `evidence`, or `verified: false` with `failureReason`). **Does NOT activate entitlements/plan/lifecycle/execution** — it writes only the evidence table and returns evidence; `paymentConfirmed`/`grantsExecution`/`planChanged`/`entitlementsChanged` are pinned `false` by contract. Provider-not-registered and verification-unavailable are typed `BillingPaymentConfirmationError` (`provider_not_registered`, `verification_unavailable`) for the route to map to `502`. |
+| Composition | `apps/api/src/billing-composition.ts` | `composeBillingVerify(db, registry): BillingPaymentConfirmationService` — constructs the service with `{ db, providers }` (seam-provided `verifySubscription`, evidence-only, no provider DB access in the adapter). Always composed — no feature flag. |
+| Route | `apps/api/src/routes/billing.ts` | `POST /api/billing/verify` — session-authenticated, `requireAuth`, `isEmptyBody` (any payload ⇒ `400 invalidInput`, never client-supplied `reference` or secret), `userId` from session only, per-IP limit `BILLING_VERIFY_RATE_LIMIT_MAX = 10`/min, server-derived reference. Success: `200` with `billingPaymentVerificationResultSchema` (`verified: boolean`, `failureReason?`, `evidence: BillingVerifiedTransaction | null`, `grantsExecution: false`, `planChanged: false`, `entitlementsChanged: false`). Subscription/snapshot missing or reconciliation mismatch ⇒ `200 verified:false` / typed `failureReason` (`snapshot_mismatch`, `reference_mismatch`, …) — not a throw. Provider-not-registered / verification-unavailable ⇒ `502 provider_unavailable` via `isBillingPaymentConfirmationError`. Conflicting evidence ⇒ `409` only for the integer-authority collisions; reconciliation mismatches are always `200 verified:false`. |
+| Contracts | `packages/contracts/src/billing-provider.ts` | `providerSubscriptionStateSchema` now carries `paidAt: string | null`, `providerTransactionId: string | null`, `providerTransactionStatus: string` alongside `state: unknown`. `packages/contracts/src/billing-verification.ts` (new) defines `billingVerifiedTransactionSchema` (GHS/2, sandbox, `providerReference`, `idempotencyKey`, `evidenceHash`, `paidAt`, etc.) and `billingPaymentVerificationResultSchema` (`verified`, `failureReason`, `evidence`, `grantsExecution/planChanged/entitlementsChanged: literal(false)`) — `paymentConfirmed` is never set to `true` by this flow. |
+
+What Step 7 deliberately does not do:
+
+- Never uses `charge.success` as payment confirmation — the webhook event is receipt only; only `GET /transaction/verify/:reference` after strict validation and exact reconciliation counts as evidence authority.
+- Never promotes `providerTransactionStatus` (`success`, `failed`, `abandoned`, …) to a subscription lifecycle — the provider still reports `state: unknown` and lifecycle stays `unknown`; no `subscriptions.status` or `provider_state` is written.
+- Never writes `subscriptions`, `users`, entitlements, automation gates or execution — the evidence table is the only writer; the provider→FREE gate (`resolveEntitlements`) and `paymentConfirmed` are unchanged.
+- Never converts currency, never re-rates and never applies tolerance — amount is integer minor-unit GHS/2 exact equality between the verified `data.amount` and the locked snapshot `amount_minor`; any mismatch is `amount_mismatch` (`verified:false`).
+- Never accepts a client-supplied reference, amount, currency, customer_code or secret — the reference is derived from the locked snapshot and every field is validated server-side against `test` domain / `GHS` / `paystack`.
+- Never touches production: no live key, no production credential, no plan mutation (`PUT /plan` is still never called), no FX publication and no `apps/web` change. The four sandbox epochs (when Step 4 is run) remain the only provider plans.
+
+Idempotency + concurrency: `idempotency_key = 've-' + providerReference` and `evidenceHash` make verification idempotent per reference — a second `POST /api/billing/verify` for the same reference returns the same `evidence` row; concurrent writers race on the unique constraints and the loser returns the winner's row (no duplicate evidence).
 
 ## Verification + synchronization (Later-billing-PR #7)
 

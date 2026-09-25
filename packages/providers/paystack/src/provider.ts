@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { z } from 'zod';
 import {
   BILLING_CURRENCY,
   BILLING_PAYMENT_AMOUNT_EXPONENT,
@@ -748,6 +749,20 @@ export class PaystackBillingProvider implements BillingProvider {
       );
     }
 
+    // Step 7: paid_at is required for payment evidence. The client already
+    // validates it is a datetime, but the seam defensively ensures it is
+    // present and valid before normalizing.
+    if (
+      typeof verified.paidAt !== 'string' ||
+      verified.paidAt.trim() === '' ||
+      !z.string().datetime().safeParse(verified.paidAt).success
+    ) {
+      throw new PaystackAdapterError(
+        'unexpected_response',
+        'The provider verified transaction is missing required paid_at.',
+      );
+    }
+
     const state = providerSubscriptionStateSchema.safeParse({
       provider: this.id,
       state: PAYSTACK_VERIFIED_TRANSACTION_LIFECYCLE_STATE,
@@ -769,6 +784,9 @@ export class PaystackBillingProvider implements BillingProvider {
       cancellationReason: null,
       sourceEventIdempotencyKey: null,
       observedAt: this.client.now().toISOString(),
+      paidAt: verified.paidAt,
+      providerTransactionId: verified.providerTransactionId,
+      providerTransactionStatus: verified.status,
     });
     if (!state.success) {
       throw new PaystackAdapterError(

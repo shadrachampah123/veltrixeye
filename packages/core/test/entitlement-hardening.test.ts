@@ -570,11 +570,11 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     assert.deepEqual(offenders, [], 'every reader goes through resolveEntitlements');
   });
 
-  it('adds no migration and leaves migrations 0001–0032 as the whole set', () => {
+  it('adds no migration beyond Step 7 and leaves migrations 0001–0033 as the whole set', () => {
     const files = readdirSync(MIGRATIONS_DIR).sort();
-    assert.equal(files.length, 32, `unexpected migration set: ${files.join(', ')}`);
+    assert.equal(files.length, 33, `unexpected migration set: ${files.join(', ')}`);
     assert.equal(files[0], '0001_identity_and_audit.sql');
-    assert.equal(files[files.length - 1], '0032_billing_fx_and_pricing.sql');
+    assert.equal(files[files.length - 1], '0033_billing_payment_evidence.sql');
   });
 
   it('leaves the checkout INSERT shape and the pricing lock untouched', () => {
@@ -590,15 +590,20 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     const billingRoute = read(REPO_ROOT, 'apps', 'api', 'src', 'routes', 'billing.ts');
     // Code only: prose must not satisfy (or trip) the checks. The route file
     // still contains NO confirmation/verification authority of its own.
-    assert.doesNotMatch(codeOnly(billingRoute), /verify|confirm/i);
+    // Step 7 adds the payment-evidence verification route (POST /api/billing/verify). It is
+    // evidence-only and does not itself grant entitlements: the grant pins below
+    // still enforce that. The route file therefore now contains verify/confirm
+    // only for that evidence boundary.
+    assert.match(codeOnly(billingRoute), /verify/);
     const writes = [...billingRoute.matchAll(/app\.(post|put|patch|delete)\s*\(\s*'([^']+)'/g)]
       .map((match) => [match[1], match[2]]);
     // Later-billing-PR #7 added exactly ONE sanctioned write route: the
     // verification + synchronization trigger. Billing Step 6 added exactly one
-    // more: customer provisioning. Nothing else.
+    // more: customer provisioning. Billing Step 7 adds one more: payment-evidence
+    // verification (POST /api/billing/verify). Nothing else.
     assert.deepEqual(writes, [
-      ['post', '/api/billing/checkout'], ['post', '/api/billing/sync'], ['post', '/api/billing/customer'],
-    ], 'no billing write route beyond checkout + the PR #7 sync trigger + Step 6 customer provisioning');
+      ['post', '/api/billing/checkout'], ['post', '/api/billing/sync'], ['post', '/api/billing/customer'], ['post', '/api/billing/verify'],
+    ], 'no billing write route beyond checkout + the PR #7 sync trigger + Step 6 customer provisioning + Step 7 verify');
 
     // Billing Step 6: customer provisioning is identity bookkeeping only. It
     // resolves no entitlement, never touches subscriptions or users, grants

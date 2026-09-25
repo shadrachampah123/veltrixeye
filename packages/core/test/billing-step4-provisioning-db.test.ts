@@ -494,7 +494,7 @@ describe('Step 4 — the FX authority at the persistence boundary', () => {
 /* -------------------------------------------------------------------------- */
 
 describe('Step 4 — H. migration compatibility', () => {
-  test('migrations 0031 and 0032 are byte-identical, and no migration was added', () => {
+  test('migrations 0031 and 0032 are byte-identical, and only 0033 (Step 7) was added', () => {
     /**
      * SHA-256 of the Step 4 persistence foundations, recorded against the
      * Step 4 implementation. 0031 is pinned identically in the PR3 suite;
@@ -508,8 +508,8 @@ describe('Step 4 — H. migration compatibility', () => {
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((file) => file.endsWith('.sql'))
       .sort();
-    assert.equal(files.length, 32, 'no migration was added or removed by Step 4');
-    assert.equal(files.at(-1), '0032_billing_fx_and_pricing.sql', '0032 remains the newest migration');
+    assert.equal(files.length, 33, 'no migration was added or removed by Step 4 beyond Step 7 (0033)');
+    assert.equal(files.at(-1), '0033_billing_payment_evidence.sql', '0033 is the newest migration (Step 7)');
     for (const [file, sha] of Object.entries(EXPECTED)) {
       const digest = createHash('sha256').update(readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8')).digest('hex');
       assert.equal(digest, sha, `${file} is byte-identical to its pinned bytes`);
