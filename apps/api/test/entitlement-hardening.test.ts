@@ -152,7 +152,10 @@ beforeEach(async () => { calls = []; providerHttp = 'ok'; await retireActiveEpoc
 /* Fixtures                                                                   */
 /* -------------------------------------------------------------------------- */
 
-/** A normally registered user: free subscription row, `provider IS NULL`. */
+/**
+ * A normally registered user. Model C: registration is identity only, so the
+ * user has NO subscription row; the missing row IS the free fallback state.
+ */
 async function register(): Promise<{ cookie: string; userId: string }> {
   const res = await app.inject({
     method: 'POST', url: '/api/auth/register', headers: { 'x-forwarded-for': freshIp() },
@@ -180,22 +183,33 @@ async function checkoutUser(customer = true): Promise<{ cookie: string; userId: 
   return { userId: user.id, email: user.email, cookie: `ve_session=${session.token}` };
 }
 
-/** Rewrite an existing subscription row into a historical (provider NULL) one. */
+/**
+ * Give the user a historical, non-commercial subscription row (`provider IS
+ * NULL`, `locked_pricing_snapshot_id NULL`). Since Model C registration creates
+ * no row, the fixture seeds it; the row shape itself is unchanged and is what
+ * `resolveEntitlements(plan, status, null)` has always resolved.
+ */
 async function makeHistorical(userId: string, plan: string, status: string): Promise<void> {
   await db.pool.query(
-    `UPDATE subscriptions SET plan = $2, status = $3, provider = NULL, provider_state = NULL
-     WHERE user_id = $1`,
+    `INSERT INTO subscriptions (user_id, plan, status, provider, provider_state)
+     VALUES ($1, $2, $3, NULL, NULL)
+     ON CONFLICT (user_id) DO UPDATE
+       SET plan = EXCLUDED.plan, status = EXCLUDED.status,
+           provider = NULL, provider_state = NULL`,
     [userId, plan, status],
   );
 }
 
-/** Rewrite an existing subscription row into a provider-backed checkout row. */
+/** Rewrite/seed an existing subscription row as a provider-backed checkout row. */
 async function makeProviderBacked(
   userId: string, plan: string, status: string, providerState: string | null,
 ): Promise<void> {
   await db.pool.query(
-    `UPDATE subscriptions SET plan = $2, status = $3, provider = 'paystack', provider_state = $4
-     WHERE user_id = $1`,
+    `INSERT INTO subscriptions (user_id, plan, status, provider, provider_state)
+     VALUES ($1, $2, $3, 'paystack', $4)
+     ON CONFLICT (user_id) DO UPDATE
+       SET plan = EXCLUDED.plan, status = EXCLUDED.status,
+           provider = 'paystack', provider_state = EXCLUDED.provider_state`,
     [userId, plan, status, providerState],
   );
 }
@@ -296,8 +310,13 @@ async function seedSetups(args: {
 /* -------------------------------------------------------------------------- */
 
 describe('GET /api/billing/me — historical subscriptions are preserved', () => {
-  test('a fresh registration is free and publishes no provider at all', async () => {
-    const { cookie } = await register();
+  test('a fresh registration is free, has no subscription row and publishes no provider at all', async () => {
+    const { cookie, userId } = await register();
+    // Model C: registration creates identity + session only.
+    assert.equal(
+      (await db.pool.query('SELECT count(*)::int AS c FROM subscriptions WHERE user_id=$1', [userId])).rows[0]!.c,
+      0, 'registration provisions no billing subscription',
+    );
     const state = await billingMe(cookie);
     assert.deepEqual(state.entitlements, FREE_LIMITS);
     assert.deepEqual(state.providerStatus, { provider: null, providerState: null, paymentConfirmed: false });
@@ -561,15 +580,24 @@ describe('POST /api/billing/checkout — refusals assume no payment', () => {
   test('an existing free NULL lock is still refused and still free', async () => {
     await insertEpoch(db.pool);
     const { cookie, userId } = await register();
+    // Model C: the LEGACY row (free/active, NULL lock) is seeded explicitly —
+    // registration no longer produces it and checkout must never upgrade it.
+    await db.pool.query(
+      `INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'free', 'active')`,
+      [userId],
+    );
     const res = await app.inject({
       method: 'POST', url: '/api/billing/checkout', headers: { cookie, 'x-forwarded-for': freshIp() },
       payload: PRO_MONTHLY,
     });
     assert.equal(res.statusCode, 409, res.body);
     assert.match(res.json().error.message, /pricing_lock_required/);
-    const row = await db.pool.query('SELECT plan, provider, provider_state FROM subscriptions WHERE user_id=$1', [userId]);
-    assert.deepEqual(row.rows[0], { plan: 'free', provider: null, provider_state: null });
+    const row = await db.pool.query('SELECT plan, provider, provider_state, locked_pricing_snapshot_id FROM subscriptions WHERE user_id=$1', [userId]);
+    assert.deepEqual(row.rows[0], {
+      plan: 'free', provider: null, provider_state: null, locked_pricing_snapshot_id: null,
+    });
     assert.deepEqual((await billingMe(cookie)).entitlements, FREE_LIMITS);
+    assert.equal(calls.length, 0, 'the provider is never called for a legacy NULL-lock row');
   });
 });
 

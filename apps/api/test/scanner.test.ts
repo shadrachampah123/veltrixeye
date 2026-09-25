@@ -151,7 +151,13 @@ async function registerUser(plan: 'free' | 'pro' = 'pro'): Promise<{ cookie: str
   assert.equal(res.statusCode, 201, res.body);
   const user = res.json().user;
   if (plan !== 'free') {
-    await pool.query(`UPDATE subscriptions SET plan = $1 WHERE user_id = $2`, [plan, user.id]);
+    // Model C: registration provisions no subscription row, so the fixture
+    // seeds the historical (provider IS NULL) paid row the plan override needs.
+    await pool.query(
+      `INSERT INTO subscriptions (user_id, plan, status) VALUES ($2, $1, 'active')
+       ON CONFLICT (user_id) DO UPDATE SET plan = EXCLUDED.plan`,
+      [plan, user.id],
+    );
   }
   return { cookie: cookieFrom(res), user };
 }

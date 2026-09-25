@@ -91,6 +91,20 @@ export async function getBillingState(db: Pool, userId: string): Promise<Billing
   };
 }
 
+/**
+ * Insert a `free`/`active` subscription row if the user has none.
+ *
+ * NOT PART OF THE MODEL C LIFECYCLE, and never called by registration
+ * (`UserService.create`) or by the free fallback: since Model C a user without
+ * a `subscriptions` row IS the free state (see `getBillingState` above), and the
+ * only row the product creates is the commercial one written atomically by
+ * `BillingCheckoutService.checkout()` together with its immutable pricing lock.
+ * Kept exported because it is the honest way for tests/fixtures to materialise
+ * the LEGACY shape — a pre-Model-C row with `locked_pricing_snapshot_id = NULL`
+ * — which stays fail-closed (`pricing_lock_required`) and must never be
+ * upgraded in place (migration 0032 makes the lock immutable). It grants
+ * nothing: `provider` stays NULL, which is the historical, non-commercial row.
+ */
 export async function createFreeSubscription(db: Pool, userId: string): Promise<void> {
   await db.query(
     `INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'free', 'active')

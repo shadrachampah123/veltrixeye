@@ -34,6 +34,19 @@
 > plan has been registered locally. See
 > [paystack-provider-contract.md](./paystack-provider-contract.md) §7 and §7.1.
 >
+> **Pricing-lock lifecycle (Model C — "checkout-created commercial
+> subscription"):** registration no longer creates a `subscriptions` row. A user
+> with no row IS the free state (`free` / `active` / `paymentConfirmed: false`,
+> free entitlements, no automation); the first commercial checkout is the ONE
+> path that derives the active provider-plan epoch and its pinned FX price and
+> writes the sold subscription together with its immutable pricing lock,
+> atomically, still arbitrated by `UNIQUE (user_id)`. The lock stays a pricing
+> fact: not payment confirmation, not entitlement activation, not execution
+> authorization. Pre-existing rows with a NULL lock remain fail-closed
+> (`pricing_lock_required`) with no remediation path in this change, and the
+> activation/confirmation authority remains a separate, unimplemented step.
+> See *The pricing-lock lifecycle — Model C*.
+>
 > PR1 (merged, `ab27948`) established the authoritative commercial catalogue;
 > PR2 (merged) added the canonical billing contracts, the provider seam and
 > migration `0031_provider_billing.sql`; PR3 (merged) added USD→GHS pricing, FX authority, provider-plan epochs and the sandbox Paystack adapter. **Step 7 adds payment evidence only — it changes no price, no entitlement and no execution: `canAccessAutomation` stays `false` for every plan, `paymentConfirmed` stays `false`, and `grantsExecution`/`planChanged`/`entitlementsChanged` stay `false`.**
@@ -234,7 +247,10 @@ Consequences:
   shown the **Elite** catalogue row (same `canAccessAutomation: false`, same
   numbers — the name changes, the enforcement does not).
 - A `free` user keeps the free entitlement set; free is not a sold tier and has
-  no catalogue row.
+  no catalogue row. Since Model C a free user typically has **no
+  `subscriptions` row at all** (`UserService.create` provisions none), and the
+  missing row is what resolves to free — see *The pricing-lock lifecycle —
+  Model C*.
 - **Starter still cannot be sold.** Migration 0031 persists the *catalogue*
   identity of a provider-backed subscription, but it deliberately does **not**
   add an internal plan value for Starter: doing so would create a plan whose
@@ -419,7 +435,75 @@ subscription is created, or the subscription has no price.
 `subscriptions.currency` and `CHECK (currency = 'USD')` are untouched: the
 **commercial** currency stays USD, and the lock's scope guard only *reads* it.
 
-### 5. The sandbox adapter and its composition
+### 5. The pricing-lock lifecycle — Model C ("checkout-created commercial subscription")
+
+**The subscription row is a commercial artefact, so it is created by the
+commercial event — the first checkout — and by nothing else.**
+
+```text
+registration (UserService.create)     → user row + session/audit only. NO subscriptions row.
+user with no subscriptions row        → free fallback: plan 'free', status 'active',
+                                        paymentConfirmed false, FREE entitlements,
+                                        canAccessAutomation false, no provider
+first commercial checkout             → active provider-plan epoch + pinned FX price
+                                        → pricing snapshot + sold subscription + immutable
+                                          pricing lock, atomically, under UNIQUE (user_id)
+existing NULL-lock row                → pricing_lock_required (fail closed, unchanged)
+```
+
+| Rule | Where it lives |
+| --- | --- |
+| Registration creates the user exactly as before — same single INSERT, same transaction, same unique-email conflict mapping, same `users.plan` default — and **no billing state** (no `subscriptions` row, no `billing_customers` row, no pricing snapshot, no provider call) | `packages/core/src/auth/users.ts`. There is no billing, FX or provider import in that module |
+| A **missing** `subscriptions` row IS the supported free state: `plan: 'free'`, `status: 'active'`, `paymentConfirmed: false`, `FREE_ENTITLEMENTS`, `canAccessAutomation: false`, `providerStatus = { provider: null, providerState: null, paymentConfirmed: false }`, and `subscription.id = ''` (nothing was ever sold, so there is no commercial identity to report) | `getBillingState` (`packages/core/src/billing/subscriptions.ts`) and every entitlement reader — `resolveEntitlements('free', 'active', null)`. No row is invented to represent free access |
+| The **only** commercial creation path is the first `BillingCheckoutService.checkout()` for a row-less user: it derives the active provider-plan epoch, pins the epoch's FX version/amount into a pricing snapshot, INSERTs the sold subscription with `provider = 'paystack'`, `provider_state = 'pending'` and `locked_pricing_snapshot_id = <snapshot>`, and commits — one transaction | `packages/core/src/billing/checkout.ts` (`obtainLock`, `ON CONFLICT (user_id) DO NOTHING`). Pricing authority stays in `pricing.ts`/`provider-plans.ts`; nothing is recomputed here |
+| **Concurrency arbitration is the database's**, not the service's: `UNIQUE (user_id)` (`subscriptions_user_id_idx`, 0014) decides which racing first checkout creates the row; the loser re-reads the committed winner and uses ITS lock. `FOR UPDATE` cannot lock an absent row, so the INSERT is the arbiter | as before — unchanged by Model C |
+| The **client supplies the catalogue plan and interval only**. It cannot supply a snapshot, an amount, an FX rate, a provider plan id, a user id or a callback/return authority: the request body is `.strict()` on `{ cataloguePlan ∈ {pro, elite}, interval ∈ {monthly, annual} }`, and the provider call is built entirely from the locked snapshot | `billingCheckoutInputSchema` + `billingCheckoutRequestSchema` |
+| **The pricing lock is a pricing/quote fact — and nothing else.** It is written when the commercial subscription is created, and it is **not** payment confirmation, **not** entitlement activation and **not** execution authorization: the checkout response buys nothing, `paymentConfirmed` stays `false`, and the provider-backed row resolves to `FREE_ENTITLEMENTS` | migration 0032 + `resolveEntitlements` |
+| **The lock is immutable.** Migration 0032's `subscriptions_locked_pricing_immutable` trigger refuses repointing, re-rating AND clearing: `NULL` → non-NULL can never be written after creation. A price change applies to NEW subscriptions only | migration 0032 (**unchanged by Model C; 0001–0033 are byte-identical**) |
+
+**Why registration used to create a free row, and why it no longer does.** The
+0014-era free row had `provider IS NULL` and `locked_pricing_snapshot_id` did
+not exist yet (it arrives additively in 0032), so the row could not carry a
+price. Once 0032 made the lock immutable at creation, an eager
+`free`/`active` row could never become a commercial one — the only thing it
+could do is make the first checkout fail closed with `pricing_lock_required`.
+Model C removes the premature row instead of weakening the invariant: the
+free state is represented by the ABSENCE of a commercial record, which is also
+what "nothing has been sold yet" means.
+
+**Legacy NULL-lock rows remain fail closed — deliberately.** Any subscription
+row that already exists with `locked_pricing_snapshot_id IS NULL` (created by
+the previous registration behaviour, by the 0014 backfill, or by an operator)
+continues to be refused at checkout with `pricing_lock_required`, and the
+0032 trigger refuses to attach a lock to it later. This milestone adds **no
+remediation path, no migration, no backfill and no repair job** for those rows;
+they are handled by operators out of band. Do not "fix" one by editing the
+trigger.
+
+**Adjacent steps stay separate and unimplemented here.**
+
+- **Step 4 operator provisioning remains a prerequisite:** no provider-plan
+  epoch and no FX version are published by this change, so a row-less checkout
+  still fails closed with `plan_not_registered` until an operator runs the
+  Step 4 runbook (dashboard plans + FX publication + one registration call).
+  Provisioning registers pricing authority for future sales; it never repairs
+  an existing row.
+- **The activation/confirmation authority (Step 8 of the pricing-lock
+  milestone — not this change) is NOT implemented.** Payment confirmation,
+  payment evidence, entitlement
+  activation, webhooks, synchronization and execution are separate concerns
+  that this change does not touch, and the pricing lock grants none of them.
+  Nothing in Model C may be used as a substitute for that authority.
+- **Known follow-up (not fixed here):** an active epoch can be *retired*
+  between the active-epoch lookup and the pricing-lock creation, because the
+  epoch read is not taken under `FOR SHARE` and no active re-check is performed
+  inside the lock transaction. The outcome is fail-closed rather than unsafe —
+  the lock is created from what was active at lookup time, and the Paystack
+  adapter independently refuses a retired/mismatched epoch, so no charge is
+  initialized — but it is a race worth fixing deliberately in its own change.
+  No scope expansion was made for it here.
+
+### 6. The sandbox adapter and its composition
 
 `packages/providers/paystack` implements three documented provider operations
 (`findCustomer`, `createCustomer`, `initializeCheckout`) against
@@ -514,7 +598,9 @@ execution capability.
 ## Read-side entitlement hardening — provider-backed rows fail closed
 
 Checkout initialization (`BillingCheckoutService`, `POST /api/billing/checkout`)
-INSERTs the subscription row **before any money moves**:
+INSERTs the subscription row **before any money moves**. Since Model C this is
+the FIRST commercial checkout of a user with no subscription row (registration
+no longer creates one — see *The pricing-lock lifecycle — Model C*):
 
 ```sql
 INSERT INTO subscriptions (…, status, provider, provider_state, locked_pricing_snapshot_id)
@@ -535,6 +621,7 @@ is not a payment, and no `provider_state` value can make it one.
 
 | Subscription row | Entitlements |
 | --- | --- |
+| **no row at all** (every user who has never checked out — the Model C free state) | `FREE_ENTITLEMENTS` via `resolveEntitlements('free', 'active', null)` — reported as free/active/unconfirmed |
 | `provider IS NULL` (every historical row) | `getEntitlements(plan, status)` — **unchanged** |
 | `provider IS NOT NULL` (any checkout row) | `FREE_ENTITLEMENTS` — regardless of `status` or `provider_state` |
 

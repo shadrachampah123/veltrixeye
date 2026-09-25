@@ -37,6 +37,7 @@ import {
   cataloguePriceMinor,
   computePaymentAmountMinor,
   providerIntervalForBillingInterval,
+  UserService,
   verifyPricingSnapshot,
   type BillingCheckoutRequest,
 } from '../src/index.js';
@@ -266,7 +267,38 @@ test('an existing locked subscription bypasses new epochs and later FX entirely'
 test('a NULL lock stays pricing_lock_required — provisioning never upgrades it', async () => {
   await provisionSandboxEpochs();
   const user = await insertUser(db.pool);
+  // Model C: a registration-created user has no row at all, so the legacy
+  // NULL-lock shape is seeded explicitly. Provisioning an epoch registers
+  // pricing authority for NEW sales only; it never repairs this row.
   await createFreeSubscription(db.pool, user.id);
   await assert.rejects(service.checkout(user.id, { cataloguePlan: 'pro', interval: 'monthly' }), reason('pricing_lock_required'));
   assert.equal(calls.length, 0);
+});
+
+test('Model C: a registered (row-less) user checks out against a provisioned epoch', async () => {
+  const { codes } = await provisionSandboxEpochs();
+  // Real registration path: identity only, no billing subscription row.
+  const user = await new UserService(db.pool).create({
+    email: `step4-model-c-${randomUUID()}@example.test`, passwordHash: 'x'.repeat(32), name: 'Step 4 Model C',
+  });
+  assert.equal(
+    (await db.pool.query('SELECT count(*)::int AS c FROM subscriptions WHERE user_id=$1', [user.id])).rows[0]!['c'],
+    0, 'registration provisions nothing',
+  );
+
+  const session = await service.checkout(user.id, { cataloguePlan: 'pro', interval: 'monthly' });
+  assert.equal(session.payment?.paymentAmountMinor, 48_750);
+  assert.equal(session.pricing?.providerPlanId, codes['pro/monthly']);
+  const { rows } = await db.pool.query(
+    `SELECT plan, provider, catalogue_plan, billing_interval, provider_plan_id, locked_pricing_snapshot_id
+       FROM subscriptions WHERE user_id = $1`,
+    [user.id],
+  );
+  assert.equal(rows.length, 1, 'the commercial subscription is created exactly once');
+  assert.equal(rows[0]!['provider'], 'paystack');
+  assert.equal(rows[0]!['plan'], 'pro');
+  assert.equal(rows[0]!['catalogue_plan'], 'pro');
+  assert.equal(rows[0]!['billing_interval'], 'monthly');
+  assert.ok(rows[0]!['locked_pricing_snapshot_id'], 'the lock is created with the sold subscription');
+  assert.equal(calls.length, 1);
 });

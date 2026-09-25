@@ -6,6 +6,7 @@ import {
   BillingCheckoutService, BillingPricingSnapshotStore, BillingProviderPlanStore,
   createBillingProviderRegistry, createUnimplementedBillingProvider, createFreeSubscription,
   billingCheckoutReference, pricingIdempotencyKey, verifyPricingSnapshot,
+  FREE_ENTITLEMENTS, UserService, getBillingState,
   type BillingCheckoutRequest,
 } from '../src/index.js';
 import {
@@ -48,6 +49,7 @@ test('active epoch selects exact stale FX version, persists once, and INSERTs ac
   assert.deepEqual(session.pricing, deriveSnapshot(facts));
   assert.equal(session.payment?.paymentAmountMinor, 48_750);
   const { rows } = await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id]);
+  assert.equal(rows.length, 1, 'exactly one commercial subscription row exists');
   assert.equal(rows[0].status, 'active');
   assert.equal(rows[0].provider_state, 'pending');
   assert.equal(rows[0].provider, 'paystack');
@@ -90,8 +92,59 @@ test('missing, retired-only and ambiguous epochs fail closed without provider ca
   assert.equal(calls.length, 0);
 });
 
+test('MODEL C: registration creates no subscription row; the free fallback is the missing row', async () => {
+  const before = await db.pool.query('SELECT count(*)::int AS c FROM billing_pricing_snapshots');
+  const user = await new UserService(db.pool).create({
+    email: `model-c-${randomUUID()}@example.test`, passwordHash: 'x'.repeat(32), name: 'Model C user',
+  });
+
+  // Registration is identity only: the same user, the unchanged users.plan
+  // default, and NO billing provisioning of any kind.
+  assert.equal(user.plan, 'free');
+  assert.equal(
+    (await db.pool.query('SELECT plan FROM users WHERE id=$1', [user.id])).rows[0].plan, 'free',
+  );
+  const rows = await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id]);
+  assert.equal(rows.rowCount, 0, 'registration must not create a subscriptions row');
+  assert.deepEqual(
+    (await db.pool.query('SELECT count(*)::int AS c FROM billing_pricing_snapshots')).rows,
+    before.rows, 'registration writes no pricing state either',
+  );
+
+  // The missing row IS the supported free state: free/active, unconfirmed, no
+  // commercial entitlement and no automation, with no row invented to say so.
+  const state = await getBillingState(db.pool, user.id);
+  assert.equal(state.subscription.plan, 'free');
+  assert.equal(state.subscription.status, 'active');
+  assert.deepEqual(state.providerStatus, { provider: null, providerState: null, paymentConfirmed: false });
+  assert.deepEqual(state.entitlements, FREE_ENTITLEMENTS);
+  assert.equal(state.entitlements.canAccessAutomation, false);
+
+  // ...and the FIRST commercial checkout is the one path that creates the sold
+  // subscription together with its immutable pricing lock, atomically.
+  const facts = await insertEpoch(db.pool);
+  const session = await service.checkout(user.id, PRO_MONTHLY);
+  assert.deepEqual(session.pricing, deriveSnapshot(facts));
+  const created = await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id]);
+  assert.equal(created.rowCount, 1, 'exactly one commercial subscription');
+  assert.equal(created.rows[0].plan, 'pro');
+  assert.equal(created.rows[0].provider, 'paystack');
+  assert.equal(created.rows[0].provider_state, 'pending');
+  assert.equal(created.rows[0].provider_plan_id, facts.epoch.provider_plan_id);
+  assert.ok(created.rows[0].locked_pricing_snapshot_id, 'the lock is written with the subscription');
+  const stored = await new BillingPricingSnapshotStore(db.pool).findById(created.rows[0].locked_pricing_snapshot_id);
+  assert.deepEqual(stored?.snapshot, session.pricing);
+  // The lock is a pricing fact only: the row it belongs to is still unconfirmed
+  // and grants nothing.
+  assert.equal((await getBillingState(db.pool, user.id)).providerStatus.paymentConfirmed, false);
+  assert.deepEqual((await getBillingState(db.pool, user.id)).entitlements, FREE_ENTITLEMENTS);
+  assert.equal(calls.length, 1);
+});
+
 test('NULL lock refuses before epoch lookup and leaves the entire subscription unchanged', async () => {
   const user = await insertUser(db.pool);
+  // The LEGACY shape (what registration used to create) is modelled explicitly;
+  // it stays fail-closed and is never upgraded by checkout.
   await createFreeSubscription(db.pool, user.id);
   const read = () => db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id]);
   const before = await read();
@@ -168,6 +221,8 @@ test('concurrent absent-row checkouts with different candidates use one winning 
 });
 
 test('a concurrent free-subscription INSERT wins without any NULL-lock mutation', async () => {
+  // Simulates a LEGACY (pre-Model-C) free row racing the first checkout: the
+  // row wins the UNIQUE(user_id) race and the checkout fails closed.
   await insertEpoch(db.pool);
   const user = await insertUser(db.pool);
   const original = BillingPricingSnapshotStore.prototype.create;

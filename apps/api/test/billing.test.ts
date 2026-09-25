@@ -94,8 +94,43 @@ async function registerUser(): Promise<{ cookie: string; user: { id: string; ema
 }
 
 describe('M7.4: Billing and Entitlements API', () => {
+  test('Model C: registration succeeds without any billing provisioning', async () => {
+    const snapshotsBefore = (
+      await pool.query('SELECT count(*)::int AS c FROM billing_pricing_snapshots')
+    ).rows[0].c;
+    const { cookie, user } = await registerUser();
+
+    // The user row exists exactly as before, with the unchanged default plan…
+    const users = await pool.query('SELECT plan, email, deleted_at FROM users WHERE id = $1', [user.id]);
+    assert.equal(users.rows[0].plan, 'free');
+    assert.equal(users.rows[0].deleted_at, null);
+    // …while registration touches NO billing state at all.
+    assert.equal(
+      (await pool.query('SELECT count(*)::int AS c FROM subscriptions WHERE user_id = $1', [user.id])).rows[0].c,
+      0, 'registration must not create a subscriptions row',
+    );
+    assert.equal(
+      (await pool.query('SELECT count(*)::int AS c FROM billing_customers WHERE user_id = $1', [user.id])).rows[0].c,
+      0, 'registration must not provision a provider customer',
+    );
+    assert.equal(
+      (await pool.query('SELECT count(*)::int AS c FROM billing_pricing_snapshots')).rows[0].c,
+      snapshotsBefore, 'registration must not price anything',
+    );
+
+    // Session and audit behaviour are unchanged: the registration session is
+    // usable and the audit trail still records the registration.
+    const me = await app.inject({ method: 'GET', url: '/api/users/me', headers: { cookie, 'x-forwarded-for': freshIp() } });
+    assert.equal(me.statusCode, 200, me.body);
+    assert.equal(me.json().user.id, user.id);
+    const audit = await pool.query(
+      "SELECT action FROM audit_events WHERE user_id = $1 AND action = 'auth.registered'", [user.id],
+    );
+    assert.equal(audit.rowCount, 1, 'the registration audit event is preserved');
+  });
+
   test('New user gets correct default free entitlement', async () => {
-    const { cookie } = await registerUser();
+    const { cookie, user } = await registerUser();
     const res = await app.inject({
       method: 'GET',
       url: '/api/billing/me',
@@ -106,6 +141,14 @@ describe('M7.4: Billing and Entitlements API', () => {
     assert.equal(data.subscription.plan, 'free');
     assert.equal(data.subscription.status, 'active');
     assert.equal(data.entitlements.maxStrategies, 100);
+    // Model C: the free state IS the absent row — no provider, nothing confirmed,
+    // no commercial entitlement and no scanner access.
+    assert.deepEqual(data.providerStatus, { provider: null, providerState: null, paymentConfirmed: false });
+    assert.equal(data.entitlements.canAccessScanner, false);
+    assert.equal(
+      (await pool.query('SELECT count(*)::int AS c FROM subscriptions WHERE user_id = $1', [user.id])).rows[0].c,
+      0,
+    );
   });
 
   test('Free user is rejected from premium functionality (Strategy limit)', async () => {
@@ -134,8 +177,15 @@ describe('M7.4: Billing and Entitlements API', () => {
 
   test('Premium user can access entitled functionality', async () => {
     const { cookie, user } = await registerUser();
-    
-    await pool.query(`UPDATE subscriptions SET plan = 'premium' WHERE user_id = $1`, [user.id]);
+
+    // Model C fixture: a HISTORICAL (provider IS NULL) paid row. Registration
+    // no longer creates the row, so the fixture seeds it — the row shape and the
+    // entitlements it resolves are exactly the pre-Model-C ones.
+    await pool.query(
+      `INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'premium', 'active')
+       ON CONFLICT (user_id) DO UPDATE SET plan = EXCLUDED.plan, status = EXCLUDED.status`,
+      [user.id],
+    );
     
     const resBilling = await app.inject({
       method: 'GET',
