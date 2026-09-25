@@ -6,9 +6,10 @@ import {
   getBillingState, BillingCheckoutError, Errors, isBillingProviderPlanError,
   isBillingPricingError, isBillingFxError, isBillingSubscriptionSyncError,
   isBillingCustomerProvisioningError, type BillingCustomerProvisioningErrorReason,
+  isBillingPaymentConfirmationError,
 } from '@veltrixeye/core';
 import { isPaystackAdapterError } from '@veltrixeye/provider-paystack';
-import { composeBillingCheckout, composeBillingCustomers, composeBillingSync } from '../billing-composition.js';
+import { composeBillingCheckout, composeBillingCustomers, composeBillingSync, composeBillingVerify } from '../billing-composition.js';
 import { registerBillingWebhookRoutes } from '../billing-webhook.js';
 import type { BillingStateDto } from '@veltrixeye/contracts';
 
@@ -25,6 +26,13 @@ export const BILLING_SYNC_RATE_LIMIT_MAX = 10;
  * performs at most two provider requests (find, then create), so it is low.
  */
 export const BILLING_CUSTOMER_RATE_LIMIT_MAX = 10;
+
+/**
+ * Billing Step 7: per-IP limit for `POST /api/billing/verify` (route-level
+ * override of the global limiter, same mechanism as sync/customer/webhook).
+ * One documented provider read per call, so it is low.
+ */
+export const BILLING_VERIFY_RATE_LIMIT_MAX = 10;
 
 /**
  * Provisioning refusals that are about LOCAL state needing operator review
@@ -46,6 +54,7 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
   const checkout = composeBillingCheckout(ctx.pool, ctx.billingProviders, config);
   const sync = composeBillingSync(ctx.pool, ctx.billingProviders);
   const customers = composeBillingCustomers(ctx.pool, ctx.billingProviders);
+  const verify = composeBillingVerify(ctx.pool, ctx.billingProviders);
 
   // Billing Step 5.2 — the secure webhook receiver route. Signature-verified,
   // never session-authenticated; registered only when a billing provider
@@ -119,6 +128,37 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
         const message = `Customer provisioning refused: ${error.reason}.`;
         if (CUSTOMER_CONFLICT_REASONS.has(error.reason)) throw Errors.conflict(message);
         throw Errors.providerUnavailable(message, error);
+      }
+      throw error;
+    }
+  });
+
+  // Billing Step 7 — verify the caller's OWN checkout transaction and record
+  // durable payment evidence (sandbox only). Session-authenticated; no payload
+  // is accepted (the subject is always the session user, never a
+  // client-supplied reference); the checkout reference is derived server-side
+  // from the locked pricing snapshot. The response is the structured
+  // `BillingPaymentVerificationResult` (verified true with evidence, or
+  // verified false with a typed failure reason). It never grants
+  // entitlements or execution: `grantsExecution`, `planChanged` and
+  // `entitlementsChanged` are pinned false, and `paymentConfirmed` on the
+  // existing `GET /api/billing/me` DTO stays false.
+  app.post('/api/billing/verify', {
+    config: { rateLimit: { max: BILLING_VERIFY_RATE_LIMIT_MAX, timeWindow: '1 minute' } },
+  }, async (req, reply) => {
+    if (!await requireAuth(req, reply)) return;
+    if (!isEmptyBody(req.body)) {
+      throw Errors.invalidInput('Verification accepts no request body.');
+    }
+    const { user } = req as AuthenticatedRequest;
+    try {
+      return reply.send(await verify.confirm(user.id));
+    } catch (error) {
+      if (isBillingPaymentConfirmationError(error)) {
+        // Provider or verification failures are unavailability (nothing was
+        // persisted); snapshot mismatches that are returned as structured
+        // 200s never reach here — they are the `verified: false` case above.
+        throw Errors.providerUnavailable(`Verification refused: ${error.reason}.`, error);
       }
       throw error;
     }

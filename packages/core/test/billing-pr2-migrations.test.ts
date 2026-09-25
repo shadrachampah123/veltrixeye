@@ -53,7 +53,7 @@ const RECORDED_SHA256: Readonly<Record<string, string>> = Object.freeze({
  * migration must be added to this list deliberately, by the change that
  * introduces it.
  */
-const LATER_MIGRATIONS = ['0032_billing_fx_and_pricing.sql'] as const;
+const LATER_MIGRATIONS = ['0032_billing_fx_and_pricing.sql', '0033_billing_payment_evidence.sql'] as const;
 /** Columns `subscriptions` had before 0031 (migration 0014). */
 const SUBSCRIPTION_COLUMNS_0014 = [
   'id',

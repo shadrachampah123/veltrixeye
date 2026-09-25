@@ -152,6 +152,8 @@ describe('Paystack client — verifyTransaction (documented read)', () => {
       currency: 'GHS',
       providerCustomerId: '181873746',
       providerCustomerCode: 'CUS_1rkzaqsv4rrhqo6',
+      paidAt: '2026-09-24T09:15:02.000Z',
+      providerTransactionId: '4099260516',
     });
   });
 
@@ -163,7 +165,7 @@ describe('Paystack client — verifyTransaction (documented read)', () => {
       assert.ok(!text.includes(leaked), `verify result must not carry ${leaked}`);
     }
     assert.deepEqual(Object.keys(verified).sort(), [
-      'amountMinor', 'currency', 'domain', 'providerCustomerCode', 'providerCustomerId', 'reference', 'status',
+      'amountMinor', 'currency', 'domain', 'paidAt', 'providerCustomerCode', 'providerCustomerId', 'providerTransactionId', 'reference', 'status',
     ]);
   });
 
@@ -279,6 +281,9 @@ describe('Paystack provider — verifySubscription via transaction verify', () =
       cancellationReason: null,
       sourceEventIdempotencyKey: null,
       observedAt: OBSERVED_AT.toISOString(),
+      paidAt: '2026-09-24T09:15:02.000Z',
+      providerTransactionId: '4099260516',
+      providerTransactionStatus: 'success',
     });
     assert.equal(PAYSTACK_VERIFIED_TRANSACTION_LIFECYCLE_STATE, 'unknown');
   });

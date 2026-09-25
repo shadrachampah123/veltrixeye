@@ -112,14 +112,21 @@ const initializeDataSchema = z
  * Deliberately absent: any subscription status or subscription code. The
  * provider's published verify response carries neither, so nothing here can
  * report one (see docs/paystack-provider-contract.md §2).
+ *
+ * Step 7 adds the documented `paid_at` field (an ISO datetime) and the
+ * provider's own numeric `id` (the transaction identifier where available).
+ * Both are validated strictly; a missing or malformed `paid_at` is a typed
+ * refusal, and no card/authorization detail is ever read.
  */
 const verifyTransactionDataSchema = z
   .object({
+    id: z.union([z.number().int(), z.string().min(1).max(128)]).optional(),
     domain: z.string().min(1).max(16),
     status: z.string().min(1).max(64),
     reference: z.string().min(1).max(190),
     amount: z.number().int(),
     currency: z.string().min(1).max(8),
+    paid_at: z.string().datetime(),
     customer: z
       .object({
         id: z.union([z.number().int(), z.string().min(1).max(128)]).optional(),
@@ -141,6 +148,11 @@ const PAYSTACK_REFERENCE_SHAPE = /^[A-Za-z0-9.=-]{1,190}$/;
  * `status` is the provider's own transaction status string, passed through
  * verbatim: the provider does not publish an exhaustive transaction status
  * vocabulary, so this client interprets none of it.
+ *
+ * `paidAt` is the documented instant the transaction was paid (provider's
+ * `paid_at`). Required for payment evidence: a transaction without it is not
+ * evidence, and reconciliation refuses it. `providerTransactionId` is the
+ * provider's own numeric/string identifier where the payload carries one.
  */
 export interface PaystackVerifiedTransaction {
   /** The transaction reference the provider verified (should be ours). */
@@ -155,6 +167,10 @@ export interface PaystackVerifiedTransaction {
   currency: string;
   providerCustomerId: string | null;
   providerCustomerCode: string | null;
+  /** Provider-reported paid instant (paid_at), ISO datetime string. Required for evidence. */
+  paidAt: string;
+  /** The provider's own transaction identifier (id), where available. */
+  providerTransactionId: string | null;
 }
 
 export interface PaystackCustomerRecord {
@@ -401,6 +417,8 @@ export class PaystackClient {
       providerCustomerId:
         parsed.data.customer.id === undefined ? null : String(parsed.data.customer.id),
       providerCustomerCode: parsed.data.customer.customer_code ?? null,
+      paidAt: parsed.data.paid_at,
+      providerTransactionId: parsed.data.id === undefined ? null : String(parsed.data.id),
     };
     return verified;
   }

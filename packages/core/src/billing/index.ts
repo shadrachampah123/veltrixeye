@@ -12,3 +12,6 @@ export * from './checkout.js';
 export * from './webhook.js';
 export * from './sync.js';
 export * from './customers.js';
+export * from './payment-reconciliation.js';
+export * from './verified-transactions.js';
+export * from './confirmation.js';

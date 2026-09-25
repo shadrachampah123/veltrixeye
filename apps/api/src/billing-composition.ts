@@ -11,6 +11,7 @@ import {
   createBillingProviderRegistry,
   BillingCheckoutService,
   BillingCustomerService,
+  BillingPaymentConfirmationService,
   BillingSubscriptionSyncService,
   BillingWebhookReceiver,
   isBillingProviderPlanError,
@@ -248,4 +249,21 @@ export function composeBillingCustomers(
   db: pg.Pool, providers: BillingProviderRegistry,
 ): BillingCustomerService {
   return new BillingCustomerService({ db, providers });
+}
+
+/**
+ * Billing Step 7 — compose payment verification + durable evidence.
+ *
+ * Always composed (like checkout, sync and customers): with no registered
+ * provider the service refuses with `provider_not_registered` and writes
+ * nothing. It reaches the adapter only through the seam's
+ * `verifySubscription` (the documented transaction-verify read) and owns
+ * the `billing_verified_transactions` write itself; the adapter still
+ * never touches the database. It changes no subscription, no entitlement
+ * and no execution gate — evidence is information, never authority.
+ */
+export function composeBillingVerify(
+  db: pg.Pool, providers: BillingProviderRegistry,
+): BillingPaymentConfirmationService {
+  return new BillingPaymentConfirmationService({ db, providers });
 }

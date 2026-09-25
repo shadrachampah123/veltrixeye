@@ -406,6 +406,29 @@ export const providerSubscriptionStateSchema = z
     /** Identity of the provider response/event this state was read from. */
     sourceEventIdempotencyKey: sha256HexSchema.nullable(),
     observedAt: isoDateTime,
+    /**
+     * Step 7: the provider-reported paid instant for a verified transaction
+     * (`paid_at`). Present only for transaction-verification reads; null
+     * when the transaction has not been paid or the provider did not carry
+     * it. Required for payment evidence — reconciliation refuses a
+     * transaction without it.
+     */
+    paidAt: isoDateTime.nullable().optional(),
+    /**
+     * Step 7: the provider's own transaction identifier (`id` on the verify
+     * payload), where the provider carries one. Opaque, nullable, never a
+     * credential — only a reference.
+     */
+    providerTransactionId: providerReferenceSchema.nullable().optional(),
+    /**
+     * Step 7: the provider-reported TRANSACTION status for a verified
+     * transaction (`success`, `failed`, etc.), uninterpreted. Present only
+     * for transaction-verification reads; kept separate from the canonical
+     * lifecycle `state` (which stays `unknown` for Paystack verification).
+     * Reconciliation decides whether the status is acceptable for evidence
+     * (only `success`).
+     */
+    providerTransactionStatus: z.string().min(1).max(64).nullable().optional(),
   })
   .strict()
   .superRefine((state, ctx) => {
