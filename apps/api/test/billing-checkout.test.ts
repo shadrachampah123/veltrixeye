@@ -65,10 +65,14 @@ test('requires authentication; preserves other prohibited routes', async () => {
   const result = await checkout('');
   assert.equal(result.statusCode, 401);
   // `webhook` is no longer prohibited: Billing Step 5.2 registered the secure
-  // receiver at that path (see test/billing-webhook.test.ts).
-  for (const path of ['portal', 'customer', 'callback']) {
+  // receiver at that path (see test/billing-webhook.test.ts). `customer` is
+  // no longer prohibited either: Billing Step 6 registered the
+  // session-authenticated provisioning route there (see
+  // test/billing-customer.test.ts) — unauthenticated, it is a 401.
+  for (const path of ['portal', 'callback']) {
     assert.equal((await app.inject({ method: 'POST', url: `/api/billing/${path}` })).statusCode, 404);
   }
+  assert.equal((await app.inject({ method: 'POST', url: '/api/billing/customer' })).statusCode, 401);
   assert.equal(calls.length, 0);
 });
 

@@ -11,3 +11,4 @@ export * from './snapshots.js';
 export * from './checkout.js';
 export * from './webhook.js';
 export * from './sync.js';
+export * from './customers.js';

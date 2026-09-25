@@ -5,9 +5,10 @@ import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js
 import {
   getBillingState, BillingCheckoutError, Errors, isBillingProviderPlanError,
   isBillingPricingError, isBillingFxError, isBillingSubscriptionSyncError,
+  isBillingCustomerProvisioningError, type BillingCustomerProvisioningErrorReason,
 } from '@veltrixeye/core';
 import { isPaystackAdapterError } from '@veltrixeye/provider-paystack';
-import { composeBillingCheckout, composeBillingSync } from '../billing-composition.js';
+import { composeBillingCheckout, composeBillingCustomers, composeBillingSync } from '../billing-composition.js';
 import { registerBillingWebhookRoutes } from '../billing-webhook.js';
 import type { BillingStateDto } from '@veltrixeye/contracts';
 
@@ -18,7 +19,23 @@ import type { BillingStateDto } from '@veltrixeye/contracts';
  */
 export const BILLING_SYNC_RATE_LIMIT_MAX = 10;
 
-/** The sync route accepts NO payload: the subject is the session user, always. */
+/**
+ * Billing Step 6: per-IP limit for `POST /api/billing/customer` (route-level
+ * override of the global limiter, same mechanism as sync/webhook). A call
+ * performs at most two provider requests (find, then create), so it is low.
+ */
+export const BILLING_CUSTOMER_RATE_LIMIT_MAX = 10;
+
+/**
+ * Provisioning refusals that are about LOCAL state needing operator review
+ * (409); every other refusal is a provider-side unavailability (502).
+ */
+const CUSTOMER_CONFLICT_REASONS: ReadonlySet<BillingCustomerProvisioningErrorReason> = new Set([
+  'account_unavailable', 'customer_not_provisionable', 'customer_identity_incomplete',
+  'customer_identity_conflict',
+]);
+
+/** The sync/customer routes accept NO payload: the subject is the session user, always. */
 function isEmptyBody(body: unknown): boolean {
   if (body === undefined || body === null) return true;
   return typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 0;
@@ -28,6 +45,7 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
   const requireAuth = createSessionAuth(config, ctx);
   const checkout = composeBillingCheckout(ctx.pool, ctx.billingProviders, config);
   const sync = composeBillingSync(ctx.pool, ctx.billingProviders);
+  const customers = composeBillingCustomers(ctx.pool, ctx.billingProviders);
 
   // Billing Step 5.2 — the secure webhook receiver route. Signature-verified,
   // never session-authenticated; registered only when a billing provider
@@ -73,6 +91,34 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
       if (isBillingSubscriptionSyncError(error)) {
         // Nothing was written; the typed reason is visible, provider detail is not.
         throw Errors.providerUnavailable(`Synchronization refused: ${error.reason}.`, error);
+      }
+      throw error;
+    }
+  });
+
+  // Billing Step 6 (roadmap item 8a) — ensure the caller's OWN billing customer
+  // exists (sandbox only), so checkout's existing-customer requirement can be
+  // met. Session-authenticated; no payload is accepted (the subject and the
+  // email are always the session user's, never client-supplied); idempotent —
+  // an already-provisioned customer is returned without any provider call.
+  // The response pins entitlementsChanged / grantsExecution to false: a
+  // provisioned customer buys nothing and the provider→FREE gate is unchanged.
+  app.post('/api/billing/customer', {
+    config: { rateLimit: { max: BILLING_CUSTOMER_RATE_LIMIT_MAX, timeWindow: '1 minute' } },
+  }, async (req, reply) => {
+    if (!await requireAuth(req, reply)) return;
+    if (!isEmptyBody(req.body)) {
+      throw Errors.invalidInput('Customer provisioning accepts no request body.');
+    }
+    const { user } = req as AuthenticatedRequest;
+    try {
+      return reply.send(await customers.ensureCustomer(user.id));
+    } catch (error) {
+      if (isBillingCustomerProvisioningError(error)) {
+        // Nothing was written; the typed reason is visible, provider detail is not.
+        const message = `Customer provisioning refused: ${error.reason}.`;
+        if (CUSTOMER_CONFLICT_REASONS.has(error.reason)) throw Errors.conflict(message);
+        throw Errors.providerUnavailable(message, error);
       }
       throw error;
     }

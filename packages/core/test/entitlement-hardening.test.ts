@@ -594,9 +594,25 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     const writes = [...billingRoute.matchAll(/app\.(post|put|patch|delete)\s*\(\s*'([^']+)'/g)]
       .map((match) => [match[1], match[2]]);
     // Later-billing-PR #7 added exactly ONE sanctioned write route: the
-    // verification + synchronization trigger. Nothing else.
-    assert.deepEqual(writes, [['post', '/api/billing/checkout'], ['post', '/api/billing/sync']],
-      'no billing write route beyond checkout + the PR #7 sync trigger');
+    // verification + synchronization trigger. Billing Step 6 added exactly one
+    // more: customer provisioning. Nothing else.
+    assert.deepEqual(writes, [
+      ['post', '/api/billing/checkout'], ['post', '/api/billing/sync'], ['post', '/api/billing/customer'],
+    ], 'no billing write route beyond checkout + the PR #7 sync trigger + Step 6 customer provisioning');
+
+    // Billing Step 6: customer provisioning is identity bookkeeping only. It
+    // resolves no entitlement, never touches subscriptions or users, grants
+    // nothing, and its only write target is billing_customers.
+    const customersCore = codeOnly(read(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'customers.ts'));
+    assert.doesNotMatch(customersCore, /resolveEntitlements|getEntitlements|FREE_ENTITLEMENTS/);
+    assert.doesNotMatch(customersCore, /canAccessAutomation|grantsExecution:\s*true|entitlementsChanged:\s*true/);
+    assert.doesNotMatch(customersCore, /paymentConfirmed/);
+    assert.doesNotMatch(customersCore, /\b(UPDATE|INSERT\s+INTO|DELETE\s+FROM)\s+(subscriptions|users|billing_provider_events|billing_provider_plans|billing_pricing_snapshots)\b/i);
+    // (`ON CONFLICT … DO UPDATE SET` is the same statement's upsert clause.)
+    const customerWrites = [...customersCore.matchAll(/\b(?<!DO\s)(?:UPDATE|INSERT\s+INTO|DELETE\s+FROM)\s+(\w+)/gi)].map((m) => m[1]);
+    assert.deepEqual(customerWrites, ['billing_customers'], 'exactly one write statement, into billing_customers');
+    assert.match(customersCore, /ON CONFLICT \(provider, user_id\) DO UPDATE/);
+    assert.match(customersCore, /WHERE billing_customers\.status = 'unprovisioned'/, 'a provisioned row is never overwritten');
 
     // The PR #7 sync service may move status only through the canonical
     // mapping — it never writes `plan`, never resolves an entitlement and
