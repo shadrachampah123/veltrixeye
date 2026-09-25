@@ -130,7 +130,10 @@ test('MODEL C: registration provisions no billing row and the first checkout cre
   );
 
   // First commercial checkout: the one path that derives epoch + pinned FX
-  // pricing and writes the subscription with its immutable lock.
+  // pricing and writes the subscription with its immutable lock — snapshot,
+  // sold row and lock in ONE transaction.
+  const snapshots = () => db.pool.query('SELECT count(*)::int AS c FROM billing_pricing_snapshots');
+  const snapshotsBefore = (await snapshots()).rows[0].c;
   const result = await checkout(cookie);
   assert.equal(result.statusCode, 200, result.body);
   assert.equal(result.json().pricing.providerPlanId, facts.epoch.provider_plan_id);
@@ -140,17 +143,50 @@ test('MODEL C: registration provisions no billing row and the first checkout cre
   assert.equal(rows.rows[0].provider, 'paystack');
   assert.equal(rows.rows[0].provider_state, 'pending');
   assert.ok(rows.rows[0].locked_pricing_snapshot_id, 'the immutable pricing lock is created with the row');
+  assert.equal((await snapshots()).rows[0].c, snapshotsBefore + 1, 'exactly one pricing snapshot for the sale');
   const stored = await new BillingPricingSnapshotStore(db.pool).findById(rows.rows[0].locked_pricing_snapshot_id);
   assert.deepEqual(verifyPricingSnapshot(stored?.snapshot), result.json().pricing);
   // The lock is a pricing fact, never a confirmation: still free, still unconfirmed.
   const after = await app.inject({ method: 'GET', url: '/api/billing/me', headers: { cookie } });
   assert.equal(after.json().providerStatus.paymentConfirmed, false);
   assert.equal(after.json().entitlements.canAccessScanner, false);
-  // The retry is idempotent and creates no second row.
+  // The retry is idempotent and creates no second row and no second snapshot.
   const retry = await checkout(cookie);
   assert.equal(retry.statusCode, 200, retry.body);
   assert.deepEqual(retry.json(), result.json());
   assert.equal((await read()).rowCount, 1);
+  assert.equal((await snapshots()).rows[0].c, snapshotsBefore + 1, 'the retry re-prices nothing');
+  assert.deepEqual(
+    (await db.pool.query('SELECT locked_pricing_snapshot_id FROM subscriptions WHERE user_id=$1', [user.id])).rows[0],
+    { locked_pricing_snapshot_id: rows.rows[0].locked_pricing_snapshot_id },
+    'the immutable lock is unchanged by the retry',
+  );
+});
+
+test('parallel first checkouts leave one subscription, one snapshot and one lock', async () => {
+  await insertEpoch(db.pool);
+  await insertEpoch(db.pool, { plan: 'elite' });
+  const user = await authenticatedUser();
+  const snapshots = () => db.pool.query('SELECT count(*)::int AS c FROM billing_pricing_snapshots');
+  const snapshotsBefore = (await snapshots()).rows[0].c;
+  // Six simultaneous first checkouts over the HTTP boundary, half of them
+  // pricing a different plan than the others.
+  const results = await Promise.all(Array.from({ length: 6 }, (_, n) => checkout(
+    user.cookie, n % 2 ? PRO_MONTHLY : { cataloguePlan: 'elite', interval: 'monthly' },
+  )));
+  const [winner] = results;
+  for (const result of results) {
+    assert.equal(result.statusCode, 200, result.body);
+    assert.deepEqual(result.json(), winner!.json());
+  }
+  const rows = await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id]);
+  assert.equal(rows.rowCount, 1, 'exactly one winning commercial subscription');
+  assert.ok(rows.rows[0].locked_pricing_snapshot_id);
+  // No orphaned candidate snapshot: the losing attempts' pricing decisions are
+  // discarded with their own transactions, so only the winner's survives.
+  assert.equal((await snapshots()).rows[0].c, snapshotsBefore + 1, 'exactly one pricing snapshot survives');
+  const stored = await new BillingPricingSnapshotStore(db.pool).findById(rows.rows[0].locked_pricing_snapshot_id);
+  assert.deepEqual(verifyPricingSnapshot(stored?.snapshot), winner!.json().pricing);
 });
 
 test('legacy NULL-lock rows stay fail-closed with pricing_lock_required and are never upgraded', async () => {

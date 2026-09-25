@@ -39,8 +39,13 @@
 > with no row IS the free state (`free` / `active` / `paymentConfirmed: false`,
 > free entitlements, no automation); the first commercial checkout is the ONE
 > path that derives the active provider-plan epoch and its pinned FX price and
-> writes the sold subscription together with its immutable pricing lock,
-> atomically, still arbitrated by `UNIQUE (user_id)`. The lock stays a pricing
+> writes the pricing snapshot, the sold subscription and the immutable pricing
+> lock **together, in one database transaction** (one client, one `COMMIT`),
+> still arbitrated by `UNIQUE (user_id)`. Nothing of a failed attempt survives
+> — a refusal after the snapshot is written rolls the snapshot back with the
+> subscription and the lock — and a checkout that loses the concurrent
+> `UNIQUE (user_id)` race discards its candidate snapshot instead of leaving it
+> unlinked. The lock stays a pricing
 > fact: not payment confirmation, not entitlement activation, not execution
 > authorization. Pre-existing rows with a NULL lock remain fail-closed
 > (`pricing_lock_required`) with no remediation path in this change, and the
@@ -446,17 +451,30 @@ user with no subscriptions row        → free fallback: plan 'free', status 'ac
                                         paymentConfirmed false, FREE entitlements,
                                         canAccessAutomation false, no provider
 first commercial checkout             → active provider-plan epoch + pinned FX price
-                                        → pricing snapshot + sold subscription + immutable
-                                          pricing lock, atomically, under UNIQUE (user_id)
+                                        → ONE transaction (one client, one COMMIT):
+                                            pricing snapshot + sold subscription +
+                                            immutable pricing lock
+                                        → failed attempt: none of the three is committed
+                                        → lost UNIQUE (user_id) race: the candidate
+                                          snapshot is discarded; the winner's lock wins
 existing NULL-lock row                → pricing_lock_required (fail closed, unchanged)
 ```
+
+**Atomicity is a property of one transaction, not of application ordering.**
+The pricing *decision* is derived before the transaction opens (epoch + FX
+**reads** only). The pricing *snapshot row* is then INSERTed inside
+`obtainLock()` — on that transaction's own `PoolClient`, immediately before the
+subscription row that locks it — so the snapshot INSERT and the subscription
+INSERT/lock are the same unit of work for the database. No snapshot of this
+sale is written on the pool, and none is written before `BEGIN`.
 
 | Rule | Where it lives |
 | --- | --- |
 | Registration creates the user exactly as before — same single INSERT, same transaction, same unique-email conflict mapping, same `users.plan` default — and **no billing state** (no `subscriptions` row, no `billing_customers` row, no pricing snapshot, no provider call) | `packages/core/src/auth/users.ts`. There is no billing, FX or provider import in that module |
 | A **missing** `subscriptions` row IS the supported free state: `plan: 'free'`, `status: 'active'`, `paymentConfirmed: false`, `FREE_ENTITLEMENTS`, `canAccessAutomation: false`, `providerStatus = { provider: null, providerState: null, paymentConfirmed: false }`, and `subscription.id = ''` (nothing was ever sold, so there is no commercial identity to report) | `getBillingState` (`packages/core/src/billing/subscriptions.ts`) and every entitlement reader — `resolveEntitlements('free', 'active', null)`. No row is invented to represent free access |
-| The **only** commercial creation path is the first `BillingCheckoutService.checkout()` for a row-less user: it derives the active provider-plan epoch, pins the epoch's FX version/amount into a pricing snapshot, INSERTs the sold subscription with `provider = 'paystack'`, `provider_state = 'pending'` and `locked_pricing_snapshot_id = <snapshot>`, and commits — one transaction | `packages/core/src/billing/checkout.ts` (`obtainLock`, `ON CONFLICT (user_id) DO NOTHING`). Pricing authority stays in `pricing.ts`/`provider-plans.ts`; nothing is recomputed here |
-| **Concurrency arbitration is the database's**, not the service's: `UNIQUE (user_id)` (`subscriptions_user_id_idx`, 0014) decides which racing first checkout creates the row; the loser re-reads the committed winner and uses ITS lock. `FOR UPDATE` cannot lock an absent row, so the INSERT is the arbiter | as before — unchanged by Model C |
+| The **only** commercial creation path is the first `BillingCheckoutService.checkout()` for a row-less user: it derives the active provider-plan epoch, pins the epoch's FX version/amount into a pricing decision, then — inside ONE transaction — INSERTs that decision's pricing snapshot and the sold subscription (`provider = 'paystack'`, `provider_state = 'pending'`, `locked_pricing_snapshot_id = <snapshot>`), and COMMITs. Snapshot, subscription and lock commit together or not at all | `packages/core/src/billing/checkout.ts` (`obtainLock`, `ON CONFLICT (user_id) DO NOTHING`). Pricing authority stays in `pricing.ts`/`provider-plans.ts`; nothing is recomputed here |
+| **The snapshot INSERT rides the subscription/lock transaction.** The decision is computed before `BEGIN` (epoch + FX reads only); `obtainLock()` then writes it with `new BillingPricingSnapshotStore(client).create(...)` on the transaction's own client, wrapped in a `SAVEPOINT`. Any failure after that INSERT — subscription refusal, a NULL-lock winner, a pricing-verification refusal, a rollback — `ROLLBACK`s the snapshot with everything else, so no unlinked append-only pricing decision is left behind | `packages/core/src/billing/checkout.ts` (`obtainLock`); covered by the rollback and concurrency tests in `packages/core/test/billing-checkout.test.ts` |
+| **Concurrency arbitration is the database's**, not the service's: `UNIQUE (user_id)` (`subscriptions_user_id_idx`, 0014) decides which racing first checkout creates the row; the loser re-reads the committed winner and uses ITS lock. `FOR UPDATE` cannot lock an absent row, so the INSERT is the arbiter. Because the snapshot is written inside that same transaction, the loser also `ROLLBACK TO SAVEPOINT`s its own candidate snapshot: concurrent first checkouts leave exactly one subscription, one snapshot and one lock, whether they priced the same plan or different ones | as before — unchanged by Model C; the losing candidate is now discarded with its attempt |
 | The **client supplies the catalogue plan and interval only**. It cannot supply a snapshot, an amount, an FX rate, a provider plan id, a user id or a callback/return authority: the request body is `.strict()` on `{ cataloguePlan ∈ {pro, elite}, interval ∈ {monthly, annual} }`, and the provider call is built entirely from the locked snapshot | `billingCheckoutInputSchema` + `billingCheckoutRequestSchema` |
 | **The pricing lock is a pricing/quote fact — and nothing else.** It is written when the commercial subscription is created, and it is **not** payment confirmation, **not** entitlement activation and **not** execution authorization: the checkout response buys nothing, `paymentConfirmed` stays `false`, and the provider-backed row resolves to `FREE_ENTITLEMENTS` | migration 0032 + `resolveEntitlements` |
 | **The lock is immutable.** Migration 0032's `subscriptions_locked_pricing_immutable` trigger refuses repointing, re-rating AND clearing: `NULL` → non-NULL can never be written after creation. A price change applies to NEW subscriptions only | migration 0032 (**unchanged by Model C; 0001–0033 are byte-identical**) |

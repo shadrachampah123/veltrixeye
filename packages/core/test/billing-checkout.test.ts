@@ -18,6 +18,13 @@ let db: Awaited<ReturnType<typeof startBillingTestDb>>;
 let calls: BillingCheckoutRequest[];
 let service: BillingCheckoutService;
 const reason = (expected: string) => (error: unknown) => (error as { reason?: string }).reason === expected;
+/** Every pricing decision ever persisted, linked or not. */
+const snapshotCount = async () => (await db.pool.query('SELECT count(*)::int AS c FROM billing_pricing_snapshots')).rows[0].c as number;
+/** Pricing decisions no sold subscription points at — the orphan the blocker left. */
+const orphanSnapshotCount = async () => (await db.pool.query(
+  'SELECT count(*)::int AS c FROM billing_pricing_snapshots s'
+  + ' WHERE NOT EXISTS (SELECT 1 FROM subscriptions x WHERE x.locked_pricing_snapshot_id = s.id)',
+)).rows[0].c as number;
 before(async () => { db = await startBillingTestDb(5491); }, { timeout: 180_000 });
 after(async () => { await db?.stop(); });
 beforeEach(async () => {
@@ -123,10 +130,15 @@ test('MODEL C: registration creates no subscription row; the free fallback is th
   // ...and the FIRST commercial checkout is the one path that creates the sold
   // subscription together with its immutable pricing lock, atomically.
   const facts = await insertEpoch(db.pool);
+  const snapshotsBefore = await snapshotCount();
   const session = await service.checkout(user.id, PRO_MONTHLY);
   assert.deepEqual(session.pricing, deriveSnapshot(facts));
   const created = await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id]);
   assert.equal(created.rowCount, 1, 'exactly one commercial subscription');
+  assert.equal(
+    await snapshotCount(), snapshotsBefore + 1,
+    'exactly one pricing snapshot is persisted, and it is the one the sale locked',
+  );
   assert.equal(created.rows[0].plan, 'pro');
   assert.equal(created.rows[0].provider, 'paystack');
   assert.equal(created.rows[0].provider_state, 'pending');
@@ -147,11 +159,13 @@ test('NULL lock refuses before epoch lookup and leaves the entire subscription u
   // it stays fail-closed and is never upgraded by checkout.
   await createFreeSubscription(db.pool, user.id);
   const read = () => db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id]);
+  const snapshotsBefore = await snapshotCount();
   const before = await read();
   const find = mock.method(BillingProviderPlanStore.prototype, 'findActive', async () => { throw new Error('must not price'); });
   try {
     await assert.rejects(service.checkout(user.id, PRO_MONTHLY), reason('pricing_lock_required'));
     assert.deepEqual((await read()).rows, before.rows);
+    assert.equal(await snapshotCount(), snapshotsBefore, 'the NULL-lock refusal prices nothing');
     assert.equal(find.mock.callCount(), 0);
     assert.equal(calls.length, 0);
   } finally { find.mock.restore(); }
@@ -190,23 +204,26 @@ test('an existing lock does not consult active epochs or FX at all', async () =>
   } finally { find.mock.restore(); }
 });
 
-test('concurrent absent-row checkouts with different candidates use one winning immutable lock', async () => {
+test('concurrent absent-row checkouts with different candidates use one winning immutable lock and leave no orphaned snapshot', async () => {
   await insertEpoch(db.pool);
   await insertEpoch(db.pool, { plan: 'elite' });
   const user = await insertUser(db.pool);
-  // Barrier ensures every request has independently persisted its candidate
-  // BEFORE any transaction tries to INSERT (a real UNIQUE(user_id) race).
-  const original = BillingPricingSnapshotStore.prototype.create;
+  const snapshotsBefore = await snapshotCount();
+  const orphansBefore = await orphanSnapshotCount();
+  // Barrier on the PRICING DERIVATION, before any transaction exists: every
+  // request has independently derived its candidate (three price Pro/monthly,
+  // three price Elite/monthly) BEFORE any of them tries to INSERT, so this is
+  // a real UNIQUE(user_id) race between six simultaneous first checkouts.
+  const original = BillingProviderPlanStore.prototype.findActive;
   let ready = 0;
   let release!: () => void;
   const barrier = new Promise<void>((resolve) => { release = resolve; });
-  const create = mock.method(BillingPricingSnapshotStore.prototype, 'create', async function (
-    this: BillingPricingSnapshotStore, ...args: Parameters<typeof original>
+  const findActive = mock.method(BillingProviderPlanStore.prototype, 'findActive', async function (
+    this: BillingProviderPlanStore, ...args: Parameters<typeof original>
   ) {
-    const result = await original.apply(this, args);
     if (++ready === 6) release();
     await barrier;
-    return result;
+    return original.apply(this, args);
   });
   try {
     const results = await Promise.all(Array.from({ length: 6 }, (_, n) => service.checkout(user.id, {
@@ -214,10 +231,72 @@ test('concurrent absent-row checkouts with different candidates use one winning 
     })));
     for (const result of results) assert.deepEqual(result, results[0]);
     const rows = await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id]);
-    assert.equal(rows.rowCount, 1);
+    assert.equal(rows.rowCount, 1, 'exactly one winning commercial subscription');
     assert.equal(calls.length, 6);
-    assert.equal(ready, 6);
-  } finally { create.mock.restore(); }
+    assert.equal(ready, 6, 'every candidate was derived before any INSERT');
+    // ATOMICITY: the five losing candidates are discarded together with their
+    // own attempts. The only pricing decision that survives is the winner's,
+    // and it is exactly the one the immutable lock points at: no unlinked
+    // append-only snapshot is left behind by a losing checkout.
+    assert.equal(await snapshotCount(), snapshotsBefore + 1, 'exactly one pricing snapshot survives the race');
+    assert.equal(await orphanSnapshotCount(), orphansBefore, 'no new unlinked pricing decision');
+    const stored = await new BillingPricingSnapshotStore(db.pool).findById(rows.rows[0].locked_pricing_snapshot_id);
+    assert.deepEqual(stored?.snapshot, results[0]!.pricing, 'the lock points at the surviving snapshot');
+    assert.ok(['pro', 'elite'].includes(stored!.snapshot.cataloguePlan));
+  } finally { findActive.mock.restore(); }
+});
+
+test('a database failure after the snapshot INSERT rolls snapshot, subscription and lock back together', async () => {
+  await insertEpoch(db.pool);
+  const user = await insertUser(db.pool);
+  const snapshotsBefore = await snapshotCount();
+  // A REAL database failure, injected at the point the blocker cares about:
+  // the snapshot row already exists inside the transaction and the sold
+  // subscription INSERT is then refused by a temporary AFTER INSERT trigger.
+  // Test-only object: no migration, no product object, dropped below.
+  await db.pool.query(`CREATE FUNCTION billing_test_refuse_sale() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected: sold subscription refused'; END $$;`);
+  await db.pool.query(`CREATE TRIGGER billing_test_refuse_sale AFTER INSERT ON subscriptions
+    FOR EACH ROW EXECUTE FUNCTION billing_test_refuse_sale();`);
+  try {
+    await assert.rejects(service.checkout(user.id, PRO_MONTHLY), /injected: sold subscription refused/);
+  } finally {
+    await db.pool.query('DROP TRIGGER IF EXISTS billing_test_refuse_sale ON subscriptions');
+    await db.pool.query('DROP FUNCTION IF EXISTS billing_test_refuse_sale()');
+  }
+  assert.equal(
+    (await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id])).rowCount, 0,
+    'no commercial subscription survives the failed transaction',
+  );
+  assert.equal(
+    (await db.pool.query(
+      'SELECT count(*)::int AS c FROM subscriptions WHERE user_id=$1 AND locked_pricing_snapshot_id IS NOT NULL',
+      [user.id],
+    )).rows[0].c, 0, 'no pricing lock survives',
+  );
+  assert.equal(await snapshotCount(), snapshotsBefore, 'the snapshot INSERT was rolled back with it');
+  assert.equal(calls.length, 0);
+});
+
+test('a refusal after BOTH writes and before COMMIT still discards the snapshot', async () => {
+  await insertEpoch(db.pool);
+  const user = await insertUser(db.pool);
+  const snapshotsBefore = await snapshotCount();
+  // The in-transaction re-read of the persisted snapshot runs AFTER the
+  // snapshot INSERT and the subscription INSERT and BEFORE COMMIT: refusing it
+  // proves both already-written rows are discarded, not merely left unlinked.
+  const findById = mock.method(BillingPricingSnapshotStore.prototype, 'findById', async () => {
+    throw new Error('injected: persisted snapshot refused before COMMIT');
+  });
+  try {
+    await assert.rejects(service.checkout(user.id, PRO_MONTHLY), /injected: persisted snapshot refused before COMMIT/);
+  } finally { findById.mock.restore(); }
+  assert.equal(
+    (await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id])).rowCount, 0,
+    'the sold subscription is gone',
+  );
+  assert.equal(await snapshotCount(), snapshotsBefore, 'the snapshot is gone with it');
+  assert.equal(calls.length, 0);
 });
 
 test('a concurrent free-subscription INSERT wins without any NULL-lock mutation', async () => {
@@ -225,6 +304,7 @@ test('a concurrent free-subscription INSERT wins without any NULL-lock mutation'
   // row wins the UNIQUE(user_id) race and the checkout fails closed.
   await insertEpoch(db.pool);
   const user = await insertUser(db.pool);
+  const snapshotsBefore = await snapshotCount();
   const original = BillingPricingSnapshotStore.prototype.create;
   const create = mock.method(BillingPricingSnapshotStore.prototype, 'create', async function (
     this: BillingPricingSnapshotStore, ...args: Parameters<typeof original>
@@ -238,6 +318,9 @@ test('a concurrent free-subscription INSERT wins without any NULL-lock mutation'
     assert.equal(calls.length, 0);
     const result = await db.pool.query('SELECT plan, locked_pricing_snapshot_id, state_version FROM subscriptions WHERE user_id=$1', [user.id]);
     assert.deepEqual(result.rows[0], { plan: 'free', locked_pricing_snapshot_id: null, state_version: 1 });
+    // The candidate this attempt priced is discarded with the failed sale: the
+    // losing checkout leaves no unlinked snapshot behind it either.
+    assert.equal(await snapshotCount(), snapshotsBefore);
   } finally { create.mock.restore(); }
 });
 
@@ -256,11 +339,19 @@ test('a sneaked excluded epoch never persists a checkout authorization', async (
 });
 
 test('rejects starter, unknown interval and client pricing/callback/user fields', async () => {
+  await insertEpoch(db.pool);
   const user = await insertUser(db.pool);
   for (const input of [
     { ...PRO_MONTHLY, cataloguePlan: 'starter' }, { ...PRO_MONTHLY, interval: 'weekly' },
     { ...PRO_MONTHLY, callbackUrl: 'https://evil.example.test' }, { ...PRO_MONTHLY, userId: randomUUID() },
     { ...PRO_MONTHLY, amount: 1 },
+    // The client cannot supply the pricing decision itself — not the snapshot,
+    // not the FX facts, not the amount, not the provider plan identity.
+    { ...PRO_MONTHLY, pricing: { paymentAmountMinor: 1 } },
+    { ...PRO_MONTHLY, lockedPricingSnapshotId: randomUUID() },
+    { ...PRO_MONTHLY, fxRateScaled: 1, fxRateScale: 6 },
+    { ...PRO_MONTHLY, providerPlanId: 'PLN_client_supplied' },
+    { ...PRO_MONTHLY, payment: { paymentAmountMinor: 1, paymentCurrency: 'GHS', paymentAmountExponent: 2 } },
   ]) await assert.rejects(service.checkout(user.id, input));
   assert.equal(calls.length, 0);
 });
@@ -281,6 +372,13 @@ test('epoch pricing is the only calculation seam; no subscription UPDATE, DELETE
   assert.doesNotMatch(source, /priceCommercialPlan|Date\.now|randomUUID|UPDATE subscriptions|DELETE FROM subscriptions/);
   assert.match(source, /WHERE id = \$1.*epoch\.fxRateVersionId/);
   assert.match(source, /ON CONFLICT \(user_id\) DO NOTHING/);
+  // ATOMICITY: the snapshot is persisted inside the subscription/lock
+  // transaction, on that transaction's own client — never on the pool, and
+  // never before the transaction opens.
+  assert.doesNotMatch(source, /new BillingPricingSnapshotStore\(db\)\.create\(/);
+  assert.match(source, /new BillingPricingSnapshotStore\(client\)\.create\(/);
+  assert.match(source, /SAVEPOINT billing_pricing_snapshot/);
+  assert.match(source, /ROLLBACK TO SAVEPOINT billing_pricing_snapshot/);
   const persistence = readFileSync(new URL('../src/billing/snapshots.ts', import.meta.url), 'utf8');
   assert.match(persistence, /pricingIdempotencyKey\(s\)/);
   assert.match(persistence, /ON CONFLICT \(idempotency_key\) DO NOTHING/);
