@@ -35,14 +35,14 @@ import {
   type RealtimeCandleStream,
   type RealtimeSubscription,
 } from '@veltrixeye/contracts';
-import { CandleStore, verifyPricingSnapshot } from '@veltrixeye/core';
+import { CandleStore, getEntitlements, verifyPricingSnapshot } from '@veltrixeye/core';
 import { createPaystackProvider } from '@veltrixeye/provider-paystack';
 import { buildApp, createAppContext } from '../src/app.js';
 import { loadConfig, type AppConfig } from '../src/config.js';
 import { paystackCustomerDirectory, paystackPlanDirectory } from '../src/billing-composition.js';
 import {
-  AS_OF, PRO_MONTHLY, deriveSnapshot, insertEpoch, insertUser, retireActiveEpochs,
-  startBillingTestDb,
+  AS_OF, PRO_MONTHLY, activateSeededSubscription, deriveSnapshot, insertEpoch, insertUser,
+  retireActiveEpochs, seedCommercialSubscription, seedPaymentEvidence, startBillingTestDb,
 } from '../../../packages/core/test/helpers/billing-checkout.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -203,7 +203,23 @@ async function makeHistorical(userId: string, plan: string, status: string): Pro
 /** Rewrite/seed an existing subscription row as a provider-backed checkout row. */
 async function makeProviderBacked(
   userId: string, plan: string, status: string, providerState: string | null,
+  options: { activated?: boolean } = {},
 ): Promise<void> {
+  if (options.activated === true) {
+    // The paid case is not a row shape: it is the whole Step-8 chain — a locked
+    // commercial subscription, its verified sandbox evidence and the immutable
+    // activation FACT. Only the fact authorizes the paid entitlement, so it is
+    // seeded through the same coherent helpers the core suites use.
+    assert.equal(status, 'active', 'a seeded activation is written on an active row');
+    const commercial = await seedCommercialSubscription(db.pool, userId, {
+      cataloguePlan: plan === 'premium' ? 'elite' : 'pro',
+      interval: 'monthly',
+      providerState,
+    });
+    const evidence = await seedPaymentEvidence(db.pool, userId, commercial);
+    await activateSeededSubscription(db.pool, userId, commercial, evidence);
+    return;
+  }
   await db.pool.query(
     `INSERT INTO subscriptions (user_id, plan, status, provider, provider_state)
      VALUES ($1, $2, $3, 'paystack', $4)
@@ -401,18 +417,88 @@ describe('GET /api/billing/me — provider-backed rows are never a confirmed sub
     }
   });
 
-  test('the response cannot claim a confirmed payment', async () => {
-    assert.ok(
-      !billingStateDtoSchema.safeParse({
-        subscription: {
-          id: '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d', plan: 'pro', status: 'active',
-          currentPeriodEnd: null, cancelAtPeriodEnd: false,
-        },
-        entitlements: FREE_LIMITS,
-        providerStatus: { provider: 'paystack', providerState: 'active', paymentConfirmed: true },
-      }).success,
-      'paymentConfirmed is pinned to false by the contract',
-    );
+  test('paymentConfirmed is a derived boolean, not a client-supplied claim', async () => {
+    // The field is a real boolean on the DTO: `true` is REPRESENTABLE, because
+    // an operator-authorized activation fact is a legitimate state. What the
+    // contract refuses is anything that is not a boolean — a client can never
+    // hand the read side a confirmation.
+    const shape = (paymentConfirmed: unknown) => billingStateDtoSchema.safeParse({
+      subscription: {
+        id: '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d', plan: 'pro', status: 'active',
+        currentPeriodEnd: null, cancelAtPeriodEnd: false,
+      },
+      entitlements: FREE_LIMITS,
+      providerStatus: { provider: 'paystack', providerState: 'active', paymentConfirmed },
+    });
+    assert.equal(shape(true).success, true, 'a confirmed payment is representable');
+    assert.equal(shape(false).success, true);
+    assert.equal(shape('yes').success, false, 'a non-boolean is refused');
+    assert.equal(shape(null).success, false, 'an absent confirmation is refused');
+    assert.equal(shape(1).success, false);
+  });
+
+  test('an activation fact is the only thing that confirms a payment', async () => {
+    for (const [plan, providerState] of [
+      ['pro', 'pending'], ['pro', 'active'], ['premium', 'pending'], ['premium', 'active'],
+    ] as const) {
+      const { cookie, userId } = await register();
+      await makeProviderBacked(userId, plan, 'active', providerState, { activated: true });
+      const state = await billingMe(cookie);
+      assert.equal(
+        state.providerStatus.paymentConfirmed, true,
+        `${plan}/provider_state=${providerState} is confirmed by its activation fact`,
+      );
+      // The paid entitlement is the plan matrix, resolved through the same
+      // resolver every other reader uses — never a provider state.
+      assert.deepEqual(state.entitlements, getEntitlements(plan, 'active'));
+      assert.equal(state.entitlements.canAccessScanner, true);
+      assert.notDeepEqual(state.entitlements, FREE_LIMITS);
+      // Activation grants capability, never execution.
+      assert.equal(state.entitlements.canAccessAutomation, false);
+      // The stored values are still reported as they are.
+      assert.equal(state.subscription.plan, plan);
+      assert.equal(state.providerStatus.provider, 'paystack');
+      assert.equal(state.providerStatus.providerState, providerState);
+    }
+  });
+
+  test('the same row without the fact stays unconfirmed and free', async () => {
+    // The control for the case above: identical row shape, identical provider
+    // state, no activation fact — and therefore nothing above the free tier.
+    for (const [plan, providerState] of [
+      ['pro', 'pending'], ['pro', 'active'], ['premium', 'active'],
+    ] as const) {
+      const { cookie, userId } = await register();
+      await makeProviderBacked(userId, plan, 'active', providerState);
+      const state = await billingMe(cookie);
+      assert.equal(state.providerStatus.paymentConfirmed, false);
+      assert.deepEqual(state.entitlements, FREE_LIMITS);
+    }
+  });
+
+  test('no HTTP route can activate a subscription or read its facts', async () => {
+    // Activation is an out-of-band, DB-connected operator action (the
+    // `billing:activate` CLI). There is deliberately no route, no admin role
+    // and no operator endpoint: a client can never authorize a paid
+    // entitlement, and never read who did.
+    const { cookie } = await register();
+    const probes: Array<[string, string]> = [
+      ['post', '/api/billing/activate'],
+      ['post', '/api/billing/activations'],
+      ['post', '/api/billing/subscription/activate'],
+      ['post', '/api/billing/subscriptions/activate'],
+      ['put', '/api/billing/activate'],
+      ['patch', '/api/billing/me/paymentConfirmed'],
+      ['get', '/api/billing/activations'],
+      ['get', '/api/billing/activation'],
+    ];
+    for (const [method, url] of probes) {
+      const res = await app.inject({
+        method: method as 'post', url, headers: { cookie, 'x-forwarded-for': freshIp() },
+        payload: method === 'get' ? undefined : { operatorId: 'ops', reason: 'please' },
+      });
+      assert.equal(res.statusCode, 404, `${method.toUpperCase()} ${url} must not exist`);
+    }
   });
 });
 

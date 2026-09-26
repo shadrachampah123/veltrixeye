@@ -1,31 +1,41 @@
 /**
- * READ-SIDE ENTITLEMENT HARDENING — a provider-backed subscription fails closed.
+ * READ-SIDE ENTITLEMENT HARDENING — a provider-backed subscription fails closed
+ * until an operator activates it.
  *
  * The gap this pins: `BillingCheckoutService` INSERTs a subscription row with
  * `provider='paystack'`, `status='active'` and `provider_state='pending'` at
- * checkout INITIALIZATION — before any money has moved. This build has no
- * payment-confirmation authority (no webhook receiver, no signature
- * verification, no transaction verification), so `plan='pro' + status='active'`
- * alone used to hand an unpaid checkout the full paid entitlement set.
+ * checkout INITIALIZATION — before any money has moved. `plan='pro' +
+ * status='active'` alone therefore used to hand an unpaid checkout the full
+ * paid entitlement set.
  *
  * The fix is a single resolver beside the entitlement layer
  * (`src/billing/entitlement-resolution.ts`):
  *
- *   provider IS NULL      → getEntitlements(plan, status)   (history preserved)
- *   provider IS NOT NULL  → FREE_ENTITLEMENTS               (fail closed)
+ *   provider IS NULL, not activated → getEntitlements(plan, status)  (history preserved)
+ *   provider IS NULL, activated     → FREE_ENTITLEMENTS              (incoherent: fail closed)
+ *   provider IS NOT NULL, no fact   → FREE_ENTITLEMENTS              (evidence is not authority)
+ *   provider IS NOT NULL, fact      → getEntitlements(plan, status)  (the activation authority)
+ *
+ * Billing Step 8 adds the missing authority: an immutable ACTIVATION FACT
+ * (`billing_subscription_activations`, migration 0034) written out of band by
+ * an operator through `BillingActivationService`. Verified payment evidence
+ * (0033) alone still grants nothing; the fact is the only thing that widens a
+ * provider-backed row to its paid tier, and it can never grant execution.
  *
  * What is asserted here:
- *  1. the resolver itself, over every plan × status × provider state;
+ *  1. the resolver itself, over every plan × status × provider × activation;
  *  2. `getBillingState` — historical paid rows keep their entitlements, and
- *     provider-backed rows get the free tier for EVERY provider state;
+ *     provider-backed rows get the free tier for EVERY provider state until an
+ *     activation fact exists, at which point they get their paid tier and
+ *     `paymentConfirmed` becomes true;
  *  3. `AutomationService.readState` — `canAccessAutomation` stays false, and a
  *     provider-backed premium row resolves to the free tier;
  *  4. one real limit-enforcing reader (`StrategyService.createStrategy`) to
  *     prove the gate is wired into a transactional service, not just a helper;
  *  5. static boundaries — `entitlements.ts` stays provider-agnostic, the
  *     resolver introduces no second matrix, every production reader selects
- *     `provider`, no migration was added, and the checkout/pricing-lock shape
- *     is untouched.
+ *     `provider` AND the activation state, the checkout/pricing-lock shape is
+ *     untouched, and 0034 is the only added migration.
  *
  * Nothing here invents a payment confirmation, and nothing here changes
  * checkout, pricing, the Paystack adapter or any execution safety gate.
@@ -53,7 +63,10 @@ import {
   getEntitlements,
   resolveEntitlements,
 } from '../src/index.js';
-import { insertUser, startBillingTestDb } from './helpers/billing-checkout.js';
+import {
+  activateSeededSubscription, insertUser, seedActivatedSubscription,
+  seedCommercialSubscription, seedPaymentEvidence, startBillingTestDb,
+} from './helpers/billing-checkout.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CORE_SRC = path.resolve(HERE, '..', 'src');
@@ -129,7 +142,7 @@ describe('resolveEntitlements — provider IS NULL preserves the existing matrix
     for (const plan of USER_PLANS) {
       for (const status of [...LIVE_STATUSES, ...LAPSED_STATUSES, 'anything-else', '']) {
         assert.deepEqual(
-          resolveEntitlements(plan, status, null),
+          resolveEntitlements(plan, status, null, false),
           getEntitlements(plan, status),
           `${plan}/${status} with provider NULL must be unchanged`,
         );
@@ -140,31 +153,45 @@ describe('resolveEntitlements — provider IS NULL preserves the existing matrix
   it('keeps the paid tiers for historical live subscriptions', () => {
     for (const plan of PAID_PLANS) {
       for (const status of LIVE_STATUSES) {
-        const entitlements = resolveEntitlements(plan, status, null);
+        const entitlements = resolveEntitlements(plan, status, null, false);
         assert.equal(entitlements.canAccessScanner, true, `${plan}/${status} keeps scanner access`);
         assert.equal(entitlements.canAccessAdvancedStrategies, true);
         assert.equal(entitlements.canAccessAdvancedAlerts, true);
         assert.deepEqual(entitlements, getEntitlements(plan, status));
       }
     }
-    assert.equal(resolveEntitlements('pro', 'active', null).maxStrategies, 500);
-    assert.equal(resolveEntitlements('premium', 'active', null).maxStrategies, 1000);
+    assert.equal(resolveEntitlements('pro', 'active', null, false).maxStrategies, 500);
+    assert.equal(resolveEntitlements('premium', 'active', null, false).maxStrategies, 1000);
   });
 
   it('keeps the existing free fallback for lapsed historical subscriptions', () => {
     for (const plan of PAID_PLANS) {
       for (const status of LAPSED_STATUSES) {
-        assert.deepEqual(resolveEntitlements(plan, status, null), FREE_ENTITLEMENTS);
+        assert.deepEqual(resolveEntitlements(plan, status, null, false), FREE_ENTITLEMENTS);
       }
     }
-    assert.deepEqual(resolveEntitlements('free', 'active', null), FREE_ENTITLEMENTS);
+    assert.deepEqual(resolveEntitlements('free', 'active', null, false), FREE_ENTITLEMENTS);
+  });
+
+  it('fails closed if an activation fact is ever claimed for a provider-null row', () => {
+    // The database refuses such a fact (0034 coherence), so a reader that sees
+    // one is looking at an incoherent state: free, never paid.
+    for (const plan of PAID_PLANS) {
+      for (const status of LIVE_STATUSES) {
+        assert.equal(
+          resolveEntitlements(plan, status, null, true),
+          FREE_ENTITLEMENTS,
+          `${plan}/${status}/activated must not escalate a non-commercial row`,
+        );
+      }
+    }
   });
 });
 
-describe('resolveEntitlements — provider IS NOT NULL is fail-closed', () => {
+describe('resolveEntitlements — provider IS NOT NULL is fail-closed until activated', () => {
   it('returns the very FREE_ENTITLEMENTS object, not a copy or a new matrix', () => {
     // Reference equality: there is exactly one definition of the free tier.
-    assert.equal(resolveEntitlements('premium', 'active', 'paystack'), FREE_ENTITLEMENTS);
+    assert.equal(resolveEntitlements('premium', 'active', 'paystack', false), FREE_ENTITLEMENTS);
     assert.equal(FREE_ENTITLEMENTS, getEntitlements('free', 'active'));
   });
 
@@ -172,7 +199,7 @@ describe('resolveEntitlements — provider IS NOT NULL is fail-closed', () => {
     for (const plan of USER_PLANS) {
       for (const status of [...LIVE_STATUSES, ...LAPSED_STATUSES]) {
         for (const provider of ['paystack', IMPOSSIBLE_PROVIDER]) {
-          const entitlements = resolveEntitlements(plan, status, provider);
+          const entitlements = resolveEntitlements(plan, status, provider, false);
           assert.equal(entitlements, FREE_ENTITLEMENTS, `${plan}/${status}/${provider}`);
           assert.equal(entitlements.canAccessScanner, false);
           assert.equal(entitlements.canAccessAdvancedStrategies, false);
@@ -187,28 +214,60 @@ describe('resolveEntitlements — provider IS NOT NULL is fail-closed', () => {
     }
   });
 
-  it('never reads provider_state: the gate is the provider column alone', () => {
-    // The resolver takes exactly three arguments — there is no provider_state
-    // parameter to misread as a confirmation.
-    assert.equal(resolveEntitlements.length, 3);
+  it('grants the plan entitlement only when an activation fact exists', () => {
+    for (const plan of PAID_PLANS) {
+      for (const status of LIVE_STATUSES) {
+        const entitlements = resolveEntitlements(plan, status, 'paystack', true);
+        assert.deepEqual(
+          entitlements,
+          getEntitlements(plan, status),
+          `${plan}/${status}/activated resolves through the same matrix`,
+        );
+        assert.equal(entitlements.canAccessAutomation, false, 'activation never grants execution');
+      }
+    }
+    // A lapsed subscription is still lapsed: an activation is not a lifecycle.
+    for (const status of LAPSED_STATUSES) {
+      assert.deepEqual(
+        resolveEntitlements('premium', status, 'paystack', true),
+        FREE_ENTITLEMENTS,
+        `an activation is not a lifecycle: ${status} stays free`,
+      );
+    }
+  });
+
+  it('never reads provider_state: the gate is the provider column plus the activation fact', () => {
+    // The resolver takes exactly four arguments — plan, status, provider and
+    // the durable activation state. There is no provider_state parameter to
+    // misread as a confirmation.
+    assert.equal(resolveEntitlements.length, 4);
   });
 
   it('fails closed when a reader forgets to select the provider column', () => {
     // `undefined` is `!== null`, so an unwired reader resolves to free rather
     // than silently escalating to a paid tier.
     const forgotten = undefined as unknown as string | null;
-    assert.equal(resolveEntitlements('premium', 'active', forgotten), FREE_ENTITLEMENTS);
+    assert.equal(resolveEntitlements('premium', 'active', forgotten, false), FREE_ENTITLEMENTS);
   });
 
-  it('leaves canAccessAutomation false for every plan, status and provider', () => {
+  it('fails closed when a reader forgets the activation state', () => {
+    // `undefined` is not `true`, so a reader that forgets to ask whether an
+    // activation fact exists can never reach a paid tier.
+    const forgotten = undefined as unknown as boolean;
+    assert.equal(resolveEntitlements('premium', 'active', 'paystack', forgotten), FREE_ENTITLEMENTS);
+  });
+
+  it('leaves canAccessAutomation false for every plan, status, provider and activation', () => {
     for (const plan of USER_PLANS) {
       for (const status of [...LIVE_STATUSES, ...LAPSED_STATUSES]) {
         for (const provider of [null, 'paystack']) {
-          assert.equal(
-            resolveEntitlements(plan, status, provider).canAccessAutomation,
-            false,
-            `${plan}/${status}/${provider}`,
-          );
+          for (const activated of [false, true]) {
+            assert.equal(
+              resolveEntitlements(plan, status, provider, activated).canAccessAutomation,
+              false,
+              `${plan}/${status}/${provider}/activated=${activated}`,
+            );
+          }
         }
       }
     }
@@ -335,9 +394,107 @@ describe('getBillingState — provider-backed subscriptions are fail-closed', ()
 
   it('fails closed for a provider value outside the modelled vocabulary', async () => {
     // `subscriptions_provider_check` pins provider to 'paystack'; the resolver
-    // is still not a whitelist, so an unexpected value cannot escalate.
-    const entitlements = resolveEntitlements('premium', 'active', IMPOSSIBLE_PROVIDER);
+    // is still not a whitelist: an unexpected value with no activation fact
+    // cannot escalate. (A provider-backed row WITH an activation fact is
+    // pinned to `paystack` by migration 0034's coherence trigger, which
+    // requires the fact's provider to equal the subscription's.)
+    const entitlements = resolveEntitlements('premium', 'active', IMPOSSIBLE_PROVIDER, false);
     assert.equal(entitlements, FREE_ENTITLEMENTS);
+  });
+
+  it('grants the paid tier and reports paymentConfirmed once an activation fact exists', async () => {
+    for (const plan of PAID_PLANS) {
+      const cataloguePlan = plan === 'pro' ? 'pro' : 'elite';
+      const user = await insertUser(pool, true);
+      const commercial = await seedCommercialSubscription(pool, user.id, { cataloguePlan });
+
+      // Before activation: a locked, provider-backed checkout is still free.
+      const before = await getBillingState(pool, user.id);
+      assert.deepEqual(before.entitlements, FREE_ENTITLEMENTS);
+      assert.equal(before.providerStatus.paymentConfirmed, false);
+
+      await activateSeededSubscription(
+        pool, user.id, commercial,
+        await seedPaymentEvidence(pool, user.id, commercial),
+      );
+
+      const after = await getBillingState(pool, user.id);
+      assert.deepEqual(
+        after.entitlements,
+        getEntitlements(plan, 'active'),
+        `${plan}/activated resolves through the plan matrix`,
+      );
+      assert.equal(after.entitlements.canAccessScanner, true);
+      assert.equal(after.entitlements.canAccessAutomation, false, 'activation never grants execution');
+      assert.equal(after.providerStatus.paymentConfirmed, true, 'derived from the durable fact');
+      assert.equal(after.providerStatus.provider, 'paystack');
+      assert.equal(after.providerStatus.providerState, 'pending', 'provider_state is untouched');
+      assert.equal(after.subscription.plan, plan, 'the stored plan is reported, never rewritten');
+      assert.ok(billingStateDtoSchema.safeParse(after).success, 'the response still validates');
+      // The activation writes nothing on the subscription row itself.
+      const row = await pool.query(
+        'SELECT plan, status, provider, provider_state FROM subscriptions WHERE user_id = $1',
+        [user.id],
+      );
+      assert.deepEqual(row.rows[0], {
+        plan, status: 'active', provider: 'paystack', provider_state: 'pending',
+      });
+      assert.equal(commercial.cataloguePlan, cataloguePlan);
+    }
+  });
+
+  it('an activation fact is a fact: a second read is identical and writes nothing', async () => {
+    const user = await insertUser(pool, true);
+    await seedActivatedSubscription(pool, user.id, { cataloguePlan: 'pro' });
+    const first = await getBillingState(pool, user.id);
+    const second = await getBillingState(pool, user.id);
+    assert.deepEqual(second.entitlements, first.entitlements);
+    assert.equal(second.providerStatus.paymentConfirmed, true);
+    const rows = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM billing_subscription_activations WHERE user_id = $1',
+      [user.id],
+    );
+    assert.equal(rows.rows[0]!.n, 1, 'reading an entitlement creates no second fact');
+  });
+
+  it('evidence alone is not authority: a verified transaction without an activation stays free', async () => {
+    const user = await insertUser(pool, true);
+    const commercial = await seedCommercialSubscription(pool, user.id, { cataloguePlan: 'pro' });
+    await seedPaymentEvidence(pool, user.id, commercial);
+    const state = await getBillingState(pool, user.id);
+    assert.deepEqual(state.entitlements, FREE_ENTITLEMENTS, 'evidence is a receipt, not an activation');
+    assert.equal(state.providerStatus.paymentConfirmed, false);
+    assert.equal(state.providerStatus.providerState, 'pending');
+    const activations = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM billing_subscription_activations WHERE user_id = $1',
+      [user.id],
+    );
+    assert.equal(activations.rows[0]!.n, 0);
+  });
+
+  it('a historical provider-null row is unchanged even next to an activation fact', async () => {
+    // Two users: one historical paid row, one activated provider-backed row.
+    // The activation of one user can never widen another user's entitlement.
+    const historical = await seededUser({ plan: 'premium', status: 'active' });
+    const activated = await insertUser(pool, true);
+    await seedActivatedSubscription(pool, activated.id, { cataloguePlan: 'elite' });
+    assert.deepEqual(
+      (await getBillingState(pool, historical)).entitlements,
+      getEntitlements('premium', 'active'),
+    );
+    assert.deepEqual(
+      (await getBillingState(pool, activated.id)).entitlements,
+      getEntitlements('premium', 'active'),
+    );
+    assert.equal(
+      (await getBillingState(pool, activated.id)).providerStatus.paymentConfirmed,
+      true,
+    );
+    assert.equal(
+      (await getBillingState(pool, historical)).providerStatus.paymentConfirmed,
+      false,
+      'a provider-null row has no activation fact and says so',
+    );
   });
 
   it('leaves the row itself untouched — reading entitlements writes nothing', async () => {
@@ -351,33 +508,45 @@ describe('getBillingState — provider-backed subscriptions are fail-closed', ()
   });
 });
 
-describe('billing-state DTO — a confirmed payment is unrepresentable', () => {
-  it('rejects paymentConfirmed: true and any extra provider field', () => {
-    const base = {
-      subscription: {
-        id: '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d',
-        plan: 'pro' as const,
-        status: 'active' as const,
-        currentPeriodEnd: null,
-        cancelAtPeriodEnd: false,
-      },
-      entitlements: FREE_ENTITLEMENTS,
-      providerStatus: { provider: 'paystack', providerState: 'pending', paymentConfirmed: false as const },
-    };
+describe('billing-state DTO — paymentConfirmed is derived, never client input', () => {
+  const base = {
+    subscription: {
+      id: '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d',
+      plan: 'pro' as const,
+      status: 'active' as const,
+      currentPeriodEnd: null,
+      cancelAtPeriodEnd: false,
+    },
+    entitlements: FREE_ENTITLEMENTS,
+    providerStatus: { provider: 'paystack', providerState: 'pending', paymentConfirmed: false as const },
+  };
+
+  it('carries a real boolean, because the activation fact can exist', () => {
+    // The contract widened from z.literal(false) to z.boolean() for exactly one
+    // reason: Billing Step 8's immutable activation fact makes a confirmed
+    // payment REPRESENTABLE. Nothing else changed — the API-side test pins the
+    // derivation, so no client can supply the value.
     assert.ok(billingStateDtoSchema.safeParse(base).success);
     assert.ok(
-      !billingStateDtoSchema.safeParse({
+      billingStateDtoSchema.safeParse({
         ...base,
         providerStatus: { ...base.providerStatus, paymentConfirmed: true },
       }).success,
-      'paymentConfirmed can never be reported as true in this build',
+      'a derived confirmation is representable',
     );
     assert.ok(
       !billingStateDtoSchema.safeParse({
         ...base,
         providerStatus: { ...base.providerStatus, verified: true },
       }).success,
-      'the provider status object is strict',
+      'the provider status object is still strict',
+    );
+    assert.ok(
+      !billingStateDtoSchema.safeParse({
+        ...base,
+        providerStatus: { ...base.providerStatus, paymentConfirmed: 'yes' },
+      }).success,
+      'it is a boolean, not a string',
     );
   });
 });
@@ -516,7 +685,9 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
 
   it('the resolver is the only bridge, and it delegates rather than restating limits', () => {
     assert.deepEqual(importsOf(RESOLUTION).sort(), ['@veltrixeye/contracts', './entitlements.js'].sort());
-    assert.match(codeOnly(RESOLUTION), /if \(provider !== null\) return FREE_ENTITLEMENTS;/);
+    assert.match(codeOnly(RESOLUTION), /if \(provider !== null\) \{/);
+    assert.match(codeOnly(RESOLUTION), /if \(activated !== true\) return FREE_ENTITLEMENTS;/);
+    assert.match(codeOnly(RESOLUTION), /if \(activated === true\) return FREE_ENTITLEMENTS;/);
     assert.match(codeOnly(RESOLUTION), /return getEntitlements\(plan, status\);/);
     // No second matrix: the resolver declares no limit of its own.
     assert.doesNotMatch(
@@ -570,11 +741,11 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     assert.deepEqual(offenders, [], 'every reader goes through resolveEntitlements');
   });
 
-  it('adds no migration beyond Step 7 and leaves migrations 0001–0033 as the whole set', () => {
+  it('adds exactly one migration — 0034, the activation-fact ledger — and leaves 0001–0033 untouched', () => {
     const files = readdirSync(MIGRATIONS_DIR).sort();
-    assert.equal(files.length, 33, `unexpected migration set: ${files.join(', ')}`);
+    assert.equal(files.length, 34, `unexpected migration set: ${files.join(', ')}`);
     assert.equal(files[0], '0001_identity_and_audit.sql');
-    assert.equal(files[files.length - 1], '0033_billing_payment_evidence.sql');
+    assert.equal(files[files.length - 1], '0034_billing_activation.sql');
   });
 
   it('leaves the checkout INSERT shape and the pricing lock untouched', () => {
@@ -641,8 +812,25 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
       assert.doesNotMatch(source, /UPDATE\s+subscriptions/i, 'the receiver never moves a subscription');
       assert.doesNotMatch(source, /canAccessAutomation|grantsExecution:\s*true/);
     }
-    const billingState = read(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'subscriptions.ts');
-    assert.match(billingState, /paymentConfirmed/, 'a confirmed payment is still unrepresentable');
+    // Code only: prose must not satisfy (or trip) the column-name check.
+    const billingState = codeOnly(read(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'subscriptions.ts'));
+    assert.match(billingState, /paymentConfirmed/, 'paymentConfirmed is still reported');
+    assert.match(billingState, /billing_subscription_activations/, 'derived from the durable activation fact');
+    assert.doesNotMatch(billingState, /payment_confirmed/, 'there is no payment_confirmed column');
+
+    // Billing Step 8: the activation service is the ONLY writer of an
+    // activation fact, holds no provider, moves no subscription column and
+    // grants no execution.
+    const activation = codeOnly(read(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'activation.ts'));
+    assert.doesNotMatch(activation, /resolveEntitlements|getEntitlements|FREE_ENTITLEMENTS/,
+      'activation resolves no entitlement of its own');
+    assert.doesNotMatch(activation, /canAccessAutomation|grantsExecution:\s*true/);
+    assert.doesNotMatch(activation, /verifySubscription|initializeCheckout|findCustomer|synchronizeSubscription/,
+      'activation never calls a provider');
+    assert.doesNotMatch(activation, /UPDATE\s+subscriptions/i, 'activation moves no subscription column');
+    assert.doesNotMatch(activation, /UPDATE\s+users|INSERT\s+INTO\s+users/i, 'users.plan is never written');
+    assert.match(activation, /billing_subscription_activations/);
+    assert.match(activation, /recordAuditEvent/);
 
     const paystackDir = path.join(REPO_ROOT, 'packages', 'providers', 'paystack', 'src');
     for (const entry of readdirSync(paystackDir, { withFileTypes: true })) {

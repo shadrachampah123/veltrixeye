@@ -21,11 +21,13 @@ import { billingPaymentCurrencySchema } from './billing-payment.js';
  *
  * WHAT THIS MODULE IS NOT
  *  - it is not an entitlement, not a payment-confirmation, not a plan
- *    change and not an execution grant. `paymentConfirmed` stays
- *    `z.literal(false)` on the existing billing-state DTO
- *    (`./billing.ts`), and the evidence DTOs below pin `grantsExecution`,
- *    `planChanged` and `entitlementsChanged` to `false` by type —
- *    evidence is information, never authority.
+ *    change and not an execution grant. Evidence NEVER sets
+ *    `paymentConfirmed` on the existing billing-state DTO (`./billing.ts`):
+ *    that field is derived from the existence of an immutable ACTIVATION FACT
+ *    (Billing Step 8, migration 0034) and evidence is not one. The evidence
+ *    DTOs below pin `grantsExecution`, `planChanged` and
+ *    `entitlementsChanged` to `false` by type — evidence is information,
+ *    never authority.
  *  - it does not store, log or forward a provider payload, a card
  *    authorization, a secret or any credential-shaped value. The payload
  *    is hashed and dropped; only the hash and the canonical fields are
@@ -171,8 +173,9 @@ export function billingPaymentEvidenceIdempotencyCanonicalString(input: {
 /**
  * The structured result of a verification attempt. It is the ONLY
  * verification-related DTO the API produces, and it is intentionally
- * separate from `BillingStateDto` (`./billing.ts`), so the existing
- * `paymentConfirmed: z.literal(false)` contract is never touched.
+ * separate from `BillingStateDto` (`./billing.ts`), so a verification can
+ * never move `paymentConfirmed` — that field is derived from the durable
+ * activation fact (Billing Step 8), never from evidence.
  *
  * `verified` is true only when reconciliation succeeded and durable
  * evidence was recorded (or re-read on idempotent replay). Every other
@@ -222,10 +225,11 @@ export type BillingPaymentVerificationResult = z.infer<typeof billingPaymentVeri
 /* -------------------------------------------------------------------------- */
 
 /**
- * The existing billing-state DTO still pins `paymentConfirmed` to `false`
- * (see `packages/contracts/src/billing.ts`). That contract is re-exported
- * here only for convenience in tests that assert the safety invariants —
- * it is not redefined and it is not widened.
+ * The existing billing-state DTO still derives `paymentConfirmed` from the
+ * durable activation fact and never from evidence (see
+ * `packages/contracts/src/billing.ts` and Billing Step 8). That contract is
+ * re-exported here only for convenience in tests that assert the safety
+ * invariants — it is not redefined here and evidence never widens it.
  */
 export { billingProviderStatusDtoSchema } from './billing.js';
 export type { BillingProviderStatusDto } from './billing.js';

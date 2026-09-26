@@ -21,23 +21,44 @@ export class AuditService {
 
   async log(entry: AuditEntry): Promise<void> {
     try {
-      await this.pool.query(
-        `INSERT INTO audit_events (user_id, action, entity_type, entity_id, ip, user_agent, metadata)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [
-          entry.userId ?? null,
-          entry.action,
-          entry.entityType ?? null,
-          entry.entityId ?? null,
-          entry.ip ?? null,
-          entry.userAgent ?? null,
-          JSON.stringify(entry.metadata ?? {}),
-        ],
-      );
+      await recordAuditEvent(this.pool, entry);
     } catch (err) {
       console.error('[audit] failed to write audit event', err);
     }
   }
+}
+
+/**
+ * TRANSACTIONAL audit write.
+ *
+ * Runs on the caller's client — inside the caller's transaction — and
+ * PROPAGATES failure instead of swallowing it. This is the only correct way to
+ * record an event that is part of a durable fact: the audit row and the fact
+ * it describes must commit together or roll back together. A swallowed audit
+ * failure would leave an authoritative fact with no record of who authorized
+ * it.
+ *
+ * Deliberately separate from `AuditService.log`, which stays fire-and-forget
+ * for request-scoped events (a failed audit write must never break a
+ * user-facing operation).
+ */
+export async function recordAuditEvent(
+  db: Pick<pg.Pool | pg.PoolClient, 'query'>,
+  entry: AuditEntry,
+): Promise<void> {
+  await db.query(
+    `INSERT INTO audit_events (user_id, action, entity_type, entity_id, ip, user_agent, metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      entry.userId ?? null,
+      entry.action,
+      entry.entityType ?? null,
+      entry.entityId ?? null,
+      entry.ip ?? null,
+      entry.userAgent ?? null,
+      JSON.stringify(entry.metadata ?? {}),
+    ],
+  );
 }
 
 export interface AuditEventRow {

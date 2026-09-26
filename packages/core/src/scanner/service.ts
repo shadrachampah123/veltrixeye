@@ -813,6 +813,8 @@ export class ScannerService {
       SELECT s.id as strategy_id, s.user_id, s.status as strategy_status,
              v.id as version_id, v.version_number,
              sub.plan, sub.status as sub_status, sub.provider as sub_provider,
+             EXISTS (SELECT 1 FROM billing_subscription_activations a
+                      WHERE a.subscription_id = sub.id) AS sub_activated,
              (SELECT timeframe FROM strategy_timeframes WHERE version_id = v.id AND role = 'htf_bias') as htf_bias,
              (SELECT timeframe FROM strategy_timeframes WHERE version_id = v.id AND role = 'setup') as setup_tf,
              (SELECT timeframe FROM strategy_timeframes WHERE version_id = v.id AND role = 'entry') as entry_tf,
@@ -839,6 +841,7 @@ export class ScannerService {
       plan: string;
       sub_status: string;
       sub_provider: string | null;
+      sub_activated: boolean;
       htf_bias: string | null;
       setup_tf: string | null;
       entry_tf: string | null;
@@ -847,9 +850,13 @@ export class ScannerService {
 
     const eligible: EligibleStrategy[] = [];
     for (const row of res.rows) {
-      // A provider-backed owner row is an unconfirmed checkout: it resolves to
-      // the free tier, so its strategies are never eligible for a scan.
-      const entitlements = resolveEntitlements(row.plan as UserPlan, row.sub_status, row.sub_provider);
+      // A provider-backed owner row is an unconfirmed checkout until an
+      // immutable activation fact exists for it (Billing Step 8, migration
+      // 0034): without one it resolves to the free tier, so its strategies are
+      // never eligible for a scan.
+      const entitlements = resolveEntitlements(
+        row.plan as UserPlan, row.sub_status, row.sub_provider, row.sub_activated === true,
+      );
       if (!entitlements.canAccessScanner) continue;
 
       // Validate timeframes — must support required HTF/setup/entry

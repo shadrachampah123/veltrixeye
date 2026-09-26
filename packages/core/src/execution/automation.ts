@@ -118,13 +118,18 @@ export class AutomationService {
 
   /** Raw state used by the gate layer (entitlement + switch, no kill checks). */
   async readState(userId: string): Promise<{ entitlements: Entitlements; automationEnabled: boolean }> {
-    // `sub.provider` is read for the fail-closed entitlement gate: a
-    // provider-backed subscription row is an unconfirmed checkout, not a
-    // purchase, and resolves to the free tier.
+    // `sub.provider` and the durable activation fact are read for the
+    // fail-closed entitlement gate: a provider-backed subscription row is an
+    // unconfirmed checkout — not a purchase — until an operator has authorized
+    // an immutable activation fact for it (Billing Step 8, migration 0034), so
+    // without one it resolves to the free tier.
     const res = await this.pool.query<{
       plan: string; status: string; provider: string | null; automation_enabled: boolean;
+      activated: boolean;
     }>(
-      `SELECT sub.plan, sub.status, sub.provider, u.automation_enabled
+      `SELECT sub.plan, sub.status, sub.provider, u.automation_enabled,
+              EXISTS (SELECT 1 FROM billing_subscription_activations a
+                       WHERE a.subscription_id = sub.id) AS activated
        FROM users u
        LEFT JOIN subscriptions sub ON sub.user_id = u.id
        WHERE u.id = $1`,
@@ -135,7 +140,9 @@ export class AutomationService {
     const plan = (row.plan ?? 'free') as UserPlan;
     const status = row.status ?? 'active';
     return {
-      entitlements: resolveEntitlements(plan, status, row.provider),
+      // `canAccessAutomation` is false in every tier, activated or not: no
+      // activation fact can ever grant execution.
+      entitlements: resolveEntitlements(plan, status, row.provider, row.activated === true),
       automationEnabled: row.automation_enabled,
     };
   }

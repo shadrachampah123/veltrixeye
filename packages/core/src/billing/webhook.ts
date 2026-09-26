@@ -67,7 +67,9 @@ import {
  *  - It is NOT a payment confirmation. A recorded `payment.succeeded` row is
  *    a provider-reported receipt of one delivery: no transaction verification
  *    is performed, no subscription status moves, no entitlement changes and
- *    `paymentConfirmed` remains unrepresentable (pinned `false` upstream).
+ *    `paymentConfirmed` stays `false` — it is derived from the durable
+ *    ACTIVATION FACT (Billing Step 8, migration 0034), and a webhook delivery
+ *    is never one.
  *  - It never enables execution. `grantsExecution` is pinned `false` by the
  *    canonical contract, and nothing here touches a plan value, an
  *    entitlement or an execution gate.

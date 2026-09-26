@@ -291,7 +291,7 @@ after(async () => {
 });
 
 describe('Billing PR3 — 0032 file conventions and history integrity', () => {
-  test('0001-0031 are byte-identical and 0032 is still byte-identical; newest is 0033 (Step 7)', () => {
+  test('0001-0031 are byte-identical, and the newest migration is 0034 (Step 8)', () => {
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((file) => /^\d{4}_.+\.sql$/.test(file))
       .sort();
@@ -308,16 +308,17 @@ describe('Billing PR3 — 0032 file conventions and history integrity', () => {
 
     const versions = files.map((file) => Number(/^(\d{4})_/.exec(file)?.[1]));
     assert.equal(new Set(versions).size, versions.length, 'no duplicate migration version');
-    for (let expected = 1; expected <= 33; expected += 1) {
+    for (let expected = 1; expected <= 34; expected += 1) {
       assert.ok(versions.includes(expected), `migration ${String(expected).padStart(4, '0')} exists`);
     }
     assert.equal(files.filter((file) => file.startsWith('0032_')).length, 1, 'exactly one 0032 migration');
     assert.equal(files.filter((file) => file.startsWith('0033_')).length, 1, 'exactly one 0033 migration (Step 7)');
-    assert.equal(files.at(-1), '0033_billing_payment_evidence.sql', '0033 is the newest migration (Step 7)');
+    assert.equal(files.filter((file) => file.startsWith('0034_')).length, 1, 'exactly one 0034 migration (Step 8)');
+    assert.equal(files.at(-1), '0034_billing_activation.sql', '0034 is the newest migration (Step 8)');
     assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 33).length,
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 34).length,
       0,
-      'nothing is numbered after 0033',
+      'nothing is numbered after 0034',
     );
   });
 

@@ -17,12 +17,13 @@
 > synchronization (Later-billing-PR #7)* below). The verify response publishes
 > no subscription status, so every Paystack-verified state is `unknown`
 > (manual review): no status moves and nothing is granted via sync.
-> **Step 7 `POST /api/billing/verify` likewise confirms NOTHING to entitlements:** it records one `billing_verified_transactions` row per verified checkout reference after exact reconciliation, and returns a structured `BillingPaymentVerificationResult` (`verified: true` with evidence, or `verified: false` with a typed failure reason). `paymentConfirmed` on `GET /api/billing/me` stays `false`, `grantsExecution` stays `false`, and `resolveEntitlements` stays provider→FREE.
+> **Step 8 (this change) adds the ACTIVATION AUTHORITY** — the one missing half of the paid-entitlement authority, and the only thing in this build that can turn verified payment evidence into a paid entitlement. It is an **out-of-band, DB-connected operator action**: `npm run billing:activate -- --user <email|uuid> --by <operator-id> --reason <text>` (`scripts/billing/activate.ts` → `BillingActivationService`) writes exactly ONE immutable **activation fact** (`billing_subscription_activations`, migration `0034`) plus its transactional `billing.subscription_activated` audit event. **There is deliberately no HTTP route, no admin role, no operator endpoint and no activation token**, so no user session can reach it and no client payload can supply a payment confirmation. `paymentConfirmed` on `GET /api/billing/me` is now **DERIVED** from the existence of that fact (`z.boolean()`, never a stored column, never client input): a provider-backed row with no fact stays `false` and free; a provider-backed row WITH a fact resolves to its paid entitlement through `resolveEntitlements(plan, status, provider, activated)`. `grantsExecution` stays `false` and `canAccessAutomation` stays `false` for every plan.
+> **Step 7 `POST /api/billing/verify` confirms NOTHING to entitlements:** it records one `billing_verified_transactions` row per verified checkout reference after exact reconciliation, and returns a structured `BillingPaymentVerificationResult` (`verified: true` with evidence, or `verified: false` with a typed failure reason). Evidence is a *prerequisite* for an activation, never a substitute for one: Step 7 does not move `paymentConfirmed` (that field is now derived from the Step 8 fact), `grantsExecution` stays `false`, and the provider→FREE gate is unchanged until an operator authorizes the activation.
 > There is still no checkout UI and no `apps/web` billing change, no billing
 > portal, no refund/proration/dunning execution, no notification, no live
 > payment, no production credential, no production activation and no Starter
 > selling.
-> **Receipt is still not confirmation**: the webhook receiver records deliveries; `POST /api/billing/sync` applies the canonical status mapping without confirming payment; `POST /api/billing/verify` records verified-transaction evidence after reconciliation — none of them changes subscription plan or grants execution.
+> **Receipt is still not confirmation**: the webhook receiver records deliveries; `POST /api/billing/sync` applies the canonical status mapping without confirming payment; `POST /api/billing/verify` records verified-transaction evidence after reconciliation — none of them changes subscription plan or grants execution. The only payment-confirmation authority is the out-of-band activation fact, written by a named operator with a stated reason.
 >
 > **Account capabilities are only partially verified.** Whether this account
 > can transact in **GHS** (AC1) or run **GHS recurring** subscriptions (AC2) is
@@ -48,13 +49,14 @@
 > unlinked. The lock stays a pricing
 > fact: not payment confirmation, not entitlement activation, not execution
 > authorization. Pre-existing rows with a NULL lock remain fail-closed
-> (`pricing_lock_required`) with no remediation path in this change, and the
-> activation/confirmation authority remains a separate, unimplemented step.
+> (`pricing_lock_required`) with no remediation path in this change. The
+> activation authority is a separate, now-implemented step (Billing Step 8): it
+> reads the lock, never writes it, and it is reachable only out of band.
 > See *The pricing-lock lifecycle — Model C*.
 >
 > PR1 (merged, `ab27948`) established the authoritative commercial catalogue;
 > PR2 (merged) added the canonical billing contracts, the provider seam and
-> migration `0031_provider_billing.sql`; PR3 (merged) added USD→GHS pricing, FX authority, provider-plan epochs and the sandbox Paystack adapter. **Step 7 adds payment evidence only — it changes no price, no entitlement and no execution: `canAccessAutomation` stays `false` for every plan, `paymentConfirmed` stays `false`, and `grantsExecution`/`planChanged`/`entitlementsChanged` stay `false`.**
+> migration `0031_provider_billing.sql`; PR3 (merged) added USD→GHS pricing, FX authority, provider-plan epochs and the sandbox Paystack adapter. **Step 7 adds payment evidence only, and Step 8 adds the out-of-band activation authority that reads it: neither changes a price or grants execution — `canAccessAutomation` stays `false` for every plan, and `grantsExecution`/`planChanged`/`entitlementsChanged` stay `false` in both.**
 
 ## Decisions (operator-confirmed)
 
@@ -506,12 +508,12 @@ trigger.
   Step 4 runbook (dashboard plans + FX publication + one registration call).
   Provisioning registers pricing authority for future sales; it never repairs
   an existing row.
-- **The activation/confirmation authority (Step 8 of the pricing-lock
-  milestone — not this change) is NOT implemented.** Payment confirmation,
-  payment evidence, entitlement
-  activation, webhooks, synchronization and execution are separate concerns
-  that this change does not touch, and the pricing lock grants none of them.
-  Nothing in Model C may be used as a substitute for that authority.
+- **The activation/confirmation authority is a SEPARATE step, now delivered by
+  Billing Step 8.** Payment evidence, entitlement activation, webhooks,
+  synchronization and execution are separate concerns from the pricing lock,
+  and the lock grants none of them. Nothing in Model C may be used as a
+  substitute for that authority: the lock is a pricing fact, and only the
+  out-of-band activation fact authorizes a paid entitlement.
 - **Known follow-up (not fixed here):** an active epoch can be *retired*
   between the active-epoch lookup and the pricing-lock creation, because the
   epoch read is not taken under `FOR SHARE` and no active re-check is performed
@@ -628,28 +630,35 @@ VALUES (…, 'active', 'paystack', 'pending', <snapshot>)
 `status = 'active'` is the authoritative 0014 lifecycle value and `plan` is the
 internal value the requested commercial plan maps onto (`pro` / `premium`). Read
 through `getEntitlements(plan, status)` alone, that row therefore looked exactly
-like a paid subscription — while nothing had been charged. This build has **no
-payment-confirmation authority**: the Step 5.2 webhook receiver *records*
-deliveries (with `x-paystack-signature` verification), but recording is not
-confirming — there is no transaction verification and nothing that applies a
-recorded event to an entitlement (see the list below). An initialized checkout
-is not a payment, and no `provider_state` value can make it one.
+like a paid subscription — while nothing had been charged. An initialized
+checkout is not a payment, and no `provider_state` value can make it one: the
+Step 5.2 webhook receiver only *records* deliveries (with
+`x-paystack-signature` verification), Step 7 records verified-transaction
+**evidence**, and neither is authority. Since Billing Step 8 the only
+payment-confirmation authority is the immutable **activation fact** an operator
+writes out of band (see *Activation authority (Billing Step 8)* below).
 
 ### The rule
 
-| Subscription row | Entitlements |
-| --- | --- |
-| **no row at all** (every user who has never checked out — the Model C free state) | `FREE_ENTITLEMENTS` via `resolveEntitlements('free', 'active', null)` — reported as free/active/unconfirmed |
-| `provider IS NULL` (every historical row) | `getEntitlements(plan, status)` — **unchanged** |
-| `provider IS NOT NULL` (any checkout row) | `FREE_ENTITLEMENTS` — regardless of `status` or `provider_state` |
+| Subscription row | Activation fact | Entitlements |
+| --- | --- | --- |
+| **no row at all** (every user who has never checked out — the Model C free state) | — | `FREE_ENTITLEMENTS` via `resolveEntitlements('free', 'active', null, false)` — reported as free/active/unconfirmed |
+| `provider IS NULL` (every historical row) | none (the database refuses one for such a row) | `getEntitlements(plan, status)` — **unchanged** |
+| `provider IS NULL` | one exists | `FREE_ENTITLEMENTS` — incoherent, fail closed |
+| `provider IS NOT NULL` (any checkout row) | none — no evidence, no verification, no sync and no `provider_state` value substitutes | `FREE_ENTITLEMENTS` — regardless of `status` or `provider_state` |
+| `provider IS NOT NULL` | one exists (Billing Step 8) | `getEntitlements(plan, status)` — the paid tier the operator authorized |
 
 ### The implementation
 
 - **`packages/core/src/billing/entitlement-resolution.ts`** — one function,
-  `resolveEntitlements(plan, status, provider)`. It is the only place the
-  `provider` column may influence an entitlement, and it can only ever narrow
-  one. `provider` is a required third argument compared with `!== null`, so a
-  reader that forgets to SELECT the column resolves to free, never to paid.
+  `resolveEntitlements(plan, status, provider, activated)`. It is the only place
+  the `provider` column may influence an entitlement, and it can only ever
+  narrow one. `provider` is a required third argument compared with `!== null`
+  and `activated` is a required fourth argument compared with `=== true`, so a
+  reader that forgets to SELECT the column — or to ask whether an activation
+  fact exists — resolves to free, never to paid. A paid entitlement for a
+  provider-backed row is reachable ONLY by explicitly passing the durable
+  activation state; there is no other path.
 - **`packages/core/src/billing/entitlements.ts`** — unchanged and still
   provider-agnostic. It only gained `export` on the existing
   `FREE_ENTITLEMENTS`, so the resolver returns *that* object instead of
@@ -663,11 +672,13 @@ is not a payment, and no `provider_state` value can make it one.
   `AutomationService.readState`.
 - **`GET /api/billing/me`** additionally publishes `providerStatus`:
   `{ provider, providerState, paymentConfirmed }`. The first two are the stored
-  columns as **display information**; `paymentConfirmed` is pinned to
-  `z.literal(false)` the same way the sync result pins `grantsExecution`, so a
-  confirmed payment is unrepresentable in this build. The subscription's
-  authoritative `plan` and `status` are still reported exactly as stored — the
-  response does not lie about the row, it stops implying that the row is paid.
+  columns as **display information**; `paymentConfirmed` is a **derived
+  boolean** — `EXISTS (SELECT 1 FROM billing_subscription_activations WHERE
+  subscription_id = …)` — so `true` is representable exactly when an operator
+  authorized an activation, and it is never a column, never client input and
+  never derived from `provider_state`. The subscription's authoritative `plan`
+  and `status` are still reported exactly as stored — the response does not lie
+  about the row, it stops implying that the row is paid.
 - **`apps/web` `SubscriptionPanel`** renders that state: a provider-backed row
   is badged with its provider state plus "unconfirmed" and carries an explicit
   "Payment not confirmed" notice. No button, link, portal or checkout surface
@@ -683,8 +694,9 @@ execution safety gate. (The Step 5.2 webhook receiver, which landed later,
 only *records* deliveries — it never applies one.) `canAccessAutomation`
 remains `false` for every plan, every status and every provider.
 
-Removing the gate is the job of the confirmation authority in step 6/7 below —
-not of a display layer, and not of a provider state.
+The gate is lifted by exactly one thing: the out-of-band activation authority of
+Billing Step 8 below — not by a display layer, not by a provider state, and not
+by verified evidence on its own.
 
 ## What is still NOT implemented (PR2 scope, updated through PR-C and Step 4)
 
@@ -698,16 +710,21 @@ verification, source-IP allow-list, rate limiting, subject resolution and the
 ledger write — receipt only) — while everything below remains true at the
 **product** level:
 
-- **No payment *confirmation* authority and no checkout UI**: `POST
-  /api/billing/checkout` now initializes sandbox checkouts (PR-C), and the
-  Step 5.2 receiver now **records** provider deliveries — but recording is
-  not confirming: no transaction verification, no sync — so a provider-backed
-  subscription stays execution-inert (`paymentConfirmed` is pinned `false`;
-  the hardening sweep pins the same), and there is no UI, no redirect
-  handling beyond the callback configuration. `billing_customers` now has
-  exactly one writer — the Billing Step 6 customer provisioning flow
-  (`POST /api/billing/customer`, see below) — which records provider customer
-  identity only and grants nothing.
+- **No *self-serve* payment confirmation and no checkout UI**: `POST
+  /api/billing/checkout` initializes sandbox checkouts (PR-C), the Step 5.2
+  receiver **records** provider deliveries, Step 7 records verified-transaction
+  evidence and Step 8 records the operator-authorized activation fact — and
+  NONE of them is reachable as a confirmation a client can request. The only
+  payment-confirmation authority is the out-of-band CLI
+  (`npm run billing:activate`), which requires a named operator and a stated
+  reason and writes nothing else; there is no activation route, no admin role,
+  no operator endpoint and no activation token. A provider-backed subscription
+  without an activation fact stays execution-inert (`paymentConfirmed: false`,
+  free entitlements — the hardening sweep pins the same), and there is still no
+  checkout UI and no redirect handling beyond the callback configuration.
+  `billing_customers` now has exactly one writer — the Billing Step 6 customer
+  provisioning flow (`POST /api/billing/customer`, see below) — which records
+  provider customer identity only and grants nothing.
 - **No billing portal** and no customer self-serve surface.
 - **No webhook-driven state change.** The receiver writes
   `billing_provider_events` rows (`received`) and never touches
@@ -778,7 +795,8 @@ records the gap instead of expanding into entitlement work.
   the immutable subscription price lock. Every one of those columns is `NULL` or
   at its inert default on every existing row: the provider-backed subscription
   the checkout route writes is provider-unconfirmed by construction
-  (`paymentConfirmed` is not a column an operator can set), and no plan
+  (`paymentConfirmed` is not a column an operator can set — it is derived from
+  an activation fact that only the Step 8 CLI writes), and no plan
   has been provisioned (AC5 capability verified, four plan IDs pending — the
   Step 4 runbook below).
 - **FX publishing is an operator action, not a feature.** `billing_fx_rate_versions`
@@ -884,7 +902,7 @@ Roughly in order; each is its own PR and may be re-scoped.
      so the provider's documented retry schedule surfaces it. **What it still
      is not:** not a payment confirmation, not a transaction verification,
      not a synchronization — `subscriptions` is never written, no entitlement
-     changes, `paymentConfirmed` stays unrepresentable, and nothing here can
+     changes, no activation fact is written, and nothing here can
      grant execution. Payloads are never stored or logged (hash only). The
      receiver lives in `apps/api/src/billing-webhook.ts` (transport) and
      `packages/core/src/billing/webhook.ts` (security pipeline + ledger); the
@@ -892,7 +910,11 @@ Roughly in order; each is its own PR and may be re-scoped.
      any receiver.
 7. ~~**Verification + subscription synchronization**~~ — **delivered by
    Later-billing-PR #7 (sandbox only)**; see *Verification + synchronization
-   (Later-billing-PR #7)* below. Verification uses the documented
+   (Later-billing-PR #7)* below.
+7b. ~~**Activation authority**~~ — **delivered by Billing Step 8 (sandbox
+   only)**; see *Activation authority (Billing Step 8)* below. It is the only
+   payment-confirmation authority in the build, it is invoked out of band by
+   the `billing:activate` CLI, and it deliberately has no HTTP surface. Verification uses the documented
    transaction-verify read; there is still no subscription read, and the
    verify response publishes no subscription status, so every
    Paystack-verified state is `unknown` → manual review. Applying a real
@@ -932,7 +954,7 @@ portal, no checkout UI and no email-change synchronization.
 
 ## Payment evidence + transaction reconciliation (Billing Step 7)
 
-**Status: delivered, sandbox (Paystack) only. It records evidence, it grants nothing.** No entitlements are activated and no execution is granted. `paymentConfirmed` on `GET /api/billing/me` stays `false`, and the verification result pins `grantsExecution` / `planChanged` / `entitlementsChanged` to `false`. The verification is confirmation-authority for evidence only — `charge.success` remains a receipt/event signal and is never treated as a payment activation.
+**Status: delivered, sandbox (Paystack) only. It records evidence, it grants nothing.** No entitlements are activated and no execution is granted. `paymentConfirmed` on `GET /api/billing/me` is not moved by this step (since Billing Step 8 it is derived from the activation fact, which this step never writes), and the verification result pins `grantsExecution` / `planChanged` / `entitlementsChanged` to `false`. The verification is confirmation-authority for evidence only — `charge.success` remains a receipt/event signal and is never treated as a payment activation.
 
 | Layer | File | Role |
 | --- | --- | --- |
@@ -943,18 +965,73 @@ portal, no checkout UI and no email-change synchronization.
 | Confirmation service | `packages/core/src/billing/confirmation.ts` | `BillingPaymentConfirmationService` (constructed with `{ db, providers, now? }`) exposes `confirm(userId)` — narrow, evidence-only: (1) auth via the session `userId` the route supplies (the caller's OWN transaction only), (2) locate the user's provider-backed `subscriptions` row and its `locked_pricing_snapshot_id` (missing ⇒ structured `verified: false` / `snapshot_mismatch`, never a throw), (3) derive the deterministic checkout reference server-side from the user + locked-snapshot identity (`billingCheckoutReference(userId, snapshot.idempotencyKey)` ⇒ `ve-chk-` + SHA-256 hex, never client-supplied), (4) verify through the provider seam (`provider.verifySubscription(request)` with a server-built request), (5) build the normalized `BillingVerifiedTransaction` facts from the observed state, (6) reconcile purely against the snapshot (`reconcileBillingPaymentEvidence`), (7) persist idempotently in `billing_verified_transactions` (an idempotent replay returns the existing `BillingPaymentEvidence` row with `replayed: true`; conflicting existing evidence is refused as a typed `BillingPaymentConfirmationError`), (8) return `BillingPaymentVerificationResult` (`verified: true` with `evidence`, or `verified: false` with a typed `failureReason` + fixed credential-free `failureMessage`). **Does NOT activate entitlements/plan/lifecycle/execution** — it writes only the evidence table and returns evidence; `paymentConfirmed`/`grantsExecution`/`planChanged`/`entitlementsChanged` are pinned `false` by contract. Provider-not-registered and verification-unavailable (including conflicting-evidence refusals) are thrown as typed `BillingPaymentConfirmationError` (reason union `provider_not_registered` | `subscription_not_found` | `pricing_snapshot_not_found` | `verification_unavailable`) for the route to map to `502`. |
 | Composition | `apps/api/src/billing-composition.ts` | `composeBillingVerify(db, registry): BillingPaymentConfirmationService` — constructs the service with `{ db, providers }` (seam-provided `verifySubscription`, evidence-only, no provider DB access in the adapter). Always composed — no feature flag. |
 | Route | `apps/api/src/routes/billing.ts` | `POST /api/billing/verify` — session-authenticated, `requireAuth`, `isEmptyBody` (any payload ⇒ `400 invalidInput`; never client-supplied `reference` or secret), `userId` from session only, per-IP limit `BILLING_VERIFY_RATE_LIMIT_MAX = 10`/min, server-derived reference. Outcome: `200` with `billingPaymentVerificationResultSchema` (`verified: boolean`, `evidence: BillingPaymentEvidence | null`, `failureReason: BillingPaymentReconciliationFailureReason | null`, `failureMessage ≤ 200 chars | null`, `providerReference`, `providerStatus | null`, `replayed`, `verifiedAt`, and `grantsExecution: false`, `planChanged: false`, `entitlementsChanged: false` pinned at the type level). Subscription/snapshot missing or any reconciliation mismatch ⇒ `200 verified:false` with the typed `failureReason` (`snapshot_mismatch`, `reference_mismatch`, …) — never a throw. Provider-not-registered, verification-unavailable and conflicting-evidence refusals ⇒ `502 provider_unavailable` via `isBillingPaymentConfirmationError` → `Errors.providerUnavailable` — this endpoint returns no `409`. |
-| Contracts | `packages/contracts/src/billing-provider.ts` (+ `billing-payment-evidence.ts`) | `providerSubscriptionStateSchema` now also carries optional `paidAt: string | null`, `providerTransactionId: string | null` and `providerTransactionStatus: string | null` (verbatim provider transaction status) alongside the canonical lifecycle `state` (which stays `unknown` for Paystack verification). `packages/contracts/src/billing-payment-evidence.ts` (new) defines the canonical Step 7 vocabulary: the typed failure-reason set `BILLING_PAYMENT_RECONCILIATION_FAILURE_REASONS` + `billingPaymentReconciliationFailureReasonSchema` (`BillingPaymentReconciliationFailureReason`); `billingVerifiedTransactionSchema` (normalized provider-reported facts — `provider: 'paystack'`, `providerReference`, `providerTransactionId | null`, `providerStatus`, `providerDomain`, `paymentCurrency`, `paymentAmountMinor`, `paymentAmountExponent`, customer id/code, `paidAt | null`, `verifiedAt`); `billingPaymentEvidenceSchema` (the durable evidence row — `idempotencyKey`/`evidenceHash` as 64-hex SHA-256, `providerDomain: literal('test')`, `paymentCurrency: 'GHS'`, exponent pinned 2, NOT NULL `paidAt`); the pure idempotency derivation `billingPaymentEvidenceIdempotencyCanonicalString`; and `billingPaymentVerificationResultSchema` (`verified`, `evidence`, `failureReason`, `failureMessage`, `providerReference`, `providerStatus`, `replayed`, `verifiedAt`, `grantsExecution/planChanged/entitlementsChanged: literal(false)`) — the existing billing-state DTO keeps `paymentConfirmed: z.literal(false)` and it is never set to `true` by this flow. |
+| Contracts | `packages/contracts/src/billing-provider.ts` (+ `billing-payment-evidence.ts`) | `providerSubscriptionStateSchema` now also carries optional `paidAt: string | null`, `providerTransactionId: string | null` and `providerTransactionStatus: string | null` (verbatim provider transaction status) alongside the canonical lifecycle `state` (which stays `unknown` for Paystack verification). `packages/contracts/src/billing-payment-evidence.ts` (new) defines the canonical Step 7 vocabulary: the typed failure-reason set `BILLING_PAYMENT_RECONCILIATION_FAILURE_REASONS` + `billingPaymentReconciliationFailureReasonSchema` (`BillingPaymentReconciliationFailureReason`); `billingVerifiedTransactionSchema` (normalized provider-reported facts — `provider: 'paystack'`, `providerReference`, `providerTransactionId | null`, `providerStatus`, `providerDomain`, `paymentCurrency`, `paymentAmountMinor`, `paymentAmountExponent`, customer id/code, `paidAt | null`, `verifiedAt`); `billingPaymentEvidenceSchema` (the durable evidence row — `idempotencyKey`/`evidenceHash` as 64-hex SHA-256, `providerDomain: literal('test')`, `paymentCurrency: 'GHS'`, exponent pinned 2, NOT NULL `paidAt`); the pure idempotency derivation `billingPaymentEvidenceIdempotencyCanonicalString`; and `billingPaymentVerificationResultSchema` (`verified`, `evidence`, `failureReason`, `failureMessage`, `providerReference`, `providerStatus`, `replayed`, `verifiedAt`, `grantsExecution/planChanged/entitlementsChanged: literal(false)`) — the existing billing-state DTO's `paymentConfirmed` is never set by this flow — Step 7 writes no confirmation of any kind (Billing Step 8 later widened that field to a derived `z.boolean()` fed by the activation fact). |
 
 What Step 7 deliberately does not do:
 
 - Never uses `charge.success` as payment confirmation — the webhook event is receipt only; only `GET /transaction/verify/:reference` after strict validation and exact reconciliation counts as evidence authority.
 - Never promotes the provider's transaction status to a subscription lifecycle — only `success` is an acceptable evidence status; every other status (`failed`, `abandoned`, `reversed`, …) is a typed `invalid_status` reconciliation failure. The provider still reports `state: unknown` and lifecycle stays `unknown`; no `subscriptions.status` or `provider_state` is written.
-- Never writes `subscriptions`, `users`, entitlements, automation gates or execution — the evidence table is the only writer; the provider→FREE gate (`resolveEntitlements`) and `paymentConfirmed` are unchanged.
+- Never writes `subscriptions`, `users`, entitlements, automation gates or execution — the evidence table is the only writer; the provider→FREE gate (`resolveEntitlements`) is unchanged and no activation fact is written, so `paymentConfirmed` cannot move through this step.
 - Never converts currency, never re-rates and never applies tolerance — amount is integer minor-unit GHS/2 exact equality between the verified `data.amount` and the locked snapshot's `payment_amount_minor` (`payment.paymentAmountMinor`); any mismatch is `amount_mismatch` (`verified:false`).
 - Never accepts a client-supplied reference, amount, currency, customer_code or secret — the reference is derived from the locked snapshot and every field is validated server-side against `test` domain / `GHS` / `paystack`.
 - Never touches production: no live key, no production credential, no plan mutation (`PUT /plan` is still never called), no FX publication and no `apps/web` change. The four sandbox epochs (when Step 4 is run) remain the only provider plans.
 
 Idempotency + concurrency: `idempotency_key` is the deterministic SHA-256 hex of the canonical evidence identity — `sha256('billing-verified-transaction/v1|paystack|<providerReference>|<pricingSnapshotId>')`, derived server-side from fields no client can supply — and `evidence_hash` is the SHA-256 of the canonical verified facts. Together they make verification idempotent per (reference, snapshot): a second `POST /api/billing/verify` for the same verified observation returns the same `evidence` row with `replayed: true`; concurrent writers race on the `provider_reference` / `idempotency_key` UNIQUE constraints and the loser returns the winner's row (no duplicate evidence); a conflicting observation for the same reference is refused closed (`conflict` ⇒ `502 provider_unavailable`), never a silent overwrite.
+
+## Activation authority (Billing Step 8)
+
+**Status: delivered, sandbox only. It is the ONLY payment-confirmation authority in this build — and it grants no execution.** One migration (`0034_billing_activation.sql`), one service, one operator CLI. No HTTP route, no `apps/web` change, no provider call, no new secret.
+
+The architecture, end to end:
+
+```text
+verified payment evidence   (0033, billing_verified_transactions — EVIDENCE, never authority)
+  → explicit out-of-band operator authorization   (BillingActivationService, via the CLI)
+  → immutable activation fact                     (0034, billing_subscription_activations)
+  → read-side paid entitlement                    (resolveEntitlements(plan, status, provider, activated))
+```
+
+**Evidence is never authority.** A verified transaction proves money moved and nothing more. The step from evidence to entitlement is a *human decision*, recorded with a name and a reason — which is why the only writer is a DB-connected CLI an operator runs, and why there is no HTTP surface at all.
+
+| Layer | File | Role |
+| --- | --- | --- |
+| Schema | `packages/core/src/db/migrations/0034_billing_activation.sql` | Append-only `billing_subscription_activations` — the immutable activation FACT. One row per subscription (`subscription_id` UNIQUE), bound to its verified evidence (`evidence_id` NOT NULL UNIQUE FK to `billing_verified_transactions`), its user, its commercial subscription and its immutable pricing snapshot (FKs, so an orphan row is impossible). Self-describing: the commercial identity, the provider, the exact payment (integer minor units, GHS, exponent 2) and the SHA-256 `evidence_hash` are copied in, never re-derived. `operator_id` and `activation_reason` are NOT NULL (an activation without a named operator and a stated reason is unrepresentable) and credential-shaped text is refused by CHECK. `idempotency_key` is the deterministic SHA-256 of the canonical activation identity, so a replay collapses onto the existing fact. **No payload, no secret, no card material, and no `payment_confirmed` column.** A pre-flight `DO` block refuses to apply (rather than half-apply) when 0031/0032/0033 are missing; migrations 0001–0033 stay byte-identical and the 0001 `set_updated_at()` helper is reused, never redeclared. |
+| Immutability | same migration | Two triggers. `billing_subscription_activations_append_only` (BEFORE UPDATE OR DELETE) refuses every UPDATE ("append-only … a correction is a manual review, never a silent overwrite") and every DELETE ("never deleted: they are the audit trail of operator-authorized activations"). |
+| Coherence | same migration | `billing_subscription_activations_coherent` (BEFORE INSERT) re-derives, from the live rows, that the fact agrees with its subscription, its locked snapshot and its verified evidence on **user, subscription, snapshot, catalogue plan, interval, provider, provider plan, reference, currency, amount, exponent and evidence hash** — and that the evidence is a **successful sandbox (`test`)** transaction. It also refuses Starter (not sellable) and the excluded capability-evidence provider plan (`PLN_…` GHS 2.00 test plan — capability evidence only, never an epoch). The database is the last line of defence behind the service. |
+| Service | `packages/core/src/billing/activation.ts` | `BillingActivationService.activate({ user, operatorId, reason, evidenceId?, activatedAt? })` — the 18 numbered guarantees, in order: (1) explicit operator identity AND reason, (2) locate the commercial subscription by the user's email or uuid, (3) refuse a legacy NULL-lock row (`pricing_lock_required`), (4) validate the locked pricing snapshot through the existing strict validator, (5) refuse Starter (`forbidden_plan`) and the excluded provider plan (`excluded_provider_plan`), (6) locate matching verified evidence, (7) require a successful sandbox transaction, (8) **re-run the exact pure payment reconciliation from the stored evidence** — a wrong amount, currency, exponent, reference or customer is refused exactly as verification would refuse it, (9) one client and one transaction, (10) `SELECT … FOR UPDATE` on the subscription row, (11) insert exactly one fact, (12) insert the transactional `billing.subscription_activated` audit event on the same transaction, (13) commit both together, (14) roll everything back on any failure, (15) return an idempotent replay (`outcome: 'already_activated'`) for an already-activated subscription, (16) never write the subscription's `plan` / `status` / `provider_state`, (17) never write `users.plan`, (18) never call Paystack — the service holds no provider at all. Every refusal is a typed `BillingActivationError` with a reason from `BILLING_ACTIVATION_ERROR_REASONS`, and **nothing is written** when one is thrown. |
+| Store | same file | `BillingActivationStore` — thin read access (`findById`, `findBySubscriptionId`, `isActivated`). Never writes. |
+| Read side | `packages/core/src/billing/entitlement-resolution.ts` + `subscriptions.ts` | `resolveEntitlements(plan, status, provider, activated)` gains the required fourth argument, and `getBillingState` derives `activated` (and therefore `paymentConfirmed`) with `EXISTS (SELECT 1 FROM billing_subscription_activations WHERE subscription_id = …)`. |
+| Contracts | `packages/contracts/src/billing.ts` | `paymentConfirmed` becomes `z.boolean()` — a real boolean that is **DERIVED**, never accepted as input and never stored as a second mutable authority. `grantsExecution` / `planChanged` / `entitlementsChanged` are pinned `false` in the activation result. |
+| CLI | `scripts/billing/activate.ts` + `npm run billing:activate` | The ONLY writer. `--user <email|uuid> --by <operator-id> --reason <text> [--evidence <uuid>]`; it parses arguments, connects to the database, calls the service and prints the outcome as JSON. Exit codes: 0 recorded or replayed, 1 typed refusal (nothing written), 2 usage error. The only configuration is `DATABASE_URL`, exactly like `npm run db:migrate`. |
+| Route | — | **None.** There is no activation route, no admin role, no operator endpoint, no activation token and no new production secret: the database connection is the whole trust boundary. `POST /api/billing/verify` (Step 7) records evidence and does NOT activate. |
+
+### Operator runbook
+
+```bash
+# 1. the user's payment evidence must already exist and be reconciled
+#    (Step 7: POST /api/billing/verify, session-authenticated, records the
+#     evidence row; the operator may also pin it with --evidence <uuid>)
+
+# 2. the operator authorizes the activation, out of band, with a reason
+npm run billing:activate -- \
+  --user <email|uuid> --by <operator-id> --reason "sandbox charge verified, receipt filed"
+
+# 3. a replay is safe and returns the existing fact
+npm run billing:activate -- --user <email|uuid> --by <operator-id> --reason "…"
+```
+
+A refusal prints its typed reason and writes nothing. There is no un-activate, no
+edit and no delete: a correction is a manual review, never a silent overwrite.
+
+### What Step 8 deliberately does not do
+
+- **Never treats evidence as authority.** Verified evidence is a prerequisite; only the recorded operator authorization lifts the provider→FREE gate.
+- **Never accepts a confirmation from a client.** No route, no admin role, no operator endpoint, no activation token, no payload — `paymentConfirmed` is derived, and no HTTP request can set it.
+- **Never writes subscription state.** `plan`, `status`, `provider_state`, the pricing lock and `users.plan` are untouched, so an activation can never change a plan, a lifecycle status or a provider state, and the sync/`state_version` bookkeeping is not involved.
+- **Never calls a provider.** The service holds no provider; reconciliation is re-run purely over the stored evidence. Sandbox/test only: a non-`test` domain is refused by the evidence CHECK and by the coherence trigger.
+- **Never grants execution.** `canAccessAutomation` stays `false` for every plan; automation, live execution and broker execution stay OFF regardless of activation state.
+- **Never rewrites history.** Migrations 0001–0033 are byte-identical, 0034 is the only new migration and is additive/forward-only (no DROP, RENAME, TRUNCATE or data rewrite), and the fact table refuses UPDATE and DELETE.
+- **Never touches production.** No live key, no production credential, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, and no Starter selling. No activation has been performed in any deployed environment.
 
 ## Verification + synchronization (Later-billing-PR #7)
 
@@ -983,7 +1060,8 @@ What it asserts, and what it deliberately does not:
 - **(e) No paid grant.** Only `status` (via the canonical mapping, when one
   exists), `provider_state` and the 0031 bookkeeping move; `plan` is never
   written; the provider→FREE entitlement gate (`resolveEntitlements`) is
-  unchanged, `paymentConfirmed` stays `false`, and the result pins
+  unchanged, `paymentConfirmed` stays `false` (only a Billing Step 8 activation
+  fact moves it), and the result pins
   `planChanged` / `entitlementsChanged` / `grantsExecution` to `false`.
 - **(f) The Step 4 operator run is still pending** (below): no epoch is
   registered and no FX version is published in the deployed environment.

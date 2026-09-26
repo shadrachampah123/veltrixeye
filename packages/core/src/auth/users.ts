@@ -34,7 +34,8 @@ export class UserService {
    *  - it creates **no `subscriptions` row**. A user without one is the
    *    supported free state: `getBillingState` and every entitlement reader
    *    resolve a missing row to `plan: 'free'`, `status: 'active'`,
-   *    `paymentConfirmed: false`, the free entitlement set and
+   *    `paymentConfirmed: false` (no activation fact can exist without a
+   *    commercial subscription row), the free entitlement set and
    *    `canAccessAutomation: false` — with no provider and no commercial
    *    entitlement;
    *  - the ONE path that creates a commercial subscription row is the first

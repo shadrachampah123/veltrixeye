@@ -28,21 +28,25 @@ export type EntitlementsDto = z.infer<typeof entitlementsDtoSchema>;
 /**
  * Read-only provider display state carried alongside a billing-state response.
  *
- * This is INFORMATION, never authority. Nothing here confirms a payment, and
- * nothing here can widen an entitlement: `entitlements` is the only capability
- * statement in the response, and for a provider-backed subscription it is the
- * free tier until a real payment-confirmation authority exists.
+ * This is INFORMATION, never authority. Nothing here confirms a payment by
+ * itself, and nothing here can widen an entitlement: `entitlements` is the only
+ * capability statement in the response, and for a provider-backed subscription
+ * it stays the free tier unless a durable activation fact exists.
  *
  * A subscription row whose `provider` is set was created by a checkout
  * (`provider_state = 'pending'`, `status = 'active'`) BEFORE any money moved.
  * Publishing the provider and its reported state is what stops that row from
  * being presented to the user as a confirmed paid subscription.
  *
- * `paymentConfirmed` is pinned to `z.literal(false)` the same way the provider
- * seam pins `grantsExecution` / `planChanged` / `entitlementsChanged`: in this
- * build a confirmed payment is UNREPRESENTABLE, so no caller can read the field
- * as `true` and no producer can emit `true`. Turning it into a real boolean is
- * the job of the (still absent) confirmation authority, not of a display layer.
+ * `paymentConfirmed` is a real boolean, and it is DERIVED — never accepted as
+ * input and never stored as a second mutable authority. The only thing that
+ * makes it `true` is the existence of an immutable activation fact
+ * (`billing_subscription_activations`, migration 0034) written by the
+ * out-of-band operator CLI (`BillingActivationService`). Verified payment
+ * evidence alone (migration 0033) does NOT set it: evidence is a receipt, and a
+ * receipt is not authority. There is deliberately no `payment_confirmed`
+ * column anywhere, so no client payload, provider event or synchronization can
+ * ever write this value.
  *
  * `provider` and `providerState` are opaque nullable strings rather than the
  * `billing-provider.js` enums: that module imports this one, so importing it
@@ -56,8 +60,13 @@ export const billingProviderStatusDtoSchema = z
     provider: z.string().nullable(),
     /** The provider's last reported lifecycle state; `null` when never reported. */
     providerState: z.string().nullable(),
-    /** Always `false`: no payment-confirmation authority exists in this build. */
-    paymentConfirmed: z.literal(false),
+    /**
+     * `true` only when a durable activation fact exists for this subscription
+     * (Billing Step 8). Always `false` for a historical (`provider IS NULL`)
+     * row, for a provider-backed checkout that was never activated, and for
+     * every row that only has payment evidence.
+     */
+    paymentConfirmed: z.boolean(),
   })
   .strict();
 export type BillingProviderStatusDto = z.infer<typeof billingProviderStatusDtoSchema>;
