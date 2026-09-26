@@ -37,14 +37,21 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
     const { user } = req as AuthenticatedRequest;
 
     // Check entitlement server-side
-    // `provider` is read for the fail-closed entitlement gate: a provider-backed
-    // row is an unconfirmed checkout and never buys scanner access.
-    const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null }>(
-      `SELECT plan, status, provider FROM subscriptions WHERE user_id = $1`,
+    // `provider` and the durable activation fact are read for the fail-closed
+    // entitlement gate: a provider-backed row is an unconfirmed checkout and
+    // never buys scanner access until an operator has authorized an immutable
+    // activation fact for it (Billing Step 8, migration 0034).
+    const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null; activated: boolean }>(
+      `SELECT plan, status, provider,
+              EXISTS (SELECT 1 FROM billing_subscription_activations a
+                       WHERE a.subscription_id = subscriptions.id) AS activated
+         FROM subscriptions WHERE user_id = $1`,
       [user.id],
     );
-    const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null };
-    const entitlements = resolveEntitlements(sub.plan as UserPlan, sub.status, sub.provider);
+    const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null, activated: false };
+    const entitlements = resolveEntitlements(
+      sub.plan as UserPlan, sub.status, sub.provider, sub.activated === true,
+    );
     if (!entitlements.canAccessScanner) {
       throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
     }
@@ -59,14 +66,21 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
     if (!ok) return;
     const { user } = req as AuthenticatedRequest;
 
-    // `provider` is read for the fail-closed entitlement gate: a provider-backed
-    // row is an unconfirmed checkout and never buys scanner access.
-    const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null }>(
-      `SELECT plan, status, provider FROM subscriptions WHERE user_id = $1`,
+    // `provider` and the durable activation fact are read for the fail-closed
+    // entitlement gate: a provider-backed row is an unconfirmed checkout and
+    // never buys scanner access until an operator has authorized an immutable
+    // activation fact for it (Billing Step 8, migration 0034).
+    const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null; activated: boolean }>(
+      `SELECT plan, status, provider,
+              EXISTS (SELECT 1 FROM billing_subscription_activations a
+                       WHERE a.subscription_id = subscriptions.id) AS activated
+         FROM subscriptions WHERE user_id = $1`,
       [user.id],
     );
-    const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null };
-    const entitlements = resolveEntitlements(sub.plan as UserPlan, sub.status, sub.provider);
+    const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null, activated: false };
+    const entitlements = resolveEntitlements(
+      sub.plan as UserPlan, sub.status, sub.provider, sub.activated === true,
+    );
     if (!entitlements.canAccessScanner) {
       throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
     }
@@ -89,14 +103,21 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       if (!ok) return;
       const { user } = req as AuthenticatedRequest;
 
-      // `provider` is read for the fail-closed entitlement gate: a provider-backed
-      // row is an unconfirmed checkout and never buys scanner access.
-      const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null }>(
-        `SELECT plan, status, provider FROM subscriptions WHERE user_id = $1`,
+      // `provider` and the durable activation fact are read for the fail-closed
+      // entitlement gate: a provider-backed row is an unconfirmed checkout and
+      // never buys scanner access until an operator has authorized an immutable
+      // activation fact for it (Billing Step 8, migration 0034).
+      const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null; activated: boolean }>(
+        `SELECT plan, status, provider,
+                EXISTS (SELECT 1 FROM billing_subscription_activations a
+                         WHERE a.subscription_id = subscriptions.id) AS activated
+           FROM subscriptions WHERE user_id = $1`,
         [user.id],
       );
-      const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null };
-      const entitlements = resolveEntitlements(sub.plan as UserPlan, sub.status, sub.provider);
+      const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null, activated: false };
+      const entitlements = resolveEntitlements(
+        sub.plan as UserPlan, sub.status, sub.provider, sub.activated === true,
+      );
       if (!entitlements.canAccessScanner) {
         throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
       }

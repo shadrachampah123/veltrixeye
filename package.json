@@ -17,6 +17,7 @@
     "dev": "concurrently -k -n db,api,web -c blue,magenta,cyan \"npm:db:dev\" \"npm:api:dev\" \"npm:web:dev\"",
     "db:dev": "node scripts/db/dev-up.mjs",
     "db:migrate": "tsx scripts/db/migrate-cli.ts",
+    "billing:activate": "tsx scripts/billing/activate.ts",
     "api:dev": "npm run dev --workspace @veltrixeye/api",
     "api:build": "npm run build --workspace @veltrixeye/api",
     "api:start": "npm run start --workspace @veltrixeye/api",

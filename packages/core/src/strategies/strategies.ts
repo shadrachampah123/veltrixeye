@@ -197,14 +197,19 @@ export class StrategyService {
       await client.query('BEGIN');
 
       // M7.4 Atomic entitlement enforcement
-      // `provider` is read for the fail-closed entitlement gate: a
-      // provider-backed row is an unconfirmed checkout, never a purchase.
-      const entitlementRes = await client.query<{ plan: string; status: string; provider: string | null }>(`
-        SELECT plan, status, provider FROM subscriptions WHERE user_id = $1 FOR UPDATE
+      // `provider` and the durable activation fact are read for the
+      // fail-closed entitlement gate: a provider-backed row is an unconfirmed
+      // checkout — never a purchase — until an operator has authorized an
+      // immutable activation fact for it (Billing Step 8, migration 0034).
+      const entitlementRes = await client.query<{ plan: string; status: string; provider: string | null; activated: boolean }>(`
+        SELECT plan, status, provider,
+               EXISTS (SELECT 1 FROM billing_subscription_activations a
+                        WHERE a.subscription_id = subscriptions.id) AS activated
+          FROM subscriptions WHERE user_id = $1 FOR UPDATE
       `, [actorUserId]);
       
-      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active', provider: null };
-      const entitlements = resolveEntitlements(subRow.plan as UserPlan, subRow.status, subRow.provider);
+      const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active', provider: null, activated: false };
+      const entitlements = resolveEntitlements(subRow.plan as UserPlan, subRow.status, subRow.provider, subRow.activated === true);
       const maxStrategies = entitlements.maxStrategies;
       
       const countRes = await client.query('SELECT count(*)::int AS c FROM strategies WHERE user_id = $1', [actorUserId]);

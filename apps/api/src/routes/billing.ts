@@ -142,7 +142,8 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
   // verified false with a typed failure reason). It never grants
   // entitlements or execution: `grantsExecution`, `planChanged` and
   // `entitlementsChanged` are pinned false, and `paymentConfirmed` on the
-  // existing `GET /api/billing/me` DTO stays false.
+  // existing `GET /api/billing/me` DTO is not moved by it (that field is
+  // derived from the durable activation fact, Billing Step 8).
   app.post('/api/billing/verify', {
     config: { rateLimit: { max: BILLING_VERIFY_RATE_LIMIT_MAX, timeWindow: '1 minute' } },
   }, async (req, reply) => {
@@ -175,8 +176,9 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
       subscription: state.subscription,
       entitlements: state.entitlements,
       // Display-only provider state: it tells the client whether the row came
-      // from a provider checkout, and `paymentConfirmed` is pinned false
-      // because no confirmation authority exists. It grants nothing.
+      // from a provider checkout, and `paymentConfirmed` is derived from the
+      // durable activation fact (Billing Step 8) — never from the provider
+      // state, never from client input. It grants nothing.
       providerStatus: state.providerStatus,
     };
     

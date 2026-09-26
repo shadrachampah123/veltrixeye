@@ -31,6 +31,17 @@ const FREE_ENTITLEMENTS = {
   canAccessAutomation: false,
 };
 
+const PRO_ENTITLEMENTS = {
+  maxStrategies: 500,
+  maxBacktestsPerMonth: 1000,
+  maxAlertsPerMonth: 5000,
+  maxSavedSetups: 5000,
+  canAccessScanner: true,
+  canAccessAdvancedStrategies: true,
+  canAccessAdvancedAlerts: true,
+  canAccessAutomation: false,
+};
+
 const PREMIUM_ENTITLEMENTS = {
   maxStrategies: 1000,
   maxBacktestsPerMonth: 5000,
@@ -48,6 +59,8 @@ function billingState(args: {
   entitlements: typeof FREE_ENTITLEMENTS;
   provider?: string | null;
   providerState?: string | null;
+  /** Whether the durable activation FACT confirms the payment (Step 8). */
+  paymentConfirmed?: boolean;
 }): BillingStateDto {
   return billingStateDtoSchema.parse({
     subscription: {
@@ -61,7 +74,7 @@ function billingState(args: {
     providerStatus: {
       provider: args.provider ?? null,
       providerState: args.providerState ?? null,
-      paymentConfirmed: false,
+      paymentConfirmed: args.paymentConfirmed ?? false,
     },
   });
 }
@@ -95,6 +108,36 @@ test('no provider state is rendered as a confirmed payment', () => {
     assert.match(markup, /Payment not confirmed/, `provider_state=${providerState ?? 'NULL'}`);
     assert.doesNotMatch(markup, /confirmed payment|payment confirmed/i);
     assert.doesNotMatch(markup, />10000</, 'the premium limit is never displayed');
+  }
+});
+
+test('an activated provider-backed checkout renders its paid limits and no warning', () => {
+  // Billing Step 8: `paymentConfirmed` is DERIVED from the immutable
+  // activation fact, so a confirmed provider-backed row is a legitimate state
+  // and the panel renders it exactly like any other paid row — with the
+  // limits the server actually enforced, and still no payment affordance.
+  for (const [entitlements, strategyLimit, alertLimit] of [
+    [PRO_ENTITLEMENTS, '500', '5000'],
+    [PREMIUM_ENTITLEMENTS, '1000', '10000'],
+  ] as const) {
+    const markup = render(billingState({
+      plan: entitlements === PRO_ENTITLEMENTS ? 'pro' : 'premium',
+      status: 'active', entitlements,
+      provider: 'paystack', providerState: 'active', paymentConfirmed: true,
+    }));
+    assert.doesNotMatch(markup, /Payment not confirmed/, 'the warning is gone');
+    assert.doesNotMatch(markup, /unconfirmed/i, 'the badge does not read as a checkout');
+    assert.doesNotMatch(markup, /awaiting payment confirmation/);
+    assert.match(markup, />active</, 'the authoritative status badge is shown');
+    assert.match(markup, new RegExp(`>${strategyLimit}</`), 'the paid strategy limit is displayed');
+    assert.match(markup, new RegExp(`>${alertLimit}</`), 'the paid alert limit is displayed');
+    // Display only: nothing here can pay, confirm or activate anything.
+    assert.doesNotMatch(markup, /<button/i);
+    assert.doesNotMatch(markup, /<a\s/i);
+    // Automation stays off regardless of plan or confirmation.
+    assert.match(markup, /Automation \(M8\)/);
+    assert.match(markup, /Automation remains OFF by default/);
+    assert.match(markup, /Automation \(M8\)[\s\S]*?Not included/);
   }
 });
 

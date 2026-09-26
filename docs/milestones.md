@@ -846,11 +846,24 @@ canonical billing contracts and the Paystack provider seam — see
   **No Paystack API call, HTTP request, checkout, portal, webhook, signature
   verification, synchronization worker, credential or route was added**, and no
   new column has a writer yet.
-- **Explicitly deferred to later billing PRs:** the Paystack adapter and every
-  API call, checkout/payment initialization, verification, webhook receiver and
-  signature/replay security, subscription synchronization, provider
-  customer/subscription creation, billing portal, billing UI checkout, the
-  Starter entitlement decision, and production credentials.
+- **Delivered since PR2 (all sandbox only, none granting execution):** PR3 added
+  USD→GHS pricing, the FX authority, provider-plan epochs and the sandbox
+  Paystack adapter (migration `0032`); PR-C added checkout initialization;
+  Step 4 added the plan-provisioning workflow (the operator run itself is still
+  pending); Step 5.1/5.2 added the verified webhook event contract and the
+  secure, receipt-only webhook receiver; Billing Step 6 added customer
+  provisioning; Billing Step 7 added transaction verification and durable
+  payment evidence (migration `0033`); Later-billing-PR #7 added verified
+  subscription synchronization; and **Billing Step 8 added the ACTIVATION
+  AUTHORITY** (migration `0034`, `BillingActivationService`,
+  `npm run billing:activate`) — the only payment-confirmation authority in the
+  build. An activation is an out-of-band operator action: there is no
+  activation route, no admin role, no operator endpoint and no activation
+  token, and `paymentConfirmed` on `GET /api/billing/me` is derived from the
+  immutable activation fact rather than stored or client-supplied.
+- **Explicitly deferred to later billing PRs:** the billing portal, the checkout
+  UI, refunds/proration/dunning execution, the Starter entitlement decision,
+  and production credentials.
 - **Not started / not planned in the billing stream:** broker or MT5/Exness
   connectivity, live execution, automation, and any change to Gate 9, B1, B2 or
   paper-execution behaviour.
@@ -858,5 +871,5 @@ canonical billing contracts and the Paystack provider seam — see
 ## After M9.2 (later work, outline only)
 
 1. **Operational broker transport** — validate a concrete MT5 bridge and an approved external secret manager on demo infrastructure. M8.4 deliberately ships neither and makes no connectivity claim. M8.5/M8.6/M8.7/M9.1/M9.2 prepare reconciliation, safety plumbing, drawdown protection, notification fairness and secret hardening for it; the transport itself is gated on external validation.
-2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031); remaining steps are listed in [billing.md](./billing.md#later-billing-prs-explicitly-not-in-pr2) and in the section above.
+2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path now runs end to end through verified payment evidence and the out-of-band activation authority (Steps 6–8, migrations 0033–0034); the remaining steps — billing portal, checkout UI, refunds/proration/dunning and production credentials — are listed in [billing.md](./billing.md#later-billing-prs-explicitly-not-in-pr2) and in the section above.
 3. **More channels** (SMS/Telegram) behind same registry if needed.
