@@ -588,7 +588,21 @@ describe('M7.5: Observability', () => {
     const passwordHash = await hashPassword(PASSWORD);
     const user = await users.create({ email, passwordHash, name: 'Obs Test' });
     await makePro(user.id);
-    const strategy = await strategies.createStrategy(user.id, { name: `Obs Strat ${Date.now()}`, description: 'test' });
+    const strategy = await strategies.createStrategy(user.id, {
+      name: `Obs Strat ${Date.now()}`,
+      description: 'test',
+      version: {
+        timeframes: {
+          htf_bias: '4h',
+          setup: '1h',
+          entry: '15m',
+        },
+        marketScope: {
+          mode: 'instruments',
+          instruments: [{ assetClass: 'forex', symbol: 'EURUSD' }],
+        },
+      },
+    });
 
     const result = await scanner.triggerScan({ strategyId: strategy.id, force: true });
 
