@@ -6,7 +6,7 @@ import {
   getBillingState, BillingCheckoutError, Errors, isBillingProviderPlanError,
   isBillingPricingError, isBillingFxError, isBillingSubscriptionSyncError,
   isBillingCustomerProvisioningError, type BillingCustomerProvisioningErrorReason,
-  isBillingPaymentConfirmationError,
+  isBillingPaymentConfirmationError, readBillingPortalFacts,
 } from '@veltrixeye/core';
 import { isPaystackAdapterError } from '@veltrixeye/provider-paystack';
 import { composeBillingCheckout, composeBillingCustomers, composeBillingSync, composeBillingVerify } from '../billing-composition.js';
@@ -14,6 +14,8 @@ import { registerBillingWebhookRoutes } from '../billing-webhook.js';
 import {
   isBillingCheckoutProjectionError,
   projectBillingCheckoutSession,
+  projectBillingPortalSummary,
+  UNAVAILABLE_BILLING_PORTAL_SUMMARY,
   type BillingStateDto,
 } from '@veltrixeye/contracts';
 
@@ -186,6 +188,52 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
         throw Errors.providerUnavailable(`Verification refused: ${error.reason}.`, error);
       }
       throw error;
+    }
+  });
+
+  /**
+   * Billing Portal v1 — the READ-ONLY billing overview.
+   *
+   * The subject is ALWAYS the authenticated session user: the route reads no
+   * body field, no query parameter and no header for an identity, so a
+   * `userId`, `customerId`, `subscriptionId` or any other provider identity a
+   * browser supplies cannot change whose summary is answered. (Fastify parses
+   * no body for a GET, so an injected body is simply not read — the test suite
+   * pins that it changes neither the state nor the bytes of the answer.)
+   *
+   * What it answers is a PROJECTION (`BillingPortalSummaryDto`): the state
+   * (free / awaiting verification / evidence awaiting activation / activated /
+   * unknown / unavailable), the server-derived commercial plan + interval, the
+   * trusted PERSISTED period end and the authoritative cancellation state —
+   * and nothing else. No subscription/user/customer id, no provider code or
+   * reference, no transaction reference, no evidence hash, no idempotency key,
+   * no pricing snapshot and no operator activation detail can leave through it:
+   * the read does not select those columns and the DTO is strict.
+   *
+   * The state is derived ONLY from server facts, and `activated` only ever from
+   * the durable activation fact (the Step 8 operator authority). A stored
+   * `status = 'active'`, a provider state, verified payment evidence or any
+   * client payload cannot produce a paid state, and a renewal date is never
+   * calculated from the billing interval — a missing one is `null`.
+   *
+   * FAIL CLOSED: if the read or the projection fails, the route answers
+   * `UNAVAILABLE_BILLING_PORTAL_SUMMARY` (`state: "unavailable"`, every optional
+   * field null) and logs the failure server-side. A reason, a provider error, a
+   * credential or a partially read row never reaches the browser, and no
+   * failure path writes anything, so a failed read cannot change billing state.
+   */
+  app.get('/api/billing/portal', async (req, reply) => {
+    if (!await requireAuth(req, reply)) return;
+    // Nothing else is read from the request: not the body (Fastify parses none
+    // for a GET), not the query string and not a header. There is therefore no
+    // input channel through which a caller could name a subject, so the only
+    // identity this route can ever be about is `user.id` — the session's.
+    const { user } = req as AuthenticatedRequest;
+    try {
+      return reply.send(projectBillingPortalSummary(await readBillingPortalFacts(ctx.pool, user.id)));
+    } catch (error) {
+      req.log.error({ err: error }, 'billing portal summary unavailable');
+      return reply.send(UNAVAILABLE_BILLING_PORTAL_SUMMARY);
     }
   });
 

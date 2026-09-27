@@ -47,6 +47,8 @@ import type {
   BillingCheckoutSessionDto,
   BillingCustomerProvisioningResult,
   BillingPaymentVerificationResult,
+  // Billing Portal v1 — the read-only billing overview
+  BillingPortalSummaryDto,
   // M7.5 — live scanner
   ScannerHealthDto,
   ScannerRunDto,
@@ -95,6 +97,7 @@ import type {
 import {
   billingCheckoutRequestDtoSchema,
   billingCheckoutSessionDtoSchema,
+  billingPortalSummaryDtoSchema,
   MAX_ALERTS_LIMIT,
   MAX_BACKTESTS_LIMIT,
   MAX_BACKTEST_TRADES,
@@ -775,6 +778,22 @@ export const api = {
       method: 'POST',
       body: EMPTY_JSON_BODY,
     }),
+
+  /**
+   * Billing Portal v1 — `GET /api/billing/portal`, the read-only overview.
+   *
+   * A body-less GET: there is nothing to send, because the subject is the
+   * session user and every fact is server-derived. The answer is parsed through
+   * `billingPortalSummaryDtoSchema`, so a response carrying an internal id, a
+   * provider identifier, a reference, a hash or a pricing snapshot is a
+   * client-side failure — never something to render. The overview grants
+   * nothing: `canAccessAutomation` and `grantsExecution` are pinned `false` in
+   * the DTO.
+   */
+  getBillingPortalSummary: async (): Promise<BillingPortalSummaryDto> =>
+    billingPortalSummaryDtoSchema.parse(
+      await request<BillingPortalSummaryDto>('/billing/portal'),
+    ),
 };
 
 /** Summary row shape from the API list endpoint. */

@@ -516,7 +516,20 @@ describe('Billing Step 9 — source pins', () => {
       /billingCheckoutSessionDtoSchema\.parse/,
       'and the answer is parsed through the strict disclosed DTO',
     );
-    assert.doesNotMatch(apiSource, /\/billing\/(portal|callback|activate)/, 'no portal, callback or activation call');
+    // Billing Portal v1 added exactly ONE more call: the read-only
+    // `GET /api/billing/portal`, which sends no method, no body and no
+    // identity — the subject is the session. Nothing self-service exists: no
+    // callback, activation, cancellation, invoice or payment-method call.
+    assert.match(
+      apiSource,
+      /getBillingPortalSummary:[\s\S]{0,240}?request<BillingPortalSummaryDto>\('\/billing\/portal'\)/,
+      'the portal overview is a body-less read of the session user\'s own summary',
+    );
+    assert.doesNotMatch(
+      apiSource,
+      /\/billing\/(callback|activate|activations|cancel|invoices|payment-methods|refund)/,
+      'no callback, activation, cancellation, invoice, payment-method or refund call',
+    );
   });
 });
 

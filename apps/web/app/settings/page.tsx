@@ -6,9 +6,10 @@ import { RequireAuth, useAuth } from '@/components/auth-context';
 import { api, ApiError } from '@/lib/api';
 import { Alert, Badge, Button, Card, CardHeader, Field, Input, Spinner } from '@/components/ui';
 import { formatDateTime } from '@/lib/formats';
-import type { SessionDto, BillingStateDto } from '@veltrixeye/contracts';
+import type { SessionDto, BillingPortalSummaryDto, BillingStateDto } from '@veltrixeye/contracts';
 import { SubscriptionPanel, PlanComparison } from '@/components/subscription-panel';
 import { BillingCheckoutPanel } from '@/components/billing-checkout';
+import { BillingPortalPanel } from '@/components/billing-portal';
 import { WatchlistPanel } from '@/components/watchlist';
 import { NotificationPreferencesPanel } from '@/components/notification-preferences';
 import { BRAND } from '@/lib/brand';
@@ -30,6 +31,13 @@ function SettingsContent() {
    * server still derives `paymentConfirmed` from the activation fact.
    */
   const [evidenceRecorded, setEvidenceRecorded] = React.useState(false);
+  /**
+   * Billing Portal v1 — the read-only overview (`GET /api/billing/portal`).
+   * It is its OWN read, so a failure here cannot be mistaken for a free state:
+   * `portalUnavailable` presents the overview as unavailable and claims nothing.
+   */
+  const [portal, setPortal] = React.useState<BillingPortalSummaryDto | null>(null);
+  const [portalUnavailable, setPortalUnavailable] = React.useState(false);
   const [name, setName] = React.useState(user?.name ?? '');
   const [profileMsg, setProfileMsg] = React.useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
   const [cur, setCur] = React.useState('');
@@ -57,10 +65,24 @@ function SettingsContent() {
       });
   }, []);
 
+  const loadPortal = React.useCallback(() => {
+    api
+      .getBillingPortalSummary()
+      .then((summary) => {
+        setPortal(summary);
+        setPortalUnavailable(false);
+      })
+      .catch(() => {
+        setPortal(null);
+        setPortalUnavailable(true);
+      });
+  }, []);
+
   React.useEffect(() => {
     loadSessions();
     loadBilling();
-  }, [loadSessions, loadBilling]);
+    loadPortal();
+  }, [loadSessions, loadBilling, loadPortal]);
 
   if (!user) return <Spinner />;
 
@@ -148,6 +170,17 @@ function SettingsContent() {
 
           {/* Notification Preferences M9.2 */}
           <NotificationPreferencesPanel />
+
+          {/*
+            Billing Portal v1 — the read-only billing overview: the six states
+            (free / awaiting verification / evidence awaiting activation /
+            activated / unknown / unavailable), the server-derived plan and
+            interval, the trusted persisted period end and the authoritative
+            cancellation state. Display only — no cancellation, no invoices, no
+            payment method and no plan editing (there is no endpoint for any of
+            them, and this page calls none).
+          */}
+          <BillingPortalPanel portal={portal} unavailable={portalUnavailable} />
 
           {/* Subscription & Entitlement Foundations */}
           <SubscriptionPanel

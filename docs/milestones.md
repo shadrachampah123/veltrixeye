@@ -860,10 +860,20 @@ canonical billing contracts and the Paystack provider seam — see
   build. An activation is an out-of-band operator action: there is no
   activation route, no admin role, no operator endpoint and no activation
   token, and `paymentConfirmed` on `GET /api/billing/me` is derived from the
-  immutable activation fact rather than stored or client-supplied.
-- **Explicitly deferred to later billing PRs:** the billing portal, the checkout
-  UI, refunds/proration/dunning execution, the Starter entitlement decision,
-  and production credentials.
+  immutable activation fact rather than stored or client-supplied. **Billing
+  Step 9 added the sandbox checkout surface** (`/settings`: four catalogue
+  choices, server-priced disclosure, the verbatim payment link, an explicit
+  verification click and no polling), and **Billing Portal v1 added the
+  READ-ONLY billing overview** (`GET /api/billing/portal` plus the `/settings`
+  card: six states, server-stated plan/interval, trusted persisted renewal,
+  authoritative cancellation state, `null` when the server cannot state it —
+  no renewal arithmetic, no request-supplied identity and no action of any
+  kind). It adds no migration, no provider operation and no authority change:
+  `canAccessAutomation` / `grantsExecution` stay `false`.
+- **Explicitly deferred to later billing PRs:** self-serve billing management
+  (cancellation, invoices, payment methods, plan changes), refunds/proration/
+  dunning execution, the Starter entitlement decision, and production
+  credentials.
 - **Not started / not planned in the billing stream:** broker or MT5/Exness
   connectivity, live execution, automation, and any change to Gate 9, B1, B2 or
   paper-execution behaviour.
@@ -871,5 +881,5 @@ canonical billing contracts and the Paystack provider seam — see
 ## After M9.2 (later work, outline only)
 
 1. **Operational broker transport** — validate a concrete MT5 bridge and an approved external secret manager on demo infrastructure. M8.4 deliberately ships neither and makes no connectivity claim. M8.5/M8.6/M8.7/M9.1/M9.2 prepare reconciliation, safety plumbing, drawdown protection, notification fairness and secret hardening for it; the transport itself is gated on external validation.
-2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path now runs end to end through verified payment evidence and the out-of-band activation authority (Steps 6–8, migrations 0033–0034); the remaining steps — billing portal, checkout UI, refunds/proration/dunning and production credentials — are listed in [billing.md](./billing.md#later-billing-prs-explicitly-not-in-pr2) and in the section above.
+2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path now runs end to end through verified payment evidence and the out-of-band activation authority (Steps 6–8, migrations 0033–0034), with a checkout UI and a read-only overview delivered by Billing Step 9 and Billing Portal v1; the remaining steps — self-serve subscription management, refunds/proration/dunning and production credentials — are listed in [billing.md](./billing.md#later-billing-prs-explicitly-not-in-pr2) and in the section above.
 3. **More channels** (SMS/Telegram) behind same registry if needed.

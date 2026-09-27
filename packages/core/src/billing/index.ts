@@ -16,3 +16,4 @@ export * from './payment-reconciliation.js';
 export * from './verified-transactions.js';
 export * from './confirmation.js';
 export * from './activation.js';
+export * from './portal.js';
