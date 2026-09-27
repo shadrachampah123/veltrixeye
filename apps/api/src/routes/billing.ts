@@ -11,7 +11,11 @@ import {
 import { isPaystackAdapterError } from '@veltrixeye/provider-paystack';
 import { composeBillingCheckout, composeBillingCustomers, composeBillingSync, composeBillingVerify } from '../billing-composition.js';
 import { registerBillingWebhookRoutes } from '../billing-webhook.js';
-import type { BillingStateDto } from '@veltrixeye/contracts';
+import {
+  isBillingCheckoutProjectionError,
+  projectBillingCheckoutSession,
+  type BillingStateDto,
+} from '@veltrixeye/contracts';
 
 /**
  * Later-billing-PR #7: per-IP limit for `POST /api/billing/sync`, applied as a
@@ -61,11 +65,26 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
   // exists (with no sandbox key the endpoint does not exist at all).
   await registerBillingWebhookRoutes(app, ctx, config);
 
+  // PR-C sandbox checkout initialization, disclosed to the browser by Billing
+  // Step 9. The service answer is the INTERNAL seam session; what the route
+  // sends is `projectBillingCheckoutSession(session)` — the strict
+  // `BillingCheckoutSessionDto`, which carries the session status, the
+  // authorization URL VERBATIM, the commercial (USD) price, the exact payment
+  // (GHS) amount and the FX disclosure (rate, version and time). It omits our
+  // checkout reference, the provider's reference, the provider id, the
+  // idempotency key and the whole immutable pricing snapshot (including the
+  // provider plan code and the policy/catalogue versions): those are internal
+  // identity, not display data, and a reference is the input to the
+  // verification read. A session the projection cannot disclose safely is
+  // refused (502) rather than forwarded raw. Nothing here confirms a payment:
+  // the DTO pins `paymentConfirmed`, `planChanged`, `entitlementsChanged`,
+  // `grantsExecution` and `canAccessAutomation` to false.
   app.post('/api/billing/checkout', async (req, reply) => {
     if (!await requireAuth(req, reply)) return;
     const { user } = req as AuthenticatedRequest;
     try {
-      return reply.send(await checkout.checkout(user.id, req.body));
+      const session = await checkout.checkout(user.id, req.body);
+      return reply.send(projectBillingCheckoutSession(session));
     } catch (error) {
       if (error instanceof BillingCheckoutError && error.reason === 'pricing_lock_required') {
         throw Errors.conflict(error.message);
@@ -74,6 +93,11 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
           isBillingPricingError(error) || isBillingFxError(error) || isPaystackAdapterError(error)) {
         // Existing API envelope/codes; typed billing reason remains visible, no raw payload.
         throw Errors.providerUnavailable(`Checkout refused: ${error.reason}.`, error);
+      }
+      if (isBillingCheckoutProjectionError(error)) {
+        // The session was never disclosed: no reference, no provider identifier,
+        // no idempotency key and no pricing snapshot leaves through this path.
+        throw Errors.providerUnavailable('Checkout refused: session_not_disclosable.', error);
       }
       throw error;
     }

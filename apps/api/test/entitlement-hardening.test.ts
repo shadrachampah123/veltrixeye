@@ -28,6 +28,7 @@ import { randomUUID } from 'node:crypto';
 import {
   BILLING_LIFECYCLE_STATES,
   TIMEFRAMES,
+  billingCheckoutSessionDtoSchema,
   billingStateDtoSchema,
   type Candle,
   type MarketDataProvider,
@@ -35,7 +36,7 @@ import {
   type RealtimeCandleStream,
   type RealtimeSubscription,
 } from '@veltrixeye/contracts';
-import { CandleStore, getEntitlements, verifyPricingSnapshot } from '@veltrixeye/core';
+import { BillingPricingSnapshotStore, CandleStore, getEntitlements, verifyPricingSnapshot } from '@veltrixeye/core';
 import { createPaystackProvider } from '@veltrixeye/provider-paystack';
 import { buildApp, createAppContext } from '../src/app.js';
 import { loadConfig, type AppConfig } from '../src/config.js';
@@ -515,16 +516,32 @@ describe('POST /api/billing/checkout — initialization buys nothing', () => {
       payload: PRO_MONTHLY,
     });
     assert.equal(res.statusCode, 200, res.body);
-    const session = res.json();
+    // Billing Step 9: the response is the DISCLOSED session DTO. The internal
+    // pricing snapshot is no longer forwarded, so the pricing regression is
+    // pinned on the durable row it was written to, and the disclosure is pinned
+    // against that same row.
+    const session = billingCheckoutSessionDtoSchema.parse(res.json());
     assert.equal(session.authorizationUrl, 'https://checkout.example.test/authorize');
-    // Pricing behaviour is untouched: the exact epoch snapshot, verified.
-    // `computedAt` is the composition's own clock; every priced fact must match.
-    const expectedPricing = deriveSnapshot(facts);
-    assert.deepEqual(
-      { ...session.pricing, computedAt: expectedPricing.computedAt }, expectedPricing,
-    );
-    assert.deepEqual(verifyPricingSnapshot(session.pricing), session.pricing);
     assert.equal(calls.length, 1);
+    const expectedPricing = deriveSnapshot(facts);
+    assert.deepEqual(verifyPricingSnapshot(expectedPricing), expectedPricing);
+    const locked = await db.pool.query(
+      'SELECT locked_pricing_snapshot_id FROM subscriptions WHERE user_id = $1', [user.userId],
+    );
+    const stored = await new BillingPricingSnapshotStore(db.pool).findById(locked.rows[0]!.locked_pricing_snapshot_id);
+    const persisted = verifyPricingSnapshot(stored?.snapshot);
+    // `computedAt` is the composition's own clock; every priced fact must match.
+    assert.deepEqual({ ...persisted, computedAt: expectedPricing.computedAt }, expectedPricing);
+    assert.equal(session.price?.amountMinor, persisted.commercialAmountMinor);
+    assert.equal(session.price?.cataloguePlan, persisted.cataloguePlan);
+    assert.deepEqual(session.payment, persisted.payment);
+    assert.equal(session.fx?.fxRateVersionId, persisted.fx.fxRateVersionId);
+    assert.equal(session.fx?.fxRateScaled, persisted.fx.fxRateScaled);
+    assert.equal(session.paymentConfirmed, false, 'a checkout session confirms no payment');
+    assert.equal(session.grantsExecution, false);
+    for (const forbidden of ['pricing', 'idempotencyKey', 'providerPlanId', persisted.providerPlanId ?? '']) {
+      assert.ok(!res.body.includes(forbidden), `the response must not carry "${forbidden}"`);
+    }
 
     const row = await db.pool.query(
       `SELECT status, plan, provider, provider_state, locked_pricing_snapshot_id, state_version
@@ -564,8 +581,13 @@ describe('POST /api/billing/checkout — initialization buys nothing', () => {
 
     const second = await post();
     assert.equal(second.statusCode, 200, second.body);
-    assert.deepEqual(second.json(), first.json(), 'the reference and pricing are stable');
-    assert.equal(second.json().reference, first.json().reference);
+    assert.deepEqual(second.json(), first.json(), 'the disclosed price, FX and URL are stable');
+    // The checkout REFERENCE is no longer disclosed (Step 9), so its stability is
+    // pinned where it still exists: the reference the adapter was given.
+    assert.equal(calls.length, 2);
+    assert.match(String(calls[0]!.reference), /^ve-chk-[0-9a-f]{64}$/);
+    assert.equal(calls[1]!.reference, calls[0]!.reference, 'the retry reuses one server-side reference');
+    assert.ok(!first.body.includes(String(calls[0]!.reference)), 'and the browser never sees it');
 
     const rowAfterRetry = await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.userId]);
     assert.deepEqual(rowAfterRetry.rows, rowAfterFirst.rows, 'a retry mutates nothing');

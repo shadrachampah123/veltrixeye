@@ -2,9 +2,16 @@ import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  BillingPricingSnapshotStore, billingCheckoutSessionSchema, verifyPricingSnapshot,
-  createBillingProviderRegistry, createFreeSubscription, parseProviderPlan,
+  BILLING_CHECKOUT_SESSION_STATUSES, BillingPricingSnapshotStore, verifyPricingSnapshot,
+  createBillingProviderRegistry, createFreeSubscription, createUnimplementedBillingProvider,
+  parseProviderPlan,
 } from '@veltrixeye/core';
+import {
+  BILLING_CHECKOUT_SESSION_DTO_STATUSES, billingCheckoutRequestDtoSchema,
+  billingCheckoutSessionDtoSchema,
+  type BillingCheckoutSessionDto,
+  type BillingPricingSnapshot,
+} from '@veltrixeye/contracts';
 import { createPaystackProvider } from '@veltrixeye/provider-paystack';
 import { buildApp, createAppContext } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
@@ -61,6 +68,30 @@ const checkout = (cookie: string, payload: object = PRO_MONTHLY, headers: Record
   method: 'POST', url: '/api/billing/checkout', headers: { cookie, ...headers }, payload,
 });
 
+/**
+ * Billing Step 9 — the route answers with the DISCLOSED session DTO
+ * (`billingCheckoutSessionDtoSchema`), never the internal seam session. This
+ * helper pins the disclosure to the durable pricing snapshot the checkout
+ * locked: the commercial price, the exact payment amount and the FX
+ * rate/version/time must be a faithful projection of it, and nothing else.
+ */
+function assertDisclosesSnapshot(dto: BillingCheckoutSessionDto, snapshot: BillingPricingSnapshot): void {
+  assert.deepEqual(dto.price, {
+    cataloguePlan: snapshot.cataloguePlan,
+    interval: snapshot.interval,
+    currency: snapshot.commercialCurrency,
+    amountMinor: snapshot.commercialAmountMinor,
+    display: dto.price?.display,
+  });
+  assert.deepEqual(dto.payment, snapshot.payment);
+  assert.equal(dto.fx?.fxRateScaled, snapshot.fx.fxRateScaled);
+  assert.equal(dto.fx?.fxRateScale, snapshot.fx.fxRateScale);
+  assert.equal(dto.fx?.fxRateVersionId, snapshot.fx.fxRateVersionId);
+  assert.equal(dto.fx?.fxRateEffectiveFrom, snapshot.fx.fxRateEffectiveFrom);
+  assert.equal(dto.fx?.fxRateCapturedAt, snapshot.fx.fxRateCapturedAt);
+  assert.equal(dto.fx?.quoteCurrency, snapshot.payment.paymentCurrency);
+}
+
 test('requires authentication; preserves other prohibited routes', async () => {
   const result = await checkout('');
   assert.equal(result.statusCode, 401);
@@ -84,10 +115,15 @@ test('authenticated route authorizes locked plan and exact GHS amount; retry ret
     host: 'attacker.example.test', 'x-forwarded-host': 'attacker.example.test', 'x-forwarded-proto': 'http',
   });
   assert.equal(first.statusCode, 200, first.body);
-  const session = billingCheckoutSessionSchema.parse(first.json());
+  const session = billingCheckoutSessionDtoSchema.parse(first.json());
+  assert.equal(session.status, 'initialized');
+  // The URL is carried VERBATIM: exactly what the provider returned.
   assert.equal(session.authorizationUrl, 'https://checkout.example.test/authorize');
-  assert.equal(session.pricing?.providerPlanId, facts.epoch.provider_plan_id);
-  assert.equal(session.pricing?.fx.fxRateVersionId, facts.fx.id);
+  // The FX disclosure names the immutable rate version this price is pinned to.
+  assert.equal(session.fx?.fxRateVersionId, facts.fx.id);
+  assert.equal(session.fx?.rateDisplay, '1 USD = 12.5 GHS');
+  assert.equal(session.paymentDisplay, 'GHS 487.50');
+  assert.equal(session.price?.display, '$39');
   const second = await checkout(user.cookie);
   assert.equal(second.statusCode, 200, second.body);
   assert.deepEqual(second.json(), first.json());
@@ -95,12 +131,15 @@ test('authenticated route authorizes locked plan and exact GHS amount; retry ret
   for (const call of calls) {
     assert.equal(call.url, 'https://api.paystack.co/transaction/initialize');
     assert.equal(call.method, 'POST');
-    assert.equal(call.body.plan, session.pricing?.providerPlanId);
+    assert.equal(call.body.plan, facts.epoch.provider_plan_id);
     assert.equal(call.body.amount, session.payment?.paymentAmountMinor);
     assert.equal(call.body.currency, 'GHS');
     assert.equal(call.body.email, user.email);
     assert.equal(call.body.callback_url, 'https://app.example.test/settings');
-    assert.equal(call.body.reference, session.reference);
+    // The checkout reference stays SERVER-SIDE: the adapter is given it, the
+    // browser never sees it (Step 9 projection).
+    assert.match(String(call.body.reference), /^ve-chk-[0-9a-f]{64}$/);
+    assert.ok(!first.body.includes(String(call.body.reference)), 'the reference is never disclosed');
   }
   assert.deepEqual((await db.pool.query('SELECT * FROM billing_customers WHERE user_id=$1', [user.id])).rows, beforeCustomers.rows);
 });
@@ -136,7 +175,8 @@ test('MODEL C: registration provisions no billing row and the first checkout cre
   const snapshotsBefore = (await snapshots()).rows[0].c;
   const result = await checkout(cookie);
   assert.equal(result.statusCode, 200, result.body);
-  assert.equal(result.json().pricing.providerPlanId, facts.epoch.provider_plan_id);
+  assert.equal(result.json().price.cataloguePlan, 'pro');
+  assert.equal(result.json().fx.fxRateVersionId, facts.fx.id);
   const rows = await read();
   assert.equal(rows.rowCount, 1, 'exactly one commercial subscription row');
   assert.equal(rows.rows[0].plan, 'pro');
@@ -145,7 +185,9 @@ test('MODEL C: registration provisions no billing row and the first checkout cre
   assert.ok(rows.rows[0].locked_pricing_snapshot_id, 'the immutable pricing lock is created with the row');
   assert.equal((await snapshots()).rows[0].c, snapshotsBefore + 1, 'exactly one pricing snapshot for the sale');
   const stored = await new BillingPricingSnapshotStore(db.pool).findById(rows.rows[0].locked_pricing_snapshot_id);
-  assert.deepEqual(verifyPricingSnapshot(stored?.snapshot), result.json().pricing);
+  const locked = verifyPricingSnapshot(stored?.snapshot);
+  assert.equal(locked.providerPlanId, facts.epoch.provider_plan_id);
+  assertDisclosesSnapshot(billingCheckoutSessionDtoSchema.parse(result.json()), locked);
   // The lock is a pricing fact, never a confirmation: still free, still unconfirmed.
   const after = await app.inject({ method: 'GET', url: '/api/billing/me', headers: { cookie } });
   assert.equal(after.json().providerStatus.paymentConfirmed, false);
@@ -186,7 +228,7 @@ test('parallel first checkouts leave one subscription, one snapshot and one lock
   // discarded with their own transactions, so only the winner's survives.
   assert.equal((await snapshots()).rows[0].c, snapshotsBefore + 1, 'exactly one pricing snapshot survives');
   const stored = await new BillingPricingSnapshotStore(db.pool).findById(rows.rows[0].locked_pricing_snapshot_id);
-  assert.deepEqual(verifyPricingSnapshot(stored?.snapshot), winner!.json().pricing);
+  assertDisclosesSnapshot(billingCheckoutSessionDtoSchema.parse(winner!.json()), verifyPricingSnapshot(stored?.snapshot));
 });
 
 test('legacy NULL-lock rows stay fail-closed with pricing_lock_required and are never upgraded', async () => {
@@ -283,12 +325,17 @@ test('retired locked A remains immutable and verified; adapter rejects retry wit
   assert.equal(calls.length, attemptsBefore, 'retirement guard prevents any provider HTTP request');
   assert.deepEqual((await read()).rows, locked.rows);
   const stored = await new BillingPricingSnapshotStore(db.pool).findById(locked.rows[0].locked_pricing_snapshot_id);
-  assert.deepEqual(verifyPricingSnapshot(stored?.snapshot), initial.json().pricing);
+  assertDisclosesSnapshot(billingCheckoutSessionDtoSchema.parse(initial.json()), verifyPricingSnapshot(stored?.snapshot));
   const fresh = await authenticatedUser();
   const result = await checkout(fresh.cookie);
   assert.equal(result.statusCode, 200, result.body);
-  assert.equal(result.json().pricing.providerPlanId, b.epoch.provider_plan_id);
+  // The new user is priced from epoch B: the disclosed FX version and the exact
+  // GHS amount are the server's, and the provider plan code is not disclosed.
+  assert.equal(result.json().fx.fxRateVersionId, b.fx.id);
+  assert.equal(result.json().fx.rateDisplay, '1 USD = 20 GHS');
   assert.equal(result.json().payment.paymentAmountMinor, 78_000);
+  assert.equal(result.json().paymentDisplay, 'GHS 780.00');
+  assert.ok(!result.body.includes(b.epoch.provider_plan_id), 'the provider plan code is never disclosed');
 });
 
 test('unregistered historical plan cannot reach Paystack', async () => {
@@ -351,4 +398,116 @@ test('adapter amount authorization is not bypassed by the service', async () => 
   }));
   const guarded = composeBillingCheckout(db.pool, providers, config());
   await assert.rejects(guarded.checkout(user.id, PRO_MONTHLY), { reason: 'plan_mismatch' });
+});
+
+/* ==========================================================================
+   Billing Step 9 — the disclosed checkout session (API response projection)
+
+   The route answers the browser with `BillingCheckoutSessionDto` only. These
+   tests pin BOTH directions over the HTTP boundary: what is disclosed (price,
+   exact payment amount, FX rate/version/time, the verbatim authorization URL)
+   and what is removed (our checkout reference, the provider's reference, the
+   provider id, the idempotency key and the whole internal pricing snapshot).
+   ========================================================================== */
+
+/** Every key the disclosed DTO carries — pinned so a leak is a test failure. */
+const DISCLOSED_KEYS = [
+  'authorizationUrl', 'canAccessAutomation', 'entitlementsChanged', 'fx', 'grantsExecution',
+  'initializedAt', 'payment', 'paymentConfirmed', 'paymentDisplay', 'planChanged', 'price', 'status',
+];
+
+test('Step 9 projection: the browser receives the disclosed DTO and nothing internal', async () => {
+  const facts = await insertEpoch(db.pool);
+  const user = await authenticatedUser();
+  const result = await checkout(user.cookie);
+  assert.equal(result.statusCode, 200, result.body);
+  const dto = billingCheckoutSessionDtoSchema.parse(result.json());
+  assert.deepEqual(Object.keys(result.json()).sort(), DISCLOSED_KEYS);
+  // Nothing internal survives the projection — checked on the RAW wire body,
+  // not on the parsed object, so an added field would fail here.
+  for (const forbidden of [
+    'reference', 'providerReference', 'idempotencyKey', 'pricing', 'providerPlanId',
+    'provider', 'paystack', 'catalogueVersion', 'pricingPolicyVersion', 'computedAt',
+    facts.epoch.provider_plan_id,
+  ]) {
+    assert.ok(!result.body.includes(forbidden), `the response must not carry "${forbidden}"`);
+  }
+  // What IS disclosed: the verbatim URL, the commercial price, the exact
+  // payment amount and the FX rate/version/time.
+  assert.equal(dto.status, 'initialized');
+  assert.equal(dto.authorizationUrl, 'https://checkout.example.test/authorize');
+  assert.deepEqual(dto.price, {
+    cataloguePlan: 'pro', interval: 'monthly', currency: 'USD', amountMinor: 3900, display: '$39',
+  });
+  assert.deepEqual(dto.payment, { paymentCurrency: 'GHS', paymentAmountMinor: 48_750, paymentAmountExponent: 2 });
+  assert.equal(dto.paymentDisplay, 'GHS 487.50');
+  assert.equal(dto.fx?.rateDisplay, '1 USD = 12.5 GHS');
+  assert.equal(dto.fx?.fxRateVersionId, facts.fx.id);
+  // A checkout session is an offer to pay: every capability pin is false.
+  assert.equal(dto.paymentConfirmed, false);
+  assert.equal(dto.planChanged, false);
+  assert.equal(dto.entitlementsChanged, false);
+  assert.equal(dto.grantsExecution, false);
+  assert.equal(dto.canAccessAutomation, false);
+  // The disclosure is a faithful projection of the durable locked snapshot.
+  const rows = await db.pool.query('SELECT locked_pricing_snapshot_id FROM subscriptions WHERE user_id=$1', [user.id]);
+  const stored = await new BillingPricingSnapshotStore(db.pool).findById(rows.rows[0].locked_pricing_snapshot_id);
+  assertDisclosesSnapshot(dto, verifyPricingSnapshot(stored?.snapshot));
+});
+
+test('Step 9 projection: an undisclosable initialized session is refused, never forwarded raw', async () => {
+  const facts = await insertEpoch(db.pool);
+  const user = await authenticatedUser();
+  // A provider that reports an initialized session WITHOUT the pricing snapshot
+  // the disclosure is built from: the route must refuse (502) rather than send
+  // a payment link with no price next to it — and must not fall back to the raw
+  // internal session.
+  const stubCtx = createAppContext(db.pool, config());
+  let seenReference = '';
+  stubCtx.billingProviders.register({
+    ...createUnimplementedBillingProvider(),
+    async initializeCheckout(request) {
+      seenReference = request.reference;
+      return {
+        provider: 'paystack', status: 'initialized',
+        reference: request.reference, providerReference: request.reference,
+        authorizationUrl: 'https://checkout.example.test/authorize',
+        amountMinor: request.pricing?.commercialAmountMinor ?? 0, currency: 'USD',
+        payment: null, pricing: null,
+        idempotencyKey: request.idempotencyKey, initializedAt: AS_OF.toISOString(),
+      };
+    },
+  });
+  const stubApp = await buildApp(config(), stubCtx);
+  try {
+    await stubApp.ready();
+    const result = await stubApp.inject({
+      method: 'POST', url: '/api/billing/checkout', headers: { cookie: user.cookie }, payload: PRO_MONTHLY,
+    });
+    assert.equal(result.statusCode, 502, result.body);
+    assert.equal(result.json().error.code, 'provider_unavailable');
+    assert.match(result.json().error.message, /session_not_disclosable/);
+    assert.ok(!result.body.includes('https://checkout.example.test/authorize'), 'no payment link is disclosed');
+    assert.ok(!result.body.includes(seenReference), 'no checkout reference is disclosed');
+    assert.ok(!result.body.includes(facts.epoch.provider_plan_id), 'no provider plan code is disclosed');
+    assert.ok(!result.body.includes('idempotencyKey'), 'no idempotency key is disclosed');
+  } finally {
+    await stubApp.close();
+  }
+  // The lock the checkout already wrote is untouched by the refusal.
+  const rows = await db.pool.query('SELECT locked_pricing_snapshot_id FROM subscriptions WHERE user_id=$1', [user.id]);
+  assert.ok(rows.rows[0].locked_pricing_snapshot_id, 'the pricing lock is durable even when disclosure is refused');
+  assert.equal(calls.length, 0, 'the real adapter transport was never used');
+});
+
+test('Step 9 projection: the disclosed vocabulary mirrors the seam and the body stays two fields', () => {
+  // Contracts cannot import core, so the mirror is pinned HERE — the layer that
+  // can see both the seam's session vocabulary and the disclosed DTO's.
+  assert.deepEqual([...BILLING_CHECKOUT_SESSION_DTO_STATUSES], [...BILLING_CHECKOUT_SESSION_STATUSES]);
+  // The request the browser sends is the request the service parses: two fields,
+  // strict, Starter refused on both sides.
+  assert.deepEqual(billingCheckoutRequestDtoSchema.parse(PRO_MONTHLY), PRO_MONTHLY);
+  for (const body of [{ ...PRO_MONTHLY, reference: 've-chk-client' }, { cataloguePlan: 'starter', interval: 'monthly' }]) {
+    assert.equal(billingCheckoutRequestDtoSchema.safeParse(body).success, false);
+  }
 });

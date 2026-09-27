@@ -6,7 +6,9 @@
 > `GET /api/billing/me` (read-only state), `POST /api/billing/checkout`
 > (PR-C: sandbox checkout initialization against a registered epoch and an
 > operator-published FX rate; it writes a pending provider-backed row and an
-> immutable pricing lock, and it never *confirms* a payment), `POST /api/billing/customer` (Billing Step 6: sandbox customer provisioning, idempotent) and the new `POST /api/billing/verify` (Step 7: sandbox transaction verification + reconciliation + durable evidence, empty body, per-IP rate-limited to 10/min) — plus the Step 5.2 **secure webhook receiver** `POST /api/billing/webhook`
+> immutable pricing lock, and it never *confirms* a payment — since **Billing
+> Step 9** it answers with the DISCLOSED `BillingCheckoutSessionDto` instead of
+> the internal seam session), `POST /api/billing/customer` (Billing Step 6: sandbox customer provisioning, idempotent) and the new `POST /api/billing/verify` (Step 7: sandbox transaction verification + reconciliation + durable evidence, empty body, per-IP rate-limited to 10/min) — plus the Step 5.2 **secure webhook receiver** `POST /api/billing/webhook`
 > (signature-verified, rate-limited, source-IP allow-listed; it records ONE
 > `billing_provider_events` row per verified delivery and nothing else) —
 > and the Later-billing-PR #7 **verification + synchronization** route
@@ -19,8 +21,29 @@
 > (manual review): no status moves and nothing is granted via sync.
 > **Step 8 (this change) adds the ACTIVATION AUTHORITY** — the one missing half of the paid-entitlement authority, and the only thing in this build that can turn verified payment evidence into a paid entitlement. It is an **out-of-band, DB-connected operator action**: `npm run billing:activate -- --user <email|uuid> --by <operator-id> --reason <text>` (`scripts/billing/activate.ts` → `BillingActivationService`) writes exactly ONE immutable **activation fact** (`billing_subscription_activations`, migration `0034`) plus its transactional `billing.subscription_activated` audit event. **There is deliberately no HTTP route, no admin role, no operator endpoint and no activation token**, so no user session can reach it and no client payload can supply a payment confirmation. `paymentConfirmed` on `GET /api/billing/me` is now **DERIVED** from the existence of that fact (`z.boolean()`, never a stored column, never client input): a provider-backed row with no fact stays `false` and free; a provider-backed row WITH a fact resolves to its paid entitlement through `resolveEntitlements(plan, status, provider, activated)`. `grantsExecution` stays `false` and `canAccessAutomation` stays `false` for every plan.
 > **Step 7 `POST /api/billing/verify` confirms NOTHING to entitlements:** it records one `billing_verified_transactions` row per verified checkout reference after exact reconciliation, and returns a structured `BillingPaymentVerificationResult` (`verified: true` with evidence, or `verified: false` with a typed failure reason). Evidence is a *prerequisite* for an activation, never a substitute for one: Step 7 does not move `paymentConfirmed` (that field is now derived from the Step 8 fact), `grantsExecution` stays `false`, and the provider→FREE gate is unchanged until an operator authorizes the activation.
-> There is still no checkout UI and no `apps/web` billing change, no billing
-> portal, no refund/proration/dunning execution, no notification, no live
+> **Step 9 (this change) adds the SANDBOX CHECKOUT SURFACE** — the first
+> `apps/web` billing change, and the last missing piece of the sandbox purchase
+> path. `/settings` now offers **exactly four choices** (Pro monthly, Pro annual,
+> Elite monthly, Elite annual — Starter is not sellable and is never offered),
+> provisions/uses the caller's own billing customer where checkout requires one
+> (`POST /api/billing/customer`, idempotent), initializes the sandbox checkout
+> with **`{ cataloguePlan, interval }` and nothing else**, displays the
+> **server-provided** price and FX disclosure (commercial USD price, exact GHS
+> amount, rate, rate version and rate time), renders the returned
+> **`authorizationUrl` VERBATIM** as the payment link, and offers an **explicit
+> "Verify payment" action** (`POST /api/billing/verify`, empty `{}` body).
+> **There is no polling of any kind**: no timer, no interval, no effect, no
+> automatic re-check — the provider is read only when the user clicks. The
+> surface keeps the five states visibly distinct (**free** / **awaiting
+> verification** / **evidence awaiting operator activation** / **activated** /
+> **unavailable**), and checkout is **suppressed** once evidence is recorded in
+> the current UI state and once the server confirms an activation
+> (`paymentConfirmed`). Step 9 changes **no authority**: activation stays the
+> out-of-band Step 8 CLI, `paymentConfirmed` stays derived from the activation
+> fact, the webhook stays receipt-only, entitlements stay server-resolved, and
+> `grantsExecution` / `canAccessAutomation` stay `false` for every plan.
+> There is still no billing portal, no saved payment method, no self-serve
+> cancellation, no refund/proration/dunning execution, no notification, no live
 > payment, no production credential, no production activation and no Starter
 > selling.
 > **Receipt is still not confirmation**: the webhook receiver records deliveries; `POST /api/billing/sync` applies the canonical status mapping without confirming payment; `POST /api/billing/verify` records verified-transaction evidence after reconciliation — none of them changes subscription plan or grants execution. The only payment-confirmation authority is the out-of-band activation fact, written by a named operator with a stated reason.
@@ -710,7 +733,7 @@ verification, source-IP allow-list, rate limiting, subject resolution and the
 ledger write — receipt only) — while everything below remains true at the
 **product** level:
 
-- **No *self-serve* payment confirmation and no checkout UI**: `POST
+- **No *self-serve* payment confirmation**: `POST
   /api/billing/checkout` initializes sandbox checkouts (PR-C), the Step 5.2
   receiver **records** provider deliveries, Step 7 records verified-transaction
   evidence and Step 8 records the operator-authorized activation fact — and
@@ -720,12 +743,20 @@ ledger write — receipt only) — while everything below remains true at the
   reason and writes nothing else; there is no activation route, no admin role,
   no operator endpoint and no activation token. A provider-backed subscription
   without an activation fact stays execution-inert (`paymentConfirmed: false`,
-  free entitlements — the hardening sweep pins the same), and there is still no
-  checkout UI and no redirect handling beyond the callback configuration.
+  free entitlements — the hardening sweep pins the same).
+  **Since Step 9 there IS a checkout UI** (`/settings`, sandbox only) — and it is
+  not a confirmation path either: it sends `{ cataloguePlan, interval }`, reads
+  the DISCLOSED session, renders the provider's `authorizationUrl` verbatim and
+  offers an explicit verification click. It cannot confirm a payment, cannot
+  activate a plan and never polls. Redirect handling is still only the callback
+  configuration (`PUBLIC_APPLICATION_ORIGIN` → `/settings`, a return location
+  and not a confirmation handler).
   `billing_customers` now has exactly one writer — the Billing Step 6 customer
   provisioning flow (`POST /api/billing/customer`, see below) — which records
   provider customer identity only and grants nothing.
-- **No billing portal** and no customer self-serve surface.
+- **No billing portal**: no self-serve cancellation, invoices, payment-method
+  management or subscription editing. The Step 9 surface initiates a sandbox
+  checkout and verifies it; that is the whole of the customer-facing billing UI.
 - **No webhook-driven state change.** The receiver writes
   `billing_provider_events` rows (`received`) and never touches
   `subscriptions`, entitlements or any execution gate. A recorded
@@ -862,7 +893,9 @@ Roughly in order; each is its own PR and may be re-scoped.
 5. ~~**Checkout / payment initialization route**~~ — **delivered by PR-C**:
    `POST /api/billing/checkout` (server-side initialization behind
    `initializeCheckout`, session-authenticated, epoch- and lock-bound). The
-   checkout **UI** and AC1/AC2/AC5/AC7 remain open.
+   checkout **UI** is delivered by **Billing Step 9** (see *Sandbox checkout
+   surface (Billing Step 9)* below); AC1/AC2/AC5/AC7 remain open because they
+   are operator/account facts, not code.
 6. **Webhook events** — split in two, because the provider-contract half could
    be built on published evidence while the network half cannot be built safely
    without it:
@@ -925,6 +958,14 @@ Roughly in order; each is its own PR and may be re-scoped.
      only)**; see *Customer provisioning (Billing Step 6)* below.
    - 8b. Billing portal — not started.
 9. **Web UI** — checkout and portal surfaces in `apps/web`.
+   - **9a. Sandbox checkout surface — delivered by Billing Step 9 (sandbox
+     only)**; see *Sandbox checkout surface (Billing Step 9)* below. Four
+     choices, server-provided price + FX disclosure, the provider's
+     authorization URL used verbatim, an explicit verification action, no
+     polling, and a disclosed response projection that carries no checkout
+     reference, provider identifier, idempotency key or pricing snapshot.
+   - 9b. Billing portal (self-serve management, cancellation, invoices) — not
+     started.
 10. **Starter entitlement decision** — internal plan value, limits, and the
     mapping widening described above.
 11. **Refunds / proration / dunning execution** — each its own PR, each using
@@ -950,7 +991,8 @@ the existing 0031 `billing_customers` table.
 What it deliberately does not do: it never touches `subscriptions`, `users`,
 entitlements, pricing, the webhook ledger or any execution gate; the
 provider→FREE gate and `paymentConfirmed` are unchanged; there is no billing
-portal, no checkout UI and no email-change synchronization.
+portal and no email-change synchronization (the checkout UI arrived later, in
+Billing Step 9, and calls this route before initializing a checkout).
 
 ## Payment evidence + transaction reconciliation (Billing Step 7)
 
@@ -1032,6 +1074,76 @@ edit and no delete: a correction is a manual review, never a silent overwrite.
 - **Never grants execution.** `canAccessAutomation` stays `false` for every plan; automation, live execution and broker execution stay OFF regardless of activation state.
 - **Never rewrites history.** Migrations 0001–0033 are byte-identical, 0034 is the only new migration and is additive/forward-only (no DROP, RENAME, TRUNCATE or data rewrite), and the fact table refuses UPDATE and DELETE.
 - **Never touches production.** No live key, no production credential, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, and no Starter selling. No activation has been performed in any deployed environment.
+
+## Sandbox checkout surface (Billing Step 9)
+
+**Status: delivered, sandbox (Paystack) only. It displays and initiates — it confirms nothing, activates nothing and grants nothing.** No migration, no new environment variable, no new provider operation and no change to any authority: activation stays the out-of-band Step 8 CLI, `paymentConfirmed` stays **derived** from the activation fact, the webhook receiver stays receipt-only, entitlements stay resolved server-side, the pricing lock stays immutable, and `grantsExecution` / `canAccessAutomation` stay `false` for every plan. Step 9 is the first `apps/web` billing change.
+
+The surface, end to end:
+
+```text
+/settings   four choices — Pro|Elite × monthly|annual, rendered from the frozen catalogue (Starter never offered)
+   |
+   |--> POST /api/billing/customer   {}                             provision/USE the caller's own customer (Step 6, idempotent)
+   |--> POST /api/billing/checkout   { cataloguePlan, interval }    epoch + pinned FX + immutable lock (PR-C, unchanged)
+   |<-- BillingCheckoutSessionDto    status, authorizationUrl (VERBATIM), price, payment, paymentDisplay, fx, pins = false
+   |
+   |    the user pays on the provider's SANDBOX page (browser -> provider; this app is not in that path)
+   |
+   |--> POST /api/billing/verify     {}                             EXPLICIT click; verified evidence only (Step 7)
+   |<-- BillingPaymentVerificationResult   verified => "evidence recorded, awaiting operator activation"
+   |
+   |    npm run billing:activate -- --user … --by … --reason …       out of band, operator-named (Step 8)
+   |
+   |--> GET /api/billing/me          providerStatus.paymentConfirmed: true  => "activated", checkout suppressed
+```
+
+| Layer | File | Role |
+| --- | --- | --- |
+| Contract | `packages/contracts/src/billing-checkout.ts` (new) | The Step 9 vocabulary: `billingCheckoutRequestDtoSchema` (the only body a browser may send — `{ cataloguePlan, interval }`, `.strict()`, Starter refused); `BILLING_CHECKOUT_CHOICES` (exactly four, derived from the frozen catalogue, never restated); `billingCheckoutSessionDtoSchema` (the strict DISCLOSED session — status, verbatim https-only `authorizationUrl`, commercial price, exact payment amount + display, FX disclosure, `initializedAt`, with `paymentConfirmed` / `planChanged` / `entitlementsChanged` / `grantsExecution` / `canAccessAutomation` pinned `z.literal(false)`); `billingCheckoutAuthorizationUrlSchema` (absolute **https**, no credentials — Zod's `.url()` alone accepts `javascript:`/`data:`, and this string is rendered verbatim as an `href`); the integer-only display helpers (`billingUsdAmountDisplay`, `billingPaymentAmountDisplay`, `billingFxRateDisplay` — BigInt arithmetic, no float touches money); and the five-state vocabulary `BILLING_CHECKOUT_STATES` + the pure `resolveBillingCheckoutState`. |
+| Projection | same file | `projectBillingCheckoutSession(session)` — the ONE implementation of the response projection, and fail-closed: an `initialized` session with no pricing snapshot is refused (no price ⇒ no disclosure), a session that disagrees with its own snapshot on the commercial or payment amount is refused, an unsellable plan is refused, and a refusal raises `BillingCheckoutProjectionError` rather than forwarding anything. Its input type does not even NAME `reference`, `providerReference`, `provider` or `idempotencyKey`, so the omission is a property of the code, not a convention at a call site. |
+| Route | `apps/api/src/routes/billing.ts` | `POST /api/billing/checkout` now sends `projectBillingCheckoutSession(session)`. Every existing behaviour is untouched: session auth, the strict body, epoch/FX derivation, the atomic snapshot+subscription+lock transaction, the `pricing_lock_required` 409 and the `502 provider_unavailable` refusals. A projection refusal is answered `502` `Checkout refused: session_not_disclosable.` — never the raw session. `POST /api/billing/customer`, `POST /api/billing/verify`, `POST /api/billing/sync`, `POST /api/billing/webhook` and `GET /api/billing/me` are unchanged. |
+| Client | `apps/web/lib/api.ts` | `ensureBillingCustomer()` and `verifyBillingPayment()` send the EMPTY body `EMPTY_JSON_BODY = '{}'` (the subject is always the session user); `checkoutBilling(input)` validates the input through `billingCheckoutRequestDtoSchema` **before** sending, and parses the answer through `billingCheckoutSessionDtoSchema`, so a response carrying a reference, a provider identifier, an idempotency key or a pricing snapshot fails in the browser instead of being rendered. |
+| Component | `apps/web/components/billing-checkout.tsx` (new) | `BillingCheckoutPanel` — the four choices, the two explicit actions, the server-provided disclosure, the verbatim payment link and the structured verification result. Sub-components (`BillingCheckoutChoices`, `BillingCheckoutSessionDisclosure`, `BillingVerificationNotice`) are presentational; `toVerificationSummary` reduces `BillingPaymentVerificationResult` to `{ verified, failureReason, failureMessage, replayed, verifiedAt }`, dropping the evidence row (provider references, transaction id, customer code, hashes) before it can reach the markup. `BILLING_CHECKOUT_STATE_COPY` and `BILLING_VERIFICATION_FAILURE_COPY` give every state and every typed failure reason its own words. |
+| Panel | `apps/web/components/subscription-panel.tsx` | Now derives its badge and warnings from the SAME `resolveBillingCheckoutState`, so the two panels cannot disagree: `awaiting verification`, `evidence · awaiting operator activation`, `activated`, `billing unavailable` (including a failed read, which is no longer presented as "loading"). Still display-only — no button, no link, no affordance. `PlanComparison` copy updated: a sandbox checkout surface exists; a portal, saved payment methods, self-serve cancellation and live payment still do not. |
+| Page | `apps/web/app/settings/page.tsx` | Renders `BillingCheckoutPanel` next to `SubscriptionPanel`, owns the billing read (and its failure flag) and lifts the UI-local evidence fact so both panels state the same thing. A successful checkout re-reads `GET /api/billing/me`, because the first checkout writes the subscription row and its lock. |
+| Tests | `packages/contracts/test/billing-checkout.test.ts`, `apps/web/test/billing-checkout.test.ts`, `apps/web/test/subscription-panel.test.ts`, `apps/api/test/billing-checkout.test.ts`, `apps/api/test/billing-customer.test.ts`, `apps/api/test/entitlement-hardening.test.ts` | The four choices and the refusal of Starter; the projection's disclosure and its omissions (asserted on the RAW wire body); the DTO's pins; the https-only verbatim URL; the five states and checkout suppression; the absence of any timer/effect/poll in the component source; the `{}` bodies and the exact checkout body on a fake transport; the fail-closed client parse; and the unchanged pricing/lock/entitlement regressions, now pinned against the durable snapshot instead of a forwarded one. |
+
+### What the browser is sent — and what it is never sent
+
+| Disclosed (`BillingCheckoutSessionDto`) | Removed by the projection |
+| --- | --- |
+| `status` (`initialized` / `unavailable` / `failed`) | `provider` (the provider identifier) |
+| `authorizationUrl` — **verbatim**, https-only, `null` unless initialized | `reference` (our `ve-chk-…` checkout reference — the input to the verification read) |
+| `price` — `{ cataloguePlan, interval, currency: USD, amountMinor, display }` | `providerReference` (the provider's own reference) |
+| `payment` + `paymentDisplay` — the exact GHS amount in integer minor units | `idempotencyKey` |
+| `fx` — rate integers, `rateDisplay`, `fxRateVersionId`, `fxRateEffectiveFrom`, `fxRateCapturedAt`, `fxRateSource`, `roundingMode` | `pricing` — the whole immutable snapshot, including `providerPlanId`, `catalogueVersion`, `pricingPolicyVersion` and `computedAt` |
+| `initializedAt` | anything the DTO does not declare (`.strict()`, in both directions) |
+| `paymentConfirmed` / `planChanged` / `entitlementsChanged` / `grantsExecution` / `canAccessAutomation` — all `false` by type | |
+
+The disclosure is exactly what the pricing decisions require — "USD price (prominent) + exact GHS amount + rate, version and time. GHS is shown before payment" — and nothing more. `POST /api/billing/verify` keeps its existing Step 7 result shape (unchanged by this step); the browser reduces it to the five display facts above before rendering.
+
+### The five states
+
+| State | Server facts | What the surface does |
+| --- | --- | --- |
+| `free` | no provider-backed row (or a historical `provider IS NULL` row) | offers the four choices and the checkout action |
+| `awaiting_verification` | `providerStatus.provider != null`, `paymentConfirmed: false` | still offers checkout (a retry returns the same locked price) and explains that the plan and price are locked server-side |
+| `evidence_recorded` | as above, PLUS this UI session was told `verified: true` | **suppresses checkout** — no choice, no button, no link; states that evidence is a receipt and names the only activation path (`npm run billing:activate`) |
+| `activated` | `providerStatus.paymentConfirmed: true` (derived from the Step 8 fact) | **suppresses checkout**; the paid limits shown are the server's |
+| `unavailable` | billing state unreadable, or the surface is refusing | offers nothing and claims nothing; a failed read is never presented as the free state |
+
+Precedence is fixed and server-first: `activated` > `evidence_recorded` > `awaiting_verification` > `unavailable` > `free`. The evidence flag is UI-local by design — a page reload legitimately loses it and the surface returns to `awaiting_verification`, because the server has not confirmed anything.
+
+### What Step 9 deliberately does not do
+
+- **No polling and no automatic verification.** No timer, interval, effect, socket, retry loop or "check again shortly": the provider is read only when the user clicks **Verify payment**. Returning from the provider's page changes nothing by itself.
+- **No payment confirmation and no activation.** A checkout session is an offer to pay and verified evidence is a receipt; the DTO pins `paymentConfirmed: false` and only the Step 8 operator CLI can move the derived field. The UI says so in every state.
+- **No entitlement or execution change.** `resolveEntitlements`, `getBillingState`, `grantsExecution` and `canAccessAutomation` are untouched; the provider→FREE gate still applies to an unactivated row, and the scanner/limits/automation gates behave exactly as before.
+- **No change to the webhook, sync, verify, customer or activation authorities.** The receiver stays receipt-only, `sync` still applies only `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`, `verify` still records evidence after exact reconciliation, `customer` stays the only writer of `billing_customers`, and activation stays out of band with no HTTP surface.
+- **No price, rate or plan decision in the browser.** The four choices carry the frozen catalogue's own price objects; the chargeable amount, the rate and the plan actually priced come from the server, and an existing immutable lock outranks the selection (the surface says so when they differ).
+- **No provider detail, credential or secret in the client.** No key, no provider endpoint, no provider field name, no reference, no idempotency key and no evidence hash reaches the bundle; the projection strips them server-side and the client's strict parse refuses them if they ever appear.
+- **No live payment and no production change.** Sandbox/test only (`sk_test_`), no new environment variable, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, no portal and no Starter selling. `PUBLIC_APPLICATION_ORIGIN` still decides the callback (`<origin>/settings`) and an empty value still disables checkout entirely.
 
 ## Verification + synchronization (Later-billing-PR #7)
 

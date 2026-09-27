@@ -1,8 +1,8 @@
 import { after, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { billingCustomerProvisioningResultSchema } from '@veltrixeye/contracts';
-import { FREE_ENTITLEMENTS, billingCheckoutSessionSchema } from '@veltrixeye/core';
+import { billingCheckoutSessionDtoSchema, billingCustomerProvisioningResultSchema } from '@veltrixeye/contracts';
+import { FREE_ENTITLEMENTS } from '@veltrixeye/core';
 import { createPaystackProvider } from '@veltrixeye/provider-paystack';
 import { buildApp, createAppContext } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
@@ -229,8 +229,14 @@ describe('Step 6 route — checkout becomes reachable through requireExistingCus
 
     const initialized = await checkout();
     assert.equal(initialized.statusCode, 200, initialized.body);
-    const session = billingCheckoutSessionSchema.parse(initialized.json());
-    assert.equal(session.pricing?.providerPlanId, facts.epoch.provider_plan_id);
+    // Billing Step 9: the answer is the DISCLOSED session DTO. The provider plan
+    // code the adapter was authorized with stays server-side — the browser sees
+    // the price, the exact payment amount and the FX disclosure instead.
+    const session = billingCheckoutSessionDtoSchema.parse(initialized.json());
+    assert.equal(session.status, 'initialized');
+    assert.equal(session.fx?.fxRateVersionId, facts.fx.id);
+    assert.ok(!initialized.body.includes(facts.epoch.provider_plan_id), 'no provider identifier is disclosed');
+    assert.ok(!initialized.body.includes('idempotencyKey'), 'no idempotency key is disclosed');
     assert.equal(calls.length, 1);
     assert.equal(calls[0]!.url, 'https://api.paystack.co/transaction/initialize');
     assert.equal(calls[0]!.body?.email, user.email, 'checkout uses the provisioned local customer email');
