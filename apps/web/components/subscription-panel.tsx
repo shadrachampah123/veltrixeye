@@ -7,6 +7,8 @@ import {
   BILLING_PROVIDER,
   COMMERCIAL_PLAN_CATALOGUE,
   commercialPlanForInternalPlan,
+  resolveBillingCheckoutState,
+  type BillingCheckoutState,
   type BillingStateDto,
   type PlanCatalogueEntry,
   type UserPlan,
@@ -14,8 +16,48 @@ import {
 import { BRAND } from '@/lib/brand';
 import { formatDateTime } from '@/lib/formats';
 
-export function SubscriptionPanel({ billing }: { billing: BillingStateDto | null }) {
+export interface SubscriptionPanelProps {
+  billing: BillingStateDto | null;
+  /**
+   * Billing Step 9: true once THIS UI session was told by
+   * `POST /api/billing/verify` that verified payment evidence was recorded. It
+   * is a display fact, never an authority — the server still reports
+   * `paymentConfirmed: false` until an operator writes the activation fact.
+   */
+  evidenceRecorded?: boolean;
+  /** True when the billing read failed, rather than still being in flight. */
+  unavailable?: boolean;
+}
+
+export function SubscriptionPanel({
+  billing,
+  evidenceRecorded = false,
+  unavailable = false,
+}: SubscriptionPanelProps) {
   if (!billing) {
+    // Billing Step 9: a FAILED read is its own state. It must not be presented
+    // as the free state (nothing is known) and not as a payment state.
+    if (unavailable) {
+      return (
+        <Card>
+          <CardHeader
+            title="Subscription"
+            subtitle="Entitlement & plan limits"
+            actions={<Badge tone="danger">billing unavailable</Badge>}
+          />
+          <div className="space-y-2 px-5 py-6 text-sm text-ink-400">
+            <p>
+              <strong className="text-danger-450">Billing unavailable:</strong> the server&rsquo;s billing state could
+              not be read, so nothing here is claimed, offered or confirmed.
+            </p>
+            <p className="text-xs text-ink-500">
+              Limits are enforced server-side, so the limits that apply are the last ones the API enforced. Reload the
+              page to read the billing state again.
+            </p>
+          </div>
+        </Card>
+      );
+    }
     return (
       <Card>
         <CardHeader title="Subscription" subtitle="Entitlement & plan limits" />
@@ -27,13 +69,24 @@ export function SubscriptionPanel({ billing }: { billing: BillingStateDto | null
   const ent = billing.entitlements;
   const sub = billing.subscription;
   // A provider-backed row is a CHECKOUT, not a purchase. `paymentConfirmed` is
-  // pinned false by the API (no confirmation authority exists), and the server
-  // has already resolved the row to the free tier — so the panel must never
-  // present its `status: active` as a confirmed paid subscription. Display
-  // only: this component grants nothing and cannot change any limit.
+  // DERIVED server-side from the durable activation fact (Billing Step 8), and
+  // the server has already resolved an unactivated row to the free tier — so the
+  // panel must never present its `status: active` as a confirmed paid
+  // subscription. Display only: this component grants nothing and cannot change
+  // any limit.
   const providerStatus = billing.providerStatus;
-  const awaitingConfirmation =
-    providerStatus?.provider != null && !providerStatus.paymentConfirmed;
+  // Billing Step 9 — the SAME five-state vocabulary the checkout surface uses,
+  // derived by the same pure function, so the two panels cannot disagree about
+  // what the server said: free / awaiting verification / evidence awaiting
+  // operator activation / activated / unavailable.
+  const checkoutState: BillingCheckoutState = resolveBillingCheckoutState({
+    billing,
+    evidenceRecorded,
+    unavailable,
+  });
+  const awaitingVerification = checkoutState === 'awaiting_verification';
+  const evidenceAwaitingActivation = checkoutState === 'evidence_recorded';
+  const awaitingConfirmation = awaitingVerification || evidenceAwaitingActivation;
 
   return (
     <Card>
@@ -41,8 +94,14 @@ export function SubscriptionPanel({ billing }: { billing: BillingStateDto | null
         title="Subscription & Entitlements"
         subtitle="Plan foundations — server-authoritative, no client-side bypass"
         actions={
-          awaitingConfirmation ? (
-            <Badge tone="warning">{providerStatus.providerState ?? 'pending'} · unconfirmed</Badge>
+          evidenceAwaitingActivation ? (
+            <Badge tone="info">evidence · awaiting operator activation</Badge>
+          ) : awaitingVerification ? (
+            <Badge tone="warning">
+              {providerStatus.providerState ?? 'pending'} · awaiting verification
+            </Badge>
+          ) : checkoutState === 'unavailable' ? (
+            <Badge tone="danger">billing unavailable</Badge>
           ) : (
             <Badge tone={sub.status === 'active' ? 'success' : 'warning'}>{sub.status}</Badge>
           )
@@ -54,9 +113,13 @@ export function SubscriptionPanel({ billing }: { billing: BillingStateDto | null
           <div>
             <div className="text-sm font-semibold capitalize text-ink-50">
               {sub.plan} plan
-              {awaitingConfirmation ? (
+              {awaitingVerification ? (
                 <span className="ml-2 text-[11px] font-normal normal-case text-amber-450">
-                  awaiting payment confirmation
+                  awaiting payment verification
+                </span>
+              ) : evidenceAwaitingActivation ? (
+                <span className="ml-2 text-[11px] font-normal normal-case text-info-450">
+                  evidence recorded · awaiting operator activation
                 </span>
               ) : null}
             </div>
@@ -83,17 +146,42 @@ export function SubscriptionPanel({ billing }: { billing: BillingStateDto | null
           </div>
         </div>
 
-        {awaitingConfirmation ? (
+        {awaitingVerification ? (
           <div className="rounded-md border border-amber-450/30 bg-amber-450/10 px-3 py-2.5 text-[11px] leading-snug text-ink-300">
             <strong className="text-amber-450">Payment not confirmed:</strong> this {sub.plan} subscription was
             created by a {providerStatus.provider ?? 'billing provider'} checkout and the provider last reported{' '}
             &ldquo;{providerStatus.providerState ?? 'pending'}&rdquo;. A provider state is never treated as a
-            payment, so the free-plan limits shown above are what the server enforces until a confirmation exists.
+            payment, so the free-plan limits shown above are what the server enforces until verified evidence exists
+            and an operator activates the subscription out of band.
+          </div>
+        ) : null}
+
+        {evidenceAwaitingActivation ? (
+          <div className="rounded-md border border-info-450/30 bg-info-450/10 px-3 py-2.5 text-[11px] leading-snug text-ink-300">
+            <strong className="text-info-450">Payment evidence recorded &mdash; awaiting operator activation:</strong>{' '}
+            verified evidence exists for this {sub.plan} checkout, and the server still reports{' '}
+            <span className="font-mono">paymentConfirmed: false</span>. Evidence is a receipt, never an activation, so
+            the free-plan limits shown above are what the server enforces until an operator records the activation out
+            of band. Nothing on this page can do that.
+          </div>
+        ) : null}
+
+        {checkoutState === 'unavailable' ? (
+          <div className="rounded-md border border-danger-450/30 bg-danger-450/10 px-3 py-2.5 text-[11px] leading-snug text-ink-300">
+            <strong className="text-danger-450">Billing unavailable:</strong> the billing state could not be read or
+            the sandbox checkout is refusing. The limits shown are the last ones the server enforced; nothing here is
+            offered and nothing is claimed.
           </div>
         ) : null}
 
         <div className="rounded-md border border-amber-450/20 bg-amber-450/5 px-3 py-2.5 text-[11px] leading-snug text-ink-400">
           <strong className="text-amber-450">Entitlement foundation:</strong> All limits are enforced server-side. The UI never grants access — it only displays what the API returns. M8.7 safety controls (drawdown protection, kill-switch, automation OFF) remain active regardless of plan.
+          {awaitingConfirmation ? (
+            <>
+              {' '}The server reports <span className="font-mono text-ink-300">paymentConfirmed: false</span> for this
+              row, so the limits above are the ones it enforces — no display, provider state or receipt widens them.
+            </>
+          ) : null}
         </div>
       </div>
     </Card>
@@ -125,8 +213,10 @@ function FeatureRow({ label, enabled, note }: { label: string; enabled: boolean;
 /**
  * Plan comparison — rendered from the single authoritative commercial catalogue
  * (`@veltrixeye/contracts` billing catalogue), never from local placeholder
- * values. Display only: there is no checkout, portal or payment flow, and the
- * UI cannot grant anything the API does not already return.
+ * values. Display only: the UI cannot grant anything the API does not already
+ * return. Since Billing Step 9 a SANDBOX checkout surface exists next to this
+ * card (`billing-checkout.tsx`); there is still no billing portal, no
+ * self-serve cancellation and no live payment.
  *
  * `currentPlan` is the **internal** plan value (`free` / `pro` / `premium`);
  * the commercial counterpart comes from the documented compatibility mapping.
@@ -169,9 +259,12 @@ export function PlanComparison({ currentPlan }: { currentPlan: UserPlan }) {
         {currentCommercialPlan === null
           ? `Your account is on the internal "${currentPlan}" plan, which has no commercial catalogue counterpart — nothing changes for you.`
           : 'Enforced limits are unchanged and continue to come from the API.'}{' '}
-        <strong className="text-amber-450">No billing capability yet:</strong> there is no checkout, payment method or
-        subscription management — and &ldquo;priority execution&rdquo; on Elite is a commercial descriptor only.
-        Automation, live execution and broker execution remain unavailable on every plan.
+        <strong className="text-amber-450">Sandbox billing only:</strong> the checkout surface on this page
+        initializes a provider <em>sandbox</em> (test-mode) checkout, shows the server&rsquo;s price and FX disclosure
+        and can record verified payment evidence. It cannot activate a plan — activation is an out-of-band operator
+        action — and there is still no billing portal, no saved payment method, no self-serve cancellation and no live
+        payment. &ldquo;Priority execution&rdquo; on Elite is a commercial descriptor only: automation, live execution
+        and broker execution remain unavailable on every plan.
       </div>
     </Card>
   );

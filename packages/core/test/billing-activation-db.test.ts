@@ -84,11 +84,12 @@ const EXCLUDED_PROVIDER_PLAN = ['PLN', 'u0l4961hhipl6ek'].join('_');
 
 let pool: Awaited<ReturnType<typeof createPool>>;
 let dataDir: string;
+let db: Awaited<ReturnType<typeof startEmbeddedPostgres>> | undefined;
 
 before(async () => {
   dataDir = path.join(os.tmpdir(), `ve-billing-0034-pg-${process.pid}`);
   removeDirRobust(dataDir);
-  const db = await startEmbeddedPostgres({
+  db = await startEmbeddedPostgres({
     dataDir, port: DB_PORT, user: 'test', password: randomBytes(16).toString('hex'),
     database: 'veltrixeye_billing_0034',
   });
@@ -100,7 +101,11 @@ after(async () => {
   try {
     await pool?.end();
   } finally {
-    if (dataDir) removeDirRobust(dataDir);
+    try {
+      await db?.stop();
+    } finally {
+      if (dataDir) removeDirRobust(dataDir);
+    }
   }
 });
 
@@ -116,7 +121,12 @@ describe('Step 8 — 0034 file conventions and history integrity', () => {
 
     for (const [file, expected] of Object.entries(BASELINE_SHA256)) {
       assert.equal(
-        createHash('sha256').update(readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8')).digest('hex'),
+        // Git stores migrations with LF endings; a Windows checkout with
+        // core.autocrlf rewrites them to CRLF on disk. Normalize line endings
+        // only, so the manifest pins content, not the checkout's EOL setting.
+        createHash('sha256')
+          .update(readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8').replace(/\r\n/g, '\n'))
+          .digest('hex'),
         expected,
         `${file} was modified — applied migrations are immutable`,
       );
@@ -164,13 +174,13 @@ describe('Step 8 — 0034 file conventions and history integrity', () => {
           const match = /^(\d{4})_/.exec(file);
           if (match && Number(match[1]) <= 32) copyFileSync(path.join(MIGRATIONS_DIR, file), path.join(dir32, file));
         }
-        const dataDir34 = path.join(os.tmpdir(), `ve-billing-0034-refuse-${process.pid}`);
-        removeDirRobust(dataDir34);
-        const db = await startEmbeddedPostgres({
-          dataDir: dataDir34, port: DB_PORT + 1, user: 'test',
-          password: randomBytes(16).toString('hex'), database: 'veltrixeye_billing_0034_refuse',
-        });
-        const refusePool = createPool({ databaseUrl: db.dbUrl });
+        // A fresh database on the already-running cluster (the pattern the
+        // PR-3 migration suite uses) rather than a second embedded cluster,
+        // which is slow and unreliable to boot on Windows.
+        await pool.query('CREATE DATABASE veltrixeye_billing_0034_refuse');
+        const url = new URL(db!.dbUrl);
+        url.pathname = '/veltrixeye_billing_0034_refuse';
+        const refusePool = createPool({ databaseUrl: url.toString() });
         try {
           await runMigrations(refusePool, dir32);
           await assert.rejects(
@@ -180,8 +190,7 @@ describe('Step 8 — 0034 file conventions and history integrity', () => {
           );
         } finally {
           await refusePool.end();
-          await db.stop();
-          removeDirRobust(dataDir34);
+          await pool.query('DROP DATABASE IF EXISTS veltrixeye_billing_0034_refuse');
         }
       } finally {
         rmSync(dir32, { recursive: true, force: true });

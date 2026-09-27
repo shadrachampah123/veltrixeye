@@ -8,6 +8,7 @@ import { Alert, Badge, Button, Card, CardHeader, Field, Input, Spinner } from '@
 import { formatDateTime } from '@/lib/formats';
 import type { SessionDto, BillingStateDto } from '@veltrixeye/contracts';
 import { SubscriptionPanel, PlanComparison } from '@/components/subscription-panel';
+import { BillingCheckoutPanel } from '@/components/billing-checkout';
 import { WatchlistPanel } from '@/components/watchlist';
 import { NotificationPreferencesPanel } from '@/components/notification-preferences';
 import { BRAND } from '@/lib/brand';
@@ -16,6 +17,19 @@ function SettingsContent() {
   const { user, refresh } = useAuth();
   const [sessions, setSessions] = React.useState<SessionDto[] | null>(null);
   const [billing, setBilling] = React.useState<BillingStateDto | null>(null);
+  /**
+   * Billing Step 9 — `null` billing means "loading" only while this is false.
+   * A failed read is an UNAVAILABLE billing surface, never a free one: neither
+   * panel may conclude from a failed request that nothing is owed.
+   */
+  const [billingUnavailable, setBillingUnavailable] = React.useState(false);
+  /**
+   * Verified payment evidence recorded during THIS UI session (the answer to an
+   * explicit "Verify payment" click). Lifted here so the subscription panel and
+   * the checkout surface state the same thing; it is never an authority — the
+   * server still derives `paymentConfirmed` from the activation fact.
+   */
+  const [evidenceRecorded, setEvidenceRecorded] = React.useState(false);
   const [name, setName] = React.useState(user?.name ?? '');
   const [profileMsg, setProfileMsg] = React.useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
   const [cur, setCur] = React.useState('');
@@ -33,8 +47,14 @@ function SettingsContent() {
   const loadBilling = React.useCallback(() => {
     api
       .getBillingState()
-      .then((b) => setBilling(b))
-      .catch(() => setBilling(null));
+      .then((b) => {
+        setBilling(b);
+        setBillingUnavailable(false);
+      })
+      .catch(() => {
+        setBilling(null);
+        setBillingUnavailable(true);
+      });
   }, []);
 
   React.useEffect(() => {
@@ -130,7 +150,27 @@ function SettingsContent() {
           <NotificationPreferencesPanel />
 
           {/* Subscription & Entitlement Foundations */}
-          <SubscriptionPanel billing={billing} />
+          <SubscriptionPanel
+            billing={billing}
+            evidenceRecorded={evidenceRecorded}
+            unavailable={billingUnavailable}
+          />
+
+          {/*
+            Billing Step 9 — the sandbox checkout surface: four choices
+            (Pro/Elite × monthly/annual), the server-provided price and FX
+            disclosure, the provider's authorization URL used verbatim, and an
+            explicit "Verify payment" action. No polling, no activation, no
+            execution: it is suppressed once evidence is recorded here and once
+            the server confirms an activation.
+          */}
+          <BillingCheckoutPanel
+            billing={billing}
+            unavailable={billingUnavailable}
+            evidenceRecorded={evidenceRecorded}
+            onEvidenceRecorded={() => setEvidenceRecorded(true)}
+            onBillingChange={loadBilling}
+          />
 
           <PlanComparison currentPlan={billing?.subscription.plan ?? user.plan} />
 

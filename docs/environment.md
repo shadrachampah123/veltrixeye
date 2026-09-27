@@ -44,6 +44,7 @@ git-ignored and never contain values you would commit.
 | `PAYSTACK_TIMEOUT_MS` | int 1000–60000 | `15000` | Per-request timeout for the single Paystack HTTP attempt. There is **no retry** (Paystack documents retries for webhooks, not for outbound calls) and no configurable base URL: the adapter talks to `https://api.paystack.co` and nothing else. |
 | `PAYSTACK_WEBHOOK_ALLOWED_IPS` | comma/whitespace-separated IPs/CIDRs | *(empty = documented provider IPs)* | Billing Step 5.2. Source-IP allow-list for `POST /api/billing/webhook`. Empty pins the provider's **documented** delivery addresses (`52.31.139.75`, `52.49.173.169`, `52.214.14.220` — same set in test and live). A `/0` entry is refused at boot. Defence in depth: the `x-paystack-signature` HMAC check remains the authority. The route itself exists **only** when `PAYSTACK_SECRET_KEY` is set. |
 | `PAYSTACK_WEBHOOK_RATE_LIMIT_MAX` | int 1–1000 | `30` | Billing Step 5.2. Deliveries per minute per IP accepted on the webhook route. Far above the provider's documented delivery/retry cadence, far below the global API limit — an unsigned flood stops here. |
+| `PUBLIC_APPLICATION_ORIGIN` | absolute **https** origin — no credentials, path, query or fragment | *(empty = checkout disabled)* | Billing PR-C, surfaced in the browser by Billing Step 9. The public origin of the web app (e.g. `https://app.example.com`) and the ONLY source of the checkout callback URL: the API derives `<origin>/settings` and never infers an origin from a request, so `Host` / `X-Forwarded-Host` / `X-Forwarded-Proto` cannot redirect a payment. Empty ⇒ `POST /api/billing/checkout` fails closed (`callback_not_configured`, 502) and the `/settings` checkout surface shows that refusal instead of a payment link — nothing else in the app changes. `npm run setup` and `.env.example` do **not** set it, so local development has no checkout until an operator adds it; a non-https value, a path, a query, a fragment or embedded credentials fail the boot. **Server-side only** — never a `NEXT_PUBLIC_*` variable, and Step 9 adds no new variable. |
 | `SMTP_HOST` | string | *(empty = email delivery unavailable)* | M7.3 email channel. Empty (with `NOTIFICATION_FROM`) ⇔ the SMTP adapter reports unconfigured and jobs are recorded `unavailable`, never `delivered`. |
 | `SMTP_PORT` | int 1–65535 | `587` | 587 = submission + STARTTLS (required), 465 = implicit TLS. |
 | `SMTP_SECURE` | `auto` \| `always` \| `never` | `auto` | `auto` = implicit TLS on port 465 only; STARTTLS is mandatory otherwise. |
@@ -203,8 +204,20 @@ See [deployment.md](./deployment.md) for the full production runbook.
   request, reports `live: false`, and never includes a credential in
   `describe()`. Billing is not a live-payment path: `POST /api/billing/checkout`
   exists, but it initializes **sandbox** checkouts only and never confirms a
-  payment (no webhook, no verification path — the session can never upgrade an
-  entitlement). See [paystack-provider-contract.md](./paystack-provider-contract.md).
+  payment — the webhook receiver records deliveries, `POST /api/billing/verify`
+  records verified-transaction evidence, and the only payment-confirmation
+  authority is the out-of-band operator CLI (`npm run billing:activate`), so a
+  checkout session can never upgrade an entitlement. Since **Billing Step 9**
+  that sandbox path has a browser surface (`/settings`): it sends only
+  `{ cataloguePlan, interval }`, receives a DISCLOSED session (status, the
+  provider's `authorizationUrl` used verbatim, the commercial price, the exact
+  GHS amount and the FX rate/version/time — never a checkout reference, a
+  provider identifier, an idempotency key or the internal pricing snapshot),
+  and verifies only on an explicit click (no polling). It adds **no environment
+  variable** and no client-side secret; the callback origin is
+  `PUBLIC_APPLICATION_ORIGIN` above.
+  See [paystack-provider-contract.md](./paystack-provider-contract.md) and
+  [billing.md](./billing.md) → *Sandbox checkout surface (Billing Step 9)*.
 
 ## M8.4 MT5 boundary
 

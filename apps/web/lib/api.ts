@@ -42,6 +42,11 @@ import type {
   SetupTransitionRequest,
   SetupTransitionResponseDto,
   BillingStateDto,
+  // Billing Step 9 — the sandbox checkout surface
+  BillingCheckoutRequestDto,
+  BillingCheckoutSessionDto,
+  BillingCustomerProvisioningResult,
+  BillingPaymentVerificationResult,
   // M7.5 — live scanner
   ScannerHealthDto,
   ScannerRunDto,
@@ -88,6 +93,8 @@ import type {
   QuietHours,
 } from '@veltrixeye/contracts';
 import {
+  billingCheckoutRequestDtoSchema,
+  billingCheckoutSessionDtoSchema,
   MAX_ALERTS_LIMIT,
   MAX_BACKTESTS_LIMIT,
   MAX_BACKTEST_TRADES,
@@ -203,6 +210,16 @@ function toQueryString(params: Record<string, string | number | undefined>): str
   const s = qs.toString();
   return s === '' ? '' : `?${s}`;
 }
+
+/**
+ * Billing Step 9 — the request body for the two billing calls whose subject is
+ * ALWAYS the session user: customer provisioning (`POST /api/billing/customer`)
+ * and payment verification (`POST /api/billing/verify`). Both routes refuse any
+ * non-empty body, so the client sends exactly `{}` — never `undefined` (which
+ * would omit the JSON content-type) and never a client-chosen reference, user
+ * id, amount or confirmation.
+ */
+const EMPTY_JSON_BODY = '{}';
 
 export class ApiError extends Error {
   readonly code: string;
@@ -716,6 +733,47 @@ export const api = {
     request<EmergencyStopResultDto>('/execution/safety/emergency-stop', {
       method: 'POST',
       body: JSON.stringify(reason ? { reason } : {}),
+    }),
+
+  // -------------------------------------------------------------------------
+  // Billing Step 9 — the sandbox checkout surface (/settings).
+  //
+  // Three calls, each sending only what the server accepts:
+  //   - `ensureBillingCustomer` and `verifyBillingPayment` send the EMPTY `{}`
+  //     body — the subject is the session user, so there is nothing to supply;
+  //   - `checkoutBilling` sends exactly `{ cataloguePlan, interval }`, validated
+  //     against the shared strict DTO before it leaves the browser, so no
+  //     price, amount, currency, provider plan, callback URL, reference or
+  //     idempotency key can be added by a caller of this client.
+  //
+  // The checkout answer is parsed through `billingCheckoutSessionDtoSchema`: a
+  // response carrying a checkout reference, a provider identifier, an
+  // idempotency key or the internal pricing snapshot is a client-side failure,
+  // not something to render. Nothing here confirms a payment — the DTO pins
+  // `paymentConfirmed`, `grantsExecution` and `canAccessAutomation` to false.
+  // -------------------------------------------------------------------------
+
+  /** POST /api/billing/customer — provision/use the caller's own billing customer (idempotent). */
+  ensureBillingCustomer: () =>
+    request<BillingCustomerProvisioningResult>('/billing/customer', {
+      method: 'POST',
+      body: EMPTY_JSON_BODY,
+    }),
+
+  /** POST /api/billing/checkout — initialize a sandbox checkout for one plan + interval. */
+  checkoutBilling: async (input: BillingCheckoutRequestDto): Promise<BillingCheckoutSessionDto> =>
+    billingCheckoutSessionDtoSchema.parse(
+      await request<BillingCheckoutSessionDto>('/billing/checkout', {
+        method: 'POST',
+        body: JSON.stringify(billingCheckoutRequestDtoSchema.parse(input)),
+      }),
+    ),
+
+  /** POST /api/billing/verify — verify the caller's own checkout and record evidence. */
+  verifyBillingPayment: () =>
+    request<BillingPaymentVerificationResult>('/billing/verify', {
+      method: 'POST',
+      body: EMPTY_JSON_BODY,
     }),
 };
 
