@@ -404,7 +404,7 @@ describe('billing PR2 — entitlement safety', () => {
     assert.ok(!SEAM_CODE.includes('entitlements.js'), 'the seam does not import the entitlement module');
   });
 
-  it('permits only PR-C checkout, the PR #7 sync route, the Step 6 customer route and the Step 5.2 webhook receiver', () => {
+  it('permits only PR-C checkout, the PR #7 sync route, the Step 6 customer route, the Step 7 verify route and the read-only portal', () => {
     const routesDir = path.join(REPO_ROOT, 'apps', 'api', 'src', 'routes');
     const billingRoute = readFileSync(path.join(routesDir, 'billing.ts'), 'utf8');
     assert.match(billingRoute, /app\.get\('\/api\/billing\/me'/, 'GET /api/billing/me still exists');
@@ -415,7 +415,21 @@ describe('billing PR2 — entitlement safety', () => {
       [['post', '/api/billing/checkout'], ['post', '/api/billing/sync'], ['post', '/api/billing/customer'], ['post', '/api/billing/verify']],
       'only PR-C checkout, the Later-billing-PR #7 sync route, Billing Step 6 customer route and Billing Step 7 verify route may write inline',
     );
-    assert.doesNotMatch(billingRoute, /portal/i, 'the portal remains prohibited');
+    // Billing Portal v1 adds ONE read: `GET /api/billing/portal`. It must stay
+    // the only portal route, it must be a read, and its subject must be the
+    // authenticated session user (never a client-supplied identity).
+    const portalRoutes = [...billingRoute.matchAll(/app\.(get|post|put|patch|delete)\s*\(\s*'(\/api\/billing\/portal[^']*)'/g)]
+      .map((match) => [match[1], match[2]]);
+    assert.deepEqual(portalRoutes, [['get', '/api/billing/portal']], 'the portal exists exactly once, as a read');
+    const portalBlock = billingRoute.slice(
+      billingRoute.indexOf("app.get('/api/billing/portal'"),
+      billingRoute.indexOf("app.get('/api/billing/me'"),
+    );
+    assert.match(portalBlock, /requireAuth\(req, reply\)/, 'the portal is session-authenticated');
+    assert.match(portalBlock, /readBillingPortalFacts\(ctx\.pool, user\.id\)/, 'the subject is the session user id');
+    assert.doesNotMatch(portalBlock, /req\.(body|query|headers|cookies)/, 'no client input channel is read');
+    assert.match(portalBlock, /UNAVAILABLE_BILLING_PORTAL_SUMMARY/, 'a failed read fails closed');
+    assert.doesNotMatch(portalBlock, /cancel|invoice|payment-method|refund/i, 'no self-service surface was added');
     // Billing Step 5.2: the webhook receiver is wired through exactly one
     // sanctioned composition call — never as a second inline billing route.
     assert.match(billingRoute, /registerBillingWebhookRoutes\(app, ctx, config\)/);

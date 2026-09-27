@@ -215,8 +215,9 @@ function FeatureRow({ label, enabled, note }: { label: string; enabled: boolean;
  * (`@veltrixeye/contracts` billing catalogue), never from local placeholder
  * values. Display only: the UI cannot grant anything the API does not already
  * return. Since Billing Step 9 a SANDBOX checkout surface exists next to this
- * card (`billing-checkout.tsx`); there is still no billing portal, no
- * self-serve cancellation and no live payment.
+ * card (`billing-checkout.tsx`), and Billing Portal v1 added the read-only
+ * overview card (`billing-portal.tsx`); there is still no self-serve
+ * cancellation, no invoice or payment-method surface and no live payment.
  *
  * `currentPlan` is the **internal** plan value (`free` / `pro` / `premium`);
  * the commercial counterpart comes from the documented compatibility mapping.
@@ -261,8 +262,9 @@ export function PlanComparison({ currentPlan }: { currentPlan: UserPlan }) {
           : 'Enforced limits are unchanged and continue to come from the API.'}{' '}
         <strong className="text-amber-450">Sandbox billing only:</strong> the checkout surface on this page
         initializes a provider <em>sandbox</em> (test-mode) checkout, shows the server&rsquo;s price and FX disclosure
-        and can record verified payment evidence. It cannot activate a plan — activation is an out-of-band operator
-        action — and there is still no billing portal, no saved payment method, no self-serve cancellation and no live
+        and can record verified payment evidence. The overview card above is read-only: it states the server&rsquo;s
+        answer and offers no action. This page cannot activate a plan — activation is an out-of-band operator
+        action — and there is still no saved payment method, no self-serve cancellation and no live
         payment. &ldquo;Priority execution&rdquo; on Elite is a commercial descriptor only: automation, live execution
         and broker execution remain unavailable on every plan.
       </div>

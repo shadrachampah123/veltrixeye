@@ -7,8 +7,10 @@
 > Nothing in this repository takes a live payment. `POST /api/billing/checkout`
 > exists, but it only *initializes* a sandbox checkout through the
 > `transaction/initialize` operation below — it never verifies or confirms a
-> payment. There is no checkout UI, no billing portal, no production
-> credential and no live activation.
+> payment. A sandbox checkout UI and a READ-ONLY billing overview now exist in
+> `apps/web` (Billing Step 9 and Billing Portal v1), and neither confirms a
+> payment: there is no self-serve cancellation, no invoice or payment-method
+> surface, no production credential and no live activation.
 >
 > **Verification + synchronization now exist too (§2.3, Later-billing-PR
 > #7)**: `POST /api/billing/sync` verifies the caller's own checkout reference
@@ -652,7 +654,10 @@ is likewise an **account capability**, not a code path.
 
 ## 8. What this PR deliberately does not build
 
-No checkout UI, no `apps/web` change, no billing portal, no refund/proration/dunning execution, no notifications, no
+At the time of this PR: no checkout UI, no `apps/web` change, no billing portal
+(an `apps/web` checkout surface and a READ-ONLY overview arrived later, in
+Billing Step 9 and Billing Portal v1; self-serve billing management has not),
+no refund/proration/dunning execution, no notifications, no
 live payment, no production credential, no production activation, no Starter
 selling, no provider-plan epoch registration, no epoch-derived pricing entry
 point, no `/plan` mutation, no FX publication, no Gate 9 work, no broker

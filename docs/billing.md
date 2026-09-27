@@ -42,7 +42,25 @@
 > out-of-band Step 8 CLI, `paymentConfirmed` stays derived from the activation
 > fact, the webhook stays receipt-only, entitlements stay server-resolved, and
 > `grantsExecution` / `canAccessAutomation` stay `false` for every plan.
-> There is still no billing portal, no saved payment method, no self-serve
+> **Billing Portal v1 (this change) adds the READ-ONLY BILLING OVERVIEW** —
+> `GET /api/billing/portal` and the overview card on `/settings`. One strict,
+> minimal `BillingPortalSummaryDto` for the **authenticated session user**
+> (no `userId`, `customerId`, `subscriptionId` or provider identity is accepted
+> from the browser; no request body or query string is read), in one of six
+> states: **free**, **awaiting_verification**, **evidence_awaiting_activation**,
+> **activated**, **unknown**, **unavailable**. It publishes the commercial plan
+> and interval, the **trusted persisted** period end and the authoritative
+> cancellation state — and `null` for each of them when the server cannot state
+> it: **no renewal date is ever calculated from the billing interval**.
+> `activated` is read from the durable Step 8 activation fact; a stored
+> `status = 'active'`, a provider state and verified evidence cannot produce it.
+> A read failure fails closed (`unavailable`, nothing claimed, no reason
+> published) and changes nothing. Nothing self-service was added: **no
+> cancellation endpoint or control, no invoices, no payment-method management,
+> no plan mutation, no provider operation** — and no migration. The authority is
+> untouched: `canAccessAutomation` and `grantsExecution` stay `false`, and
+> automation, live execution and broker execution stay OFF.
+> There is still no saved payment method, no self-serve
 > cancellation, no refund/proration/dunning execution, no notification, no live
 > payment, no production credential, no production activation and no Starter
 > selling.
@@ -754,9 +772,13 @@ ledger write — receipt only) — while everything below remains true at the
   `billing_customers` now has exactly one writer — the Billing Step 6 customer
   provisioning flow (`POST /api/billing/customer`, see below) — which records
   provider customer identity only and grants nothing.
-- **No billing portal**: no self-serve cancellation, invoices, payment-method
-  management or subscription editing. The Step 9 surface initiates a sandbox
-  checkout and verifies it; that is the whole of the customer-facing billing UI.
+- **No self-serve billing management**: no cancellation, invoices,
+  payment-method management, plan changes or refunds — no endpoint, no button
+  and no provider mutation exists for any of them. **Billing Portal v1 provides
+  a READ-ONLY overview** (`GET /api/billing/portal` plus the `/settings` card),
+  which states only what the server can state and offers no action; the Step 9
+  surface initiates a sandbox checkout and verifies it. Together those are the
+  whole of the customer-facing billing UI.
 - **No webhook-driven state change.** The receiver writes
   `billing_provider_events` rows (`received`) and never touches
   `subscriptions`, entitlements or any execution gate. A recorded
@@ -956,7 +978,10 @@ Roughly in order; each is its own PR and may be re-scoped.
    `billing_customers` and a self-serve portal.
    - **8a. Customer provisioning — delivered by Billing Step 6 (sandbox
      only)**; see *Customer provisioning (Billing Step 6)* below.
-   - 8b. Billing portal — not started.
+   - 8b. ~~**Billing portal — read-only v1**~~ — **delivered by Billing Portal
+     v1** (the overview only; see *Read-only billing overview (Billing Portal
+     v1)* below). Self-serve management (cancellation, invoices, payment
+     methods, plan changes) is still not started and remains its own PR.
 9. **Web UI** — checkout and portal surfaces in `apps/web`.
    - **9a. Sandbox checkout surface — delivered by Billing Step 9 (sandbox
      only)**; see *Sandbox checkout surface (Billing Step 9)* below. Four
@@ -965,7 +990,8 @@ Roughly in order; each is its own PR and may be re-scoped.
      polling, and a disclosed response projection that carries no checkout
      reference, provider identifier, idempotency key or pricing snapshot.
    - 9b. Billing portal (self-serve management, cancellation, invoices) — not
-     started.
+     started. The READ-ONLY overview card shipped with Billing Portal v1 and
+     offers no action; every self-serve surface above is still absent.
 10. **Starter entitlement decision** — internal plan value, limits, and the
     mapping widening described above.
 11. **Refunds / proration / dunning execution** — each its own PR, each using
@@ -990,9 +1016,10 @@ the existing 0031 `billing_customers` table.
 
 What it deliberately does not do: it never touches `subscriptions`, `users`,
 entitlements, pricing, the webhook ledger or any execution gate; the
-provider→FREE gate and `paymentConfirmed` are unchanged; there is no billing
-portal and no email-change synchronization (the checkout UI arrived later, in
-Billing Step 9, and calls this route before initializing a checkout).
+provider→FREE gate and `paymentConfirmed` are unchanged; this step adds no
+billing portal and no email-change synchronization (the checkout UI arrived
+later, in Billing Step 9, and calls this route before initializing a checkout;
+the read-only overview arrived in Billing Portal v1).
 
 ## Payment evidence + transaction reconciliation (Billing Step 7)
 
@@ -1105,7 +1132,7 @@ The surface, end to end:
 | Route | `apps/api/src/routes/billing.ts` | `POST /api/billing/checkout` now sends `projectBillingCheckoutSession(session)`. Every existing behaviour is untouched: session auth, the strict body, epoch/FX derivation, the atomic snapshot+subscription+lock transaction, the `pricing_lock_required` 409 and the `502 provider_unavailable` refusals. A projection refusal is answered `502` `Checkout refused: session_not_disclosable.` — never the raw session. `POST /api/billing/customer`, `POST /api/billing/verify`, `POST /api/billing/sync`, `POST /api/billing/webhook` and `GET /api/billing/me` are unchanged. |
 | Client | `apps/web/lib/api.ts` | `ensureBillingCustomer()` and `verifyBillingPayment()` send the EMPTY body `EMPTY_JSON_BODY = '{}'` (the subject is always the session user); `checkoutBilling(input)` validates the input through `billingCheckoutRequestDtoSchema` **before** sending, and parses the answer through `billingCheckoutSessionDtoSchema`, so a response carrying a reference, a provider identifier, an idempotency key or a pricing snapshot fails in the browser instead of being rendered. |
 | Component | `apps/web/components/billing-checkout.tsx` (new) | `BillingCheckoutPanel` — the four choices, the two explicit actions, the server-provided disclosure, the verbatim payment link and the structured verification result. Sub-components (`BillingCheckoutChoices`, `BillingCheckoutSessionDisclosure`, `BillingVerificationNotice`) are presentational; `toVerificationSummary` reduces `BillingPaymentVerificationResult` to `{ verified, failureReason, failureMessage, replayed, verifiedAt }`, dropping the evidence row (provider references, transaction id, customer code, hashes) before it can reach the markup. `BILLING_CHECKOUT_STATE_COPY` and `BILLING_VERIFICATION_FAILURE_COPY` give every state and every typed failure reason its own words. |
-| Panel | `apps/web/components/subscription-panel.tsx` | Now derives its badge and warnings from the SAME `resolveBillingCheckoutState`, so the two panels cannot disagree: `awaiting verification`, `evidence · awaiting operator activation`, `activated`, `billing unavailable` (including a failed read, which is no longer presented as "loading"). Still display-only — no button, no link, no affordance. `PlanComparison` copy updated: a sandbox checkout surface exists; a portal, saved payment methods, self-serve cancellation and live payment still do not. |
+| Panel | `apps/web/components/subscription-panel.tsx` | Now derives its badge and warnings from the SAME `resolveBillingCheckoutState`, so the two panels cannot disagree: `awaiting verification`, `evidence · awaiting operator activation`, `activated`, `billing unavailable` (including a failed read, which is no longer presented as "loading"). Still display-only — no button, no link, no affordance. `PlanComparison` copy updated: a sandbox checkout surface and a read-only overview card exist; saved payment methods, self-serve cancellation and live payment still do not. |
 | Page | `apps/web/app/settings/page.tsx` | Renders `BillingCheckoutPanel` next to `SubscriptionPanel`, owns the billing read (and its failure flag) and lifts the UI-local evidence fact so both panels state the same thing. A successful checkout re-reads `GET /api/billing/me`, because the first checkout writes the subscription row and its lock. |
 | Tests | `packages/contracts/test/billing-checkout.test.ts`, `apps/web/test/billing-checkout.test.ts`, `apps/web/test/subscription-panel.test.ts`, `apps/api/test/billing-checkout.test.ts`, `apps/api/test/billing-customer.test.ts`, `apps/api/test/entitlement-hardening.test.ts` | The four choices and the refusal of Starter; the projection's disclosure and its omissions (asserted on the RAW wire body); the DTO's pins; the https-only verbatim URL; the five states and checkout suppression; the absence of any timer/effect/poll in the component source; the `{}` bodies and the exact checkout body on a fake transport; the fail-closed client parse; and the unchanged pricing/lock/entitlement regressions, now pinned against the durable snapshot instead of a forwarded one. |
 
@@ -1143,7 +1170,59 @@ Precedence is fixed and server-first: `activated` > `evidence_recorded` > `await
 - **No change to the webhook, sync, verify, customer or activation authorities.** The receiver stays receipt-only, `sync` still applies only `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`, `verify` still records evidence after exact reconciliation, `customer` stays the only writer of `billing_customers`, and activation stays out of band with no HTTP surface.
 - **No price, rate or plan decision in the browser.** The four choices carry the frozen catalogue's own price objects; the chargeable amount, the rate and the plan actually priced come from the server, and an existing immutable lock outranks the selection (the surface says so when they differ).
 - **No provider detail, credential or secret in the client.** No key, no provider endpoint, no provider field name, no reference, no idempotency key and no evidence hash reaches the bundle; the projection strips them server-side and the client's strict parse refuses them if they ever appear.
-- **No live payment and no production change.** Sandbox/test only (`sk_test_`), no new environment variable, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, no portal and no Starter selling. `PUBLIC_APPLICATION_ORIGIN` still decides the callback (`<origin>/settings`) and an empty value still disables checkout entirely.
+- **No live payment and no production change.** Sandbox/test only (`sk_test_`), no new environment variable, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, no self-serve portal (the read-only overview arrived later, in Billing Portal v1) and no Starter selling. `PUBLIC_APPLICATION_ORIGIN` still decides the callback (`<origin>/settings`) and an empty value still disables checkout entirely.
+
+## Read-only billing overview (Billing Portal v1)
+
+**Status: delivered. It is READ-ONLY: it displays server facts, claims nothing
+it cannot state, offers no action and grants nothing.** No migration, no new
+environment variable, no provider call, no new provider operation and no change
+to any authority: activation stays the out-of-band Step 8 CLI, the webhook
+receiver stays receipt-only, entitlements stay resolved server-side,
+`canAccessAutomation` / `grantsExecution` stay `false` for every plan, and
+automation, live execution and broker execution stay OFF.
+
+```text
+GET /api/billing/portal   (session-authenticated; no body, query or header is read)
+      |
+      |--> readBillingPortalFacts(pool, user.id)      the SESSION user's own rows only
+      |      subscriptions                            plan, status, provider, catalogue plan,
+      |                                               interval, current_period_end,
+      |                                               cancel_at_period_end, sync flags
+      |      billing_subscription_activations EXISTS  activated        (the only payment authority)
+      |      billing_verified_transactions    EXISTS  evidenceRecorded (a receipt)
+      |
+      |--> projectBillingPortalSummary(facts)          the strict BillingPortalSummaryDto
+      v
+   { state, plan, periodEnd, cancelAtPeriodEnd, canAccessAutomation: false, grantsExecution: false }
+```
+
+| State | Server facts | What the portal states |
+| --- | --- | --- |
+| `free` | no `subscriptions` row (Model C), or a non-commercial (`provider IS NULL`, `plan = 'free'`) row | nothing is owed: no plan, no renewal and no cancellation state |
+| `awaiting_verification` | provider-backed row, no activation fact, no evidence | the checkout exists and no payment is confirmed; the plan and interval are stated as the checkout's plan, with the trusted stored period end if one exists |
+| `evidence_awaiting_activation` | provider-backed row, verified evidence exists, no activation fact | a receipt exists and is not an activation; the entitlement is still the free tier |
+| `activated` | an immutable activation fact exists AND the row's authoritative lifecycle still carries a paid period (`active` / `trialing` / `past_due`) | the plan, the interval, the stored period end and the authoritative cancellation state |
+| `unknown` | a row the server cannot classify honestly — no coherent commercial identity, `sync_state = 'conflict'` / `sync_required`, a lifecycle that no longer carries a paid period, or a non-commercial row whose internal plan is paid | nothing is claimed: plan, period end and cancellation state are all `null` |
+| `unavailable` | the read or the projection failed | `UNAVAILABLE_BILLING_PORTAL_SUMMARY`: every optional field `null`, no reason and no provider error |
+
+| Layer | File | Role |
+| --- | --- | --- |
+| Contract | `packages/contracts/src/billing-portal.ts` (new) | `BILLING_PORTAL_STATES` (the six states), `billingPortalSummaryDtoSchema` (the strict, minimal summary — `state`, `plan: { cataloguePlan, interval } | null`, `periodEnd | null`, `cancelAtPeriodEnd | null`, with `canAccessAutomation` / `grantsExecution` pinned `z.literal(false)` and a `superRefine` that forbids a plan, period end or cancellation state in the three states that state no subscription), `UNAVAILABLE_BILLING_PORTAL_SUMMARY` (the frozen fail-closed answer), and the pure `resolveBillingPortalState(facts)` / `projectBillingPortalSummary(facts)`. The facts interface names no user, customer, subscription or provider identity, no reference, no hash, no idempotency key and no pricing field: the omission is a property of the code, not a convention at a call site. |
+| Read | `packages/core/src/billing/portal.ts` (new) | `readBillingPortalFacts(db, userId)`: one parameterized `SELECT` over an explicit column list (never `SELECT *`, never a provider code, reference, hash or pricing-lock column) plus two `EXISTS` checks (the activation fact and the evidence). An unparseable row raises instead of degrading into a permissive default. It writes nothing, calls no provider and resolves no entitlement; `BILLING_PORTAL_LIVE_LIFECYCLE_STATUSES` is a DISPLAY-only list pinned against `getEntitlements()` by `packages/core/test/billing-portal.test.ts`, so the display rule and the enforcement matrix cannot drift apart. |
+| Route | `apps/api/src/routes/billing.ts` | `GET /api/billing/portal` — session-authenticated, the subject is always `user.id`, and no request input is read at all: a `userId` / `customerId` / `subscriptionId` query parameter or body changes nothing. The answer is the projection; any failure is answered `UNAVAILABLE_BILLING_PORTAL_SUMMARY` after a server-side log, so no reason, provider error or partially read row reaches the browser. |
+| Client | `apps/web/lib/api.ts` | `getBillingPortalSummary()` — a body-less `GET` whose answer is parsed through `billingPortalSummaryDtoSchema`, so a response carrying an identity, provider, reference or pricing field fails in the browser instead of being rendered. |
+| Component | `apps/web/components/billing-portal.tsx` (new) | `BillingPortalPanel` — `BILLING_PORTAL_STATE_COPY` gives each of the six states its own label, tone and explanation; the plan and interval render only when the server stated them, renewal only from a persisted period end (otherwise "Unavailable" copy that says no date is inferred), and the panel contains no button, link, form, input, effect, timer or API call. |
+| Page | `apps/web/app/settings/page.tsx` | Renders `BillingPortalPanel` above `SubscriptionPanel`, with its own read and its own failure flag, so a failed overview read cannot be mistaken for the free state. |
+| Tests | `packages/contracts/test/billing-portal.test.ts`, `packages/core/test/billing-portal.test.ts`, `apps/api/test/billing-portal.test.ts`, `apps/web/test/billing-portal.test.ts` | The six states and the strict DTO; the absence of interval arithmetic; the classification table; the live-status pin against the entitlement matrix; the authorization and billing-truth matrix against a real database (own-subject only, injected identity ignored, `status = 'active'` ≠ activated, evidence ≠ activation, activation = activated, a missing renewal date stays unavailable, `canAccessAutomation` false); the sensitive-field boundary asserted on the RAW response body; the fail-closed read (a fault-injected `subscriptions` read answers `unavailable`, leaks nothing and writes nothing); and the read-only UI (no control of any kind, unavailable renewal copy, no provider/internal identifier in the markup). |
+
+### What Billing Portal v1 deliberately does not do
+
+- **No self-service management.** There is no cancellation endpoint and no cancellation control, no invoice endpoint/model/download, no payment-method management, no upgrade or downgrade, no plan mutation, no refund, no proration and no dunning — and **no provider operation of any kind**: the portal holds no provider, reads none and calls none.
+- **No renewal arithmetic.** `periodEnd` is published only when `subscriptions.current_period_end` already holds one. Nothing is derived from `monthly`/`annual`, from the activation instant or from any clock — the contract module contains no date construction at all.
+- **No new authority and no entitlement change.** `activated` is a READ of the Step 8 activation fact; `resolveEntitlements`, `getBillingState`, the webhook receiver, the sync mapping, checkout, pricing and the pricing lock are untouched, and `canAccessAutomation` / `grantsExecution` stay `false`.
+- **No migration.** The overview reads the existing 0014 / 0031 / 0033 / 0034 columns and tables; no schema change was required or made.
+- **No sensitive field.** The response carries no user, customer, subscription, pricing-snapshot, evidence or activation id; no provider name, customer/subscription/plan code or reference; no transaction or checkout reference; no evidence hash; no idempotency key; no card or bank data; no raw provider payload or error; no email verification token; no authorization code; and no operator activation detail.
 
 ## Verification + synchronization (Later-billing-PR #7)
 
