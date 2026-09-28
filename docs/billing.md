@@ -24,7 +24,9 @@
 > **Step 9 (this change) adds the SANDBOX CHECKOUT SURFACE** — the first
 > `apps/web` billing change, and the last missing piece of the sandbox purchase
 > path. `/settings` now offers **exactly four choices** (Pro monthly, Pro annual,
-> Elite monthly, Elite annual — Starter is not sellable and is never offered),
+> Elite monthly, Elite annual — Starter is not sellable and is never offered;
+> Billing Step 10a records that decision, so Starter stays a catalogue concept
+> only and is shown as "Not available yet" — see *Starter disposition*),
 > provisions/uses the caller's own billing customer where checkout requires one
 > (`POST /api/billing/customer`, idempotent), initializes the sandbox checkout
 > with **`{ cataloguePlan, interval }` and nothing else**, displays the
@@ -60,10 +62,22 @@
 > no plan mutation, no provider operation** — and no migration. The authority is
 > untouched: `canAccessAutomation` and `grantsExecution` stay `false`, and
 > automation, live execution and broker execution stay OFF.
+> **Billing Step 10a (this change) records the STARTER DECISION.** Starter stays
+> **unsold and unpurchasable**: it keeps its catalogue entry as a documented
+> future concept, the plan comparison marks it **"Not available yet"** and
+> explains that it is a catalogue concept only with **no enforced entitlement
+> tier**, and nothing else changes — no internal plan value, no entitlement
+> definition, no provider plan, no widened checkout / pricing / provisioning /
+> activation / portal / entitlement gate and no Paystack change. The UI derives
+> sellability from `BILLING_CHECKOUT_SELLABLE_PLANS` (Pro + Elite) and the
+> twelve enforcement gates that would all have to be widened before Starter
+> could be sold are inventoried under *Starter disposition* below. Step 10a is
+> documentation and display copy only: **no route, no service, no migration, no
+> schema change, no provider operation and no authority.**
 > There is still no saved payment method, no self-serve
 > cancellation, no refund/proration/dunning execution, no notification, no live
 > payment, no production credential, no production activation and no Starter
-> selling.
+> selling (Step 10a records that as a decision, not as a pending gap).
 > **Receipt is still not confirmation**: the webhook receiver records deliveries; `POST /api/billing/sync` applies the canonical status mapping without confirming payment; `POST /api/billing/verify` records verified-transaction evidence after reconciliation — none of them changes subscription plan or grants execution. The only payment-confirmation authority is the out-of-band activation fact, written by a named operator with a stated reason.
 >
 > **Account capabilities are only partially verified.** Whether this account
@@ -217,12 +231,17 @@ load:
 
 | Plan | Monthly (USD) | Annual (USD) | Active strategies | Markets | Trade frequency |
 | --- | --- | --- | --- | --- | --- |
-| **Starter** | $15 | $150 | 1 | 1 market category | Delayed / limited |
+| **Starter** *(catalogue concept — not sold)* | $15 | $150 | 1 | 1 market category | Delayed / limited |
 | **Pro** | $39 | $390 | 5 | Forex + crypto + stocks | Real-time |
 | **Elite** | $99 | $990 | Unlimited | Forex + crypto + stocks | Real-time + priority execution |
 
 Notes:
 
+- **Starter is a catalogue concept only (Billing Step 10a).** Its prices and
+  descriptors document a possible future tier: the plan is **not sold, not
+  purchasable and has no enforced entitlement tier**, and the plan comparison
+  shows it as "Not available yet". Pro and Elite are what is sold. See
+  *Starter disposition*.
 - Prices are **operator-defined** and stored as integer minor units (USD cents)
   alongside a display string. They are not derived or recalculated anywhere.
 - Annual pricing is exactly as defined above (each annual amount equals ten
@@ -285,7 +304,7 @@ PR2 the mapping is also enforced by the database
 | `free` | — (default, not sold) | n/a — `catalogue_plan` must be `NULL` |
 | `pro` | **Pro** ($39 / $390) | ✅ 1:1, same name |
 | `premium` | **Elite** ($99 / $990) | ✅ highest internal tier |
-| — | **Starter** ($15 / $150) | ❌ no internal value yet → needs a **later** migration + an entitlement decision |
+| — | **Starter** ($15 / $150) | ❌ no internal value yet → needs a **later** migration + an entitlement decision. **Billing Step 10a keeps it that way on purpose: Starter is not sold in this build — see *Starter disposition*** |
 
 Consequences:
 
@@ -305,7 +324,10 @@ Consequences:
   entitlements are undefined (it would fall through `getEntitlements()` to the
   free set) and would therefore be an entitlement change, which is outside
   PR2's scope. `unmappedCommercialPlans()` still returns `['starter']`, and the
-  database enforces the same fact (see below).
+  database enforces the same fact (see below). Billing Step 10a confirms the
+  boundary rather than crossing it: Starter is not sold, and the twelve gates
+  that would all have to widen first are inventoried under *Starter
+  disposition*.
 
 If a later change would require altering the stored enum or migrating existing
 users, that is the point to stop and widen scope deliberately — it was not part
@@ -818,15 +840,20 @@ ledger write — receipt only) — while everything below remains true at the
   MT5/Exness and broker integration are untouched; no new execution permission
   exists; `canAccessAutomation` remains `false` for `free`, `pro` and
   `premium`; Elite's "priority execution" remains a commercial descriptor only.
-- **No new internal plan value.** Starter is still not sellable (see above).
+- **No new internal plan value.** Starter is still not sellable (see above), and
+  Billing Step 10a records that it stays that way in this build — see *Starter
+  disposition*.
 
 ### Prerequisite discovered, deliberately not started
 
-Making **Starter** sellable needs three changes that are all outside PR2's
-scope: an internal plan value in the 0001/0014 CHECKs, an entitlement
+Making **Starter** sellable needs at least three changes that are all outside
+PR2's scope: an internal plan value in the 0001/0014 CHECKs, an entitlement
 definition for it in `entitlements.ts` (an entitlement change), and a widening
-of `subscriptions_catalogue_plan_mapping_check`. PR2 stops at the boundary and
-records the gap instead of expanding into entitlement work.
+of `subscriptions_catalogue_plan_mapping_check`. PR2 stopped at the boundary
+and recorded the gap instead of expanding into entitlement work. **Billing Step
+10a keeps that boundary and supersedes this three-change sketch with the full
+twelve-gate inventory under *Starter disposition*** — the three above are the
+minimum subset, not the whole set. No gate was widened.
 
 ## Operational notes
 
@@ -992,8 +1019,15 @@ Roughly in order; each is its own PR and may be re-scoped.
    - 9b. Billing portal (self-serve management, cancellation, invoices) — not
      started. The READ-ONLY overview card shipped with Billing Portal v1 and
      offers no action; every self-serve surface above is still absent.
-10. **Starter entitlement decision** — internal plan value, limits, and the
-    mapping widening described above.
+10. **Starter sellability decision — decided: NOT sold in this build (Billing
+    Step 10a).** Starter keeps its catalogue entry as a documented future
+    concept and the plan comparison marks it "Not available yet"; nothing was
+    added for it — no internal plan value, no entitlement definition, no
+    provider plan — and no gate was widened. Making it sellable remains a
+    future decision that would require **all twelve** gates listed under
+    *Starter disposition* to be widened together, plus the two unresolved
+    product decisions recorded there (Starter's advertised limits sit below the
+    free tier's enforced limits, and the free-tier disposition is undecided).
 11. **Refunds / proration / dunning execution** — each its own PR, each using
     the amount actually charged (never a re-rate).
 12. **Production credentials + go-live** only after all of the above, and only
@@ -1100,7 +1134,7 @@ edit and no delete: a correction is a manual review, never a silent overwrite.
 - **Never calls a provider.** The service holds no provider; reconciliation is re-run purely over the stored evidence. Sandbox/test only: a non-`test` domain is refused by the evidence CHECK and by the coherence trigger.
 - **Never grants execution.** `canAccessAutomation` stays `false` for every plan; automation, live execution and broker execution stay OFF regardless of activation state.
 - **Never rewrites history.** Migrations 0001–0033 are byte-identical, 0034 is the only new migration and is additive/forward-only (no DROP, RENAME, TRUNCATE or data rewrite), and the fact table refuses UPDATE and DELETE.
-- **Never touches production.** No live key, no production credential, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, and no Starter selling. No activation has been performed in any deployed environment.
+- **Never touches production.** No live key, no production credential, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, and no Starter selling (Billing Step 10a records that Starter is not sold — see *Starter disposition*). No activation has been performed in any deployed environment.
 
 ## Sandbox checkout surface (Billing Step 9)
 
@@ -1170,7 +1204,7 @@ Precedence is fixed and server-first: `activated` > `evidence_recorded` > `await
 - **No change to the webhook, sync, verify, customer or activation authorities.** The receiver stays receipt-only, `sync` still applies only `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`, `verify` still records evidence after exact reconciliation, `customer` stays the only writer of `billing_customers`, and activation stays out of band with no HTTP surface.
 - **No price, rate or plan decision in the browser.** The four choices carry the frozen catalogue's own price objects; the chargeable amount, the rate and the plan actually priced come from the server, and an existing immutable lock outranks the selection (the surface says so when they differ).
 - **No provider detail, credential or secret in the client.** No key, no provider endpoint, no provider field name, no reference, no idempotency key and no evidence hash reaches the bundle; the projection strips them server-side and the client's strict parse refuses them if they ever appear.
-- **No live payment and no production change.** Sandbox/test only (`sk_test_`), no new environment variable, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, no self-serve portal (the read-only overview arrived later, in Billing Portal v1) and no Starter selling. `PUBLIC_APPLICATION_ORIGIN` still decides the callback (`<origin>/settings`) and an empty value still disables checkout entirely.
+- **No live payment and no production change.** Sandbox/test only (`sk_test_`), no new environment variable, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, no self-serve portal (the read-only overview arrived later, in Billing Portal v1) and no Starter selling (Step 10a shows Starter as "Not available yet"; it is never offered). `PUBLIC_APPLICATION_ORIGIN` still decides the callback (`<origin>/settings`) and an empty value still disables checkout entirely.
 
 ## Read-only billing overview (Billing Portal v1)
 
@@ -1223,6 +1257,99 @@ GET /api/billing/portal   (session-authenticated; no body, query or header is re
 - **No new authority and no entitlement change.** `activated` is a READ of the Step 8 activation fact; `resolveEntitlements`, `getBillingState`, the webhook receiver, the sync mapping, checkout, pricing and the pricing lock are untouched, and `canAccessAutomation` / `grantsExecution` stay `false`.
 - **No migration.** The overview reads the existing 0014 / 0031 / 0033 / 0034 columns and tables; no schema change was required or made.
 - **No sensitive field.** The response carries no user, customer, subscription, pricing-snapshot, evidence or activation id; no provider name, customer/subscription/plan code or reference; no transaction or checkout reference; no evidence hash; no idempotency key; no card or bank data; no raw provider payload or error; no email verification token; no authorization code; and no operator activation detail.
+
+## Starter disposition (Billing Step 10a)
+
+**Decision (Billing Step 10a): Starter is NOT sold in this build.** It stays in
+the commercial catalogue as a documented future concept, and that is all it is.
+No internal plan value, no entitlement definition, no provider plan and no
+sellable epoch exist for it, and nothing in the checkout, pricing, provisioning,
+activation, portal, entitlement, automation, execution or Paystack path was
+widened to make it sellable. The UI states it plainly: the plan comparison marks
+the Starter card **"Not available yet"** and explains that Starter is a
+*catalogue concept only* — not offered, not purchasable, and with **no enforced
+entitlement tier**.
+
+This section is the single place that records the decision. Step 10a is
+documentation and display copy only: it adds **no route, no service, no
+migration, no schema change, no provider operation and no authority**.
+
+| Layer | File | What Step 10a does |
+| --- | --- | --- |
+| Catalogue cards | `apps/web/components/subscription-panel.tsx` (`PlanComparison`) | Derives sellability from `BILLING_CHECKOUT_SELLABLE_PLANS` (imported, never restated), marks every catalogue entry that is not a sellable plan **"Not available yet"** (today: Starter only) and states that Starter is a catalogue concept only with no enforced entitlement tier. Pro/Elite rendering and the current-plan badge are unchanged, and no card offers any action. |
+| Tests | `apps/web/test/subscription-panel.test.ts` | Every catalogue entry renders; exactly the non-sellable entry is marked unavailable; Starter is described as a concept; no card — Starter included — offers an action; the current-plan badge is unchanged (Starter can never be current); sellability is pinned to `BILLING_CHECKOUT_SELLABLE_PLANS` behaviourally and in the component source (no restated sellable-plan literal). |
+| README | `README.md` | States that Pro/Elite are what is sold and that Starter is a catalogue concept only — not sold, not purchasable, no enforced entitlement tier, shown as "Not available yet". |
+| This document | `docs/billing.md` | Records the decision, the twelve gates and the two unresolved product decisions; the existing Starter statements point here. |
+
+### What "not sold" means here, precisely
+
+- **No internal plan value.** `USER_PLANS` is `free` / `pro` / `premium`
+  (`packages/contracts/src/users.ts`), and migrations `0001` / `0014`
+  CHECK-constrain `users.plan` / `subscriptions.plan` to exactly those values.
+  `INTERNAL_PLAN_FOR_COMMERCIAL_PLAN.starter` stays `null`.
+- **No entitlement definition.** `getEntitlements()` has no `starter` branch; a
+  hypothetical internal value would fall through `default` to the free set,
+  which is why adding one is an **entitlement change** and not a naming change.
+- **No provider plan and no pricing.** `billing_provider_plans` and
+  `billing_pricing_snapshots` CHECK `catalogue_plan IN ('pro','elite')`, the
+  Step 4 provisioning workflow provisions only the two sellable plans, and both
+  pricing entry points refuse a plan returned by `unmappedCommercialPlans()`.
+- **No checkout and no activation.** The server's checkout input schema is
+  `z.enum(['pro','elite'])`, and the activation authority — plus the migration
+  `0034` CHECK and its coherence trigger — refuses `starter` explicitly.
+- **No portal identity.** The read-only overview resolves a commercial identity
+  only for a sellable plan, so a rogue Starter row would state nothing.
+- **Paystack is not asked to do anything new.** No API call, no plan
+  registration, no endpoint, header, credential or payload change: Step 10a
+  contains no provider code and changes no provider behaviour.
+
+### The twelve gates that would all have to be widened
+
+Selling Starter is **not** a copy change. Every one of the following twelve
+enforcement points refuses Starter today; all twelve would have to be widened
+together, deliberately, in a reviewed change. The first three are the minimum
+set PR2 recorded; this is the full inventory:
+
+| # | Gate | Anchor | What would have to widen |
+| --- | --- | --- | --- |
+| 1 | Internal plan vocabulary + stored CHECKs | `packages/contracts/src/users.ts`; migrations `0001`, `0014` (`plan IN ('free','pro','premium')`) | a new internal plan value and a migration widening both CHECKs |
+| 2 | Compatibility mapping | `packages/contracts/src/billing-catalogue.ts` (`INTERNAL_PLAN_FOR_COMMERCIAL_PLAN.starter = null`) | the mapping that says no internal value exists yet |
+| 3 | Entitlement definition | `packages/core/src/billing/entitlements.ts` (no `starter` branch; `default` → free) | an explicit entitlement tier and its matrix tests (**an entitlement change**) |
+| 4 | Compatibility constraint in the database | `packages/core/src/db/migrations/0031_provider_billing.sql` → `subscriptions_catalogue_plan_mapping_check` | the CHECK that makes `catalogue_plan = 'starter'` unpersistable |
+| 5 | Server checkout input | `packages/core/src/billing/checkout.ts` → `billingCheckoutInputSchema` (`z.enum(['pro','elite'])`) | the request refusal, which happens before any pricing or provider work |
+| 6 | Pricing derivation | `packages/core/src/billing/pricing.ts` (both entry points refuse `unmappedCommercialPlans()`) | both refusals and their tests |
+| 7 | Provider-plan epochs | `packages/core/src/billing/provider-plans.ts` (`forbidden_plan`) + `0032` → `billing_provider_plans_catalogue_plan_check` | epoch registration and the CHECK |
+| 8 | Pricing-snapshot persistence | `0032` → `billing_pricing_snapshots_catalogue_plan_check` | the CHECK the immutable pricing lock depends on |
+| 9 | Step 4 sandbox provisioning | `packages/core/src/billing/provisioning.ts` (the two sellable plans only) | the provisioning workflow — and a provider plan would have to exist first |
+| 10 | Activation authority | `packages/core/src/billing/activation.ts` (`forbidden_plan`) + `0034` CHECK and coherence trigger | the service refusal, the CHECK and the trigger |
+| 11 | Checkout contract + surface | `packages/contracts/src/billing-checkout.ts` (`BILLING_CHECKOUT_SELLABLE_PLANS`, `BILLING_CHECKOUT_CHOICES`) and `apps/web/components/billing-checkout.tsx` | the sellable set and the four offered choices |
+| 12 | Portal identity + seam sellability | `packages/core/src/billing/portal.ts` and `packages/contracts/src/billing-provider.ts` (`isSellableBillingPlan`) | the commercial-identity resolution |
+
+The split above counts **one gate per enforcement boundary**, and counts a
+database constraint together with the service check it mirrors. **No gate was
+widened by Step 10a**: this list is the checklist a future change must walk, and
+it is deliberately the only place the enumeration is stated.
+
+### Two unresolved product decisions (deliberately not decided here)
+
+1. **Starter's advertised limits sit below the free tier's enforced limits.**
+   The catalogue advertises Starter as *1 active strategy · 1 market category ·
+   delayed/limited*, while the **enforced** free tier is wider:
+   `maxStrategies: 100`, `maxBacktestsPerMonth: 100`, `maxAlertsPerMonth: 1000`,
+   `maxSavedSetups: 1000` (`FREE_ENTITLEMENTS`, `entitlements.ts`). Selling
+   Starter as advertised would hand a paying customer *fewer* strategies than
+   they have for free, so either the advertised allowance or the enforced tier
+   would have to change — an entitlement decision, not a catalogue edit.
+2. **Free-tier disposition.** `free` has no catalogue row and is not a sold
+   tier: since Model C a free user typically has **no `subscriptions` row at
+   all**, and the missing row is what resolves to free. Introducing a $15 entry
+   tier therefore needs a product decision about whether free survives, with
+   which limits, and how existing free users are treated (retained, migrated or
+   grandfathered). Step 10a does not decide it and changes nothing for free
+   users.
+
+Both decisions stay **open**, and they are recorded here so a future Starter
+decision starts from the real constraints instead of from a price row.
 
 ## Verification + synchronization (Later-billing-PR #7)
 

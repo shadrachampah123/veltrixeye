@@ -816,10 +816,13 @@ canonical billing contracts and the Paystack provider seam — see
   **USD**; development uses **sandbox/test credentials only**; no secrets in
   source control; **Render stays on the Free plan**.
 - **Catalogue (single authoritative source, deeply frozen, validated at module
-  load):** Starter $15/mo · $150/yr (1 active strategy, 1 market category,
-  delayed/limited) · Pro $39/mo · $390/yr (5 active strategies, forex + crypto +
-  stocks, real-time) · Elite $99/mo · $990/yr (unlimited strategies, forex +
-  crypto + stocks, real-time + priority execution).
+  load):** Pro $39/mo · $390/yr (5 active strategies, forex + crypto + stocks,
+  real-time) and Elite $99/mo · $990/yr (unlimited strategies, forex + crypto +
+  stocks, real-time + priority execution) are what is **sold**; **Starter**
+  $15/mo · $150/yr (1 active strategy, 1 market category, delayed/limited) is a
+  **catalogue concept only** — not sold, not purchasable and with no enforced
+  entitlement tier, shown in the UI as "Not available yet" while it stays in the
+  catalogue as a documented future concept (**Billing Step 10a**).
 - **Three layers kept separate:** the *commercial catalogue* (what is sold),
   *entitlement enforcement* (`getEntitlements`, unchanged), and *future
   execution capabilities* (still OFF for every plan). Elite's "priority
@@ -832,7 +835,10 @@ canonical billing contracts and the Paystack provider seam — see
   identity in a separate `subscriptions.catalogue_plan` column bound to that
   mapping, so **Starter is still not sellable** — it needs an internal plan
   value *and* an entitlement definition, which is an entitlement change and
-  stays deferred.
+  stays deferred. **Billing Step 10a records that decision** (Starter is not
+  sold in this build) and inventories the **twelve gates** that would all have
+  to be widened before it could be — see
+  [billing.md](./billing.md#starter-disposition-billing-step-10a).
 - **PR2 (delivered): persistence + seam, no integration.** Migration
   `0031_provider_billing.sql` extends the ONE authoritative `subscriptions` row
   (catalogue plan, interval, currency, provider identifiers, canonical provider
@@ -872,7 +878,11 @@ canonical billing contracts and the Paystack provider seam — see
   `canAccessAutomation` / `grantsExecution` stay `false`.
 - **Explicitly deferred to later billing PRs:** self-serve billing management
   (cancellation, invoices, payment methods, plan changes), refunds/proration/
-  dunning execution, the Starter entitlement decision, and production
+  dunning execution, the Starter **sellability** decision (Billing Step 10a
+  decided Starter is **not sold** in this build; making it sellable would
+  require widening all twelve gates documented in
+  [billing.md](./billing.md#starter-disposition-billing-step-10a) together, plus
+  the two unresolved product decisions recorded there), and production
   credentials.
 - **Not started / not planned in the billing stream:** broker or MT5/Exness
   connectivity, live execution, automation, and any change to Gate 9, B1, B2 or
@@ -881,5 +891,5 @@ canonical billing contracts and the Paystack provider seam — see
 ## After M9.2 (later work, outline only)
 
 1. **Operational broker transport** — validate a concrete MT5 bridge and an approved external secret manager on demo infrastructure. M8.4 deliberately ships neither and makes no connectivity claim. M8.5/M8.6/M8.7/M9.1/M9.2 prepare reconciliation, safety plumbing, drawdown protection, notification fairness and secret hardening for it; the transport itself is gated on external validation.
-2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path now runs end to end through verified payment evidence and the out-of-band activation authority (Steps 6–8, migrations 0033–0034), with a checkout UI and a read-only overview delivered by Billing Step 9 and Billing Portal v1; the remaining steps — self-serve subscription management, refunds/proration/dunning and production credentials — are listed in [billing.md](./billing.md#later-billing-prs-explicitly-not-in-pr2) and in the section above.
+2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path now runs end to end through verified payment evidence and the out-of-band activation authority (Steps 6–8, migrations 0033–0034), with a checkout UI and a read-only overview delivered by Billing Step 9 and Billing Portal v1; the remaining steps — self-serve subscription management, refunds/proration/dunning, production credentials, and the Starter sellability decision (Billing Step 10a records that Starter is **not sold** and shows it as "Not available yet"; see [the Starter disposition](./billing.md#starter-disposition-billing-step-10a)) — are listed in [billing.md](./billing.md#later-billing-prs) and in the section above.
 3. **More channels** (SMS/Telegram) behind same registry if needed.
