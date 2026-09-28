@@ -74,6 +74,22 @@
 > could be sold are inventoried under *Starter disposition* below. Step 10a is
 > documentation and display copy only: **no route, no service, no migration, no
 > schema change, no provider operation and no authority.**
+> **Billing Step 9b (this change) is a DECISION/SCOPE document, not an
+> implementation.** It bounds self-serve billing management to **cancellation**
+> and **invoices**, puts **payment-method management** and **plan changes**
+> outside 9b, keeps refunds / proration / dunning / production go-live out, and
+> records the two unresolved technical decisions that block implementation:
+> **C-1** (Paystack cancellation requires the subscription's `email_token`,
+> which this build does not persist and this change does not start persisting —
+> persisting it would introduce a standing, reusable cancellation credential
+> into a build whose rule is that no secret is storable) and **R-1**
+> (`findSubscription` is unimplemented and there is no verified
+> subscription-read source, so no lifecycle state may be claimed or inferred).
+> It also records that the Step 4 provisioning operator run has still not
+> happened, so no sandbox subscription exists to manage. It is **documentation
+> only**: no route, no service, no migration, no schema change, no column, no
+> provider operation, no provider call, no credential and no authority — and
+> every safety boundary above is unchanged.
 > There is still no saved payment method, no self-serve
 > cancellation, no refund/proration/dunning execution, no notification, no live
 > payment, no production credential, no production activation and no Starter
@@ -800,7 +816,13 @@ ledger write — receipt only) — while everything below remains true at the
   a READ-ONLY overview** (`GET /api/billing/portal` plus the `/settings` card),
   which states only what the server can state and offers no action; the Step 9
   surface initiates a sandbox checkout and verifies it. Together those are the
-  whole of the customer-facing billing UI.
+  whole of the customer-facing billing UI. **Billing Step 9b is the scope
+  decision for the next step of that work, not an implementation of it**: it
+  bounds self-serve management to cancellation and invoices, puts payment-method
+  management and plan changes outside it, and records the two decisions that
+  must be answered first — see *Self-serve billing management scope (Billing
+  Step 9b)*. Nothing in that section is built, and the sentence above stays
+  exactly as true as it was before it.
 - **No webhook-driven state change.** The receiver writes
   `billing_provider_events` rows (`received`) and never touches
   `subscriptions`, entitlements or any execution gate. A recorded
@@ -1016,9 +1038,19 @@ Roughly in order; each is its own PR and may be re-scoped.
      authorization URL used verbatim, an explicit verification action, no
      polling, and a disclosed response projection that carries no checkout
      reference, provider identifier, idempotency key or pricing snapshot.
-   - 9b. Billing portal (self-serve management, cancellation, invoices) — not
-     started. The READ-ONLY overview card shipped with Billing Portal v1 and
-     offers no action; every self-serve surface above is still absent.
+   - 9b. Billing portal (self-serve management, cancellation, invoices) — **SCOPE
+     DECIDED, NOT IMPLEMENTED (Billing Step 9b, this document only)**. The
+     READ-ONLY overview card shipped with Billing Portal v1 and offers no
+     action; every self-serve surface above is still absent. Step 9b records the
+     boundary (**cancellation** and **invoices** in scope; **payment-method
+     management** and **plan changes** out; refunds / proration / dunning /
+     go-live out) and the two unresolved decisions that block implementation —
+     **C-1** (Paystack cancellation needs the subscription's `email_token`,
+     which this build does not persist and this PR does not start persisting)
+     and **R-1** (`findSubscription` is unimplemented and there is no verified
+     subscription-read source, so no lifecycle state may be claimed). See
+     *Self-serve billing management scope (Billing Step 9b)*. It adds no route,
+     no migration, no provider operation and no authority.
 10. **Starter sellability decision — decided: NOT sold in this build (Billing
     Step 10a).** Starter keeps its catalogue entry as a documented future
     concept and the plan comparison marks it "Not available yet"; nothing was
@@ -1350,6 +1382,266 @@ it is deliberately the only place the enumeration is stated.
 
 Both decisions stay **open**, and they are recorded here so a future Starter
 decision starts from the real constraints instead of from a price row.
+
+## Self-serve billing management scope (Billing Step 9b)
+
+**Status: SCOPE DECIDED — IMPLEMENTATION NOT STARTED, AND NOT STARTABLE YET.**
+This section records what Billing Step 9b is allowed to contain, the two
+technical decisions that must be answered before any of it can be written, and
+what is explicitly outside it. It is **documentation only**: it adds **no
+route, no service, no migration, no schema change, no column, no provider
+operation, no provider call, no credential, no API endpoint and no authority
+change** — the same shape as Billing Step 10a, and for the same reason.
+
+9b is the earliest unfinished item under *Later billing PRs* (#9). Read-only
+recon found it is **not implementation-ready**: of the four capabilities the
+repository currently names under it, **two are blocked by unresolved technical
+decisions** and **two do not belong to it at all**. Neither blocked decision
+can be closed by writing code, and neither is closed by this section.
+
+Neither **C-1** nor **R-1** below is recorded under *Decisions
+(operator-confirmed)* above, because **neither is decided**. They are recorded
+here so that the eventual implementation PR starts from the real constraints
+instead of from a button.
+
+### 1. The 9b boundary
+
+| Capability | In 9b? | Disposition |
+| --- | --- | --- |
+| **Cancellation** (self-serve) | **In scope — BLOCKED** by **C-1** | The provider's documented disable operation needs a credential this build deliberately does not persist. This section authorizes **no** credential persistence. |
+| **Invoices** (self-serve) | **In scope — BLOCKED** by **R-1** | There is no verified subscription-read source, so no invoice list can be produced truthfully. See R-1 for what a truthful receipt-shaped surface would and would not be. |
+| **Payment-method management** | **OUT of 9b** | This build persists no card, authorization or bank detail and reads none. The provider's `authorizations[]` on a customer fetch is credential-shaped material the adapter never reads, and a management surface over it would have to display reusable payment credentials. That is a separate decision with its own security review, not a 9b capability. |
+| **Plan changes** (upgrade / downgrade) | **OUT of 9b** | Provider plan-change semantics are documented as **unknown** (in-place change vs new subscription, re-authorization, timing — *paystack-provider-contract.md* §1), `PUT /plan` is forbidden by the provider-mutation decision, and a change would move the entitlement identity, which no billing surface may do (`planChanged` / `entitlementsChanged` are pinned `z.literal(false)`). A plan change is a NEW checkout against a NEW epoch (D-9) — a purchase path the Step 9 surface already provides — not a self-serve mutation of an existing subscription. |
+| **Refunds** | OUT | Later billing work (#11), its own PR, and it must use the amount actually charged (D-6). |
+| **Proration** | OUT | Later billing work (#11), its own PR. |
+| **Dunning** | OUT | Later billing work (#11), its own PR. The provider documents that "subscriptions aren't retried", so a local dunning policy would be new product behaviour rather than a passthrough. |
+| **Production go-live** | OUT | Later billing work (#12), gated on everything above. |
+
+9b is therefore, at most, **two** capabilities — a truthful cancellation and a
+truthful invoice surface — and **both are blocked**. Nothing in this section
+widens the existing statement that "no self-serve billing management" exists:
+no cancellation, invoices, payment-method management, plan changes or refunds —
+no endpoint, no button and no provider mutation exists for any of them, and
+that is exactly as true after this section as before it.
+
+### 2. Decision C-1 — what could make a cancellation truthful (UNRESOLVED)
+
+**The problem, stated exactly.** The seam declares `cancelSubscription`
+(`packages/core/src/billing/provider.ts`, `billingSubscriptionCancelRequestSchema`:
+`userId`, `providerSubscriptionId`, `immediate`, `reason`, `idempotencyKey`,
+`requestedAt`). The Paystack adapter **refuses** it with
+`PaystackNotImplementedError`, and the reason is a fact, not a placeholder:
+
+> cancellation is documented as needing the subscription code **AND** its
+> `email_token`, which this build does not persist
+> (`PAYSTACK_UNIMPLEMENTED_REASONS.cancelSubscription`)
+
+The provider's documented enable/disable operation requires **both** `code` and
+`token`. The `email_token` is issued by the provider on subscription creation
+and is published inside invoice payloads — where the normalizer deliberately
+**never reads it** (fixture-pinned with `DO_NOT_PERSIST` sentinels in
+`packages/providers/paystack/test/fixtures/webhook/invoice-*.json`).
+
+**Why this build does not persist it — and why this PR does not start.**
+Migration `0031` persists `provider_subscription_code` (the `SUB_…` code) but
+**no token column exists anywhere** in the schema, and nothing in the
+repository writes `provider_subscription_code` either. The omission is
+load-bearing, not an oversight:
+
+- Every provider-reference schema in the contracts rejects credential-shaped
+  material (`BILLING_CREDENTIAL_SHAPED_RE` — `token`, `authorization`,
+  `credential`, `secret`, …), so a token could not even be represented as a
+  provider reference.
+- Migration `0031`'s own posture is **reject, not redact after the fact**:
+  `billing_provider_events.failure_reason` carries a CHECK that refuses
+  credential-shaped text outright, mirroring the Gate 9 rule.
+- `BillingPortalSummaryDto` and the whole Billing Portal v1 boundary forbid
+  reusable material — "no email verification token, no authorization code, no
+  key, no secret and no reusable authorization value" — and
+  `packages/core/test/billing-portal.test.ts` asserts the raw response body
+  carries none. The omission is a property of the code, not a convention.
+
+**Security / redaction implication if it were persisted.** An `email_token` is
+a **standing, reusable cancellation credential** for one subscription, held in
+the same database as the row it can cancel. Every read path that reaches
+`subscriptions` becomes a read path that reaches a cancellation credential;
+every backup, replica, export, log line and error message that carries a row
+becomes a carrier of it; and the minimal-projection discipline that keeps the
+portal safe (an explicit column list, no `SELECT *`, a strict DTO) would have
+to be re-opened to hold it. That is a strictly larger blast radius than
+anything this billing stream has shipped, it introduces a **new class of
+secret** into a build whose documented rule is that no secret is storable, and
+it would make a *read-only* surface one schema change away from being a
+*cancellation* surface. **This PR does not implement credential persistence,
+and no later 9b PR may assume it was authorized here.**
+
+**Options that could support a truthful cancellation without persisting the
+credential** (recorded so the decision is made from evidence, not invented at
+implementation time):
+
+- **O-1 — Out-of-band operator cancellation**, mirroring the Step 8 activation
+  authority: a named operator, a stated reason, no HTTP route, no admin role,
+  no operator endpoint and no token, with the operator supplying the
+  provider's `email_token` at run time from outside the platform. **Truthful**:
+  it either performs the documented operation with both required values or it
+  refuses. Cost: it is not self-serve, so it does not by itself satisfy "9b =
+  self-serve management".
+- **O-2 — Provider-hosted management**: link the customer to the provider's own
+  dashboard/customer surface. Genuinely self-serve and truthful, with **no
+  credential in our database** and **no provider mutation from our code**.
+  Cost: the UI leaves the application; it needs a product decision about the
+  handoff, and no such link exists in this repository today.
+- **O-3 — Persist the token.** **Rejected** on the grounds above; not
+  implemented by this PR. Nothing in the current schema, contract or projection
+  would accept it without widening every one of those boundaries at once.
+- **O-4 — Set a local cancellation flag only** (write
+  `cancel_at_period_end` / `cancelled_at` / `cancellation_reason` and show it).
+  **Rejected**: it would state a cancellation the provider has not performed.
+  The local cancellation columns have **no writer at all** today, and inventing
+  one would be a false claim rendered as a fact.
+
+**A second, independent blocker on reporting it back.** Even a cancellation
+performed out of band could not be *reported to the UI from a provider event*:
+`subscription.disable` and `subscription.not_renew` have **no published
+payload shape** and are recorded as unsupported, so they normalize to
+`unrecognized`. A truthful cancellation state in the UI must therefore come
+from a verified read (see **R-1**) or from the durable record of the
+authorized action itself — never from an event name.
+
+**The decision that must be made before implementation:** which of **O-1** /
+**O-2** (or a new, separately authorized option) is authorized; and, if **O-1**,
+what the durable record of an operator-performed cancellation is, given that
+the local cancellation columns have no writer and 9b is not authorized to add
+one. Until that is answered, **no cancellation UI may be built**, and the only
+honest customer-facing answer remains the out-of-band one.
+
+### 3. Decision R-1 — what evidence must exist before a lifecycle state is claimed (UNRESOLVED)
+
+**The current state, exactly.** `findSubscription` is **unimplemented** and
+fails closed:
+
+- The adapter rejects it with `PaystackNotImplementedError`, reason: *"the
+  platform has no verified subscription read operation (only the
+  transaction-verify read, used by verifySubscription)"*.
+- `describe().verification.subscriptionRead` honestly reports `'none'`.
+- `verifySubscription` is the **only** provider read this build performs for a
+  subscription, and it reports lifecycle state **`unknown` always**: the
+  documented verify response carries a **transaction** status only — no
+  subscription status and no subscription code. A transaction status is never
+  promoted to a subscription state.
+- The webhook normalizer supports exactly the four published payload shapes
+  (`charge.success`, `subscription.create`, `invoice.update`,
+  `invoice.payment_failed`); the cancellation/lifecycle events
+  (`subscription.disable`, `subscription.not_renew`, `subscription.enable`)
+  have no published payload, so **an event cannot supply a lifecycle state
+  either**.
+
+**Therefore the only sources of subscription lifecycle state in this build are
+local**: (a) the authoritative `subscriptions` row — written by checkout, and
+by sync's canonical status mapping through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`
+— and (b) the Step 8 activation fact. Billing Portal v1 already states exactly
+those, and nothing more.
+
+**What must exist before the UI is allowed to claim a subscription lifecycle
+state:**
+
+1. A **verified subscription read** behind the seam — a **documented** provider
+   operation that returns a subscription status for **our own** subscription,
+   implemented as a seam operation, exercised in **sandbox**, and fail-closed
+   for everything it cannot verify (an ambiguous or unmodelled state must map
+   to `unknown` / manual review, exactly as `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`
+   already does).
+2. A durable place for the result to live — today every lifecycle fact the UI
+   could show is already in `subscriptions` (`status`, `provider_state`,
+   `current_period_*`, `cancel_at_period_end`) or in the activation fact; a new
+   provider-sourced state would need the same single-writer, `state_version`-guarded
+   discipline `BillingSubscriptionSyncService` already enforces, not a second
+   source of truth.
+3. Until (1) exists, the UI may state **only what the local authoritative row
+   already states**, and must answer `null` / `unknown` for everything else —
+   which is precisely Billing Portal v1's behaviour.
+
+**Do not infer.** Each of the following is a guess this repository has already
+refused, and 9b must not reintroduce any of them:
+
+- promoting a **transaction** status to a subscription state;
+- reading a lifecycle state from an **event name** whose payload is unpublished;
+- deriving a period, renewal or expiry from the **interval** or a **clock** —
+  the portal contract contains no date construction at all;
+- treating a stored `status = 'active'` as a paid lifecycle (it is a checkout
+  artefact);
+- treating `provider_state` as provider-verified when every Paystack-verified
+  state today is `unknown`.
+
+**Consequence for invoices.** An invoice surface built on an unverified
+lifecycle read would either invent invoices or invent their state. The only
+truthful payment facts this build holds are **local and receipt-shaped**:
+verified payment evidence (`billing_verified_transactions`, Step 7) and the
+append-only `billing_provider_events` ledger (Step 5.2). Neither is an invoice,
+neither carries a provider invoice identity, and 9b is **not** authorized to
+expose either as one. Whether a truthful, clearly-labelled "payment history"
+view of local receipts belongs in 9b is a **product** decision to take with
+**R-1** — it is not decided here, and nothing in this section builds it.
+
+### 4. Sandbox prerequisite — the Step 4 operator run has still not happened
+
+The Step 4 provisioning workflow exists
+(`packages/core/src/billing/provisioning.ts`), but the **separately authorized
+operator run has not been performed**: no `billing_fx_rate_versions` row is
+published and no `billing_provider_plans` epoch is registered in any
+environment.
+
+The consequence is direct: `POST /api/billing/checkout` fails closed with
+`plan_not_registered`, so **no commercial `subscriptions` row can be created at
+all**. With no subscription there is nothing to cancel, nothing to invoice and
+nothing to change — so a realistic sandbox end-to-end **management** flow
+cannot be exercised, independently of decisions C-1 and R-1.
+
+**This PR does not perform that operator run.** It publishes no FX rate,
+creates no provider plan, registers no epoch, and provisions no sandbox data.
+AC5 (the four production-shaped Pro/Elite × monthly/annual sandbox plans)
+remains uncleared for exactly the same reason, and the runbook stays where it
+is — under *Sandbox plan provisioning (Step 4)*.
+
+### 5. Boundaries this section preserves (unchanged by 9b)
+
+Every boundary below was already true before this section and is restated here
+so that the 9b implementation PR cannot quietly relax one:
+
+- **Paystack sandbox / test mode only.** `sk_test_` keys; a live key is refused
+  at construction; `live` is pinned `false` by type and guarded at registration.
+- **No production credentials**, no production FX publication, no production
+  provider-plan registration, no production activation, no `render.yaml` or
+  Vercel change, and Render stays on the Free plan.
+- **No live provider mutations.** No cancellation call, no plan mutation
+  (`PUT /plan` is never called), no refund call, no payment-method write. A
+  price change remains a NEW epoch plus a NEW provider plan, retired locally.
+- **The webhook stays receipt-only** unless separately authorized: it records
+  `billing_provider_events` rows and never touches `subscriptions`,
+  entitlements or any execution gate.
+- **Entitlements stay server-resolved** from the internal `plan` + `status`
+  pair; `paymentConfirmed` stays derived from the Step 8 activation fact; no
+  billing surface, read or write, can move either.
+- **Automation and execution stay OFF.** `canAccessAutomation` and
+  `grantsExecution` stay `false` for every plan; a self-serve billing action can
+  never be an execution grant, and Elite's "priority execution" remains a
+  commercial descriptor only.
+- **No broker / MT5 / Exness work** — untouched.
+- **No change to Gate 9, B1, B2**, the M10 transport or paper-execution
+  behaviour.
+- **No migration, no new column, no new environment variable, no new route.**
+
+### What 9b is not
+
+9b is not a licence to build the rest of the billing stream. It is not refunds,
+proration or dunning execution (#11); it is not production credentials or
+go-live (#12); it is not Starter sellability (Step 10a decided that Starter is
+**not sold** in this build); and it is not a provider-mutation surface. It is,
+at most, two blocked capabilities whose unblocking conditions are the two
+decisions above — and the answer to "what exactly are we going to build for
+self-serve billing management?" is: **a truthful cancellation and a truthful
+invoice surface, both gated on C-1 and R-1, with everything else explicitly
+out.**
 
 ## Verification + synchronization (Later-billing-PR #7)
 
