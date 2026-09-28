@@ -17,13 +17,27 @@
  *  - the panel still contains NO checkout button, payment link or portal link —
  *    the checkout affordances live in `billing-checkout.tsx`
  *    (test/billing-checkout.test.ts), and this panel stays display-only.
+ *  - Billing Step 10a: the catalogue cards (`PlanComparison`) distinguish what
+ *    is SOLD from what merely exists in the catalogue — every catalogue entry
+ *    renders, sellability is DERIVED from `BILLING_CHECKOUT_SELLABLE_PLANS`
+ *    (never restated), Starter is the one non-sellable entry and is marked
+ *    "Not available yet" and explained as a catalogue concept with no enforced
+ *    entitlement tier, no card offers any action, and the current-plan badge
+ *    behaves exactly as before (Starter can never be current).
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import * as React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { billingStateDtoSchema, type BillingStateDto } from '@veltrixeye/contracts';
-import { SubscriptionPanel } from '../components/subscription-panel';
+import {
+  BILLING_CHECKOUT_SELLABLE_PLANS,
+  COMMERCIAL_PLAN_CATALOGUE,
+  billingStateDtoSchema,
+  type BillingStateDto,
+  type UserPlan,
+} from '@veltrixeye/contracts';
+import { PlanComparison, SubscriptionPanel } from '../components/subscription-panel';
 
 const SUBSCRIPTION_ID = '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d';
 
@@ -295,4 +309,154 @@ test('the loading state is unchanged, and is not the unavailable state', () => {
   assert.doesNotMatch(markup, /Payment not confirmed/);
   assert.doesNotMatch(markup, /billing unavailable/, 'in flight is not a failure');
   assert.doesNotMatch(markup, /evidence/i);
+});
+
+/* -------------------------------------------------------------------------- */
+/* Billing Step 10a — the catalogue cards: sold vs catalogue concept only      */
+/* -------------------------------------------------------------------------- */
+
+const CARD_OPEN = '<div class="rounded-lg border p-4 ';
+const GRID_OPEN = '<div class="grid gap-4 p-5 sm:grid-cols-3">';
+const FOOTER_OPEN = '<div class="border-t border-ink-700 px-5 py-3';
+
+function renderComparison(currentPlan: UserPlan): string {
+  return renderToStaticMarkup(React.createElement(PlanComparison, { currentPlan }));
+}
+
+/** The catalogue grid only — the cards, without the explanatory footer copy. */
+function catalogueGrid(markup: string): string {
+  const start = markup.indexOf(GRID_OPEN);
+  assert.ok(start >= 0, 'the catalogue grid renders');
+  const end = markup.indexOf(FOOTER_OPEN);
+  assert.ok(end > start, 'the grid closes before the footer');
+  return markup.slice(start, end);
+}
+
+/** One catalogue card's own markup, located by the plan name it renders. */
+function cardFor(grid: string, planName: string): string {
+  const card = grid
+    .split(CARD_OPEN)
+    .slice(1)
+    .find((segment) => segment.includes(`>${planName}</span>`));
+  assert.ok(card !== undefined, `the ${planName} catalogue card renders`);
+  return `${CARD_OPEN}${card}`;
+}
+
+test('every catalogue entry renders, and exactly the non-sellable entry is marked unavailable', () => {
+  const grid = catalogueGrid(renderComparison('free'));
+  const sellable: readonly string[] = BILLING_CHECKOUT_SELLABLE_PLANS;
+  const nonSellable = COMMERCIAL_PLAN_CATALOGUE.filter((plan) => !sellable.includes(plan.id));
+
+  // Every catalogue entry renders, with its own catalogue name and prices.
+  assert.equal(
+    grid.split(CARD_OPEN).length - 1,
+    COMMERCIAL_PLAN_CATALOGUE.length,
+    'one card per catalogue entry',
+  );
+  for (const plan of COMMERCIAL_PLAN_CATALOGUE) {
+    assert.match(grid, new RegExp(`>${plan.name}</span>`), `${plan.name} renders`);
+    for (const price of [plan.pricing.monthly.display, plan.pricing.annual.display]) {
+      assert.ok(grid.includes(price), `${plan.name} renders the catalogue price ${price}`);
+    }
+  }
+
+  // Starter is the ONLY non-sellable catalogue entry, and the only card marked.
+  assert.deepEqual(nonSellable.map((plan) => plan.id), ['starter']);
+  assert.equal(
+    (grid.match(/Not available yet/g) ?? []).length,
+    1,
+    'exactly one catalogue card is marked unavailable',
+  );
+  assert.match(cardFor(grid, 'Starter'), /Not available yet/, 'Starter is the marked card');
+  for (const plan of COMMERCIAL_PLAN_CATALOGUE.filter((entry) => sellable.includes(entry.id))) {
+    assert.doesNotMatch(
+      cardFor(grid, plan.name),
+      /Not available yet|not purchasable/,
+      `${plan.name} is sellable and is not marked otherwise`,
+    );
+  }
+  // No "Available"-style badge is introduced for the sellable plans.
+  assert.doesNotMatch(grid, />\s*Available\s*</i, 'no Available badge exists');
+});
+
+test('Starter is described as a catalogue concept only, with no enforced entitlement tier', () => {
+  const markup = renderComparison('pro');
+  assert.match(markup, /Starter is a catalogue concept only\./);
+  assert.match(markup, /Not offered and not purchasable in this build/);
+  assert.match(markup, /no enforced entitlement tier/);
+  assert.match(markup, /not a plan the server sells, prices, provisions or activates/);
+  // The catalogue price is still shown — as catalogue information, not as an offer.
+  assert.ok(cardFor(catalogueGrid(markup), 'Starter').includes('$15'));
+  // And nothing claims Starter is purchasable or included.
+  assert.doesNotMatch(markup, /Starter[^<]{0,40}(Buy|Subscribe|Upgrade)/i);
+  assert.doesNotMatch(markup, /\b(Get started|Start now|Choose plan|Upgrade now)\b/i);
+});
+
+test('no catalogue card — Starter included — offers any action or checkout affordance', () => {
+  for (const currentPlan of ['free', 'pro', 'premium'] as const) {
+    const markup = renderComparison(currentPlan);
+    const starterCard = cardFor(catalogueGrid(markup), 'Starter');
+    assert.doesNotMatch(starterCard, /<button/i, 'no button on the Starter card');
+    assert.doesNotMatch(starterCard, /<a\s/i, 'no link on the Starter card');
+    assert.doesNotMatch(starterCard, /href=|onclick=|<form|<input|<label/i, 'no control on the Starter card');
+    assert.doesNotMatch(starterCard, /\b(Buy|Subscribe|Upgrade|Checkout|Verify payment)\b/i);
+    // The whole card is display-only, exactly as it was before Step 10a.
+    assert.doesNotMatch(markup, /<button/i);
+    assert.doesNotMatch(markup, /<a\s/i);
+    assert.doesNotMatch(markup, /href=|onclick=|<form|<input/i);
+  }
+});
+
+test('the current-plan badge behaves exactly as before, and Starter is never current', () => {
+  const expectations: readonly (readonly [UserPlan, string | null])[] = [
+    ['free', null],
+    ['pro', 'Pro'],
+    ['premium', 'Elite'],
+  ];
+  for (const [internalPlan, expectedCommercialName] of expectations) {
+    const grid = catalogueGrid(renderComparison(internalPlan));
+    const currentCount = (grid.match(/>Current</g) ?? []).length;
+    assert.equal(
+      currentCount,
+      expectedCommercialName === null ? 0 : 1,
+      `exactly ${expectedCommercialName === null ? 0 : 1} Current badge for the internal "${internalPlan}" plan`,
+    );
+    for (const plan of COMMERCIAL_PLAN_CATALOGUE) {
+      const card = cardFor(grid, plan.name);
+      const isMarked = />Current</.test(card);
+      assert.equal(
+        isMarked,
+        plan.name === expectedCommercialName,
+        `${plan.name} current=${isMarked} for internal "${internalPlan}"`,
+      );
+    }
+    // A non-sellable entry can never be the account's current plan.
+    assert.doesNotMatch(cardFor(grid, 'Starter'), />Current</);
+  }
+});
+
+test('sellability is pinned to BILLING_CHECKOUT_SELLABLE_PLANS and never restated', () => {
+  // The contract is the authority: the sellable set is exactly Pro + Elite.
+  assert.deepEqual([...BILLING_CHECKOUT_SELLABLE_PLANS], ['pro', 'elite']);
+
+  // Behavioural pin: the cards WITHOUT the unavailable marker are exactly the
+  // entries the shared constant sells.
+  const grid = catalogueGrid(renderComparison('free'));
+  const markedUnavailable = COMMERCIAL_PLAN_CATALOGUE.filter((plan) =>
+    /Not available yet/.test(cardFor(grid, plan.name)),
+  ).map((plan) => plan.id);
+  assert.deepEqual(
+    markedUnavailable,
+    COMMERCIAL_PLAN_CATALOGUE.filter(
+      (plan) => !(BILLING_CHECKOUT_SELLABLE_PLANS as readonly string[]).includes(plan.id),
+    ).map((plan) => plan.id),
+    'the marked set and the non-sellable set are the same set',
+  );
+
+  // Source pin: the component derives sellability from the shared constant and
+  // restates no sellable-plan list of its own (a second source of truth would
+  // let the UI drift from what the server actually sells).
+  const source = readFileSync(new URL('../components/subscription-panel.tsx', import.meta.url), 'utf8');
+  assert.match(source, /BILLING_CHECKOUT_SELLABLE_PLANS/, 'the component uses the shared constant');
+  assert.doesNotMatch(source, /\[\s*'pro'\s*,\s*'elite'\s*\]/, 'no restated sellable-plan literal');
 });

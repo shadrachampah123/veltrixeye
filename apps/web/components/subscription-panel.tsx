@@ -3,6 +3,7 @@
 import * as React from 'react';
 import { Badge, Card, CardHeader } from '@/components/ui';
 import {
+  BILLING_CHECKOUT_SELLABLE_PLANS,
   BILLING_CURRENCY,
   BILLING_PROVIDER,
   COMMERCIAL_PLAN_CATALOGUE,
@@ -221,9 +222,27 @@ function FeatureRow({ label, enabled, note }: { label: string; enabled: boolean;
  *
  * `currentPlan` is the **internal** plan value (`free` / `pro` / `premium`);
  * the commercial counterpart comes from the documented compatibility mapping.
+ *
+ * Billing Step 10a: the cards distinguish what is SOLD from what merely exists
+ * in the catalogue. Sellability comes from `BILLING_CHECKOUT_SELLABLE_PLANS`
+ * and nothing else; a catalogue entry without a sellable plan (today: Starter)
+ * is marked "Not available yet" and explained as a catalogue concept with no
+ * enforced entitlement tier. Pro/Elite rendering and the current-plan badge are
+ * unchanged, and no card offers any action.
  */
 export function PlanComparison({ currentPlan }: { currentPlan: UserPlan }) {
   const currentCommercialPlan = commercialPlanForInternalPlan(currentPlan);
+  // Billing Step 10a — sellability is DERIVED, never restated here: the sellable
+  // plans are exactly `BILLING_CHECKOUT_SELLABLE_PLANS` (Pro + Elite), and every
+  // other catalogue entry is a catalogue CONCEPT only. Starter is therefore
+  // rendered as "Not available yet" and nothing about it is offered, priced for
+  // payment, provisioned or activatable: no internal plan value, no entitlement
+  // definition and no provider plan exists for it, and the server refuses it at
+  // every gate. This is a display distinction and it grants nothing.
+  const sellablePlans: readonly string[] = BILLING_CHECKOUT_SELLABLE_PLANS;
+  const unavailableCataloguePlans = COMMERCIAL_PLAN_CATALOGUE.filter(
+    (plan) => !sellablePlans.includes(plan.id),
+  );
 
   return (
     <Card>
@@ -236,13 +255,15 @@ export function PlanComparison({ currentPlan }: { currentPlan: UserPlan }) {
       <div className="grid gap-4 p-5 sm:grid-cols-3">
         {COMMERCIAL_PLAN_CATALOGUE.map((plan) => {
           const isCurrent = plan.id === currentCommercialPlan;
+          const isSellable = sellablePlans.includes(plan.id);
           return (
-            <div key={plan.id} className={`rounded-lg border p-4 ${isCurrent ? 'border-signal-500/50 bg-signal-500/5' : 'border-ink-700 bg-ink-800'}`}>
+            <div key={plan.id} className={`rounded-lg border p-4 ${isCurrent ? 'border-signal-500/50 bg-signal-500/5' : isSellable ? 'border-ink-700 bg-ink-800' : 'border-ink-700 bg-ink-850/60'}`}>
               <div className="flex items-center justify-between">
-                <span className="font-semibold text-ink-50">{plan.name}</span>
+                <span className={`font-semibold ${isSellable ? 'text-ink-50' : 'text-ink-300'}`}>{plan.name}</span>
                 {isCurrent && <Badge tone="success">Current</Badge>}
+                {!isSellable && <Badge tone="neutral">Not available yet</Badge>}
               </div>
-              <div className="mt-1 font-mono text-lg text-ink-100">
+              <div className={`mt-1 font-mono text-lg ${isSellable ? 'text-ink-100' : 'text-ink-400'}`}>
                 {plan.pricing.monthly.display}
                 <span className="text-xs text-ink-400">/mo</span>
                 <span className="ml-2 text-sm text-ink-300">
@@ -260,6 +281,22 @@ export function PlanComparison({ currentPlan }: { currentPlan: UserPlan }) {
         {currentCommercialPlan === null
           ? `Your account is on the internal "${currentPlan}" plan, which has no commercial catalogue counterpart — nothing changes for you.`
           : 'Enforced limits are unchanged and continue to come from the API.'}{' '}
+        {unavailableCataloguePlans.length > 0 ? (
+          <p className="mt-2">
+            <strong className="text-ink-300">
+              {`${unavailableCataloguePlans.map((plan) => plan.name).join(' and ')} ${
+                unavailableCataloguePlans.length === 1
+                  ? 'is a catalogue concept only.'
+                  : 'are catalogue concepts only.'
+              }`}
+            </strong>{' '}
+            <span>
+              Not offered and not purchasable in this build, with no enforced entitlement tier: the prices and
+              allowances on its card are the commercial concept, not a plan the server sells, prices, provisions or
+              activates. Every catalogue entry that is not a sellable plan is marked &ldquo;Not available yet&rdquo;.
+            </span>
+          </p>
+        ) : null}
         <strong className="text-amber-450">Sandbox billing only:</strong> the checkout surface on this page
         initializes a provider <em>sandbox</em> (test-mode) checkout, shows the server&rsquo;s price and FX disclosure
         and can record verified payment evidence. The overview card above is read-only: it states the server&rsquo;s
