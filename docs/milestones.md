@@ -877,13 +877,24 @@ canonical billing contracts and the Paystack provider seam — see
   kind). It adds no migration, no provider operation and no authority change:
   `canAccessAutomation` / `grantsExecution` stay `false`.
 - **Explicitly deferred to later billing PRs:** self-serve billing management
-  (cancellation, invoices, payment methods, plan changes), refunds/proration/
-  dunning execution, the Starter **sellability** decision (Billing Step 10a
-  decided Starter is **not sold** in this build; making it sellable would
-  require widening all twelve gates documented in
+  (cancellation, invoices, payment methods, plan changes). **Billing Step 9b
+  has since scoped that work without implementing any of it**: cancellation and
+  invoices are in scope but **blocked** by two unresolved decisions — C-1 (a
+  truthful Paystack cancellation needs the subscription's `email_token`, which
+  this build does not persist and Step 9b does not start persisting) and R-1
+  (`findSubscription` is unimplemented and there is no verified
+  subscription-read source, so no subscription lifecycle state may be claimed or
+  inferred) — while payment-method management and plan changes are **out** of
+  9b. See
+  [billing.md](./billing.md#self-serve-billing-management-scope-billing-step-9b);
+  nothing was built, and no endpoint, migration, provider operation or
+  authority was added. Refunds/proration/dunning execution, the Starter
+  **sellability** decision (Billing Step 10a decided Starter is **not sold** in
+  this build; making it sellable would require widening all twelve gates
+  documented in
   [billing.md](./billing.md#starter-disposition-billing-step-10a) together, plus
   the two unresolved product decisions recorded there), and production
-  credentials.
+  credentials also remain deferred as before.
 - **Not started / not planned in the billing stream:** broker or MT5/Exness
   connectivity, live execution, automation, and any change to Gate 9, B1, B2 or
   paper-execution behaviour.
@@ -891,5 +902,5 @@ canonical billing contracts and the Paystack provider seam — see
 ## After M9.2 (later work, outline only)
 
 1. **Operational broker transport** — validate a concrete MT5 bridge and an approved external secret manager on demo infrastructure. M8.4 deliberately ships neither and makes no connectivity claim. M8.5/M8.6/M8.7/M9.1/M9.2 prepare reconciliation, safety plumbing, drawdown protection, notification fairness and secret hardening for it; the transport itself is gated on external validation.
-2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path now runs end to end through verified payment evidence and the out-of-band activation authority (Steps 6–8, migrations 0033–0034), with a checkout UI and a read-only overview delivered by Billing Step 9 and Billing Portal v1; the remaining steps — self-serve subscription management, refunds/proration/dunning, production credentials, and the Starter sellability decision (Billing Step 10a records that Starter is **not sold** and shows it as "Not available yet"; see [the Starter disposition](./billing.md#starter-disposition-billing-step-10a)) — are listed in [billing.md](./billing.md#later-billing-prs) and in the section above.
+2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path now runs end to end through verified payment evidence and the out-of-band activation authority (Steps 6–8, migrations 0033–0034), with a checkout UI and a read-only overview delivered by Billing Step 9 and Billing Portal v1; the next step — self-serve subscription management — has been **scoped but not implemented** by Billing Step 9b, which bounds it to cancellation and invoices (payment-method management and plan changes are out) and records the two decisions that must be answered before any of it can be built; refunds/proration/dunning execution, production credentials, and the Starter sellability decision (Billing Step 10a records that Starter is **not sold** and shows it as "Not available yet"; see [the Starter disposition](./billing.md#starter-disposition-billing-step-10a)) — are listed in [billing.md](./billing.md#later-billing-prs) and in the section above.
 3. **More channels** (SMS/Telegram) behind same registry if needed.
