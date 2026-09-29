@@ -13,6 +13,7 @@ import {
   providerEventIdentitySchema,
   providerEventReferenceSchema,
   type BillingCustomerIdentity,
+  type BillingPaymentAmount,
   type BillingPricingSnapshot,
   type BillingProviderId,
   type NormalizedBillingEvent,
@@ -31,6 +32,8 @@ import {
   billingEventIdempotencyKey,
   billingEventPayloadHash,
   billingProviderRawEventSchema,
+  billingSubscriptionCancelRequestSchema,
+  billingSubscriptionQuerySchema,
   billingSubscriptionVerifyRequestSchema,
   isBillingProviderPlanError,
   parseNormalizedBillingEvent,
@@ -58,12 +61,14 @@ import {
   PAYSTACK_SUPPORTED_EVENTS,
   PAYSTACK_UNSUPPORTED_EVENT_REASONS,
   normalizePaystackEventPayload,
+  paystackLifecycleState,
 } from './events.js';
 import {
   PAYSTACK_LIVE,
   PaystackClient,
   type PaystackClientConfig,
   type PaystackFetchFn,
+  type PaystackSubscriptionRecord,
 } from './client.js';
 
 /**
@@ -78,16 +83,44 @@ import {
  *  - `initializeCheckout`   → `POST /transaction/initialize` (documented), using
  *                             an ALREADY-AUTHORIZED amount: the adapter never
  *                             prices, never converts and never invents one.
- *  - `verifySubscription`   → `GET  /transaction/verify/:reference` (documented,
- *                             Later-billing-PR #7): the ONLY provider read this
- *                             build performs for a subscription. It verifies
- *                             OUR checkout reference and reports what the
- *                             provider documents for it (customer, amount,
+ *  - `findSubscription`     → `GET /subscription/:id_or_code` (documented,
+ *                             Billing Step 9b Part 1): the documented
+ *                             single-subscription READ. It reports what the
+ *                             provider documents about the subscription the
+ *                             caller named — its own code/id, the owning
+ *                             customer, the plan it was sold as, its
+ *                             documented status mapped through the ONE shared
+ *                             status mapping, and the payment amount exactly as
+ *                             reported. `null` is returned ONLY for a 404 that
+ *                             clearly says the subscription does not exist; an
+ *                             ambiguous 404 is an error, never "no
+ *                             subscription". Nothing is retained.
+ *  - `verifySubscription`   → `GET /transaction/verify/:reference` (documented,
+ *                             Later-billing-PR #7): the checkout read. It
+ *                             verifies OUR checkout reference and reports what
+ *                             the provider documents for it (customer, amount,
  *                             currency). The published verify response carries
  *                             NO subscription status and NO subscription code,
  *                             so the lifecycle state it reports is always the
  *                             canonical `unknown` (manual review) — never a
- *                             state inferred from a transaction status.
+ *                             state inferred from a transaction status. It
+ *                             remains the read that confirms a PAYMENT; the
+ *                             subscription read above reports subscription
+ *                             state and confirms no payment.
+ *  - `cancelSubscription`   → `POST /subscription/disable` (documented,
+ *                             Billing Step 9b Part 2): NON-IMMEDIATE
+ *                             cancellation only. The provider documents ONE
+ *                             subscription-cancellation operation and it
+ *                             requires BOTH the subscription code AND that
+ *                             subscription's email token, so the credential is
+ *                             obtained inside the client, from the documented
+ *                             subscription read, spent on that one call and
+ *                             dropped. It never crosses this seam: not on a
+ *                             request, not on the canonical state, not in a log
+ *                             and not in an error message. `immediate: true`
+ *                             FAILS CLOSED — nothing published ends access
+ *                             mid-period, so it is refused rather than
+ *                             approximated by an irreversible verb.
  *  - `normalizeEvent`       → NO provider call: a pure function of a delivered
  *                             webhook payload (`./events.ts`). It normalizes
  *                             only the four events whose payload shapes the
@@ -106,28 +139,16 @@ import {
  * ---------------------------------------------------------------------------
  * WHAT IT DELIBERATELY DOES NOT IMPLEMENT (and why)
  * ---------------------------------------------------------------------------
- *  - `findSubscription`: the platform's verified facts do not include a
- *    subscription READ operation (no subscription fetch is used, and a
- *    subscription identifier alone cannot be verified). Finding a subscription
- *    is therefore left unimplemented rather than guessed, and FAILS CLOSED.
  *  - `synchronizeSubscription`: synchronization is performed by core's
  *    `BillingSubscriptionSyncService`, which owns the database write, the
  *    canonical status mapping and the ledger transitions. The adapter holds no
  *    database access and never applies state, so this operation FAILS CLOSED.
- *  - `cancelSubscription`: cancellation is documented as requiring BOTH the
- *    subscription code and the subscription's email token, and no build here
- *    persists that token (there is no subscription writer yet). Rather than
- *    guess a cancellation path — the provider also documents a plan-update
- *    operation whose default cancels or reprices existing subscriptions —
- *    cancellation FAILS CLOSED with an explicit reason. Note that the events
- *    which would report a cancellation (`subscription.disable`,
- *    `subscription.not_renew`) are likewise NOT normalized: their payload
- *    shapes are not published, so this build cannot report a cancellation from
- *    an event either.
+ *    Reading a subscription is not applying one, and cancelling one is not
+ *    reconciling one.
  *
  * `implemented` therefore stays `false`, honestly: the adapter makes real
- * provider calls for four of the eight seam operations and normalizes events
- * locally for a fifth; the remaining three refuse.
+ * provider calls for six of the eight seam operations and normalizes events
+ * locally for a seventh; the remaining one refuses.
  *
  * ---------------------------------------------------------------------------
  * FAIL-CLOSED RULES ENFORCED HERE
@@ -159,6 +180,33 @@ import {
  *  9. Normalizing an event is not confirming a payment, not verifying a
  *     subscription and not resolving a local subject: it grants nothing, and
  *     `grantsExecution` stays pinned `false` by the canonical contract.
+ * 10. The subscription read (`findSubscription`) is sandbox-guarded (a
+ *     non-sandbox domain is refused), requires the caller to have named a
+ *     subscription id or code (a user id alone is not a lookup key, so it
+ *     refuses BEFORE any call), and requires the provider to ECHO that
+ *     identifier — a response describing a different subscription is a
+ *     conflict, never this subscription. It asserts no catalogue plan, no
+ *     interval and no commercial currency (only a locally authorized plan epoch
+ *     may say what a provider plan MEANS), and reports no billing period: the
+ *     published read documents neither a period start nor a period end.
+ * 11. The provider's subscription `email_token` — the credential it documents
+ *     as required to CANCEL a subscription — exists ONLY in memory, inside the
+ *     one client method that spends it. It is never returned, never normalized
+ *     onto any contract, never logged, never persisted and never put in an
+ *     error message (it is registered as a redaction literal for the call, so
+ *     a provider that echoes it back cannot leak it through a refusal). The
+ *     general subscription read does not declare it at all, so no other
+ *     operation, record or state can ever carry it.
+ * 12. A read is not an application: `findSubscription` changes nothing, grants
+ *     nothing and confirms no payment. Applying verified state to the
+ *     authoritative subscription row remains core's synchronization step.
+ * 13. Cancellation is fail-closed on its prerequisites and non-immediate
+ *     only: an identifier that is not reference-shaped, a missing
+ *     subscription, a response that does not echo the subscription that was
+ *     named, a non-sandbox domain, or a response carrying no credential all
+ *     mean the disable is NEVER attempted. An immediate cancellation is
+ *     refused before any call, because the provider publishes no operation
+ *     that would do it and this verb would be a different, irreversible act.
  *
  * The adapter holds no database access: the two local directories below are
  * supplied by composition (apps/api), so this package cannot read or write
@@ -211,16 +259,19 @@ const PAYSTACK_OPERATIONS = [
 export type PaystackOperation = (typeof PAYSTACK_OPERATIONS)[number];
 
 /**
- * Operations this adapter really performs: four documented provider calls
- * (customer fetch, customer create, transaction initialize and the
- * transaction-verify read), and one purely local normalization of delivered
- * event payloads.
+ * Operations this adapter really performs: six documented provider calls
+ * (customer fetch, customer create, transaction initialize, the subscription
+ * fetch read, the transaction-verify read and the non-immediate subscription
+ * cancellation), and one purely local normalization of delivered event
+ * payloads.
  */
 export const PAYSTACK_IMPLEMENTED_OPERATIONS: readonly PaystackOperation[] = [
   'findCustomer',
   'createCustomer',
   'initializeCheckout',
+  'findSubscription',
   'verifySubscription',
+  'cancelSubscription',
   'normalizeEvent',
 ] as const;
 
@@ -238,12 +289,8 @@ export const PAYSTACK_VERIFIED_TRANSACTION_LIFECYCLE_STATE = 'unknown' as const;
 
 /** Operations that fail closed, with the reason, for operators. */
 export const PAYSTACK_UNIMPLEMENTED_REASONS: Readonly<Record<string, string>> = Object.freeze({
-  findSubscription:
-    'the platform has no verified subscription read operation (only the transaction-verify read, used by verifySubscription)',
   synchronizeSubscription:
     'synchronization is performed by core (BillingSubscriptionSyncService); the adapter never applies state',
-  cancelSubscription:
-    'cancellation is documented as needing the subscription code AND its email token, which this build does not persist',
 });
 
 export class PaystackNotImplementedError extends PaystackAdapterError {
@@ -293,7 +340,7 @@ export class PaystackBillingProvider implements BillingProvider {
   readonly id: BillingProviderId = BILLING_PROVIDER;
   readonly name = 'paystack-sandbox';
   /**
-   * Honest capability flag. The seam defines eight operations; four are
+   * Honest capability flag. The seam defines eight operations; six are
    * implemented against documented endpoints (plus local event
    * normalization), so this is `false` until the rest are — callers must treat
    * a non-implemented provider as unavailable.
@@ -800,23 +847,298 @@ export class PaystackBillingProvider implements BillingProvider {
   }
 
   /* ------------------------------------------------------------------------ */
-  /* Operations this adapter refuses (fail closed, never guessed)              */
+  /* Subscription read (the documented single-subscription fetch)              */
   /* ------------------------------------------------------------------------ */
 
-  findSubscription(_request: BillingSubscriptionQuery): Promise<ProviderSubscriptionState | null> {
-    return Promise.reject(new PaystackNotImplementedError('findSubscription'));
+  /**
+   * Read ONE provider subscription (documented: `GET /subscription/:id_or_code`).
+   *
+   * What it guarantees:
+   *  - a canonical request is required, and it must NAME the subscription
+   *    (an id or a code). There is no documented "find the subscription of this
+   *    user" operation here — a subscription listing is not implemented — so a
+   *    request carrying only a local user id is refused BEFORE any call rather
+   *    than resolved by guessing which subscription the user meant;
+   *  - exactly one provider call, no retry, nothing written and nothing
+   *    retained;
+   *  - the provider must ECHO the identifier that was asked for, as either the
+   *    subscription code or the subscription id. A response that describes a
+   *    DIFFERENT subscription is a `response_conflict`, never this
+   *    subscription;
+   *  - the sandbox posture holds: a non-sandbox `domain` is refused;
+   *  - `null` means "the provider has no such subscription", and only for a 404
+   *    that clearly says so. An ambiguous or authorization-shaped 404 is a typed
+   *    ERROR: an unresolved 404 must never read as "this user has no
+   *    subscription";
+   *  - the lifecycle state comes from the ONE documented status mapping
+   *    (`paystackLifecycleState`, shared with event normalization); an
+   *    undocumented status becomes the canonical `unknown` (manual review),
+   *    never a guess;
+   *  - the payment amount is reported exactly as the provider states it,
+   *    in a payment currency this build understands with its documented
+   *    exponent; an amount whose currency is not understood is NOT reported
+   *    (never converted), and a subscription that contradicts its own plan
+   *    amount is refused rather than halved or averaged;
+   *  - NO catalogue plan, NO interval and NO commercial currency is asserted:
+   *    only a locally authorized plan epoch may say what a provider plan means,
+   *    and that is core's synchronization step, not a provider read;
+   *  - NO billing period is asserted: the published read documents no period
+   *    start and no period end (its `start` is the subscription start instant
+   *    and `next_payment_date` is the NEXT charge date — neither is documented
+   *    as a period boundary);
+   *  - the provider's `email_token` — its cancellation credential — is never
+   *    read, never normalized, never logged and never persisted; the result is
+   *    re-validated by the canonical `.strict()` contract, so no
+   *    provider-shaped field can cross the seam;
+   *  - reading a subscription is not confirming a payment and not applying
+   *    state: it grants nothing, changes nothing locally, and the transaction
+   *    fields of the contract are left null because this read publishes no
+   *    transaction.
+   */
+  async findSubscription(request: BillingSubscriptionQuery): Promise<ProviderSubscriptionState | null> {
+    const parsed = billingSubscriptionQuerySchema.safeParse(request);
+    if (!parsed.success) {
+      throw paystackInvalidRequest('findSubscription was called with a request that is not canonical.');
+    }
+
+    const identifier = parsed.data.providerSubscriptionId ?? null;
+    if (identifier === null || identifier === '') {
+      // No documented "list the subscriptions of this user" read exists in this
+      // build, so a local user id is not a lookup key. Refuse before any call
+      // rather than fetch a subscription nobody named.
+      throw paystackInvalidRequest(
+        'findSubscription needs the provider subscription id or code: this build implements only the documented ' +
+          'single-subscription read, so a local user id alone cannot be looked up. Nothing was called.',
+      );
+    }
+
+    const record = await this.client.fetchSubscription(identifier);
+    if (record === null) return null;
+
+    // (10) The provider must echo the subscription that was asked for.
+    if (record.providerSubscriptionCode !== identifier && record.providerSubscriptionId !== identifier) {
+      throw new PaystackAdapterError(
+        'response_conflict',
+        'The provider returned a different subscription than the one requested. ' +
+          'The result is not treated as this subscription: this is a conflict requiring review.',
+      );
+    }
+    if (record.domain !== 'test') {
+      throw new PaystackAdapterError(
+        'response_conflict',
+        'The provider reported a non-sandbox subscription domain; this build is sandbox-only, so the read is refused.',
+      );
+    }
+
+    const state = providerSubscriptionStateSchema.safeParse({
+      provider: this.id,
+      // The provider's own status word, mapped by the single documented table
+      // shared with event normalization. Anything undocumented is `unknown`,
+      // which changes no authoritative state and always requires review.
+      state: paystackLifecycleState(record.providerStatus),
+      providerSubscriptionId: record.providerSubscriptionId,
+      providerSubscriptionCode: record.providerSubscriptionCode,
+      providerCustomerId: record.providerCustomerId,
+      providerCustomerCode: record.providerCustomerCode,
+      providerPlanId: record.providerPlanCode,
+      // A subscription read publishes no transaction reference.
+      providerReference: null,
+      // Only a locally authorized plan epoch may say what a provider plan
+      // means; a provider read never resolves a commercial plan.
+      cataloguePlan: null,
+      interval: null,
+      // The COMMERCIAL currency is never provider-reported; the catalogue is
+      // the only authority for it.
+      currency: null,
+      payment: this.subscriptionPayment(record),
+      // No period is documented on this read (see the method documentation).
+      currentPeriodStart: null,
+      currentPeriodEnd: null,
+      // The provider publishes no cancellation flag on this read, so none is
+      // asserted. A `non-renewing` status is reported through the lifecycle
+      // state above, never turned into a cancellation fact.
+      cancelAtPeriodEnd: false,
+      cancelAt: null,
+      cancelledAt: null,
+      cancellationReason: null,
+      // This state was read, not received as an event.
+      sourceEventIdempotencyKey: null,
+      observedAt: this.client.now().toISOString(),
+      // This read publishes no transaction, so it evidences no payment: the
+      // transaction fields stay null and the payment confirmation remains the
+      // separate, documented transaction-verify read.
+      paidAt: null,
+      providerTransactionId: null,
+      providerTransactionStatus: null,
+    });
+    if (!state.success) {
+      throw new PaystackAdapterError(
+        'unexpected_response',
+        `The subscription could not be normalized onto the canonical provider state at: ${[
+          ...new Set(state.error.issues.map((issue) => issue.path.join('.') || '<root>')),
+        ].join(', ')}.`,
+      );
+    }
+    return state.data;
   }
+
+  /**
+   * The payment amount a subscription read reports, or `null` when no amount
+   * can be reported honestly.
+   *
+   * `null` (nothing reported, never a default) when the payload carries no
+   * amount, no currency, or a currency this build does not understand: an
+   * amount without a known minor unit is never reported. A REFUSAL when the
+   * subscription amount and the plan amount it carries disagree — the same
+   * documented fact reported twice, contradicting itself.
+   */
+  private subscriptionPayment(record: PaystackSubscriptionRecord): BillingPaymentAmount | null {
+    if (record.amountMinor === null) return null;
+    if (record.planAmountMinor !== null && record.planAmountMinor !== record.amountMinor) {
+      throw new PaystackAdapterError(
+        'unexpected_response',
+        'The provider reports a subscription amount that disagrees with the amount on its own plan, so no amount is ' +
+          'reported. Nothing was assumed from it.',
+      );
+    }
+    if (record.currency === null) return null;
+    const currency = billingPaymentCurrencySchema.safeParse(record.currency);
+    if (!currency.success) return null;
+    const amount = billingPaymentAmountSchema.safeParse({
+      paymentCurrency: currency.data,
+      paymentAmountMinor: record.amountMinor,
+      paymentAmountExponent: BILLING_PAYMENT_AMOUNT_EXPONENT[currency.data],
+    });
+    return amount.success ? amount.data : null;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Cancellation (the documented non-immediate disable only)                  */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * Cancel a provider subscription (documented: `POST /subscription/disable`).
+   *
+   * NON-IMMEDIATE ONLY. `immediate: true` is refused before any call: the
+   * provider publishes exactly one subscription-cancellation operation, and it
+   * is this one — it stops future renewals while the period already paid for
+   * continues. Nothing published would end access mid-period, so ending it
+   * immediately is left unimplemented and fails closed rather than approximated
+   * by this verb (which would silently be a different, and irreversible, act
+   * than the caller asked for).
+   *
+   * What it guarantees:
+   *  - a canonical request is required, naming the subscription to cancel. A
+   *    subscription is never resolved by email, by customer, or by "the
+   *    subscription this user seems to have";
+   *  - the provider's cancellation credential is obtained INSIDE the client,
+   *    from the documented subscription read, and never crosses this seam: it
+   *    is not on this request, not on the returned state, not in a log and not
+   *    in an error message. Nothing here reads, stores or returns it;
+   *  - the operation fails CLOSED when its prerequisites cannot be established:
+   *    a non-reference-shaped identifier, a missing subscription, a response
+   *    that does not echo the subscription that was named, a non-sandbox
+   *    domain, or a response carrying no credential. In each case the disable
+   *    is never attempted, so a live provider subscription is never cancelled
+   *    on a guess;
+   *  - the returned state reports what the operation MEANT and what the
+   *    provider ACKNOWLEDGED — nothing more. The documented disable response
+   *    publishes no status, no instant and no reason, so none is invented:
+   *    `state` is the canonical mapping of the documented "will not renew"
+   *    status, `cancelAtPeriodEnd` is `true` (that is what this operation IS),
+   *    and `cancelledAt` stays null because access continues to the end of the
+   *    paid period;
+   *  - `cancellationReason` is OUR reason for asking (the canonical
+   *    vocabulary the request already carries), not a provider-reported fact.
+   *    The provider publishes no reason for a disable;
+   *  - exactly one disable, no retry, no idempotency assumption, and the
+   *    result is re-validated by the canonical `.strict()` contract so nothing
+   *    provider-shaped crosses back.
+   */
+  async cancelSubscription(request: BillingSubscriptionCancelRequest): Promise<ProviderSubscriptionState> {
+    const parsed = billingSubscriptionCancelRequestSchema.safeParse(request);
+    if (!parsed.success) {
+      throw paystackInvalidRequest('cancelSubscription was called with a request that is not canonical.');
+    }
+    if (parsed.data.immediate) {
+      throw paystackInvalidRequest(
+        'cancelSubscription implements non-immediate cancellation only: the provider documents one subscription ' +
+          'operation, which stops future renewals, and publishes nothing that ends access mid-period. Nothing was called.',
+      );
+    }
+    const identifier = parsed.data.providerSubscriptionId ?? null;
+    if (identifier === null || identifier === '') {
+      throw paystackInvalidRequest(
+        'cancelSubscription needs the provider subscription id or code of the subscription to cancel. ' +
+          'Nothing was called.',
+      );
+    }
+
+    // The documented operation, and the only call: the credential is obtained
+    // and spent inside the client and never reaches this method.
+    const disabled = await this.client.disableSubscription({ idOrCode: identifier });
+
+    const state = providerSubscriptionStateSchema.safeParse({
+      provider: this.id,
+      // The documented status of a subscription that will not renew, mapped by
+      // the SINGLE table shared with event normalization (never restated
+      // here): `non-renewing` → `unsubscribed`.
+      state: paystackLifecycleState('non-renewing'),
+      // The disable operation addresses a subscription by its CODE; the
+      // provider's numeric id was not part of the operation and is not claimed.
+      providerSubscriptionId: null,
+      providerSubscriptionCode: disabled.providerSubscriptionCode,
+      // The disable response publishes no customer, plan or plan identity, and
+      // this build asserts nothing the operation did not return.
+      providerCustomerId: null,
+      providerCustomerCode: null,
+      providerPlanId: null,
+      providerReference: null,
+      cataloguePlan: null,
+      interval: null,
+      currency: null,
+      payment: null,
+      // The published response documents no period, and a period ending is
+      // not a cancellation instant.
+      currentPeriodStart: null,
+      currentPeriodEnd: null,
+      // This IS the documented "stop renewing" operation: access continues to
+      // the end of the period already paid for.
+      cancelAtPeriodEnd: true,
+      cancelAt: null,
+      // Access continues, so nothing is cancelled YET and no cancellation
+      // instant is published or inferred.
+      cancelledAt: null,
+      // Our reason for asking, in the canonical vocabulary. The provider
+      // publishes no reason for a disable, so none is claimed as its own.
+      cancellationReason: parsed.data.reason,
+      // The cancellation was requested, not received as an event.
+      sourceEventIdempotencyKey: null,
+      observedAt: this.client.now().toISOString(),
+      // A cancellation evidences no payment and publishes no transaction.
+      paidAt: null,
+      providerTransactionId: null,
+      providerTransactionStatus: null,
+    });
+    if (!state.success) {
+      throw new PaystackAdapterError(
+        'unexpected_response',
+        `The cancellation could not be normalized onto the canonical provider state at: ${[
+          ...new Set(state.error.issues.map((issue) => issue.path.join('.') || '<root>')),
+        ].join(', ')}.`,
+      );
+    }
+    return state.data;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Operations this adapter refuses (fail closed, never guessed)              */
+  /* ------------------------------------------------------------------------ */
 
   synchronizeSubscription(
     _request: BillingSubscriptionSyncRequest,
   ): Promise<SubscriptionSyncResult> {
     return Promise.reject(new PaystackNotImplementedError('synchronizeSubscription'));
-  }
-
-  cancelSubscription(
-    _request: BillingSubscriptionCancelRequest,
-  ): Promise<ProviderSubscriptionState> {
-    return Promise.reject(new PaystackNotImplementedError('cancelSubscription'));
   }
 
   /* ------------------------------------------------------------------------ */

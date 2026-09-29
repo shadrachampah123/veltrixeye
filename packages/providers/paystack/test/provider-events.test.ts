@@ -29,6 +29,7 @@ import {
   PAYSTACK_WITHHELD_FAILURE_DETAIL,
   PaystackAdapterError,
   createPaystackProvider,
+  isPaystackNotImplementedError,
   isPaystackSupportedEvent,
   normalizePaystackEventPayload,
   paystackLifecycleState,
@@ -301,7 +302,9 @@ describe('the verified Paystack event vocabulary', () => {
       'findCustomer',
       'createCustomer',
       'initializeCheckout',
+      'findSubscription',
       'verifySubscription',
+      'cancelSubscription',
       'normalizeEvent',
     ]);
     const unimplemented = provider.describe()['operations'] as {
@@ -310,11 +313,7 @@ describe('the verified Paystack event vocabulary', () => {
     };
     assert.ok(unimplemented.implemented.includes('normalizeEvent'));
     assert.ok(!unimplemented.unimplemented.includes('normalizeEvent'));
-    assert.deepEqual(unimplemented.unimplemented, [
-      'findSubscription',
-      'synchronizeSubscription',
-      'cancelSubscription',
-    ]);
+    assert.deepEqual(unimplemented.unimplemented, ['synchronizeSubscription']);
   });
 
   it('reports the event contract, and that nothing receives or confirms anything yet', () => {
@@ -1145,16 +1144,14 @@ describe('required fields and malformed payloads', () => {
     });
   });
 
-  it('still refuse the operations that are genuinely unimplemented', async () => {
+  it('still refuse the operation that is genuinely unimplemented, and fail closed on immediate cancellation', async () => {
     const userId = '3f2504e0-4f89-41d3-9a0c-0305e82c3301';
     const error = await provider
-      .cancelSubscription({
+      .synchronizeSubscription({
         provider: 'paystack',
         userId,
-        providerSubscriptionId: 'SUB_fixture0000001',
-        immediate: false,
-        reason: 'user',
-        idempotencyKey: 'a'.repeat(64),
+        source: 'webhook',
+        eventIdempotencyKeys: [],
         requestedAt: '2027-06-01T00:00:00.000Z',
       })
       .then(
@@ -1163,8 +1160,31 @@ describe('required fields and malformed payloads', () => {
       );
     assert.ok(error instanceof PaystackAdapterError);
     assert.equal(error.reason, 'not_implemented');
-    assert.ok(error.message.includes('cancelSubscription'));
+    assert.ok(error.message.includes('synchronizeSubscription'));
     assert.ok(!error.message.includes('normalizeEvent'));
+
+    // Cancellation IS implemented (Billing Step 9b Part 2), but only for
+    // non-immediate cancellation: an immediate one is refused before any call,
+    // because the provider publishes no operation that ends access mid-period.
+    const immediate = await provider
+      .cancelSubscription({
+        provider: 'paystack',
+        userId,
+        providerSubscriptionId: 'SUB_fixture0000001',
+        immediate: true,
+        reason: 'user',
+        idempotencyKey: 'a'.repeat(64),
+        requestedAt: '2027-06-01T00:00:00.000Z',
+      })
+      .then(
+        () => undefined,
+        (cause: unknown) => cause,
+      );
+    assert.ok(immediate instanceof PaystackAdapterError);
+    assert.equal(immediate.reason, 'invalid_request');
+    assert.ok(!isPaystackNotImplementedError(immediate));
+    // …and it contacted nothing: the subscription read is not even attempted.
+    assert.deepEqual(fetchCalls, []);
   });
 });
 

@@ -204,6 +204,7 @@ export const billingSubscriptionQuerySchema = z
   .object({
     provider: z.literal(BILLING_PROVIDER),
     userId: uuid,
+    /** Provider subscription id OR code; the adapter performs one exact lookup. */
     providerSubscriptionId: z.string().trim().min(1).max(128).nullish(),
   })
   .strict();

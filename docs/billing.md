@@ -1651,26 +1651,33 @@ out.**
 | Layer | File | Role |
 | --- | --- | --- |
 | Transport | `packages/providers/paystack/src/client.ts` | `verifyTransaction(reference)` → documented `GET /transaction/verify/:reference`; documented fields only (`domain`, `status`, `reference`, `amount`, `currency`, `customer.id`, `customer.customer_code`), one attempt, typed fail-closed errors, nothing retained. |
-| Adapter | `packages/providers/paystack/src/provider.ts` | `verifySubscription` built on that read. Requires OUR checkout reference; refuses a subscription-id-only request before any call; reports lifecycle state **`unknown`** always. `findSubscription`, `synchronizeSubscription`, `cancelSubscription` still refuse; `implemented` stays `false`. |
-| Sync | `packages/core/src/billing/sync.ts` | `BillingSubscriptionSyncService`: one verification per call, then ONE transaction that claims the subscription's `received` ledger rows, applies status ONLY through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE` guarded by `state_version`, writes the bookkeeping and settles the claimed rows. |
+| Adapter | `packages/providers/paystack/src/provider.ts` | `verifySubscription` remains the documented transaction-verify read and reports lifecycle state **`unknown`**. `findSubscription` uses the documented subscription GET and returns only normalized subscription facts; `synchronizeSubscription` remains a core-owned operation and refuses in the adapter. |
+| Sync | `packages/core/src/billing/sync.ts` | `BillingSubscriptionSyncService`: when the local row has a bound `provider_subscription_code` (preferred) or `provider_subscription_id`, it reads that exact subscription once; otherwise it retains the checkout-reference transaction-verification fallback. Then ONE transaction claims the subscription's `received` ledger rows, applies status ONLY through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE` guarded by `state_version`, binds a newly confirmed provider id subject to uniqueness/coherence, writes bookkeeping and settles the claimed rows. |
 | Ledger | `packages/core/src/billing/webhook.ts` | `claimReceivedBillingProviderEvents` / `settleBillingProviderEvents` — the only processing transitions; the receiver never calls them. |
-| Route | `apps/api/src/routes/billing.ts` | `POST /api/billing/sync` — session-authenticated, no body, per-IP limit `BILLING_SYNC_RATE_LIMIT_MAX = 10`/min, canonical `SubscriptionSyncResult` response, `provider_unavailable` refusal (nothing written) when no provider is registered or verification fails. |
+| Route | `apps/api/src/routes/billing.ts` | `POST /api/billing/sync` — session-authenticated, no body, per-IP limit `BILLING_SYNC_RATE_LIMIT_MAX = 10`/min, canonical `SubscriptionSyncResult` response. It uses an exact subscription read when a local provider id/code is available; missing read, provider refusal or unusable response returns `provider_unavailable` with nothing written. Rows without either identity retain transaction verification and its `unknown` lifecycle result. |
 
 What it asserts, and what it deliberately does not:
 
-- **(a) Transaction verify is the read operation** — the only documented
-  provider read this build uses for a subscription.
-- **(b) No subscription GET** is used or implemented.
-- **(c) Undocumented statuses fail closed.** The verify response carries a
-  transaction status and **no subscription status**; a transaction status
-  (e.g. `success`) is never promoted to a subscription state. Every
-  Paystack-verified state is therefore `unknown`.
+- **(a) The documented subscription GET is the lifecycle read** when the
+  local row has a previously bound provider subscription code or id. The
+  adapter normalizes the published subscription status; no provider payload or
+  credential crosses the seam.
+- **(b) A subscription GET is never guessed.** Sync queries only the exact
+  locally stored code (preferred) or id. If neither exists, the existing
+  checkout-reference transaction-verification fallback remains in place.
+- **(c) Undocumented statuses fail closed.** The subscription-read status is
+  mapped through the canonical lifecycle vocabulary; an unmodelled value is
+  `unknown` and requires manual review. The transaction-verify fallback still
+  carries no subscription status, so its lifecycle result remains `unknown`;
+  a transaction status (e.g. `success`) is never promoted to a subscription state.
 - **(d) No cancellation is inferred** from unpublished shapes: no
   cancellation, period or plan fact is read or written.
-- **(e) No paid grant.** Only `status` (via the canonical mapping, when one
-  exists), `provider_state` and the 0031 bookkeeping move; `plan` is never
-  written; the provider→FREE entitlement gate (`resolveEntitlements`) is
-  unchanged, `paymentConfirmed` stays `false` (only a Billing Step 8 activation
+- **(e) No paid grant.** `status` (via the canonical mapping, when one
+  exists), `provider_state`, a previously-null identity-checked
+  `provider_subscription_id` (when returned by the exact subscription read),
+  and 0031 bookkeeping may move; `plan` is never written; the provider→FREE
+  entitlement gate (`resolveEntitlements`) is unchanged, `paymentConfirmed` stays
+  `false` (only a Billing Step 8 activation
   fact moves it), and the result pins
   `planChanged` / `entitlementsChanged` / `grantsExecution` to `false`.
 - **(f) The Step 4 operator run is still pending** (below): no epoch is
@@ -1680,10 +1687,10 @@ Outcome table (the mapping is the contracts' single source of truth):
 
 | Verified state | Outcome | `status` | `sync_state` / `sync_required` | Bound `received` ledger rows |
 | --- | --- | --- | --- | --- |
-| `active`, `trialing`, `past_due`, `cancelled`, `unsubscribed`, `expired` | `updated` (or `unchanged` when already equal) | mapped value | `synced` / `false` | `processed` (`unrecognized` rows → `ignored`) |
+| `active`, `trialing`, `past_due`, `cancelled`, `unsubscribed`, `expired` (from exact subscription GET) | `updated` (or `unchanged` when already equal) | mapped value | `synced` / `false` | `processed` (`unrecognized` rows → `ignored`) |
 | `unprovisioned` | `ignored` | unchanged | `pending` / `false` | `ignored` |
-| `pending`, `unknown` (**every Paystack verification today**) | `requires_manual_review` | unchanged | `conflict` / `true` | `ignored` |
-| identity disagreement (reference, customer or subscription id) | `conflict` | unchanged (`provider_state` too) | `conflict` / `true` | `failed` |
+| `pending`, `unknown` (unmodelled subscription-read state or transaction-verify fallback) | `requires_manual_review` | unchanged | `conflict` / `true` | `ignored` |
+| identity disagreement (customer, subscription id/code, or transaction-reference fallback) | `conflict` | unchanged (`provider_state` too) | `conflict` / `true` | `failed` |
 | a concurrent writer moved `state_version` first | `conflict` | unchanged | unchanged | untouched (`received`) |
 | verification failed / no provider | refused (`provider_unavailable`) | unchanged | unchanged | untouched (`received`) |
 

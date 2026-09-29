@@ -7,6 +7,8 @@
  *
  *  - NO plan mutation of any kind (no create/update/delete of a provider plan),
  *    because updating a provider plan can cancel or reprice live subscriptions;
+ *  - the only subscription path is the documented READ, and the provider's
+ *    cancellation credential (`email_token`) is never read by it;
  *  - NO FX or market-rate lookup: the adapter never converts currency and never
  *    learns a rate;
  *  - NO money arithmetic: the adapter cannot invent, round or re-scale an
@@ -44,26 +46,117 @@ describe('Paystack package — no plan mutation, ever', () => {
     }
   });
 
-  test('the only request paths are the documented customer, transaction-initialize and transaction-verify operations', () => {
+  test('the only request paths are the documented customer, transaction-initialize, transaction-verify, subscription-fetch and subscription-disable operations', () => {
     const paths = new Set<string>();
     for (const file of FILES) {
       for (const match of source(file).matchAll(/['"`](\/[a-z][a-z/]*)['"`]/g)) {
         paths.add(match[1]!);
       }
     }
-    assert.deepEqual([...paths].sort(), ['/customer', '/transaction/initialize']);
+    assert.deepEqual([...paths].sort(), [
+      '/customer',
+      '/subscription/disable',
+      '/transaction/initialize',
+    ]);
 
-    // Parameterized paths (template literals ending in an interpolation):
-    // exactly the documented customer fetch and the documented transaction
-    // verify read (Later-billing-PR #7). No subscription path of any kind.
+    // Parameterized paths (template literals ending in an interpolation): the
+    // documented customer fetch, the documented transaction verify read
+    // (Later-billing-PR #7) and the documented subscription fetch read
+    // (Billing Step 9b Part 1) — and nothing else.
     const templated = new Set<string>();
     for (const file of FILES) {
       for (const match of source(file).matchAll(/`(\/[a-z][a-z/]*)\$\{/g)) {
         templated.add(match[1]!);
       }
     }
-    assert.deepEqual([...templated].sort(), ['/customer/', '/transaction/verify/']);
-    assert.doesNotMatch(allSource(), /['"`]\/subscription/, 'no subscription request path exists');
+    assert.deepEqual([...templated].sort(), ['/customer/', '/subscription/', '/transaction/verify/']);
+  });
+
+  test('the only subscription WRITE is the documented disable; nothing else mutates a subscription', () => {
+    const text = allSource();
+    // No subscription create, no enable, no update link, no listing: the
+    // documented disable is the ONLY subscription write in this build.
+    for (const forbidden of [
+      /['"`]\/subscription\/enable/,
+      /['"`]\/subscription['"`]\s*[,)]/,
+      /update_existing_subscriptions/,
+      /generate_?update_?link/i,
+    ]) {
+      assert.doesNotMatch(text, forbidden, `only the documented subscription disable may exist (${forbidden})`);
+    }
+    // Every subscription request is pinned: the documented fetch (twice — the
+    // read itself, and the read the cancellation spends its credential on) and
+    // the documented disable. Nothing else in the package addresses a
+    // subscription, and nothing else writes.
+    const subscriptionCalls = [...text.matchAll(/this\.request\(\s*'([A-Z]+)'\s*,\s*([^,)]+)/g)]
+      .filter(([, , path]) => String(path).includes('subscription'))
+      .map(([, method, path]) => `${method} ${String(path).trim()}`);
+    assert.deepEqual(
+      subscriptionCalls.map((call) => call.split(' ')[0]),
+      ['GET', 'GET', 'POST'],
+      `unexpected subscription calls: ${subscriptionCalls.join(', ')}`,
+    );
+    for (const call of subscriptionCalls.filter((call) => call.startsWith('GET'))) {
+      assert.match(call, /^GET `\/(customer|subscription)\/\$\{/, 'only the documented reads address a record');
+    }
+    assert.ok(
+      subscriptionCalls.filter((call) => call.startsWith('POST')).every((call) => call === "POST '/subscription/disable'"),
+      'the only subscription write is the documented disable',
+    );
+  });
+
+  test('the provider cancellation credential is read in exactly one place, and never leaves it', () => {
+    const client = source('client.ts');
+    // The email token is the documented credential needed to cancel. It must
+    // not be a field of the general subscription response schema, nor of any
+    // record that crosses the seam, nor be read by the adapter that normalizes
+    // a read or a cancellation.
+    const schema = /const subscriptionDataSchema = z[\s\S]*?\.passthrough\(\);\n/.exec(client)?.[0] ?? '';
+    assert.ok(schema.length > 0, 'the subscription schema is present');
+    assert.doesNotMatch(
+      schema,
+      /email_token|authorization|last4|bin\b|signature/,
+      'the subscription schema must declare neither the cancellation credential nor card material',
+    );
+    const record = /export interface PaystackSubscriptionRecord \{[\s\S]*?\n\}/.exec(client)?.[0] ?? '';
+    assert.ok(record.length > 0, 'the subscription record is present');
+    assert.doesNotMatch(record, /email_token|authorization/i, 'the record carries no cancellation credential');
+
+    // The adapter's own operations never name the field.
+    const provider = source('provider.ts');
+    const findSubscription =
+      /async findSubscription\([\s\S]*?\n {2}\}\n/.exec(provider)?.[0] ?? '';
+    const cancelSubscription =
+      /async cancelSubscription\([\s\S]*?\n {2}\}\n/.exec(provider)?.[0] ?? '';
+    assert.ok(findSubscription.length > 0, 'findSubscription is implemented');
+    assert.ok(cancelSubscription.length > 0, 'cancelSubscription is implemented');
+    for (const [label, block] of [
+      ['findSubscription', findSubscription],
+      ['cancelSubscription', cancelSubscription],
+    ] as Array<[string, string]>) {
+      assert.doesNotMatch(block, /email_token/i, `${label} never handles the email token`);
+    }
+
+    // The one schema that does read it is the cancellation one, and the
+    // credential is bound to a LOCAL inside the single method that spends it:
+    // no exported record, contract or result type may name it.
+    const tokenSchema = /const subscriptionCancellationDataSchema = z[\s\S]*?\.passthrough\(\);\n/.exec(client)?.[0] ?? '';
+    assert.ok(tokenSchema.includes('email_token'), 'the cancellation schema reads the documented credential');
+    for (const exported of [
+      /export interface PaystackSubscriptionRecord \{[\s\S]*?\n\}/,
+      /export interface PaystackSubscriptionDisableResult \{[\s\S]*?\n\}/,
+    ]) {
+      const block = exported.exec(client)?.[0] ?? '';
+      assert.ok(block.length > 0);
+      assert.doesNotMatch(block, /email_token/i, 'no exported result type carries the credential');
+    }
+    const disable = /async disableSubscription\([\s\S]*?\n {2}\}\n/.exec(client)?.[0] ?? '';
+    assert.ok(disable.length > 0, 'disableSubscription is implemented');
+    // It is a local binding, and it is returned nowhere.
+    assert.match(disable, /const token = parsed\.data\.email_token/);
+    assert.doesNotMatch(disable, /return[^;]*\btoken\b/);
+    // …and it is registered as a redaction literal for the call that spends it.
+    assert.match(disable, /secrets: \[token\]/);
   });
 
   test('the transaction-verify read is a GET with an encoded, shape-checked reference', () => {

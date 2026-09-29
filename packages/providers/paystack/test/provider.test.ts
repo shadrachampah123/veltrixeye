@@ -168,7 +168,7 @@ const expectReason = (reason: string) => (error: unknown) => {
 describe('Paystack provider — honest capability reporting', () => {
   test('implemented is false and live is false, and describe() lists what really works', () => {
     const { provider } = build({});
-    assert.equal(provider.implemented, false, 'five of eight seam operations are implemented');
+    assert.equal(provider.implemented, false, 'seven of eight seam operations are implemented');
     assert.equal(provider.live, false);
     assert.equal(provider.id, 'paystack');
 
@@ -177,11 +177,7 @@ describe('Paystack provider — honest capability reporting', () => {
     assert.equal(described.live, false);
     assert.deepEqual(described.operations, {
       implemented: [...PAYSTACK_IMPLEMENTED_OPERATIONS],
-      unimplemented: [
-        'findSubscription',
-        'synchronizeSubscription',
-        'cancelSubscription',
-      ],
+      unimplemented: ['synchronizeSubscription'],
     });
     // Later-billing-PR #7: the verification read is the documented
     // transaction-verify operation and reports no subscription state.
@@ -203,10 +199,16 @@ describe('Paystack provider — honest capability reporting', () => {
   test('every unimplemented operation rejects with a typed error and touches nothing', async () => {
     const { provider, calls } = build({});
 
-    await assert.rejects(() => provider.findSubscription({ provider: 'paystack', userId: USER_ID }), PaystackNotImplementedError);
+    // findSubscription is implemented (Billing Step 9b Part 1) but, without a
+    // subscription id or code to read, it refuses before any call: the only
+    // documented read addresses ONE subscription, and no listing is implemented.
+    await assert.rejects(
+      () => provider.findSubscription({ provider: 'paystack', userId: USER_ID }),
+      expectReason('invalid_request'),
+    );
     // verifySubscription is implemented (Later-billing-PR #7) but, without a
-    // checkout reference, it refuses before any call: there is no documented
-    // subscription read to use a subscription identifier with.
+    // checkout reference, it refuses before any call: a subscription read
+    // reports subscription state and confirms no payment.
     await assert.rejects(
       () => provider.verifySubscription({ provider: 'paystack', userId: USER_ID, providerSubscriptionId: 'SUB_x', idempotencyKey: 'a'.repeat(64), requestedAt: '2026-09-22T09:00:00.000Z' }),
       expectReason('invalid_request'),
@@ -222,18 +224,21 @@ describe('Paystack provider — honest capability reporting', () => {
         }),
       PaystackNotImplementedError,
     );
+    // cancelSubscription is implemented (Billing Step 9b Part 2) but an
+    // IMMEDIATE cancellation is refused before any call: the provider publishes
+    // no operation that ends access mid-period.
     await assert.rejects(
       () =>
         provider.cancelSubscription({
           provider: 'paystack',
           userId: USER_ID,
           providerSubscriptionId: 'SUB_x',
-          immediate: false,
+          immediate: true,
           reason: 'user',
           idempotencyKey: 'a'.repeat(64),
           requestedAt: '2026-09-22T09:00:00.000Z',
         }),
-      PaystackNotImplementedError,
+      expectReason('invalid_request'),
     );
 
     assert.equal(calls.length, 0, 'an unimplemented operation never reaches the network');

@@ -60,6 +60,16 @@ import {
  *    pricing snapshot the reference was derived from. Any disagreement
  *    between resolution paths binds NOTHING — the row is recorded with a
  *    fully-null subject instead of a guessed owner.
+ *  - BINDS the provider's own subscription identifier — and only from a
+ *    `subscription.created` delivery whose subject IS that identifier — onto
+ *    the EXISTING `subscriptions.provider_subscription_code` column
+ *    (migration 0031), onto the row the delivery resolved to. This is an
+ *    IDENTITY write, not a state change: it moves no status, no plan, no
+ *    period and no entitlement, and it is a no-op (a reported outcome, not an
+ *    error) on every delivery it does not apply to. It never discovers a
+ *    subscription, never looks one up by email and never overwrites or moves a
+ *    code; a disagreement, an ambiguity or an unavailable write binds nothing
+ *    and is reported for review.
  *
  * ---------------------------------------------------------------------------
  * WHAT THIS MODULE DELIBERATELY DOES NOT DO
@@ -69,7 +79,9 @@ import {
  *    is performed, no subscription status moves, no entitlement changes and
  *    `paymentConfirmed` stays `false` — it is derived from the durable
  *    ACTIVATION FACT (Billing Step 8, migration 0034), and a webhook delivery
- *    is never one.
+ *    is never one. The subscription-code binding below is likewise an identity
+ *    write, never a state application: the authoritative status still moves
+ *    only through synchronization.
  *  - It never enables execution. `grantsExecution` is pinned `false` by the
  *    canonical contract, and nothing here touches a plan value, an
  *    entitlement or an execution gate.
@@ -501,6 +513,147 @@ export function createBillingEventSubjectResolver(db: Pool): BillingEventSubject
 }
 
 /* -------------------------------------------------------------------------- */
+/* Provider subscription-code binding (identity, never state)                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What happened to the provider's own subscription identifier while one
+ * delivery was recorded.
+ *
+ * Only `bound` and `already_bound` mean the column now (or already) carries
+ * the code. Every other outcome means NOTHING was written: a delivery is never
+ * refused because of it, and a code that cannot be proven to belong to the
+ * resolved row is never stored.
+ */
+export const BILLING_SUBSCRIPTION_CODE_BINDINGS = [
+  /** The code was written onto the resolved row. */
+  'bound',
+  /** The resolved row already carried exactly this code (a replay). */
+  'already_bound',
+  /** The delivery is not a subscription-creation, or carries no code. */
+  'not_applicable',
+  /** The delivery resolved no local owner, so there is no row to bind. */
+  'unbound_subject',
+  /** The code, the row or the identity disagrees with what is stored. */
+  'conflict',
+  /** The write could not be completed; the delivery stays recorded. */
+  'failed',
+] as const;
+export type BillingSubscriptionCodeBinding = (typeof BILLING_SUBSCRIPTION_CODE_BINDINGS)[number];
+
+/** 0031 unique indexes that bind a provider subscription code to one row. */
+const SUBSCRIPTION_CODE_IDENTITY_CONSTRAINTS = new Set([
+  'subscriptions_provider_subscription_code_uniq',
+]);
+
+/** The one event whose subject IS the provider's own subscription identity. */
+const SUBSCRIPTION_CODE_BINDING_EVENT: BillingEventType = 'subscription.created';
+
+/**
+ * Bind the provider's own subscription code onto the EXISTING
+ * `subscriptions.provider_subscription_code` column (migration 0031).
+ *
+ * The only source is the `subscription.created` delivery the seam has already
+ * normalized: its subject carries the provider's subscription identifier, and
+ * the receiver has already bound that delivery to ONE local (subscription,
+ * user) pair through the existing resolver. This writes that identifier onto
+ * the row the delivery belongs to — it does not discover a subscription, look
+ * one up by email, or scan for a candidate.
+ *
+ * EVERY precondition is re-checked at the write, and any disagreement binds
+ * nothing:
+ *  - the code is re-validated with the SAME canonical reference rule the seam
+ *    and the ledger apply, so credential-shaped material is refused before SQL;
+ *  - a provider subscription code belongs to exactly one row (0031's partial
+ *    UNIQUE index). A row that already holds it — a replay, or a concurrent
+ *    delivery — is `already_bound`; ANY other row holding it is a conflict,
+ *    never a move;
+ *  - the UPDATE itself re-asserts the (row, user, provider) identity and binds
+ *    only from a null, or from the same code. A row whose
+ *    `provider_subscription_id` already holds a DIFFERENT provider identifier
+ *    is a conflict: this build has no documented relationship between a
+ *    provider's subscription id and its code, so coherence cannot be proven
+ *    and the code is left for review;
+ *  - a UNIQUE violation raised by a race between two deliveries is caught and
+ *    reported as a conflict, never propagated as a delivery failure.
+ *
+ * It writes NOTHING else: no status, no provider state, no period, no plan, no
+ * price and no sync bookkeeping. `state_version` is incremented because the row
+ * genuinely changed, which is what makes an in-flight synchronization verify
+ * against the version it actually read (0031's monotonic trigger permits an
+ * increase and refuses a decrease).
+ */
+export async function bindProviderSubscriptionCode(
+  db: Pool,
+  input: { subscriptionId: string; userId: string; providerSubscriptionCode: string },
+): Promise<BillingSubscriptionCodeBinding> {
+  const subscriptionId = z.string().uuid().parse(input.subscriptionId);
+  const userId = z.string().uuid().parse(input.userId);
+  // The canonical reference rule: an identifier, never credential-shaped
+  // material, never wider than the column (0031's CHECK).
+  const code = providerReferenceSchema.parse(input.providerSubscriptionCode);
+
+  // 1. Who holds this code? More than one row, or any row but ours, is a
+  //    conflict — the code is not moved and not overwritten. Our own row
+  //    holding it is a replay: nothing is written.
+  const owners = await db.query<{ id: string }>(
+    `SELECT id
+       FROM subscriptions
+      WHERE provider = $1 AND provider_subscription_code = $2`,
+    [BILLING_PROVIDER, code],
+  );
+  if (owners.rows.length > 1) return 'conflict';
+  const owner = owners.rows[0];
+  if (owner !== undefined) {
+    return owner.id === subscriptionId ? 'already_bound' : 'conflict';
+  }
+
+  // 2. The write. Every identity precondition lives in the WHERE clause, so a
+  //    row that changed under this delivery is simply not updated.
+  try {
+    const bound = await db.query<{ id: string }>(
+      `UPDATE subscriptions
+          SET provider_subscription_code = $3,
+              state_version = state_version + 1
+        WHERE id = $1
+          AND user_id = $2
+          AND provider = $4
+          AND provider_subscription_code IS NULL
+          AND (provider_subscription_id IS NULL OR provider_subscription_id = $3)
+        RETURNING id`,
+      [subscriptionId, userId, code, BILLING_PROVIDER],
+    );
+    if ((bound.rowCount ?? 0) > 0) return 'bound';
+  } catch (error) {
+    // A race between two deliveries: the partial UNIQUE index refused a second
+    // holder. That is a conflict to review, not a failed delivery.
+    const constraint = (error as { code?: string; constraint?: string }) ?? {};
+    if (
+      constraint.code === '23505' &&
+      SUBSCRIPTION_CODE_IDENTITY_CONSTRAINTS.has(constraint.constraint ?? '')
+    ) {
+      return 'conflict';
+    }
+    throw error;
+  }
+
+  // 3. Nothing landed: re-read OUR row (never another user's) to tell a
+  //    replay apart from a real identity conflict.
+  const current = await db.query<{
+    provider_subscription_code: string | null;
+    provider_subscription_id: string | null;
+  }>(
+    `SELECT provider_subscription_code, provider_subscription_id
+       FROM subscriptions
+      WHERE id = $1 AND user_id = $2 AND provider = $3`,
+    [subscriptionId, userId, BILLING_PROVIDER],
+  );
+  const row = current.rows[0];
+  if (row === undefined) return 'conflict'; // the subject pointed at no row of ours
+  return row.provider_subscription_code === code ? 'already_bound' : 'conflict';
+}
+
+/* -------------------------------------------------------------------------- */
 /* The receiver                                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -552,6 +705,14 @@ export interface BillingWebhookReceipt {
    * delivery was not accepted, so its documented retry schedule surfaces it.
    */
   deliveryRefused: boolean;
+  /**
+   * What happened to the provider's own subscription identifier for this
+   * delivery. Only `bound`/`already_bound` wrote anything; every other outcome
+   * left the subscription row exactly as it was, for review. This is an
+   * IDENTITY write, not a state change: no status, plan, period or entitlement
+   * moves, and no delivery is refused because of it.
+   */
+  subscriptionCodeBinding: BillingSubscriptionCodeBinding;
 }
 
 export interface BillingWebhookReceiverOptions {
@@ -632,7 +793,13 @@ export class BillingWebhookReceiver {
         occurredAt: null,
         receivedAt,
       });
-      return { ...stored, eventType: 'unrecognized', subjectResolved: false, deliveryRefused: true };
+      return {
+        ...stored,
+        eventType: 'unrecognized',
+        subjectResolved: false,
+        deliveryRefused: true,
+        subscriptionCodeBinding: 'not_applicable',
+      };
     }
 
     // 4. Normalize through the seam. A refusal here is a typed provider
@@ -673,7 +840,13 @@ export class BillingWebhookReceiver {
         occurredAt: null,
         receivedAt,
       });
-      return { ...stored, eventType: 'unrecognized', subjectResolved: false, deliveryRefused: true };
+      return {
+        ...stored,
+        eventType: 'unrecognized',
+        subjectResolved: false,
+        deliveryRefused: true,
+        subscriptionCodeBinding: 'not_applicable',
+      };
     }
 
     // 5. Resolve the local subject BEFORE anything is persisted. The
@@ -713,7 +886,42 @@ export class BillingWebhookReceiver {
       eventType: normalized.identity.eventType,
       subjectResolved: bound !== null,
       deliveryRefused: false,
+      subscriptionCodeBinding: await this.bindSubscriptionCode(normalized, bound),
     };
+  }
+
+  /**
+   * Bind the provider's own subscription identifier onto the resolved row, for
+   * the ONE delivery whose subject is that identifier (`subscription.created`).
+   *
+   * It runs AFTER the ledger row is durably recorded and never fails the
+   * delivery: evidence first, identity second. A binding that cannot be
+   * completed — an unresolved subject, a disagreement, a write that did not
+   * land — leaves the row untouched and is reported for review, never guessed
+   * and never retried here.
+   */
+  private async bindSubscriptionCode(
+    normalized: NormalizedBillingEvent,
+    bound: ResolvedBillingEventSubject | null,
+  ): Promise<BillingSubscriptionCodeBinding> {
+    if (normalized.identity.eventType !== SUBSCRIPTION_CODE_BINDING_EVENT) return 'not_applicable';
+    const code = normalized.subject?.providerSubscriptionId ?? null;
+    if (code === null) return 'not_applicable';
+    // No local owner was proven, so there is no row this code may be written
+    // onto. A subscription is never bound by email, by customer code or by a
+    // scan for "the" subscription.
+    if (bound === null || bound.subscriptionId === null) return 'unbound_subject';
+    try {
+      return await bindProviderSubscriptionCode(this.options.db, {
+        subscriptionId: bound.subscriptionId,
+        userId: bound.userId,
+        providerSubscriptionCode: code,
+      });
+    } catch {
+      // The delivery is recorded and stays recorded. A binding that could not
+      // be completed is left for review rather than retried or guessed here.
+      return 'failed';
+    }
   }
 
   private async safeRecord(
