@@ -6,7 +6,10 @@
  * Provider: `verifySubscription` built on that read. The published verify
  * response carries NO subscription status, so the canonical lifecycle state is
  * always `unknown` (manual review) — a transaction status is never promoted to
- * a subscription state. `findSubscription` stays refused.
+ * a subscription state. A subscription's own state is read by the separate,
+ * documented subscription read (`findSubscription`, Billing Step 9b Part 1);
+ * this read remains the one that confirms a payment, and a subscription
+ * identifier alone is still not enough to verify anything.
  *
  * Every call goes through an injected stub transport: no socket is opened.
  */
@@ -241,15 +244,17 @@ describe('Paystack client — verifyTransaction (documented read)', () => {
 /* ========================================================================== */
 
 describe('Paystack provider — verifySubscription via transaction verify', () => {
-  test('is implemented, while findSubscription stays refused without any call', async () => {
+  test('is implemented, and a subscription identifier alone still verifies nothing', async () => {
     assert.ok(PAYSTACK_IMPLEMENTED_OPERATIONS.includes('verifySubscription'));
-    assert.ok(!PAYSTACK_IMPLEMENTED_OPERATIONS.includes('findSubscription'));
+    assert.ok(PAYSTACK_IMPLEMENTED_OPERATIONS.includes('findSubscription'));
     const { adapter, calls } = provider([ok(verifiedData())]);
     assert.equal(adapter.implemented, false, 'capability reporting stays honest');
     assert.equal(adapter.live, false);
+    // The subscription read reports subscription state; it does not confirm a
+    // payment, so it is not a verification and cannot stand in for one.
     await assert.rejects(
-      () => adapter.findSubscription({ provider: 'paystack', userId: USER_ID, providerSubscriptionId: 'SUB_x' }),
-      PaystackNotImplementedError,
+      () => adapter.verifySubscription({ provider: 'paystack', userId: USER_ID, providerSubscriptionId: 'SUB_x', idempotencyKey: 'a'.repeat(64), requestedAt: '2026-09-22T09:00:00.000Z' }),
+      (error: unknown) => isPaystackAdapterError(error) && error.reason === 'invalid_request',
     );
     assert.equal(calls.length, 0);
   });
@@ -363,7 +368,7 @@ describe('Paystack provider — verifySubscription via transaction verify', () =
     }
   });
 
-  test('synchronizeSubscription and cancelSubscription still refuse without a call', async () => {
+  test('synchronizeSubscription still refuses, and verification is not a cancellation', async () => {
     const { adapter, calls } = provider([ok(verifiedData())]);
     await assert.rejects(
       () => adapter.synchronizeSubscription({
@@ -372,13 +377,9 @@ describe('Paystack provider — verifySubscription via transaction verify', () =
       }),
       PaystackNotImplementedError,
     );
-    await assert.rejects(
-      () => adapter.cancelSubscription({
-        provider: 'paystack', userId: USER_ID, providerSubscriptionId: 'SUB_x', immediate: false,
-        reason: 'user', idempotencyKey: 'a'.repeat(64), requestedAt: '2026-09-24T09:59:00.000Z',
-      }),
-      PaystackNotImplementedError,
-    );
+    // Cancellation is a separate documented operation now (Billing Step 9b
+    // Part 2). Nothing on the verification path cancels anything: the
+    // transaction read is a read, and the stub is never even asked for it.
     assert.equal(calls.length, 0);
   });
 });

@@ -37,18 +37,32 @@ const CREDENTIAL_SHAPED_ASSIGNMENT_RE =
 
 /**
  * Redact provider-authored text before it can appear in an error message: the
- * configured key is removed verbatim, key-shaped strings and bearer values are
- * replaced, and `field: value` credential assignments lose their value.
+ * configured key is removed verbatim, any further known secret literal is
+ * removed verbatim, key-shaped strings and bearer values are replaced, and
+ * `field: value` credential assignments lose their value.
+ *
+ * `extraSecrets` carries TRANSIENT credentials a call submitted but does not
+ * retain (the provider's subscription cancellation token). A provider that
+ * echoes such a value back in its own message must not be able to leak it
+ * through a refusal, and a value that carries no label would otherwise survive
+ * every pattern below — so the literal is removed the same way the key is.
  *
  * Prose is preserved: a provider message that merely contains the WORD
  * "authorization" (for example "Invalid authorization") keeps its meaning, so
  * an operator can still diagnose the failure. The message is bounded to
  * `PAYSTACK_ERROR_MESSAGE_MAX` characters.
  */
-export function redactPaystackMessage(message: string, secretKey?: string): string {
+export function redactPaystackMessage(
+  message: string,
+  secretKey?: string,
+  extraSecrets: readonly string[] = [],
+): string {
   let redacted = message;
   if (secretKey && secretKey !== '') {
     redacted = redacted.split(secretKey).join('[redacted]');
+  }
+  for (const secret of extraSecrets) {
+    if (secret !== '') redacted = redacted.split(secret).join('[redacted]');
   }
   redacted = redacted.replace(/\b(sk|pk)_(test|live)_[A-Za-z0-9]+/g, '[redacted-key]');
   redacted = redacted.replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [redacted]');

@@ -7,6 +7,10 @@ export {
   type PaystackCustomerRecord,
   type PaystackFetchFn,
   type PaystackInitializedTransaction,
+  type PaystackNotFoundSubject,
+  type PaystackRequestOptions,
+  type PaystackSubscriptionDisableResult,
+  type PaystackSubscriptionRecord,
   type PaystackVerifiedTransaction,
 } from './client.js';
 

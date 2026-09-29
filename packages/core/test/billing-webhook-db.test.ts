@@ -5,6 +5,7 @@ import { BILLING_PROVIDER, type NormalizedBillingEvent } from '@veltrixeye/contr
 import {
   BillingProviderEventStore,
   BillingWebhookReceiver,
+  bindProviderSubscriptionCode,
   billingCheckoutReference,
   billingEventIdempotencyKey,
   billingEventPayloadHash,
@@ -380,5 +381,209 @@ describe('Step 5.2 (db) — receiver end-to-end (real store + resolver, stubbed 
       (error: unknown) => isBillingWebhookError(error) && error.reason === 'persistence_failed',
     );
     assert.equal((await ledgerRows()).length, 0);
+  });
+});
+
+/* ==========================================================================
+   Billing Step 9b Part 2 (db) — the provider subscription-code BINDING.
+
+   The real table, the real 0031 constraints: the binding writes the EXISTING
+   `subscriptions.provider_subscription_code` column (no migration), respects
+   the partial UNIQUE index that makes a code belong to one row, and moves
+   nothing else on the row.
+   ========================================================================== */
+
+describe('Step 9b Part 2 (db) — provider subscription-code binding', () => {
+  /** The state checkout leaves behind: a provider-backed row, code not yet bound. */
+  async function seedProviderSubscription(userId: string): Promise<string> {
+    const { rows } = await db.pool.query(
+      `INSERT INTO subscriptions (user_id, plan, status, currency, provider, provider_state)
+       VALUES ($1, 'pro', 'active', 'USD', 'paystack', 'active') RETURNING id`,
+      [userId],
+    );
+    return rows[0]!.id as string;
+  }
+
+  async function row(id: string) {
+    const { rows } = await db.pool.query(
+      `SELECT provider, provider_subscription_code, provider_subscription_id, state_version,
+              status, plan, catalogue_plan, sync_state, sync_required, last_event_idempotency_key
+         FROM subscriptions WHERE id = $1`,
+      [id],
+    );
+    return rows[0]!;
+  }
+
+  it('binds the code onto the row the delivery resolved to, and moves nothing else', async () => {
+    const user = await insertUser(db.pool, false);
+    const subscriptionId = await seedProviderSubscription(user.id);
+    const before = await row(subscriptionId);
+
+    assert.equal(
+      await bindProviderSubscriptionCode(db.pool, {
+        subscriptionId,
+        userId: user.id,
+        providerSubscriptionCode: 'SUB_bound0001',
+      }),
+      'bound',
+    );
+    const after = await row(subscriptionId);
+    assert.equal(after.provider_subscription_code, 'SUB_bound0001');
+    // Identity ONLY: the row version moves because the row changed, and
+    // nothing about the plan, the status or the sync bookkeeping does.
+    assert.equal(after.state_version, Number(before.state_version) + 1);
+    for (const column of ['status', 'plan', 'catalogue_plan', 'sync_state', 'sync_required', 'last_event_idempotency_key', 'provider_subscription_id']) {
+      assert.deepEqual(after[column], before[column], `${column} must not move`);
+    }
+  });
+
+  it('is idempotent: the same code again is already_bound and writes nothing', async () => {
+    const user = await insertUser(db.pool, false);
+    const subscriptionId = await seedProviderSubscription(user.id);
+    const input = { subscriptionId, userId: user.id, providerSubscriptionCode: 'SUB_bound0002' };
+    assert.equal(await bindProviderSubscriptionCode(db.pool, input), 'bound');
+    const after = await row(subscriptionId);
+    assert.equal(await bindProviderSubscriptionCode(db.pool, input), 'already_bound');
+    assert.deepEqual(await row(subscriptionId), after, 'a replay changes nothing at all');
+  });
+
+  it('never overwrites a DIFFERENT code, and never steals another user\'s code', async () => {
+    const owner = await insertUser(db.pool, false);
+    const other = await insertUser(db.pool, false);
+    const ownedRow = await seedProviderSubscription(owner.id);
+    const otherRow = await seedProviderSubscription(other.id);
+    assert.equal(
+      await bindProviderSubscriptionCode(db.pool, {
+        subscriptionId: ownedRow, userId: owner.id, providerSubscriptionCode: 'SUB_taken00001',
+      }),
+      'bound',
+    );
+
+    // The same code claimed for another user's row is a conflict, both in the
+    // binder and — the backstop — in 0031's partial UNIQUE index.
+    assert.equal(
+      await bindProviderSubscriptionCode(db.pool, {
+        subscriptionId: otherRow, userId: other.id, providerSubscriptionCode: 'SUB_taken00001',
+      }),
+      'conflict',
+    );
+    assert.equal((await row(otherRow)).provider_subscription_code, null);
+    assert.equal((await row(ownedRow)).provider_subscription_code, 'SUB_taken00001');
+
+    // A row that already carries a different code keeps it.
+    assert.equal(
+      await bindProviderSubscriptionCode(db.pool, {
+        subscriptionId: otherRow, userId: other.id, providerSubscriptionCode: 'SUB_other000001',
+      }),
+      'bound',
+    );
+    assert.equal(
+      await bindProviderSubscriptionCode(db.pool, {
+        subscriptionId: otherRow, userId: other.id, providerSubscriptionCode: 'SUB_third000001',
+      }),
+      'conflict',
+    );
+    assert.equal((await row(otherRow)).provider_subscription_code, 'SUB_other000001');
+  });
+
+  it('refuses a row that already carries a different provider subscription id', async () => {
+    const user = await insertUser(db.pool, false);
+    const subscriptionId = await seedProviderSubscription(user.id);
+    await db.pool.query('UPDATE subscriptions SET provider_subscription_id = $2 WHERE id = $1', [
+      subscriptionId,
+      '292646',
+    ]);
+    const before = await row(subscriptionId);
+    assert.equal(
+      await bindProviderSubscriptionCode(db.pool, {
+        subscriptionId, userId: user.id, providerSubscriptionCode: 'SUB_incoherent1',
+      }),
+      'conflict',
+    );
+    assert.deepEqual(await row(subscriptionId), before, 'an incoherent identity is left untouched');
+  });
+
+  it('binds nothing onto a row that is not provider-backed, or onto another user\'s row', async () => {
+    const user = await insertUser(db.pool, false);
+    const stranger = await insertUser(db.pool, false);
+    const { rows } = await db.pool.query(
+      `INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'free', 'active') RETURNING id`,
+      [user.id],
+    );
+    const legacy = rows[0]!.id as string;
+    const providerRow = await seedProviderSubscription(stranger.id);
+
+    // `provider IS NULL` is the provider-binding CHECK of 0031: such a row can
+    // never carry a provider identifier.
+    assert.equal(
+      await bindProviderSubscriptionCode(db.pool, {
+        subscriptionId: legacy, userId: user.id, providerSubscriptionCode: 'SUB_legacy00001',
+      }),
+      'conflict',
+    );
+    // The (row, user) pair is re-asserted: a delivery resolved for one user
+    // can never write onto another user's row.
+    assert.equal(
+      await bindProviderSubscriptionCode(db.pool, {
+        subscriptionId: providerRow, userId: user.id, providerSubscriptionCode: 'SUB_legacy00001',
+      }),
+      'conflict',
+    );
+    assert.equal((await row(legacy)).provider_subscription_code, null);
+    assert.equal((await row(providerRow)).provider_subscription_code, null);
+  });
+
+  it('the receiver binds a real subscription.created delivery end to end', async () => {
+    const user = await insertUser(db.pool, true);
+    const { rows: customerRows } = await db.pool.query(
+      'SELECT provider_customer_code FROM billing_customers WHERE user_id = $1', [user.id],
+    );
+    const subscriptionId = await seedProviderSubscription(user.id);
+
+    const registry = createBillingProviderRegistry();
+    registry.register({
+      ...createUnimplementedBillingProvider(),
+      normalizeEvent: async (request) => {
+        const payloadHash = billingEventPayloadHash(request.payload);
+        const input = {
+          provider: BILLING_PROVIDER, providerEventId: null,
+          eventType: 'subscription.created' as const, occurredAt: '2026-09-24T10:34:57.000Z', payloadHash,
+        };
+        return {
+          identity: {
+            ...input,
+            idempotencyKey: billingEventIdempotencyKey(input),
+            receivedAt: request.receivedAt,
+          },
+          category: 'subscription' as const,
+          subject: {
+            userId: null, subscriptionId: null, billingCustomerId: null,
+            providerCustomerId: customerRows[0]!.provider_customer_code as string,
+            providerSubscriptionId: 'SUB_e2e0000001',
+            providerReference: null,
+          },
+          data: null,
+          grantsExecution: false as const,
+        };
+      },
+    });
+    const receiver = new BillingWebhookReceiver({ db: db.pool, providers: registry, secretKey: SECRET });
+    const raw = JSON.stringify({ event: 'subscription.create', data: { subscription_code: 'SUB_e2e0000001' } });
+    const receipt = await receiver.receive({
+      rawBody: Buffer.from(raw),
+      signatureHeader: sign(raw),
+      receivedAt: RECEIVED_AT,
+    });
+
+    assert.equal(receipt.eventType, 'subscription.created');
+    assert.equal(receipt.subjectResolved, true);
+    assert.equal(receipt.subscriptionCodeBinding, 'bound');
+    assert.equal((await row(subscriptionId)).provider_subscription_code, 'SUB_e2e0000001');
+    // The ledger keeps the evidence with the same identifier.
+    const ledger = await ledgerRows();
+    const created = ledger.find((row) => row.event_type === 'subscription.created');
+    assert.ok(created);
+    assert.equal(created.provider_subscription_id, 'SUB_e2e0000001');
+    assert.equal(created.subscription_id, subscriptionId);
   });
 });
