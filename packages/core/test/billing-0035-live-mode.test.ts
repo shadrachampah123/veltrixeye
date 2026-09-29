@@ -352,9 +352,13 @@ describe('0035 — live-mode provisioning and mode-specific directories', () => 
       liveEvidenceEntry('elite', 'annual'),
     ];
     const service = new BillingPlanProvisioningService({ db: pool, mode: 'live', now: () => AS_OF });
+    // A LIVE registration is auditable by construction: the operator identity
+    // and the reason are mandatory in live mode (`audit_required` otherwise),
+    // and the audit event is written on the same transaction as the epochs.
     const registered = await service.registerSandboxPlanEpochs({
       fxRateVersionId: fxRow.id,
       evidence: liveEvidence,
+      audit: { operatorId: OPERATOR, reason: REASON },
     });
     assert.equal(registered.length, 4);
     for (const epoch of registered) {

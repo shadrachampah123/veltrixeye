@@ -1862,3 +1862,74 @@ production step):
 
 Refunds, proration, dunning, automatic payment confirmation and batch
 reconciliation remain **out of scope** in live mode exactly as in test mode.
+
+## Live plan registration (`npm run billing:provision:live`)
+
+**Live mode made the schema capable of live epochs (0035 + `PAYSTACK_MODE`);
+this step supplies the operator path that actually registers them.** The four
+live provider plans are created by an operator in the Paystack dashboard —
+outside this repository and outside the adapter, exactly as in the sandbox
+Step 4 run — so their four `PLN_…` codes are **supplied at run time** and are
+never committed, defaulted or invented here. Registering an epoch makes it
+*selectable by live checkout*; it confirms no payment, activates no
+subscription, grants no execution and publishes no FX rate.
+
+**The entry point** (`scripts/billing/provision-live.ts`, composed by
+`packages/core/src/billing/live-plan-registration.ts`):
+
+```bash
+PAYSTACK_MODE=live PAYSTACK_LIVE_PLAN_CODES='{"pro-monthly":"PLN_…","pro-annual":"PLN_…","elite-monthly":"PLN_…","elite-annual":"PLN_…"}' \
+  npm run billing:provision:live -- --fx-rate-version <uuid> --by <operator-id> \
+    --reason "…" --reference "<dashboard/ticket label>" [--dry-run] [--amount <slot>=<minor>]
+```
+
+or all four codes as `--plan <slot>=<PLN_…>` flags (supplying some flags and
+some environment values is refused, so no code's provenance is ambiguous).
+Exit codes: **0** registered (or a clean `--dry-run`), **1** typed refusal
+(nothing written), **2** usage/configuration error — an unknown or absent
+`PAYSTACK_MODE`, a missing/malformed code set or a missing operator argument.
+
+**What it enforces, all of it inherited from the existing Step 4 workflow**
+
+- **Fail-closed on mode.** A run without `PAYSTACK_MODE=live` is refused before
+  the database is touched (`not_live_mode`), and the service registers live
+  epochs only when it was explicitly constructed `mode: 'live'`. There is no
+  fallback in either direction: a live batch never falls back to `test`, and a
+  test-mode build can never write a live epoch.
+- **The same four-plan batch.** Exactly Pro Monthly, Pro Annual, Elite Monthly,
+  Elite Annual; **Starter is refused** (it is not sellable — Step 10a), an
+  unknown/partial slot set is refused, one code cannot map to two
+  combinations, and the excluded GHS 2.00 capability-evidence plan is still
+  refused.
+- **Amounts are derived, never taken from evidence.** `half_up(catalogue USD
+  minor × FX)` via the two existing authorities, under ONE operator-selected,
+  already-published, fresh (≤900 s) FX version the whole batch pins. Optional
+  `--amount` observations are evidence: a disagreement with the derivation is
+  refused (`amount_mismatch`) instead of being stored.
+- **Genuine codes only.** Provider-issued `PLN_…` shape, no placeholder or
+  fixture markers, no duplicates; credential-shaped operator text (id, reason,
+  label) is refused by the shared credential pattern.
+- **Atomic and auditable.** The four epochs and ONE
+  `billing.provider_plans_registered` audit event — naming the operator, the
+  reason, the shared FX version, the pricing/catalogue versions and all four
+  epochs with their amounts — commit on the same transaction. Live
+  registration **requires** the operator descriptor (`audit_required`
+  otherwise), so an unaudited live epoch is unrepresentable; a conflict, a
+  stale rate, a rejected code or a failing audit write rolls the whole batch
+  back and leaves zero rows. Live epochs are immutable like every other epoch:
+  a later FX version never reprices them and retirement stays a separate,
+  explicitly approved action.
+- **No provider call of any kind.** No transport, no fetch, no adapter import,
+  no credential and no environment read in the workflow module (silent
+  registration is SQL only). The CLI reads `DATABASE_URL`, `PAYSTACK_MODE` and
+  the supplied codes at its own configuration boundary.
+- **Sandbox behaviour unchanged.** A `test` batch still registers without an
+  audit descriptor and writes no audit event; the two domains never see each
+  other's epochs or keys.
+
+**Verify after a live run:** exactly four `active` rows with `mode = 'live'`,
+one shared `fx_rate_version_id`, GHS, exponent 2, the derived amounts and the
+supplied `PLN_…` codes, plus one `billing.provider_plans_registered` audit
+event naming the operator. `--dry-run` performs the whole validation and writes
+nothing; on any refusal, fix the input and rerun the batch — never retry a
+conflicting input, upsert or auto-retire.
