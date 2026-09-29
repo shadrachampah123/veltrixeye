@@ -4,6 +4,7 @@ import {
   billingPaymentCurrencySchema,
   type BillingPaymentCurrency,
   type BillingPricingSnapshot,
+  type BillingProviderMode,
 } from '@veltrixeye/contracts';
 import {
   BILLING_PAYMENT_RECONCILIATION_FAILURE_REASONS,
@@ -74,6 +75,13 @@ export interface BillingPaymentReconciliationInput {
   snapshot: BillingPricingSnapshot;
   /** Local billing customer for the user, when known (for identity coherence). */
   localCustomer?: { providerCustomerId: string | null; providerCustomerCode: string | null } | null;
+  /**
+   * The configured provider domain the evidence must come from (`test` by
+   * default; `live` only when the caller — confirmation or activation — was
+   * composed with an explicit live mode). Evidence from any other domain is
+   * a `domain_mismatch`, never reconcilable.
+   */
+  expectedProviderDomain?: BillingProviderMode;
 }
 
 export type BillingPaymentReconciliationOutcome =
@@ -119,12 +127,16 @@ export function reconcileBillingPaymentEvidence(
     };
   }
 
-  // 4. Domain must be test (sandbox-only).
-  if (verified.providerDomain !== 'test') {
+  // 4. Domain must equal the configured provider mode (default: test).
+  const expectedProviderDomain = input.expectedProviderDomain ?? 'test';
+  if (verified.providerDomain !== expectedProviderDomain) {
     return {
       ok: false,
       reason: 'domain_mismatch',
-      message: `The provider domain is not test (sandbox).`,
+      message:
+        expectedProviderDomain === 'test'
+          ? `The provider domain is not test (sandbox).`
+          : `The provider domain is not live (the configured provider mode).`,
     };
   }
 

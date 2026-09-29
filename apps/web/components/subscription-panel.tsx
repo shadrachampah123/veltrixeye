@@ -76,6 +76,9 @@ export function SubscriptionPanel({
   // subscription. Display only: this component grants nothing and cannot change
   // any limit.
   const providerStatus = billing.providerStatus;
+  // The server-reported provider domain: the copy below is only ever rendered
+  // with a READ billing state, so the mode is known here — never guessed.
+  const mode = billing.mode;
   // Billing Step 9 — the SAME five-state vocabulary the checkout surface uses,
   // derived by the same pure function, so the two panels cannot disagree about
   // what the server said: free / awaiting verification / evidence awaiting
@@ -170,8 +173,8 @@ export function SubscriptionPanel({
         {checkoutState === 'unavailable' ? (
           <div className="rounded-md border border-danger-450/30 bg-danger-450/10 px-3 py-2.5 text-[11px] leading-snug text-ink-300">
             <strong className="text-danger-450">Billing unavailable:</strong> the billing state could not be read or
-            the sandbox checkout is refusing. The limits shown are the last ones the server enforced; nothing here is
-            offered and nothing is claimed.
+            the {mode === 'test' ? 'sandbox ' : ''}checkout is refusing. The limits shown are the last ones the server
+            enforced; nothing here is offered and nothing is claimed.
           </div>
         ) : null}
 
@@ -230,7 +233,19 @@ function FeatureRow({ label, enabled, note }: { label: string; enabled: boolean;
  * enforced entitlement tier. Pro/Elite rendering and the current-plan badge are
  * unchanged, and no card offers any action.
  */
-export function PlanComparison({ currentPlan }: { currentPlan: UserPlan }) {
+export function PlanComparison({
+  currentPlan,
+  mode = 'test',
+}: {
+  currentPlan: UserPlan;
+  /**
+   * The configured provider domain of the billing state (null while the read
+   * has not answered). Defaults to the sandbox copy for direct renders; the
+   * page passes the server-reported mode so a live build never claims
+   * sandbox — and an unknown mode claims neither.
+   */
+  mode?: 'test' | 'live' | null;
+}) {
   const currentCommercialPlan = commercialPlanForInternalPlan(currentPlan);
   // Billing Step 10a — sellability is DERIVED, never restated here: the sellable
   // plans are exactly `BILLING_CHECKOUT_SELLABLE_PLANS` (Pro + Elite), and every
@@ -297,13 +312,37 @@ export function PlanComparison({ currentPlan }: { currentPlan: UserPlan }) {
             </span>
           </p>
         ) : null}
-        <strong className="text-amber-450">Sandbox billing only:</strong> the checkout surface on this page
-        initializes a provider <em>sandbox</em> (test-mode) checkout, shows the server&rsquo;s price and FX disclosure
-        and can record verified payment evidence. The overview card above is read-only: it states the server&rsquo;s
-        answer and offers no action. This page cannot activate a plan — activation is an out-of-band operator
-        action — and there is still no saved payment method, no self-serve cancellation and no live
-        payment. &ldquo;Priority execution&rdquo; on Elite is a commercial descriptor only: automation, live execution
-        and broker execution remain unavailable on every plan.
+        {mode === 'live' ? (
+          <>
+            <strong className="text-amber-450">Live billing:</strong> the checkout surface on this page initializes a
+            provider <em>live-mode</em> checkout, shows the server&rsquo;s price and FX disclosure and can record
+            verified payment evidence. The overview card above is read-only: it states the server&rsquo;s answer and
+            offers no action. This page cannot activate a plan — activation is an out-of-band operator action — and
+            there is still no saved payment method and no self-serve cancellation. &ldquo;Priority execution&rdquo; on
+            Elite is a commercial descriptor only: automation, live execution and broker execution remain unavailable
+            on every plan.
+          </>
+        ) : mode === 'test' ? (
+          <>
+            <strong className="text-amber-450">Sandbox billing only:</strong> the checkout surface on this page
+            initializes a provider <em>sandbox</em> (test-mode) checkout, shows the server&rsquo;s price and FX
+            disclosure and can record verified payment evidence. The overview card above is read-only: it states the
+            server&rsquo;s answer and offers no action. This page cannot activate a plan — activation is an
+            out-of-band operator action — and there is still no saved payment method, no self-serve cancellation and
+            no live payment. &ldquo;Priority execution&rdquo; on Elite is a commercial descriptor only: automation,
+            live execution and broker execution remain unavailable on every plan.
+          </>
+        ) : (
+          <>
+            <strong className="text-amber-450">Billing:</strong> the checkout surface on this page initializes a
+            provider checkout in the domain the server has configured, shows the server&rsquo;s price and FX
+            disclosure and can record verified payment evidence. The overview card above is read-only: it states the
+            server&rsquo;s answer and offers no action. This page cannot activate a plan — activation is an
+            out-of-band operator action — and there is still no saved payment method and no self-serve cancellation.
+            &ldquo;Priority execution&rdquo; on Elite is a commercial descriptor only: automation, live execution and
+            broker execution remain unavailable on every plan.
+          </>
+        )}
       </div>
     </Card>
   );

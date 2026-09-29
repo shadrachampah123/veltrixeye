@@ -11,7 +11,7 @@ import {
   cataloguePriceMinor, computePaymentAmountMinor, priceFromProviderPlanEpoch,
 } from '../../src/index.js';
 import { internalPlanForCommercialPlan } from '@veltrixeye/contracts';
-import type { BillingInterval, CommercialPlanId } from '@veltrixeye/contracts';
+import type { BillingInterval, BillingProviderMode, CommercialPlanId } from '@veltrixeye/contracts';
 
 export const AS_OF = new Date('2026-09-22T12:00:00.000Z');
 /** The capability-evidence plan code that is never a sellable epoch. */
@@ -47,7 +47,7 @@ export async function insertFx(pool: Pool, rateScaled = 12_500_000) {
 
 export async function insertEpoch(pool: Pool, options: {
   plan?: CommercialPlanId; interval?: BillingInterval; providerPlanId?: string;
-  rateScaled?: number; amount?: number;
+  rateScaled?: number; amount?: number; mode?: BillingProviderMode;
 } = {}) {
   const fx = await insertFx(pool, options.rateScaled);
   const plan = options.plan ?? 'pro';
@@ -57,11 +57,12 @@ export async function insertEpoch(pool: Pool, options: {
     usdMinor: BigInt(usd), rateScaled: BigInt(fx.fx_rate_scaled), rateScale: fx.fx_rate_scale,
   }));
   const { rows } = await pool.query(
-    `INSERT INTO billing_provider_plans (catalogue_plan, billing_interval, payment_amount_minor,
+    `INSERT INTO billing_provider_plans (mode, catalogue_plan, billing_interval, payment_amount_minor,
        provider_plan_id, fx_rate_version_id, pricing_policy_version, catalogue_version,
        catalogue_amount_minor, valid_from)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING ${EPOCH_COLUMNS}`,
-    [plan, interval, amount, options.providerPlanId ?? `PLN_${randomUUID().replaceAll('-', '')}`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING ${EPOCH_COLUMNS}`,
+    [options.mode ?? 'test', plan, interval, amount,
+      options.providerPlanId ?? `PLN_${randomUUID().replaceAll('-', '')}`,
       fx.id, BILLING_PRICING_POLICY_VERSION, BILLING_CATALOGUE_VERSION, usd, fx.effective_from],
   );
   return { epoch: rows[0]!, fx };
@@ -90,7 +91,11 @@ export async function insertUser(pool: Pool, customer = true) {
 }
 
 export function deriveSnapshot(facts: Awaited<ReturnType<typeof insertEpoch>>) {
-  return priceFromProviderPlanEpoch({ ...facts, fxVersion: facts.fx, asOf: AS_OF, providerReference: null });
+  const mode = facts.epoch.mode;
+  if (mode !== 'test' && mode !== 'live') {
+    throw new Error(`deriveSnapshot: unexpected epoch mode "${mode}"`);
+  }
+  return priceFromProviderPlanEpoch({ ...facts, fxVersion: facts.fx, asOf: AS_OF, providerReference: null, mode });
 }
 
 /* ==========================================================================
@@ -115,16 +120,17 @@ async function findOrCreateEpoch(
   plan: CommercialPlanId,
   interval: BillingInterval,
   providerPlanId?: string,
+  mode: BillingProviderMode = 'test',
 ): Promise<Awaited<ReturnType<typeof insertEpoch>>> {
   if (providerPlanId !== undefined) {
     await retireActiveEpochs(pool);
-    return insertEpoch(pool, { plan, interval, providerPlanId });
+    return insertEpoch(pool, { plan, interval, providerPlanId, mode });
   }
   const existing = await pool.query(
     `SELECT ${EPOCH_COLUMNS} FROM billing_provider_plans
-      WHERE catalogue_plan = $1 AND billing_interval = $2 AND status = 'active'
+      WHERE catalogue_plan = $1 AND billing_interval = $2 AND mode = $3 AND status = 'active'
       ORDER BY valid_from DESC LIMIT 1`,
-    [plan, interval],
+    [plan, interval, mode],
   );
   // The capability-evidence plan is never a sellable epoch: if a previous test
   // left it active, retire it and provision a real one instead.
@@ -138,12 +144,14 @@ async function findOrCreateEpoch(
     ]);
     return { epoch: existing.rows[0], fx: fx.rows[0] };
   }
-  return insertEpoch(pool, { plan, interval });
+  return insertEpoch(pool, { plan, interval, mode });
 }
 
 export interface SeedCommercialOptions {
   cataloguePlan?: CommercialPlanId;
   interval?: BillingInterval;
+  /** Provider domain of the epoch (`test`, the default, or `live`). */
+  mode?: BillingProviderMode;
   /** Provider plan epoch code; defaults to a fresh synthetic code. */
   providerPlanId?: string;
   /** Provider state written on the subscription row (defaults to `pending`). */
@@ -173,7 +181,7 @@ export async function seedCommercialSubscription(
 ): Promise<SeededCommercial> {
   const cataloguePlan = options.cataloguePlan ?? 'pro';
   const interval = options.interval ?? 'monthly';
-  const facts = await findOrCreateEpoch(pool, cataloguePlan, interval, options.providerPlanId);
+  const facts = await findOrCreateEpoch(pool, cataloguePlan, interval, options.providerPlanId, options.mode ?? 'test');
   const snapshot = deriveSnapshot(facts);
   const persisted = await new BillingPricingSnapshotStore(pool).create(snapshot);
   const { rows } = await pool.query<{ id: string }>(
@@ -209,8 +217,8 @@ export interface SeedEvidenceOptions {
   paymentAmountExponent?: number;
   /** Defaults to `success`. */
   providerStatus?: string;
-  /** Defaults to `test`. */
-  providerDomain?: 'test';
+  /** Defaults to `test`; the two-value domain widened by migration 0035. */
+  providerDomain?: 'test' | 'live';
   /** Defaults to null; pass a code to model a wrong-customer observation. */
   providerCustomerCode?: string | null;
   paidAt?: Date;

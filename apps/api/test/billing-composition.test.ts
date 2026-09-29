@@ -49,6 +49,7 @@ describe('Billing PR3 — configuration', () => {
     const cfg = config().billing;
     assert.deepEqual(cfg, {
       provider: 'paystack',
+      mode: 'test',
       sandbox: true,
       live: false,
       enabled: false,
@@ -110,7 +111,9 @@ describe('Billing PR3 — composition fails closed', () => {
     assert.equal(composition.registry.size, 1);
 
     const listed = composition.registry.list();
-    assert.deepEqual(listed, [{ id: 'paystack', name: 'paystack-sandbox', implemented: false, live: false }]);
+    assert.deepEqual(listed, [
+      { id: 'paystack', name: 'paystack-sandbox', implemented: false, live: false, mode: 'test' },
+    ]);
     assert.deepEqual(composition.registry.implementedProviders(), []);
     assert.equal(JSON.stringify(composition.status.describe).includes(TEST_KEY), false);
     assert.equal(composition.status.describe?.live, false);

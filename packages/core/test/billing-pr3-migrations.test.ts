@@ -291,7 +291,7 @@ after(async () => {
 });
 
 describe('Billing PR3 — 0032 file conventions and history integrity', () => {
-  test('0001-0031 are byte-identical, and the newest migration is 0034 (Step 8)', () => {
+  test('0001-0031 are byte-identical, and the newest migration is 0035 (live-mode widening)', () => {
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((file) => /^\d{4}_.+\.sql$/.test(file))
       .sort();
@@ -308,17 +308,18 @@ describe('Billing PR3 — 0032 file conventions and history integrity', () => {
 
     const versions = files.map((file) => Number(/^(\d{4})_/.exec(file)?.[1]));
     assert.equal(new Set(versions).size, versions.length, 'no duplicate migration version');
-    for (let expected = 1; expected <= 34; expected += 1) {
+    for (let expected = 1; expected <= 35; expected += 1) {
       assert.ok(versions.includes(expected), `migration ${String(expected).padStart(4, '0')} exists`);
     }
     assert.equal(files.filter((file) => file.startsWith('0032_')).length, 1, 'exactly one 0032 migration');
     assert.equal(files.filter((file) => file.startsWith('0033_')).length, 1, 'exactly one 0033 migration (Step 7)');
     assert.equal(files.filter((file) => file.startsWith('0034_')).length, 1, 'exactly one 0034 migration (Step 8)');
-    assert.equal(files.at(-1), '0034_billing_activation.sql', '0034 is the newest migration (Step 8)');
+    assert.equal(files.filter((file) => file.startsWith('0035_')).length, 1, 'exactly one 0035 migration (live mode)');
+    assert.equal(files.at(-1), '0035_billing_live_mode.sql', '0035 is the newest migration (live-mode widening)');
     assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 34).length,
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 35).length,
       0,
-      'nothing is numbered after 0034',
+      'nothing is numbered after 0035',
     );
   });
 
@@ -691,11 +692,14 @@ describe('Billing PR3 — provider-plan epochs', () => {
         (err) => pgCode(err) === '23514',
         'Starter cannot be registered',
       );
-      // Live mode is not producible by this build.
+      // On this 0032-only migration set the epoch mode is still pinned to
+      // test, so a live row is refused (0035 later widens the constraint to
+      // ('test','live') on full-migration databases; the mode-aware
+      // application services keep refusing a configured-mode mismatch).
       await expectRejects(
         () => insert({ mode: 'live', catalogue_plan: 'elite', billing_interval: 'annual' }),
         (err) => pgCode(err) === '23514',
-        'sandbox only',
+        'sandbox only (0032 constraint on this migration set)',
       );
       // An amount below the documented ₵0.10 minimum is refused.
       await expectRejects(

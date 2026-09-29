@@ -430,8 +430,9 @@ mechanism; `BILLING_SYNC_RATE_LIMIT_MAX = 10` per minute), and refuses as
 - **One host, a constant.** `PAYSTACK_API_BASE_URL = 'https://api.paystack.co'`;
   there is no configuration key for it, so no deployment can repoint the
   adapter, and a test cannot accidentally reach the real API.
-- **Sandbox only.** `secretKey` must start with `sk_test_`; `sk_live_`, `pk_*`
-  and empty keys are refused **at construction**. `PAYSTACK_LIVE` is pinned
+- **Mode-matched keys.** `secretKey` must start with the configured mode's
+  prefix (`sk_test_` ↔ test, `sk_live_` ↔ live); `pk_*`, empty keys and a
+  mismatched prefix are refused **at construction**. `PAYSTACK_LIVE` is pinned
   `false`.
 - **One attempt, no retries.** Paystack documents retries for **webhooks**, not
   for outbound API calls, so the client never retries and never backs off.
@@ -688,3 +689,22 @@ its meaning and none of its substance:
   subscription status, so every verified state is `unknown` (manual review) —
   no status moves, no paid entitlement, no execution effect, and the webhook
   receiver remains receipt-only.
+
+
+## Mode-aware adapter (live-domain support)
+
+The client/provider take an explicit `mode: 'test' | 'live'` (default
+`'test'`), injected only by `apps/api/src/billing-composition.ts` from
+`PAYSTACK_MODE`:
+
+- the key prefix must match the mode (`sk_test_` ↔ test, `sk_live_` ↔ live) —
+  construction with the wrong pair refuses, keeping the original
+  test-mode messages for the test branch;
+- `expectedDomain` derives from the mode: `normalizeEvent` accepts only the
+  configured webhook domain, and transaction verification/find refuse an
+  answer from the other domain (wrong-domain rejection preserved both ways);
+- `name` is `paystack-sandbox`/`paystack-live`, `describe().mode` reports the
+  mode, and **`live` stays `false` in both modes** — the execution gate is not
+  part of the mode;
+- nothing else changed in the contract: five of eight operations, one HTTP
+  attempt, no retry, no idempotency header, receipts-only webhooks.

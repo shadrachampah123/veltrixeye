@@ -517,6 +517,7 @@ describe('billing-state DTO — paymentConfirmed is derived, never client input'
       currentPeriodEnd: null,
       cancelAtPeriodEnd: false,
     },
+    mode: 'test' as const,
     entitlements: FREE_ENTITLEMENTS,
     providerStatus: { provider: 'paystack', providerState: 'pending', paymentConfirmed: false as const },
   };
@@ -741,11 +742,11 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     assert.deepEqual(offenders, [], 'every reader goes through resolveEntitlements');
   });
 
-  it('adds exactly one migration — 0034, the activation-fact ledger — and leaves 0001–0033 untouched', () => {
+  it('adds migration 0034 (the activation-fact ledger) plus 0035 (live-mode widening), leaving 0001–0033 untouched', () => {
     const files = readdirSync(MIGRATIONS_DIR).sort();
-    assert.equal(files.length, 34, `unexpected migration set: ${files.join(', ')}`);
+    assert.equal(files.length, 35, `unexpected migration set: ${files.join(', ')}`);
     assert.equal(files[0], '0001_identity_and_audit.sql');
-    assert.equal(files[files.length - 1], '0034_billing_activation.sql');
+    assert.equal(files[files.length - 1], '0035_billing_live_mode.sql');
   });
 
   it('leaves the checkout INSERT shape and the pricing lock untouched', () => {

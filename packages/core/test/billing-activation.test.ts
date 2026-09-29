@@ -350,14 +350,20 @@ describe('Step 8 — the payment evidence must reconcile exactly', () => {
     assert.equal(await activationCount(user.id), 0);
   });
 
-  it('a non-sandbox domain is unrepresentable in the evidence table at all', async () => {
+  it('a live-domain row is storable (0035) but never activatable by the default-mode service', async () => {
     const user = await insertUser(pool, true);
     const commercial = await seedCommercialSubscription(pool, user.id);
-    await assert.rejects(
-      seedPaymentEvidence(pool, user.id, commercial, { providerDomain: 'live' as 'test' }),
-      /domain/,
-      'migration 0033 pins the domain to test, so activation can never see a live observation',
-    );
+    // Migration 0035 widened the evidence domain to ('test','live'): the
+    // database layer now ACCEPTS a live-domain row — the enforcement moved to
+    // the mode-aware application boundary.
+    const liveEvidence = await seedPaymentEvidence(pool, user.id, commercial, { providerDomain: 'live' });
+    // The service's configured mode defaults to `test`, so a live observation
+    // can never activate a sandbox-mode deployment.
+    const error = await refusal(service().activate({
+      user: user.email, operatorId: OPERATOR, reason: REASON, evidenceId: liveEvidence.evidenceId,
+    }));
+    assert.equal(error.reason, 'evidence_not_successful');
+    assert.equal(await activationCount(user.id), 0);
   });
 
   it('the currency/exponent check the activation re-runs is exact', () => {

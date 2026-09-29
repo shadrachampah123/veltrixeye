@@ -14,6 +14,7 @@ import {
   type BillingLifecycleState,
   type BillingPaymentAmount,
 } from '@veltrixeye/contracts';
+import type { BillingProviderMode } from '@veltrixeye/contracts';
 import {
   PAYSTACK_ERROR_MESSAGE_MAX,
   PaystackAdapterError,
@@ -444,20 +445,31 @@ function contractViolation(what: string, error: z.ZodError): PaystackAdapterErro
 }
 
 /**
- * This build is sandbox-only (`PAYSTACK_LIVE` is pinned false and only
- * `sk_test_` credentials are accepted), so a delivery that reports any other
- * domain is a configuration contradiction, not an event: it is refused with a
- * configuration reason and never normalized.
+ * A delivery must report the CONFIGURED domain (default sandbox/test; `live`
+ * only when the adapter was composed with an explicit live mode). A delivery
+ * from any other domain is a configuration contradiction, not an event: it is
+ * refused with a configuration reason and never normalized — in either
+ * direction. The default (test) message keeps the sandbox-only wording the
+ * test suite pins.
  */
-function assertSandboxDomain(event: string, domain: string): void {
-  if (domain !== 'test') {
+function assertProviderDomain(event: string, domain: string, expectedDomain: BillingProviderMode): void {
+  if (domain !== expectedDomain) {
     throw new PaystackAdapterError(
       'invalid_configuration',
-      `The "${event}" delivery does not report the sandbox domain. This build is sandbox-only and normalizes ` +
-        'sandbox deliveries; a delivery from another domain means the webhook is not configured for this build. ' +
-        'Nothing was normalized.',
+      expectedDomain === 'test'
+        ? `The "${event}" delivery does not report the sandbox domain. This build is sandbox-only and normalizes ` +
+          'sandbox deliveries; a delivery from another domain means the webhook is not configured for this build. ' +
+          'Nothing was normalized.'
+        : `The "${event}" delivery does not report the live domain. This build is configured for live mode and ` +
+          'normalizes live deliveries; a delivery from another domain means the webhook is not configured for ' +
+          'this build. Nothing was normalized.',
     );
   }
+}
+
+/** The normalization context every per-event normalizer receives. */
+interface NormalizeEventContext {
+  expectedDomain: BillingProviderMode;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -520,13 +532,13 @@ function paymentAmount(
  * verification. Confirming a payment still requires the documented transaction
  * verification read, which this build does not implement.
  */
-function normalizeChargeSuccess(data: unknown): PaystackEventFacts {
+function normalizeChargeSuccess(data: unknown, context: NormalizeEventContext): PaystackEventFacts {
   const event = 'charge.success';
   const parsed = chargeSuccessDataSchema.safeParse(data);
   if (!parsed.success) throw malformedFromZod(event, parsed.error);
   const payload = parsed.data;
 
-  assertSandboxDomain(event, payload.domain);
+  assertProviderDomain(event, payload.domain, context.expectedDomain);
   if (payload.status !== 'success') {
     // The canonical type is payment.succeeded; a delivery whose own transaction
     // status contradicts that is refused rather than recorded as a success.
@@ -562,13 +574,13 @@ function normalizeChargeSuccess(data: unknown): PaystackEventFacts {
  * Documented as "a subscription has been created"; the payload is the
  * subscription object with its plan, authorization and customer.
  */
-function normalizeSubscriptionCreate(data: unknown): PaystackEventFacts {
+function normalizeSubscriptionCreate(data: unknown, context: NormalizeEventContext): PaystackEventFacts {
   const event = 'subscription.create';
   const parsed = subscriptionCreateDataSchema.safeParse(data);
   if (!parsed.success) throw malformedFromZod(event, parsed.error);
   const payload = parsed.data;
 
-  assertSandboxDomain(event, payload.domain);
+  assertProviderDomain(event, payload.domain, context.expectedDomain);
   if (payload.plan.amount !== payload.amount) {
     // The subscription amount and its plan amount are the same documented fact;
     // a delivery that disagrees with itself is refused, never averaged.
@@ -601,12 +613,13 @@ function invoiceFacts(
   event: 'invoice.update' | 'invoice.payment_failed',
   data: unknown,
   eventTypeFor: (paid: boolean) => BillingEventType,
+  context: NormalizeEventContext,
 ): PaystackEventFacts {
   const parsed = invoiceDataSchema.safeParse(data);
   if (!parsed.success) throw malformedFromZod(event, parsed.error);
   const payload = parsed.data;
 
-  assertSandboxDomain(event, payload.domain);
+  assertProviderDomain(event, payload.domain, context.expectedDomain);
   const eventType = eventTypeFor(payload.paid);
   const failureDetail =
     eventType === 'invoice.failed' && payload.description !== undefined && payload.description !== null
@@ -656,16 +669,18 @@ function invoiceFacts(
  * is a provider-reported receipt; confirming the underlying transaction is a
  * separate, documented read this build does not perform.
  */
-function normalizeInvoiceUpdate(data: unknown): PaystackEventFacts {
-  return invoiceFacts('invoice.update', data, (paid) => (paid ? 'invoice.processed' : 'invoice.failed'));
+function normalizeInvoiceUpdate(data: unknown, context: NormalizeEventContext): PaystackEventFacts {
+  return invoiceFacts('invoice.update', data, (paid) => (paid ? 'invoice.processed' : 'invoice.failed'), context);
 }
 
 /** `invoice.payment_failed` → `invoice.failed`. */
-function normalizeInvoicePaymentFailed(data: unknown): PaystackEventFacts {
-  return invoiceFacts('invoice.payment_failed', data, () => 'invoice.failed');
+function normalizeInvoicePaymentFailed(data: unknown, context: NormalizeEventContext): PaystackEventFacts {
+  return invoiceFacts('invoice.payment_failed', data, () => 'invoice.failed', context);
 }
 
-const NORMALIZERS: Readonly<Record<PaystackSupportedEvent, (data: unknown) => PaystackEventFacts>> =
+const NORMALIZERS: Readonly<
+  Record<PaystackSupportedEvent, (data: unknown, context: NormalizeEventContext) => PaystackEventFacts>
+> =
   Object.freeze({
     'charge.success': normalizeChargeSuccess,
     'invoice.payment_failed': normalizeInvoicePaymentFailed,
@@ -694,7 +709,10 @@ const NORMALIZERS: Readonly<Record<PaystackSupportedEvent, (data: unknown) => Pa
  *
  * The payload itself is never returned, stored or logged by this function.
  */
-export function normalizePaystackEventPayload(payload: unknown): PaystackEventFacts {
+export function normalizePaystackEventPayload(
+  payload: unknown,
+  options?: { expectedDomain?: BillingProviderMode },
+): PaystackEventFacts {
   const envelope = envelopeSchema.safeParse(payload);
   if (!envelope.success) {
     throw new PaystackAdapterError(
@@ -714,5 +732,5 @@ export function normalizePaystackEventPayload(payload: unknown): PaystackEventFa
   if (envelope.data.data === undefined) {
     throw malformed(name, 'data');
   }
-  return NORMALIZERS[name](envelope.data.data);
+  return NORMALIZERS[name](envelope.data.data, { expectedDomain: options?.expectedDomain ?? 'test' });
 }

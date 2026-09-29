@@ -44,7 +44,10 @@ import {
   billingFxRateDisplay,
   billingPaymentAmountDisplay,
   billingUsdAmountDisplay,
+  billingPaymentEvidenceSchema,
+  billingProviderModeSchema,
   billingStateDtoSchema,
+  BILLING_PROVIDER_MODES,
   getCommercialPlan,
   isBillingCheckoutProjectionError,
   projectBillingCheckoutSession,
@@ -138,8 +141,10 @@ function billingState(args: {
   provider?: string | null;
   providerState?: string | null;
   paymentConfirmed?: boolean;
+  mode?: 'test' | 'live';
 } = {}): BillingStateDto {
   return billingStateDtoSchema.parse({
+    mode: args.mode ?? 'test',
     subscription: {
       id: SUBSCRIPTION_ID,
       plan: args.plan ?? 'free',
@@ -577,6 +582,73 @@ describe('Billing Step 9 — resolveBillingCheckoutState', () => {
     assert.equal(billing.providerStatus.paymentConfirmed, false, 'the server fact is untouched');
     // Losing the UI flag (a reload) returns to the server-derived state.
     assert.equal(resolveBillingCheckoutState({ billing }), 'awaiting_verification');
+  });
+});
+
+/* ========================================================================== */
+/* The explicit test|live mode vocabulary (migration 0035 widening)          */
+/* ========================================================================== */
+
+describe('Billing — the two-value provider mode is explicit and exhaustive', () => {
+  const SHA = 'a'.repeat(64);
+  const ISO = '2026-09-22T12:00:00.000Z';
+  const evidenceRow = (providerDomain: unknown) => ({
+    id: '2b0e7c1e-1111-4222-8333-444455556666',
+    userId: '2b0e7c1e-1111-4222-8333-444455557777',
+    subscriptionId: '2b0e7c1e-1111-4222-8333-444455558888',
+    pricingSnapshotId: '2b0e7c1e-1111-4222-8333-444455559999',
+    provider: 'paystack',
+    providerReference: 've-chk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    providerTransactionId: null,
+    paymentAmountMinor: 48_750,
+    paymentCurrency: 'GHS',
+    paymentAmountExponent: 2,
+    providerStatus: 'success',
+    providerDomain,
+    providerCustomerId: null,
+    providerCustomerCode: null,
+    paidAt: ISO,
+    verifiedAt: ISO,
+    evidenceHash: SHA,
+    idempotencyKey: SHA,
+    createdAt: ISO,
+    updatedAt: ISO,
+  });
+
+  test('the vocabulary is exactly {test, live} — never an implicit boolean', () => {
+    assert.deepEqual([...BILLING_PROVIDER_MODES], ['test', 'live'], 'exactly two provider modes exist');
+    assert.equal(billingProviderModeSchema.safeParse('test').success, true);
+    assert.equal(billingProviderModeSchema.safeParse('live').success, true);
+    for (const invalid of ['sandbox', 'prod', 'production', 'Sandbox', '', 'true']) {
+      assert.equal(billingProviderModeSchema.safeParse(invalid).success, false, `refuses "${invalid}"`);
+    }
+  });
+
+  test('a durable evidence row carries a two-value domain: test and live parse, anything else does not', () => {
+    assert.equal(billingPaymentEvidenceSchema.safeParse(evidenceRow('test')).success, true);
+    assert.equal(billingPaymentEvidenceSchema.safeParse(evidenceRow('live')).success, true);
+    for (const invalid of ['sandbox', 'Sandbox', 'TEST', 'prod', '']) {
+      assert.equal(
+        billingPaymentEvidenceSchema.safeParse(evidenceRow(invalid)).success,
+        false,
+        `evidence domain "${invalid}" is refused`,
+      );
+    }
+  });
+
+  test('the billing-state DTO requires the configured mode, and only test|live parse', () => {
+    const base = billingState();
+    assert.equal(base.mode, 'test', 'the default state is test/sandbox');
+    assert.equal(billingStateDtoSchema.safeParse({ ...base, mode: 'live' }).success, true);
+    const { mode: _mode, ...withoutMode } = base;
+    assert.equal(
+      billingStateDtoSchema.safeParse(withoutMode).success,
+      false,
+      'mode is required — a response never omits it and never infers it',
+    );
+    for (const invalid of ['sandbox', 'Sandbox', 'prod', true]) {
+      assert.equal(billingStateDtoSchema.safeParse({ ...base, mode: invalid }).success, false);
+    }
   });
 });
 

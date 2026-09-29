@@ -20,6 +20,7 @@ import {
   type ProviderSubscriptionState,
   type SubscriptionSyncResult,
 } from '@veltrixeye/contracts';
+import type { BillingProviderMode } from '@veltrixeye/contracts';
 // The billing provider SEAM (the interface this adapter satisfies, its request
 // schemas and the checkout session contract) lives in core. Core never imports
 // a provider package, so this dependency cannot create a cycle.
@@ -72,7 +73,8 @@ import {
 } from './client.js';
 
 /**
- * The Paystack billing provider — SANDBOX ONLY, fail-closed, no hidden I/O.
+ * The Paystack billing provider — mode-aware (sandbox by default, live only by
+ * explicit configuration), fail-closed, no hidden I/O.
  *
  * ---------------------------------------------------------------------------
  * WHAT THIS ADAPTER IMPLEMENTS (documented provider operations only)
@@ -153,8 +155,9 @@ import {
  * ---------------------------------------------------------------------------
  * FAIL-CLOSED RULES ENFORCED HERE
  * ---------------------------------------------------------------------------
- *  1. Sandbox only: `sk_test_` keys only; live keys are refused at construction
- *     and `live` is pinned `false`.
+ *  1. Mode-matched keys only: the key prefix must match the configured mode
+ *     (`sk_test_` in test, `sk_live_` in live); a mismatch is refused at
+ *     construction, and `live` is pinned `false`.
  *  2. An authorized pricing snapshot is REQUIRED to initialize a payment. A
  *     missing, malformed, mismatched or provider-plan-inconsistent snapshot
  *     means nothing is sent.
@@ -338,7 +341,13 @@ export function deterministicLocalId(...parts: string[]): string {
 
 export class PaystackBillingProvider implements BillingProvider {
   readonly id: BillingProviderId = BILLING_PROVIDER;
-  readonly name = 'paystack-sandbox';
+  /** Adapter name states the configured domain: sandbox (default) or live. */
+  readonly name: string;
+  /**
+   * The configured provider domain this adapter operates in (`test`, the
+   * default, or `live`), inherited from the validated client configuration.
+   */
+  readonly mode: BillingProviderMode;
   /**
    * Honest capability flag. The seam defines eight operations; six are
    * implemented against documented endpoints (plus local event
@@ -352,6 +361,8 @@ export class PaystackBillingProvider implements BillingProvider {
 
   constructor(private readonly config: PaystackProviderConfig) {
     this.client = new PaystackClient(config);
+    this.mode = this.client.mode;
+    this.name = this.mode === 'live' ? 'paystack-live' : 'paystack-sandbox';
   }
 
   describe(): Record<string, unknown> {
@@ -674,7 +685,10 @@ export class PaystackBillingProvider implements BillingProvider {
       // currency + exponent, exact amount, provider plan identifier, FX version,
       // pricing policy and ACTIVE status. Retirement, a mismatch or an unknown
       // value fails closed — there is no fallback epoch and no re-rate.
-      assertProviderPlanMatches(plan, providerPlanExpectationFromSnapshot(snapshot, providerPlanId));
+      assertProviderPlanMatches(
+        plan,
+        providerPlanExpectationFromSnapshot(snapshot, providerPlanId, { mode: this.mode }),
+      );
     } catch (error) {
       if (isBillingProviderPlanError(error)) {
         throw new PaystackAdapterError('plan_mismatch', error.message);
@@ -773,10 +787,12 @@ export class PaystackBillingProvider implements BillingProvider {
           'The result is not treated as this checkout: this is a conflict requiring review.',
       );
     }
-    if (verified.domain !== 'test') {
+    if (verified.domain !== this.mode) {
       throw new PaystackAdapterError(
         'response_conflict',
-        'The provider reported a non-sandbox transaction domain; this build is sandbox-only, so the verification is refused.',
+        this.mode === 'test'
+          ? 'The provider reported a non-sandbox transaction domain; this build is sandbox-only, so the verification is refused.'
+          : 'The provider reported a non-live transaction domain; this adapter is configured for live mode, so the verification is refused.',
       );
     }
 
@@ -923,10 +939,12 @@ export class PaystackBillingProvider implements BillingProvider {
           'The result is not treated as this subscription: this is a conflict requiring review.',
       );
     }
-    if (record.domain !== 'test') {
+    if (record.domain !== this.mode) {
       throw new PaystackAdapterError(
         'response_conflict',
-        'The provider reported a non-sandbox subscription domain; this build is sandbox-only, so the read is refused.',
+        this.mode === 'test'
+          ? 'The provider reported a non-sandbox subscription domain; this build is sandbox-only, so the read is refused.'
+          : 'The provider reported a non-live subscription domain; this adapter is configured for live mode, so the read is refused.',
       );
     }
 
@@ -1197,7 +1215,7 @@ export class PaystackBillingProvider implements BillingProvider {
     const providerEventId = this.eventReference(delivery.providerEventId);
 
     // Pure normalization: canonical facts, or a typed refusal.
-    const facts = normalizePaystackEventPayload(delivery.payload);
+    const facts = normalizePaystackEventPayload(delivery.payload, { expectedDomain: this.mode });
 
     // Deterministic identity. Core owns both derivations (one implementation of
     // the rule, already covered by core's tests); the payload is hashed, never

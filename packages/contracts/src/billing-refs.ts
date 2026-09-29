@@ -49,3 +49,15 @@ export const billingIsoDateTimeSchema = z.string().datetime();
 
 /** UUID identifier. */
 export const billingUuidSchema = z.string().uuid();
+
+/**
+ * The explicit provider-domain (Paystack mode) vocabulary: `test` (sandbox)
+ * or `live` (production). This is the ONE shared spelling of the two-value
+ * domain used by the evidence ledger, provider-plan epochs, the billing-state
+ * DTO, the adapter seam and the configuration — never an implicit boolean.
+ * `test` is the default everywhere; `live` only ever arrives through explicit
+ * configuration (`PAYSTACK_MODE`), never as a fallback.
+ */
+export const BILLING_PROVIDER_MODES = ['test', 'live'] as const;
+export type BillingProviderMode = (typeof BILLING_PROVIDER_MODES)[number];
+export const billingProviderModeSchema = z.enum(BILLING_PROVIDER_MODES);

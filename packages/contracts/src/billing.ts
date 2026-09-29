@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { userPlanSchema } from './users.js';
+import { billingProviderModeSchema } from './billing-refs.js';
 
 export const subscriptionStatusSchema = z.enum(['active', 'trialing', 'past_due', 'canceled', 'expired']);
 export type SubscriptionStatus = z.infer<typeof subscriptionStatusSchema>;
@@ -72,6 +73,14 @@ export const billingProviderStatusDtoSchema = z
 export type BillingProviderStatusDto = z.infer<typeof billingProviderStatusDtoSchema>;
 
 export const billingStateDtoSchema = z.object({
+  /**
+   * The configured provider mode this response is served in: `test`
+   * (sandbox, the default) or `live`. Display-only — the UI derives its copy
+   * ("Sandbox Checkout" vs "Checkout") from this field so a live deployment
+   * never claims to be a sandbox, and vice versa. It never widens any
+   * capability in the payload.
+   */
+  mode: billingProviderModeSchema,
   subscription: subscriptionDtoSchema,
   entitlements: entitlementsDtoSchema,
   providerStatus: billingProviderStatusDtoSchema,

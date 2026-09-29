@@ -63,6 +63,7 @@ import {
   type ExecutionProviderRegistry,
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
+import type { PaystackFetchFn } from '@veltrixeye/provider-paystack';
 import { authRoutes } from './routes/auth.js';
 import { userRoutes } from './routes/users.js';
 import { strategyRoutes } from './routes/strategies.js';
@@ -187,7 +188,18 @@ export interface AppContext {
   };
 }
 
-export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
+export function createAppContext(
+  pool: pg.Pool,
+  config: AppConfig,
+  options?: {
+    /**
+     * TEST-ONLY transport injection for the billing adapter. Production never
+     * passes this: the adapter then uses global fetch. Tests inject a stub so
+     * an end-to-end composition can exercise live mode without any network.
+     */
+    billingFetchFn?: PaystackFetchFn;
+  },
+): AppContext {
   const audit = new AuditService(pool);
   const providerRegistry = createProviderRegistry();
   const candles = new CandleStore(pool);
@@ -436,7 +448,11 @@ export function createAppContext(pool: pg.Pool, config: AppConfig): AppContext {
   // rate that ages out must never unregister a provider. Data-dependent
   // decisions fail closed per call instead (stale rate → refuse to price,
   // epoch mismatch → refuse to charge).
-  const billing = composeBillingProvider(pool, config);
+  const billing = composeBillingProvider(
+    pool,
+    config,
+    options?.billingFetchFn !== undefined ? { fetchFn: options.billingFetchFn } : undefined,
+  );
   // Billing Step 5.2 — the secure webhook receiver. Exists only when the
   // provider is registered (a sandbox key is configured); with no key the
   // route does not exist, so nothing half-configured is reachable.

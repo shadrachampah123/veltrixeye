@@ -424,6 +424,7 @@ describe('GET /api/billing/me — provider-backed rows are never a confirmed sub
     // contract refuses is anything that is not a boolean — a client can never
     // hand the read side a confirmation.
     const shape = (paymentConfirmed: unknown) => billingStateDtoSchema.safeParse({
+      mode: 'test',
       subscription: {
         id: '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d', plan: 'pro', status: 'active',
         currentPeriodEnd: null, cancelAtPeriodEnd: false,

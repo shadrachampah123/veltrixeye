@@ -22,7 +22,9 @@
  *  - it never writes `subscriptions`, `users`, entitlements or execution;
  *  - it never enables execution: `canAccessAutomation` stays false for every plan;
  *  - it reads no secret and creates none: the only configuration is
- *    `DATABASE_URL`, exactly like `npm run db:migrate`.
+ *    `DATABASE_URL` plus the explicit provider domain `PAYSTACK_MODE`
+ *    (`test` default, `live` only when the deployment says so) — the same
+ *    fail-closed pairing the API composes with. It never reads a key.
  *
  * Exit codes: 0 on a recorded or replayed activation, 1 on a typed refusal
  * (nothing was written), 2 on a usage error.
@@ -150,9 +152,23 @@ async function main(): Promise<number> {
     return 2;
   }
 
+  // The configured provider domain: same vocabulary and same default as the
+  // API's PAYSTACK_MODE, validated fail-closed here (an unknown value refuses
+  // instead of guessing a domain). The mode scopes which evidence domain this
+  // activation accepts — no silent cross-domain activation in either
+  // direction.
+  const modeRaw = env('PAYSTACK_MODE') ?? 'test';
+  if (modeRaw !== 'test' && modeRaw !== 'live') {
+    console.error(
+      '[billing:activate] PAYSTACK_MODE must be exactly "test" or "live"; refusing to guess a provider domain.',
+    );
+    return 2;
+  }
+  const mode = modeRaw;
+
   const pool = createPool({ databaseUrl });
   try {
-    const service = new BillingActivationService({ db: pool });
+    const service = new BillingActivationService({ db: pool, mode });
     const result = await service.activate({
       user: args.user,
       operatorId: args.by,
@@ -165,6 +181,7 @@ async function main(): Promise<number> {
         {
           outcome: result.outcome,
           replayed: result.replayed,
+          mode,
           activation: {
             id: activation.id,
             userId: activation.userId,

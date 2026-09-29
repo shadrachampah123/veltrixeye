@@ -155,7 +155,11 @@ describe('billing provider seam — the boundary only', () => {
 
     registry.register(createUnimplementedBillingProvider());
     assert.equal(registry.size, 1);
-    assert.deepEqual(registry.list(), [{ id: 'paystack', name: 'paystack-unimplemented', implemented: false, live: false }]);
+    // The registered info now carries the configured mode (`test` default) —
+    // an additive widening of the seam's status surface (migration 0035).
+    assert.deepEqual(registry.list(), [
+      { id: 'paystack', name: 'paystack-unimplemented', implemented: false, live: false, mode: 'test' },
+    ]);
     assert.deepEqual(registry.implementedProviders(), [], 'a placeholder is not an implementation');
     assert.throws(
       () => registry.register(createUnimplementedBillingProvider()),

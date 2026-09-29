@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { BillingProviderMode } from '@veltrixeye/contracts';
 import {
   PAYSTACK_ERROR_MESSAGE_MAX,
   PaystackAdapterError,
@@ -8,15 +9,16 @@ import {
 } from './errors.js';
 
 /**
- * Paystack REST client — SANDBOX ONLY, documented operations only, one HTTP
- * attempt per call.
+ * Paystack REST client — mode-aware (sandbox by default, live only by explicit
+ * configuration), documented operations only, one HTTP attempt per call.
  *
- * The platform's payment provider is used exclusively in TEST MODE. This client
- * therefore:
+ * The configured provider domain comes from `mode`, and the secret key's
+ * prefix MUST match it. This client therefore:
  *
- *  * accepts ONLY a `sk_test_` secret key. A live key (`sk_live_`) — or any
- *    other key shape — is refused at construction time, so no code path,
- *    configuration mistake or deployment can put live money through this build;
+ *  * accepts only the key matching the configured mode (`sk_test_` in test,
+ *    `sk_live_` in live); a prefix that contradicts the mode — or any other
+ *    key shape — is refused at construction time, so no code path or
+ *    configuration mistake can silently cross domains;
  *  * talks to exactly one host, `https://api.paystack.co`, which is a constant.
  *    There is no environment variable for it: no deployment can point the
  *    adapter at a different host, and no test can accidentally reach the real
@@ -45,10 +47,18 @@ import {
 /** The only host this build may talk to (test and live keys share it). */
 export const PAYSTACK_API_BASE_URL = 'https://api.paystack.co' as const;
 
-/** The only key prefix this build accepts (sandbox/test mode). */
+/** The key prefix test mode accepts (sandbox/test credentials). */
 export const PAYSTACK_TEST_KEY_PREFIX = 'sk_test_' as const;
 
-/** Pinned: this adapter is not a live-payment path. */
+/** The key prefix live mode accepts (production credentials). */
+export const PAYSTACK_LIVE_KEY_PREFIX = 'sk_live_' as const;
+
+/**
+ * Pinned: this adapter is not an EXECUTION path. Independent of the provider
+ * domain (`mode`): even a live-mode adapter grants no execution and lies
+ * about nothing — `live` here always answers "billing is not an execution
+ * path".
+ */
 export const PAYSTACK_LIVE = false as const;
 
 export type PaystackFetchFn = (
@@ -62,7 +72,14 @@ export type PaystackFetchFn = (
 ) => Promise<{ status: number; json(): Promise<unknown> }>;
 
 export interface PaystackClientConfig {
-  /** Test-mode secret key (`sk_test_…`). Never logged, never persisted. */
+  /**
+   * The configured provider domain: `test` (sandbox, the default) or `live`.
+   * The secret key's prefix MUST match it (test → `sk_test_`, live →
+   * `sk_live_`); a mismatch fails construction — there is no cross-mode use
+   * and no silent fallback between modes.
+   */
+  mode?: BillingProviderMode;
+  /** Secret key matching the configured mode (`sk_test_…` or `sk_live_…`). Never logged, never persisted. */
   secretKey: string;
   /** Per-request timeout (ms). */
   timeoutMs: number;
@@ -382,31 +399,48 @@ export interface PaystackInitializedTransaction {
 }
 
 export class PaystackClient {
+  /** The configured provider domain this client operates in. */
+  readonly mode: BillingProviderMode;
+  /** The provider domain responses and deliveries must report. */
+  readonly expectedDomain: BillingProviderMode;
   private readonly secretKey: string;
   private readonly timeoutMs: number;
   private readonly fetchFn: PaystackFetchFn;
   private readonly clock: () => Date;
 
   constructor(config: PaystackClientConfig) {
+    const mode = config.mode ?? 'test';
+    const requiredPrefix = mode === 'live' ? PAYSTACK_LIVE_KEY_PREFIX : PAYSTACK_TEST_KEY_PREFIX;
     const key = config.secretKey ?? '';
     if (key === '') {
       throw paystackConfigurationError(
-        'Paystack is not configured: a sandbox test secret key is required.',
+        mode === 'test'
+          ? 'Paystack is not configured: a sandbox test secret key is required.'
+          : 'Paystack is not configured: a live secret key is required.',
       );
     }
-    if (!key.startsWith(PAYSTACK_TEST_KEY_PREFIX)) {
+    if (!key.startsWith(requiredPrefix)) {
       throw paystackConfigurationError(
-        `Only sandbox (test-mode) Paystack credentials are accepted by this build (a key starting ` +
-          `"${PAYSTACK_TEST_KEY_PREFIX}"); live credentials are refused.`,
+        mode === 'test'
+          ? `Only sandbox (test-mode) Paystack credentials are accepted by this build (a key starting ` +
+            `"${PAYSTACK_TEST_KEY_PREFIX}"); live credentials are refused.`
+          : `Only live-mode Paystack credentials are accepted when mode is live (a key starting ` +
+            `"${PAYSTACK_LIVE_KEY_PREFIX}"); sandbox test credentials are refused.`,
       );
     }
-    if (/^sk_test_\s*$/.test(key)) {
-      throw paystackConfigurationError('The configured Paystack test key is empty.');
+    if (new RegExp(`^${requiredPrefix}\\s*$`).test(key)) {
+      throw paystackConfigurationError(
+        mode === 'test'
+          ? 'The configured Paystack test key is empty.'
+          : 'The configured Paystack live key is empty.',
+      );
     }
     if (!Number.isInteger(config.timeoutMs) || config.timeoutMs <= 0) {
       throw paystackConfigurationError('A positive Paystack request timeout (ms) is required.');
     }
 
+    this.mode = mode;
+    this.expectedDomain = mode;
     this.secretKey = key;
     this.timeoutMs = config.timeoutMs;
     this.fetchFn =
@@ -423,10 +457,12 @@ export class PaystackClient {
 
   /** Never returns the key. Operator-safe description for boot logs. */
   describe(): Record<string, unknown> {
+    // Operator-safe: never carries the key. The mode field states which
+    // domain this client is configured for — identical shape in both modes.
     return {
       provider: 'paystack',
       baseUrl: PAYSTACK_API_BASE_URL,
-      mode: 'test',
+      mode: this.mode,
       live: PAYSTACK_LIVE,
       timeoutMs: this.timeoutMs,
     };
@@ -754,11 +790,14 @@ export class PaystackClient {
           'Nothing was cancelled.',
       );
     }
-    if (parsed.data.domain !== 'test') {
+    if (parsed.data.domain !== this.expectedDomain) {
       throw new PaystackAdapterError(
         'response_conflict',
-        'The provider reported a non-sandbox subscription domain; this build is sandbox-only, so the cancellation ' +
-          'is refused.',
+        this.expectedDomain === 'test'
+          ? 'The provider reported a non-sandbox subscription domain; this build is sandbox-only, so the ' +
+            'cancellation is refused.'
+          : 'The provider reported a non-live subscription domain; this client is configured for live mode, so ' +
+            'the cancellation is refused.',
       );
     }
 

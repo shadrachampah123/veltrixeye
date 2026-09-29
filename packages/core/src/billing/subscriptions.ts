@@ -1,5 +1,6 @@
 import type { Pool } from 'pg';
 import {
+  type BillingProviderMode,
   type BillingProviderStatusDto,
   type SubscriptionDto,
   type UserPlan,
@@ -26,6 +27,12 @@ interface SubscriptionStateRow {
 }
 
 export interface BillingState {
+  /**
+   * The configured provider mode this state is reported in (`test`, the
+   * default, or `live`) — the display-only field of the billing-state DTO.
+   * Composition/routes pass the configured mode; direct callers get `test`.
+   */
+  mode: BillingProviderMode;
   subscription: SubscriptionDto;
   entitlements: Entitlements;
   /**
@@ -69,7 +76,12 @@ function toProviderStatus(row: SubscriptionStateRow): BillingProviderStatusDto {
   };
 }
 
-export async function getBillingState(db: Pool, userId: string): Promise<BillingState> {
+export async function getBillingState(
+  db: Pool,
+  userId: string,
+  options?: { mode?: BillingProviderMode },
+): Promise<BillingState> {
+  const mode = options?.mode ?? 'test';
   const { rows } = await db.query<SubscriptionStateRow>(
     `SELECT *,
             EXISTS (
@@ -90,6 +102,7 @@ export async function getBillingState(db: Pool, userId: string): Promise<Billing
       cancelAtPeriodEnd: false,
     };
     return {
+      mode,
       subscription: sub,
       // provider IS NULL: the historical, unchanged free resolution.
       entitlements: resolveEntitlements('free', 'active', null, false),
@@ -100,6 +113,7 @@ export async function getBillingState(db: Pool, userId: string): Promise<Billing
   const row = rows[0]!;
   const sub = toSubscriptionDto(row);
   return {
+    mode,
     subscription: sub,
     // A provider-backed row resolves to the free tier until an immutable
     // activation fact exists (evidence alone is never authority); a historical

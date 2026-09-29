@@ -8,6 +8,7 @@ import {
   type BillingInterval,
   type BillingPaymentCurrency,
   type BillingPricingSnapshot,
+  type BillingProviderMode,
   type CommercialPlanId,
 } from '@veltrixeye/contracts';
 import { BILLING_CATALOGUE_VERSION, cataloguePriceMinor, unmappedCommercialPlans } from './catalogue.js';
@@ -385,6 +386,14 @@ export interface PriceFromProviderPlanEpochInput {
   asOf: Date;
   /** Our own reference for the intended purchase, when one exists. */
   providerReference?: string | null;
+  /**
+   * The configured provider domain the derivation runs in (`test`, the
+   * default, or `live`). Passed straight to the epoch parser's allowed-mode
+   * check: a snapshot is only ever derived from an epoch in the SAME domain
+   * as the caller — defaulting stays test, and a live path passes `live`
+   * explicitly (no silent cross-domain derivation).
+   */
+  mode?: BillingProviderMode;
 }
 
 /**
@@ -427,7 +436,7 @@ export interface PriceFromProviderPlanEpochInput {
 export function priceFromProviderPlanEpoch(
   input: PriceFromProviderPlanEpochInput,
 ): BillingPricingSnapshot {
-  const epoch = parseProviderPlan(input.epoch);
+  const epoch = parseProviderPlan(input.epoch, { allowedMode: input.mode ?? 'test' });
   // A retired epoch is history: retirement is one-way and a retired epoch can
   // never authorize a new charge or a new snapshot.
   assertProviderPlanRetirable(epoch);

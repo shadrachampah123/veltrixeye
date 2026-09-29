@@ -205,7 +205,7 @@ function SettingsContent() {
             onBillingChange={loadBilling}
           />
 
-          <PlanComparison currentPlan={billing?.subscription.plan ?? user.plan} />
+          <PlanComparison currentPlan={billing?.subscription.plan ?? user.plan} mode={billing?.mode ?? null} />
 
           {/* Active sessions */}
           <Card>

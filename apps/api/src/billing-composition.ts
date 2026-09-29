@@ -1,10 +1,11 @@
 import type pg from 'pg';
-import { BILLING_PROVIDER } from '@veltrixeye/contracts';
+import { BILLING_PROVIDER, type BillingProviderMode } from '@veltrixeye/contracts';
 import {
   PaystackNotImplementedError,
   PaystackAdapterError,
   createPaystackProvider,
   type PaystackCustomerDirectory,
+  type PaystackFetchFn,
   type PaystackPlanDirectory,
 } from '@veltrixeye/provider-paystack';
 import {
@@ -58,7 +59,8 @@ export interface BillingCompositionStatus {
   /** Why registration did or did not happen (operator-facing, no secrets). */
   reason: string;
   provider: string;
-  mode: 'test';
+  /** The configured provider domain composition ran in (`test` | `live`). */
+  mode: 'test' | 'live';
   /** Operator-safe adapter description when registered. */
   describe: Record<string, unknown> | null;
 }
@@ -96,26 +98,35 @@ export function paystackCustomerDirectory(db: pg.Pool): PaystackCustomerDirector
  * adapter then compares the validated epoch against the authorized payment
  * before any recurring charge. The adapter never sees an unvalidated row.
  */
-export function paystackPlanDirectory(db: pg.Pool): PaystackPlanDirectory {
+export function paystackPlanDirectory(
+  db: pg.Pool,
+  mode: BillingProviderMode = 'test',
+): PaystackPlanDirectory {
   return {
     async find(providerPlanId: string): Promise<BillingProviderPlan | null> {
       // Explicit column list, matching the epoch contract exactly: `SELECT *`
       // would also return durable audit columns (created_at/updated_at/
       // catalogue_amount_minor) that the strict epoch parser refuses by design,
       // turning a valid epoch into a hard failure.
+      //
+      // MODE-SCOPED (migration 0035): the directory only ever sees epochs in
+      // the configured domain, and the parser re-checks the allowed mode — a
+      // live deployment never selects a test epoch and vice versa, even when
+      // both rows share the same provider plan identifier.
       const { rows } = await db.query(
         `SELECT id, provider, mode, catalogue_plan, billing_interval, payment_currency,
                 payment_amount_minor, payment_amount_exponent, provider_plan_id,
                 provider_plan_reference, fx_rate_version_id, pricing_policy_version,
                 catalogue_version, status, valid_from, retired_at, retired_reason
            FROM billing_provider_plans
-          WHERE provider = $1 AND provider_plan_id = $2`,
-        [BILLING_PROVIDER, providerPlanId],
+          WHERE provider = $1 AND provider_plan_id = $2 AND mode = $3`,
+        [BILLING_PROVIDER, providerPlanId, mode],
       );
       const row = rows[0];
       if (row === undefined) return null;
-      // Throws on anything this build does not fully understand.
-      return parseProviderPlan(row);
+      // Throws on anything this build does not fully understand — including a
+      // row from any domain other than the configured one.
+      return parseProviderPlan(row, { allowedMode: mode });
     },
   };
 }
@@ -123,12 +134,20 @@ export function paystackPlanDirectory(db: pg.Pool): PaystackPlanDirectory {
 /**
  * Build the billing provider composition.
  *
- * Registered ONLY when the configuration carries a usable sandbox key; the
- * adapter itself refuses any key that is not a `sk_test_` test key, so this
- * function cannot register a live provider even if it wanted to.
+ * Registered ONLY when the configuration carries a usable key FOR THE
+ * CONFIGURED MODE (`PAYSTACK_MODE` + matching prefix — already validated at
+ * boot): the adapter repeats the prefix/domain validation, so an empty key,
+ * a wrong-prefix key or a mode mismatch cannot reach the registry. Options
+ * exist for TESTS ONLY: `fetchFn` injects the transport so no test ever
+ * reaches a network.
  */
-export function composeBillingProvider(db: pg.Pool, config: AppConfig): BillingComposition {
+export function composeBillingProvider(
+  db: pg.Pool,
+  config: AppConfig,
+  options?: { fetchFn?: PaystackFetchFn },
+): BillingComposition {
   const registry = createBillingProviderRegistry();
+  const mode = config.billing.mode;
 
   const secretKey = config.PAYSTACK_SECRET_KEY;
   if (secretKey === '') {
@@ -137,7 +156,7 @@ export function composeBillingProvider(db: pg.Pool, config: AppConfig): BillingC
       status: {
         registered: false,
         provider: BILLING_PROVIDER,
-        mode: 'test',
+        mode,
         reason:
           'PAYSTACK_SECRET_KEY is not set — no billing provider is registered, so no customer can be ' +
           'provisioned and no payment can be initialized (fail closed).',
@@ -148,9 +167,11 @@ export function composeBillingProvider(db: pg.Pool, config: AppConfig): BillingC
 
   const provider = createPaystackProvider({
     secretKey,
+    mode,
     timeoutMs: config.billing.timeoutMs,
     customers: paystackCustomerDirectory(db),
-    plans: paystackPlanDirectory(db),
+    plans: paystackPlanDirectory(db, mode),
+    ...(options?.fetchFn !== undefined ? { fetchFn: options.fetchFn } : {}),
   });
 
   registry.register(provider);
@@ -160,8 +181,11 @@ export function composeBillingProvider(db: pg.Pool, config: AppConfig): BillingC
     status: {
       registered: true,
       provider: BILLING_PROVIDER,
-      mode: 'test',
-      reason: 'Paystack sandbox adapter registered (test mode; live credentials are refused).',
+      mode,
+      reason:
+        mode === 'test'
+          ? 'Paystack sandbox adapter registered (test mode; live credentials are refused).'
+          : 'Paystack adapter registered (live mode; billing remains not an execution path).',
       describe: provider.describe(),
     },
   };
@@ -263,7 +287,11 @@ export function composeBillingCustomers(
  * and no execution gate — evidence is information, never authority.
  */
 export function composeBillingVerify(
-  db: pg.Pool, providers: BillingProviderRegistry,
+  db: pg.Pool, providers: BillingProviderRegistry, config?: AppConfig,
 ): BillingPaymentConfirmationService {
-  return new BillingPaymentConfirmationService({ db, providers });
+  return new BillingPaymentConfirmationService({
+    db,
+    providers,
+    mode: config?.billing.mode ?? 'test',
+  });
 }
