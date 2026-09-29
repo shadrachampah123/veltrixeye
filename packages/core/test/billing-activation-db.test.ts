@@ -114,7 +114,7 @@ after(async () => {
    ========================================================================== */
 
 describe('Step 8 — 0034 file conventions and history integrity', () => {
-  test('0001-0033 are byte-identical and 0034 is the only new migration', () => {
+  test('0001-0033 are byte-identical, 0034 is the only Step 8 migration, and 0035 is the only later one', () => {
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((file) => /^\d{4}_.+\.sql$/.test(file))
       .sort();
@@ -135,15 +135,16 @@ describe('Step 8 — 0034 file conventions and history integrity', () => {
 
     const versions = files.map((file) => Number(/^(\d{4})_/.exec(file)?.[1]));
     assert.equal(new Set(versions).size, versions.length, 'no duplicate migration version');
-    for (let expected = 1; expected <= 34; expected += 1) {
+    for (let expected = 1; expected <= 35; expected += 1) {
       assert.ok(versions.includes(expected), `migration ${String(expected).padStart(4, '0')} exists`);
     }
     assert.equal(files.filter((file) => file.startsWith('0034_')).length, 1, 'exactly one 0034 migration');
-    assert.equal(files.at(-1), MIGRATION_0034, '0034 is the newest migration');
+    assert.equal(files.filter((file) => file.startsWith('0035_')).length, 1, 'exactly one 0035 migration (live mode)');
+    assert.equal(files.at(-1), '0035_billing_live_mode.sql', '0035 is the newest migration (live-mode widening)');
     assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 34).length,
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 35).length,
       0,
-      'nothing is numbered after 0034',
+      'nothing is numbered after 0035',
     );
   });
 

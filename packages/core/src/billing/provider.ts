@@ -17,6 +17,7 @@ import {
   type BillingEventIdempotencyInput,
   type BillingPlanIdentity,
   type BillingProviderId,
+  type BillingProviderMode,
   type BillingProviderOperation,
   type NormalizedBillingEvent,
   type ProviderSubscriptionState,
@@ -300,9 +301,17 @@ export interface BillingProvider {
   readonly implemented: boolean;
   /**
    * Pinned `false` by the type: the billing seam is not an execution path and
-   * can never become one.
+   * can never become one. This is intentionally independent of `mode` below:
+   * `mode` says which provider DOMAIN the adapter talks to (test/live), while
+   * `live` here always answers "billing is never an execution path".
    */
   readonly live: false;
+  /**
+   * The configured provider domain this adapter operates in: `test` (sandbox,
+   * the default) or `live` (production). Supplied by composition from explicit
+   * configuration — never inferred, never defaulted on a live path.
+   */
+  readonly mode: BillingProviderMode;
   /**
    * Operator-safe description for boot logs. MUST NOT contain a credential:
    * the seam holds no keys in PR2, and a later adapter describes itself
@@ -337,6 +346,8 @@ export interface RegisteredBillingProviderInfo {
   name: string;
   implemented: boolean;
   live: false;
+  /** Configured provider domain of the registered adapter (`test` | `live`). */
+  mode: BillingProviderMode;
 }
 
 /**
@@ -372,6 +383,7 @@ export class BillingProviderRegistry {
       name: provider.name,
       implemented: provider.implemented,
       live: provider.live,
+      mode: provider.mode,
     }));
   }
 
@@ -431,6 +443,7 @@ export function createUnimplementedBillingProvider(id: BillingProviderId = BILLI
     name: `${id}-unimplemented`,
     implemented: false,
     live: false as const,
+    mode: 'test' as const,
     describe() {
       return Object.freeze({
         id,

@@ -40,7 +40,8 @@ git-ignored and never contain values you would commit.
 | `TWELVE_DATA_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-request upstream timeout. |
 | `TWELVE_DATA_MAX_RPM` | int 1–10000 | `50` | Client-side upstream cap (keep under plan credits/min). |
 | `TWELVE_DATA_CRYPTO_EXCHANGE` | string 1–32 | `Binance` | Pinned crypto venue (defines the stored series — don't change casually). |
-| `PAYSTACK_SECRET_KEY` | secret, ≤256 chars, **must start with `sk_test_`** | *(empty = billing unavailable)* | Billing PR3. **Sandbox only**: a live key (`sk_live_`) or a public key (`pk_*`) fails the boot — no deployment can move live money by setting a variable. Empty ⇒ the Paystack provider is **not registered** (the registry stays empty and a caller fails loudly) — fail closed, never a half-configured provider. **Server-side only**: never in the repo, an image, a log, a response or the database. |
+| `PAYSTACK_MODE` | `test` \| `live` | `test` | Provider domain. **Absent = `test`: the sandbox remains the default.** `test` requires an `sk_test_` key, `live` requires an `sk_live_` key, and a mismatch fails startup (the rejected key is never echoed); an unknown value fails startup too. `PAYSTACK_MODE=live` is **not a go-live procedure** — it only selects the domain this build is configured for; see `docs/billing.md` → *Live mode is configuration, not a go-live procedure* for the operator checklist it does **not** perform. Only configuration/composition reads this variable; no business or provider code reads the environment. |
+| `PAYSTACK_SECRET_KEY` | secret, ≤256 chars, **prefix must match `PAYSTACK_MODE`** (`sk_test_` in test, `sk_live_` in live) | *(empty = billing unavailable)* | Billing PR3. A key whose prefix contradicts `PAYSTACK_MODE` — or any other shaped key (`pk_*`, `sk_…` without a domain) — fails the boot. Empty ⇒ billing is **disabled in either mode**: the Paystack provider is **not registered** (the registry stays empty and a caller fails loudly) — fail closed, never a half-configured provider. **Server-side only**: never in the repo, an image, a log, a response or the database. |
 | `PAYSTACK_TIMEOUT_MS` | int 1000–60000 | `15000` | Per-request timeout for the single Paystack HTTP attempt. There is **no retry** (Paystack documents retries for webhooks, not for outbound calls) and no configurable base URL: the adapter talks to `https://api.paystack.co` and nothing else. |
 | `PAYSTACK_WEBHOOK_ALLOWED_IPS` | comma/whitespace-separated IPs/CIDRs | *(empty = documented provider IPs)* | Billing Step 5.2. Source-IP allow-list for `POST /api/billing/webhook`. Empty pins the provider's **documented** delivery addresses (`52.31.139.75`, `52.49.173.169`, `52.214.14.220` — same set in test and live). A `/0` entry is refused at boot. Defence in depth: the `x-paystack-signature` HMAC check remains the authority. The route itself exists **only** when `PAYSTACK_SECRET_KEY` is set. |
 | `PAYSTACK_WEBHOOK_RATE_LIMIT_MAX` | int 1–1000 | `30` | Billing Step 5.2. Deliveries per minute per IP accepted on the webhook route. Far above the provider's documented delivery/retry cadence, far below the global API limit — an unsigned flood stops here. |
@@ -185,8 +186,10 @@ See [deployment.md](./deployment.md) for the full production runbook.
 - The service needs up to **five** secrets: the `DATABASE_URL` credentials,
   the `TWELVE_DATA_API_KEY` provider key (server-side only — it travels in
   upstream query strings by vendor design, so it must never reach logs or
-  browsers), `PAYSTACK_SECRET_KEY` (sandbox/test-mode only; refused unless it
-  starts with `sk_test_`), and — once delivery is switched on — `SMTP_PASS` and
+  browsers), `PAYSTACK_SECRET_KEY` (the prefix must match `PAYSTACK_MODE` —
+  `sk_test_` for the default test mode, `sk_live_` only for an explicitly
+  configured live mode; a mismatch refuses the boot), and — once delivery is
+  switched on — `SMTP_PASS` and
   `NOTIFICATION_WORKER_TOKEN`. Session tokens are server-side (random per
   session, stored hashed) — no JWT secret is required.
 - Delivery credentials never leave the API process: they are read at boot, held
@@ -198,17 +201,18 @@ See [deployment.md](./deployment.md) for the full production runbook.
 - **No invented production credentials.** Real values are injected by the
   operator at deploy time; the code contains no stand-in production
   values. See [security.md](./security.md).
-- **Billing credentials are sandbox-only by construction.** The billing
-  configuration exposes exactly two variables (above), the Paystack adapter
-  refuses any key that is not a `sk_test_` test key before it can build a
-  request, reports `live: false`, and never includes a credential in
-  `describe()`. Billing is not a live-payment path: `POST /api/billing/checkout`
-  exists, but it initializes **sandbox** checkouts only and never confirms a
-  payment — the webhook receiver records deliveries, `POST /api/billing/verify`
+- **Billing credentials are mode-checked by construction.** The billing
+  configuration exposes exactly three variables (above), the Paystack adapter
+  refuses any key whose prefix contradicts `PAYSTACK_MODE` before it can build
+  a request, reports `live: false`, and never includes a credential in
+  `describe()`. Billing is not an execution path: `POST /api/billing/checkout`
+  exists, but it initializes checkouts only in the configured domain (sandbox
+  by default) and never confirms a payment — the webhook receiver records
+  deliveries, `POST /api/billing/verify`
   records verified-transaction evidence, and the only payment-confirmation
   authority is the out-of-band operator CLI (`npm run billing:activate`), so a
   checkout session can never upgrade an entitlement. Since **Billing Step 9**
-  that sandbox path has a browser surface (`/settings`): it sends only
+  that checkout path has a browser surface (`/settings`): it sends only
   `{ cataloguePlan, interval }`, receives a DISCLOSED session (status, the
   provider's `authorizationUrl` used verbatim, the commercial price, the exact
   GHS amount and the FX rate/version/time — never a checkout reference, a

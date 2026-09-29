@@ -8,6 +8,7 @@ import {
   type BillingInterval,
   type BillingPaymentEvidence,
   type BillingPricingSnapshot,
+  type BillingProviderMode,
   type BillingVerifiedTransaction,
   type CommercialPlanId,
 } from '@veltrixeye/contracts';
@@ -103,7 +104,7 @@ export const BILLING_ACTIVATION_ERROR_REASONS = [
   'incoherent_subscription',
   /** No verified payment evidence matches this subscription. */
   'payment_evidence_not_found',
-  /** The evidence is not a successful sandbox transaction. */
+  /** The evidence is not a successful transaction in the configured mode. */
   'evidence_not_successful',
   /** The exact payment reconciliation refused the evidence. */
   'reconciliation_failed',
@@ -396,10 +397,21 @@ interface SubscriptionFactRow {
 export interface BillingActivationOptions {
   db: Pool;
   now?: () => Date;
+  /**
+   * The configured provider mode activation accepts evidence from (`test`
+   * by default; `live` only when the operator CLI injects it from explicit
+   * configuration). Evidence from any other domain — and the SQL lookup that
+   * finds it — is scoped to THIS mode.
+   */
+  mode?: BillingProviderMode;
 }
 
 export class BillingActivationService {
-  constructor(private readonly options: BillingActivationOptions) {}
+  private readonly mode: BillingProviderMode;
+
+  constructor(private readonly options: BillingActivationOptions) {
+    this.mode = options.mode ?? 'test';
+  }
 
   /**
    * Authorize the activation of one user's commercial subscription.
@@ -497,12 +509,14 @@ export class BillingActivationService {
       }
       if (
         evidence.provider !== BILLING_PROVIDER ||
-        evidence.providerDomain !== 'test' ||
+        evidence.providerDomain !== this.mode ||
         evidence.providerStatus !== 'success'
       ) {
         throw new BillingActivationError(
           'evidence_not_successful',
-          'Activation refused: the payment evidence is not a successful sandbox paystack transaction.',
+          this.mode === 'test'
+            ? 'Activation refused: the payment evidence is not a successful sandbox paystack transaction.'
+            : 'Activation refused: the payment evidence is not a successful paystack transaction from the configured provider mode (live).',
         );
       }
 
@@ -528,6 +542,7 @@ export class BillingActivationService {
         expectedReference,
         snapshot,
         localCustomer,
+        expectedProviderDomain: this.mode,
       });
       if (!reconciliation.ok) {
         throw new BillingActivationError(
@@ -701,7 +716,7 @@ export class BillingActivationService {
     client: PoolClient,
     args: { evidenceId: string | null; subscriptionId: string; pricingSnapshotId: string },
   ): Promise<BillingPaymentEvidence | null> {
-    const store = new BillingVerifiedTransactionStore(client);
+    const store = new BillingVerifiedTransactionStore(client, this.mode);
     if (args.evidenceId !== null) {
       const pinned = await store.findById(args.evidenceId);
       if (pinned === null) return null;
@@ -716,9 +731,9 @@ export class BillingActivationService {
     const { rows } = await client.query<{ id: string }>(
       `SELECT id FROM billing_verified_transactions
         WHERE subscription_id = $1 AND pricing_snapshot_id = $2
-          AND provider = $3 AND provider_domain = 'test' AND provider_status = 'success'
+          AND provider = $3 AND provider_domain = $4 AND provider_status = 'success'
         ORDER BY created_at DESC, id DESC LIMIT 1`,
-      [args.subscriptionId, args.pricingSnapshotId, BILLING_PROVIDER],
+      [args.subscriptionId, args.pricingSnapshotId, BILLING_PROVIDER, this.mode],
     );
     const id = rows[0]?.id;
     if (id === undefined) return null;

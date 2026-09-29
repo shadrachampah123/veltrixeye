@@ -4,7 +4,9 @@ import { z } from 'zod';
 import {
   BILLING_PROVIDER,
   billingPaymentCurrencySchema,
+  billingProviderModeSchema,
   type BillingPaymentCurrency,
+  type BillingProviderMode,
 } from '@veltrixeye/contracts';
 import { billingPaymentEvidenceSchema, type BillingPaymentEvidence, type BillingVerifiedTransaction } from '@veltrixeye/contracts';
 import { billingPaymentEvidenceIdempotencyCanonicalString } from '@veltrixeye/contracts';
@@ -42,7 +44,10 @@ import { billingPaymentEvidenceIdempotencyCanonicalString } from '@veltrixeye/co
  *    evidence ledger.
  *
  * All amounts are integers in minor units; GHS exponent stays 2; provider
- * is pinned to `paystack` and domain to `test` by the database CHECKs.
+ * is pinned to `paystack` and the domain to the two-value vocabulary
+ * (`test` | `live`, widened by migration 0035) by the database CHECKs — the
+ * store stamps only the configured mode (default `test`) and refuses any
+ * other domain at the service boundary.
  */
 
 const isoDateTime = z.string().datetime();
@@ -162,7 +167,7 @@ const rowSchema = z
     payment_currency: billingPaymentCurrencySchema,
     payment_amount_exponent: z.number().int(),
     provider_status: z.string().min(1).max(64),
-    provider_domain: z.literal('test'),
+    provider_domain: billingProviderModeSchema,
     provider_customer_id: z.string().min(1).max(128).nullable(),
     provider_customer_code: z.string().min(1).max(128).nullable(),
     paid_at: z.union([z.date(), z.string().datetime()]).transform((v) => new Date(v).toISOString()),
@@ -233,7 +238,15 @@ function fromRow(row: unknown): BillingPaymentEvidence {
  * Thin append-only persistence for verified-transaction evidence.
  */
 export class BillingVerifiedTransactionStore {
-  constructor(private readonly db: Pick<Pool | PoolClient, 'query'>) {}
+  constructor(
+    private readonly db: Pick<Pool | PoolClient, 'query'>,
+    /**
+     * The configured provider mode this store stamps on `record()` (`test`
+     * by default; `live` only when the confirmation/activation path injects
+     * it). Evidence from any other domain is refused at the boundary.
+     */
+    private readonly mode: BillingProviderMode = 'test',
+  ) {}
 
   async findByProviderReference(providerReference: string): Promise<BillingPaymentEvidence | null> {
     const { rows } = await this.db.query('SELECT * FROM billing_verified_transactions WHERE provider_reference = $1', [
@@ -271,12 +284,15 @@ export class BillingVerifiedTransactionStore {
     }
     const { userId, subscriptionId, pricingSnapshotId, verified } = parsed.data;
 
-    // Enforce sandbox/test invariants at the service boundary as well.
+    // Enforce the configured-domain invariants at the service boundary too.
     if (verified.provider !== BILLING_PROVIDER) {
       throw new BillingVerifiedTransactionError('invalid_input', 'Evidence provider must be paystack.');
     }
-    if (verified.providerDomain !== 'test') {
-      throw new BillingVerifiedTransactionError('invalid_input', 'Evidence domain must be test.');
+    if (verified.providerDomain !== this.mode) {
+      throw new BillingVerifiedTransactionError(
+        'invalid_input',
+        `Evidence domain must be the configured provider mode (${this.mode}).`,
+      );
     }
     if (verified.paymentCurrency !== 'GHS' || verified.paymentAmountExponent !== 2) {
       throw new BillingVerifiedTransactionError('invalid_input', 'Evidence currency must be GHS with exponent 2.');

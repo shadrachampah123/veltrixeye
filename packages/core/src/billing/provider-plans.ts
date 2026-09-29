@@ -10,6 +10,7 @@ import {
   type BillingInterval,
   type BillingPaymentCurrency,
   type BillingPricingSnapshot,
+  type BillingProviderMode,
   type CommercialPlanId,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
@@ -150,8 +151,18 @@ export function isBillingProviderPlanError(error: unknown): error is BillingProv
  * Normalize and validate one epoch row. Anything unknown (plan, interval,
  * currency, exponent, status, mode) is rejected here — an epoch the platform
  * does not fully understand can never be used to charge.
+ *
+ * Mode: the two-value domain (`test` | `live`, migration 0035) is validated
+ * for membership, and the row must be in the ALLOWED mode, which defaults to
+ * `test`. A caller that operates in `live` must pass `{ allowedMode: 'live' }`
+ * explicitly — a live epoch is never parseable by default, and a test epoch is
+ * never parseable by a live-mode caller. There is no path by which a row from
+ * the wrong domain is silently accepted.
  */
-export function parseProviderPlan(row: unknown): BillingProviderPlan {
+export function parseProviderPlan(
+  row: unknown,
+  options?: { allowedMode?: BillingProviderMode },
+): BillingProviderPlan {
   const parsed = billingProviderPlanRowSchema.safeParse(row);
   if (!parsed.success) {
     throw new BillingProviderPlanError(
@@ -162,14 +173,23 @@ export function parseProviderPlan(row: unknown): BillingProviderPlan {
     );
   }
   const value = parsed.data;
+  const allowedMode = options?.allowedMode ?? 'test';
 
   if (value.provider !== BILLING_PROVIDER) {
     throw new BillingProviderPlanError('invalid', `Unknown billing provider "${value.provider}".`);
   }
-  if (value.mode !== 'test') {
+  if (value.mode !== 'test' && value.mode !== 'live') {
     throw new BillingProviderPlanError(
       'invalid',
-      `Provider mode "${value.mode}" is not usable: billing is sandbox-only in this build.`,
+      `Provider mode "${value.mode}" is not a recognized provider domain (test|live).`,
+    );
+  }
+  if (value.mode !== allowedMode) {
+    throw new BillingProviderPlanError(
+      'invalid',
+      allowedMode === 'test'
+        ? `Provider mode "${value.mode}" is not usable: billing is sandbox-only in this build.`
+        : `Provider mode "${value.mode}" is not usable: the configured provider mode is live.`,
     );
   }
   if (!commercialPlanIdSchema.safeParse(value.catalogue_plan).success) {
@@ -246,6 +266,15 @@ export function providerPlanKeyMatches(
   );
 }
 
+/** Narrow an untrusted mode string to the two-value domain, or fail closed. */
+export function providerPlanModeOrThrow(mode: string): BillingProviderMode {
+  if (mode === 'test' || mode === 'live') return mode;
+  throw new BillingProviderPlanError(
+    'invalid',
+    `Unknown provider mode "${mode}": the only recognized provider domains are test and live.`,
+  );
+}
+
 /**
  * Select the ONE active epoch for a key. Fails closed when:
  *  - no epoch matches                 → `not_found`
@@ -258,7 +287,8 @@ export function selectActiveProviderPlan(
   plans: readonly unknown[],
   key: BillingProviderPlanKey,
 ): BillingProviderPlan {
-  const parsed = plans.map((row) => parseProviderPlan(row));
+  const allowedMode = providerPlanModeOrThrow(key.mode);
+  const parsed = plans.map((row) => parseProviderPlan(row, { allowedMode }));
   const matching = parsed.filter((plan) => providerPlanKeyMatches(plan, key));
 
   if (matching.length === 0) {
@@ -360,6 +390,7 @@ export function assertProviderPlanMatches(
 export function providerPlanExpectationFromSnapshot(
   snapshot: BillingPricingSnapshot,
   providerPlanId: string,
+  options?: { mode?: BillingProviderMode },
 ): ProviderPlanExpectation {
   return {
     cataloguePlan: snapshot.cataloguePlan,
@@ -369,6 +400,11 @@ export function providerPlanExpectationFromSnapshot(
     providerPlanId,
     fxRateVersionId: snapshot.fx.fxRateVersionId,
     pricingPolicyVersion: snapshot.pricingPolicyVersion,
+    // The snapshot itself is mode-less (the schema stores no domain column);
+    // a mode appears in the expectation ONLY when the caller states the
+    // configured one explicitly. Omitting it keeps `assertProviderPlanMatches`
+    // defaulting to `test` — a live expectation is never derived implicitly.
+    ...(options?.mode !== undefined ? { mode: options.mode } : {}),
   };
 }
 
@@ -408,7 +444,7 @@ export interface RegisterProviderPlanInput {
   pricingPolicyVersion?: string;
   catalogueVersion: string;
   validFrom?: Date;
-  mode?: string;
+  mode?: BillingProviderMode;
   provider?: string;
 }
 
@@ -427,10 +463,27 @@ export class BillingProviderPlanStore {
   constructor(
     private readonly db: Pick<Pool, 'query'>,
     private readonly policyVersion: string = BILLING_PRICING_POLICY_VERSION,
+    /**
+     * The configured provider domain this store reads and writes (`test`, the
+     * default, or `live`). Every row it returns is parsed against THIS mode:
+     * a row from the other domain is a hard failure, never a selection.
+     * Composition passes the configured mode; tests that do not pass one are
+     * sandbox/test stores by construction.
+     */
+    private readonly mode: BillingProviderMode = 'test',
   ) {}
 
   /** The active epoch for a key, or a typed failure. Never a fallback. */
   async findActive(key: BillingProviderPlanKey): Promise<BillingProviderPlan> {
+    // A store reads ONLY its own configured domain: a key for the other
+    // domain is `not_found` here — never a silent cross-domain selection.
+    if (key.mode !== this.mode) {
+      throw new BillingProviderPlanError(
+        'not_found',
+        `No provider-plan epoch exists for ${key.cataloguePlan}/${key.interval} (${key.paymentCurrency}): ` +
+          `the configured provider mode is ${this.mode} and this directory never reads domain "${key.mode}".`,
+      );
+    }
     const { rows } = await this.db.query(
       `SELECT id, provider, mode, catalogue_plan, billing_interval, payment_currency,
               payment_amount_minor, payment_amount_exponent, provider_plan_id,
@@ -500,7 +553,7 @@ export class BillingProviderPlanStore {
                    catalogue_version, status, valid_from, retired_at, retired_reason`,
         [
           input.provider ?? BILLING_PROVIDER,
-          input.mode ?? 'test',
+          input.mode ?? this.mode,
           input.cataloguePlan,
           input.interval,
           input.paymentCurrency,
@@ -515,7 +568,7 @@ export class BillingProviderPlanStore {
           input.validFrom ?? null,
         ],
       );
-      return parseProviderPlan(rows[0]);
+      return parseProviderPlan(rows[0], { allowedMode: input.mode ?? this.mode });
     } catch (error) {
       if (isUniqueViolation(error)) {
         throw new BillingProviderPlanError(
@@ -551,7 +604,7 @@ export class BillingProviderPlanStore {
     if (rows.length === 0) {
       throw new BillingProviderPlanError('not_found', `No provider-plan epoch ${planId} exists.`);
     }
-    return parseProviderPlan(rows[0]);
+    return parseProviderPlan(rows[0], { allowedMode: this.mode });
   }
 
   /** True when a usable (active) epoch exists — used by fail-closed composition. */

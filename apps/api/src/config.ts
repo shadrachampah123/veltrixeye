@@ -83,7 +83,7 @@ export function loadDotEnv(): void {
  * Session tokens are server-side (random per session, stored hashed) — no
  * JWT secret is required. See docs/environment.md and docs/security.md.
  */
-const envSchema = z.object({
+const baseEnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   /** Port the API listens on. */
   PORT: z.coerce.number().int().positive().max(65535).default(4000),
@@ -255,11 +255,14 @@ const envSchema = z.object({
    *  - Empty ⇒ no billing provider is registered at all: no customer
    *    provisioning, no payment initialization, no charge path. Billing is
    *    simply unavailable (fail closed) — it is not an error state.
-   *  - Only a TEST key (`sk_test_…`) is accepted. A live key, a public key or
-   *    any other shape is refused AT BOOT, so no deployment can move live money
-   *    through this build by setting a variable. Live activation is a
-   *    deliberate future change (code + schema + credentials), never a config
-   *    accident.
+   *  - The key's PREFIX must match `PAYSTACK_MODE`: test mode accepts only
+   *    `sk_test_…`, live mode accepts only `sk_live_…`, and the cross-check
+   *    below fails BOOT on any mismatch (the issue is reported on
+   *    PAYSTACK_SECRET_KEY). An empty key stays fail-closed/disabled in both
+   *    modes: billing simply is not registered. A public key or any other
+   *    shape is refused outright. Live mode is therefore never reachable by
+   *    accident — it takes the explicit `PAYSTACK_MODE=live` AND a matching
+   *    live key, together with the schema/application support this build ships.
    *  - Server-side only: the key never leaves the API process, is never logged
    *    (see the adapter's `describe()`), never reaches a browser and is never
    *    stored in the database.
@@ -268,10 +271,21 @@ const envSchema = z.object({
     .string()
     .max(256)
     .default('')
-    .refine((value) => value === '' || value.startsWith('sk_test_'), {
+    .refine((value) => value === '' || value.startsWith('sk_test_') || value.startsWith('sk_live_'), {
       message:
-        'must be empty or a Paystack SANDBOX test key starting with "sk_test_" — live and public keys are refused',
+        'must be empty or a Paystack key starting with "sk_test_" (test mode) or "sk_live_" (live mode) — public and malformed keys are refused',
     }),
+  /**
+   * Explicit provider domain: `test` (sandbox, the DEFAULT) or `live`.
+   *
+   * This is the ONLY switch that selects the domain, and it never works
+   * alone: the key prefix must match it (checked below), every composition
+   * path threads it explicitly (no layer outside configuration/composition
+   * reads this variable), and all services default to `test` when no mode is
+   * injected. Setting `PAYSTACK_MODE=live` is NOT a go-live procedure — see
+   * docs/environment.md for the operational prerequisites.
+   */
+  PAYSTACK_MODE: z.enum(['test', 'live']).default('test'),
   /**
    * Billing Step 5.2 — webhook SOURCE-IP ALLOW-LIST for
    * `POST /api/billing/webhook` (comma- or whitespace-separated IPs/CIDRs).
@@ -303,6 +317,31 @@ const envSchema = z.object({
   }, { message: 'must be empty or an HTTPS application origin without credentials, path, query or fragment' }),
   /** Per-request timeout for Paystack calls (ms). */
   PAYSTACK_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60000).default(15000),
+});
+
+/**
+ * Cross-field boot checks. Mismatched mode/key combinations fail BOOT with the
+ * issue reported on `PAYSTACK_SECRET_KEY` (the credential is the offending
+ * value); an empty key is always allowed (billing stays disabled/fail-closed).
+ */
+const envSchema = baseEnvSchema.superRefine((values, ctx) => {
+  const key = values.PAYSTACK_SECRET_KEY;
+  if (values.PAYSTACK_MODE === 'test' && key.startsWith('sk_live_')) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['PAYSTACK_SECRET_KEY'],
+      message:
+        'must not be a live key ("sk_live_") while PAYSTACK_MODE is "test" — set PAYSTACK_MODE=live explicitly to run in live mode',
+    });
+  }
+  if (values.PAYSTACK_MODE === 'live' && key.startsWith('sk_test_')) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['PAYSTACK_SECRET_KEY'],
+      message:
+        'must be a live key ("sk_live_") when PAYSTACK_MODE is "live" — a sandbox test key is refused in live mode',
+    });
+  }
 });
 
 /** Email-channel configuration passed to the SMTP provider adapter. */
@@ -348,20 +387,27 @@ export interface NotificationConfig {
  * Billing configuration (PR3). Derived once at boot and handed to the billing
  * composition, which registers the provider ONLY when it is usable.
  *
- * Note what is deliberately NOT here: an FX rate, a price, a provider plan id,
- * a provider base URL or a "live mode" switch. Rates and plan mappings are
- * server-side DATA with their own authority (migration 0032), the catalogue is
- * code, and the provider host is a constant in the adapter — a deployment
- * cannot choose any of them.
+ * Note what is deliberately NOT here: an FX rate, a price, a provider plan id
+ * or a provider base URL. Rates and plan mappings are server-side DATA with
+ * their own authority (migration 0032), the catalogue is code, and the
+ * provider host is a constant in the adapter — a deployment cannot choose any
+ * of them. The `mode` IS here (and only here): it pairs with the key at boot
+ * and is passed down explicitly by composition.
  */
 export interface BillingConfig {
   /** The only billing provider (`paystack`). */
   provider: 'paystack';
-  /** Sandbox mode. Pinned `true` in this build. */
-  sandbox: true;
-  /** Never `true` in this build: live credentials are refused at boot. */
-  live: false;
-  /** True when a usable sandbox key is configured. */
+  /**
+   * The configured provider domain (`PAYSTACK_MODE`): `test` (sandbox, the
+   * default) or `live`. Derived ONCE at boot from configuration and handed to
+   * every composition path — never re-read from the environment anywhere else.
+   */
+  mode: 'test' | 'live';
+  /** True only in test/sandbox mode (display + legacy checks). */
+  sandbox: boolean;
+  /** True only in live mode; still never an execution path. */
+  live: boolean;
+  /** True when a usable key for the configured mode is present. */
   enabled: boolean;
   /** Per-request timeout for provider calls (ms). */
   timeoutMs: number;
@@ -493,8 +539,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     billing: {
       provider: 'paystack',
-      sandbox: true,
-      live: false,
+      mode: values.PAYSTACK_MODE,
+      sandbox: values.PAYSTACK_MODE === 'test',
+      live: values.PAYSTACK_MODE === 'live',
       enabled: values.PAYSTACK_SECRET_KEY !== '',
       timeoutMs: values.PAYSTACK_TIMEOUT_MS,
       commercialCurrency: 'USD',

@@ -6,6 +6,7 @@ import {
   commercialPlanIdSchema,
   type BillingInterval,
   type BillingPaymentCurrency,
+  type BillingProviderMode,
 } from '@veltrixeye/contracts';
 import { BILLING_CATALOGUE_VERSION, cataloguePriceMinor } from './catalogue.js';
 import {
@@ -75,8 +76,10 @@ import {
  *    cap — including cap=1 — is refused. (Commercial entitlement limits such
  *    as Pro's strategy allowance are a different topic entirely and are not
  *    touched anywhere by this module.)
- *  - Sandbox only: provider `paystack`, mode `test`, payment currency GHS.
- *    Live mode, live credentials and any production configuration are refused.
+ *  - Mode-scoped: provider `paystack`, evidence mode equal to the configured
+ *    provider mode (`test` by default; `live` only when explicitly injected
+ *    by configuration), payment currency GHS. Evidence from any other mode,
+ *    live credentials and any production configuration are refused.
  *
  * IMMUTABILITY
  *  - Registered epochs are immutable pricing records (migration 0032): a later
@@ -105,7 +108,7 @@ export type BillingProvisioningFailureReason =
   | 'excluded_provider_plan'
   /** Provider interval does not match the explicit local→provider mapping. */
   | 'interval_mismatch'
-  /** Evidence is not for test/sandbox mode. */
+  /** Evidence mode does not match the configured provider mode. */
   | 'mode_mismatch'
   /** Capped, unknown or missing recurring payment-count evidence. */
   | 'cap_mismatch'
@@ -257,8 +260,8 @@ export const sandboxProviderPlanEvidenceSchema = z
     paymentAmountMinor: scaledInteger,
     /** The plan's minor-unit exponent as the operator observed it (must be 2). */
     paymentAmountExponent: z.number().int(),
-    /** The environment the plan exists in (must be `test`). */
-    mode: z.string().min(1).max(16),
+  /** The environment the plan exists in (must equal the configured mode). */
+  mode: z.string().min(1).max(16),
     /** Recurring payment-count evidence; only `uncapped` is admissible. */
     paymentCountCap: providerPlanPaymentCountCapSchema,
     /**
@@ -349,6 +352,12 @@ export interface ValidatedSandboxProvisioningBatch {
   readonly fxVersion: BillingFxRateVersion;
   /** The instant freshness was measured against (one instant per batch). */
   readonly registeredAt: Date;
+  /**
+   * The configured provider mode every registration is written in. Derived
+   * from the injected `mode` parameter (default `test`) — never inferred from
+   * the evidence, which must already match it.
+   */
+  readonly mode: BillingProviderMode;
   /** Exactly the four registrations, in matrix order. */
   readonly registrations: readonly ValidatedSandboxEpochRegistration[];
 }
@@ -496,8 +505,16 @@ export function prepareSandboxProvisioningBatch(params: {
   fxVersion: unknown;
   evidence: readonly unknown[];
   registeredAt: Date;
+  /**
+   * The configured provider mode this batch is validated for (`test` by
+   * default). Every evidence entry must already be in THIS mode — a batch
+   * never crosses domains, and a live batch exists only when configuration
+   * explicitly asked for one.
+   */
+  mode?: BillingProviderMode;
 }): ValidatedSandboxProvisioningBatch {
   const { registeredAt } = params;
+  const mode = params.mode ?? 'test';
   if (!(registeredAt instanceof Date) || !Number.isFinite(registeredAt.getTime())) {
     throw new BillingProvisioningError(
       'invalid_instant',
@@ -580,11 +597,12 @@ export function prepareSandboxProvisioningBatch(params: {
           'A local period is never passed through to the provider layer silently.',
       );
     }
-    if (entry.mode !== 'test') {
+    if (entry.mode !== mode) {
       throw new BillingProvisioningError(
         'mode_mismatch',
-        `${entry.providerPlanId}: evidence mode "${entry.mode}" is not "test". Provisioning is sandbox-only; ` +
-          'live mode (and live credentials or configuration) are refused.',
+        `${entry.providerPlanId}: evidence mode "${entry.mode}" does not match the configured provider mode ` +
+          `"${mode}". Provisioning never crosses domains: live mode (and live credentials or configuration) ` +
+          'are refused by a test configuration, and vice versa.',
       );
     }
     if (entry.paymentCurrency !== BILLING_FX_POLICY.quoteCurrency) {
@@ -672,7 +690,7 @@ export function prepareSandboxProvisioningBatch(params: {
     (a, b) => (order.get(`${a.cataloguePlan}/${a.interval}`) ?? 0) - (order.get(`${b.cataloguePlan}/${b.interval}`) ?? 0),
   );
 
-  return { fxVersion: fx, registeredAt, registrations: ordered };
+  return { fxVersion: fx, registeredAt, mode, registrations: ordered };
 }
 
 /** The store inputs for a validated batch (still prior to any write). */
@@ -690,6 +708,7 @@ export function sandboxProvisioningRegisterInputs(
     fxRateVersionId: registration.fxRateVersionId,
     pricingPolicyVersion: registration.pricingPolicyVersion,
     catalogueVersion: registration.catalogueVersion,
+    mode: batch.mode,
     validFrom: batch.registeredAt,
   }));
 }
@@ -702,6 +721,13 @@ export interface BillingPlanProvisioningOptions {
   db: Pool;
   /** Injected clock for the registration instant (tests pin it). */
   now?: () => Date;
+  /**
+   * The configured provider mode this service registers epochs in (`test`
+   * by default; `live` only when configuration explicitly injects it).
+   * Threads through the batch validation and the epoch store — evidence
+   * from any other mode is a `mode_mismatch` failure, never a fallback.
+   */
+  mode?: BillingProviderMode;
 }
 
 export interface RegisterSandboxPlanEpochsInput {
@@ -748,10 +774,12 @@ const registerSandboxPlanEpochsInputSchema = z
 export class BillingPlanProvisioningService {
   private readonly db: Pool;
   private readonly nowFn: () => Date;
+  private readonly mode: BillingProviderMode;
 
   constructor(options: BillingPlanProvisioningOptions) {
     this.db = options.db;
     this.nowFn = options.now ?? (() => new Date());
+    this.mode = options.mode ?? 'test';
   }
 
   /**
@@ -812,6 +840,7 @@ export class BillingPlanProvisioningService {
         fxVersion: selected.rows[0],
         evidence: parsed.data.evidence,
         registeredAt,
+        mode: this.mode,
       });
       if (batch.fxVersion.id !== parsed.data.fxRateVersionId) {
         // Defensive: the selected id is the batch identity, retained verbatim.
@@ -833,7 +862,7 @@ export class BillingPlanProvisioningService {
         }
       }
 
-      const store = new BillingProviderPlanStore(client);
+      const store = new BillingProviderPlanStore(client, undefined, this.mode);
       const registered: BillingProviderPlan[] = [];
       for (const registerInput of sandboxProvisioningRegisterInputs(batch)) {
         try {

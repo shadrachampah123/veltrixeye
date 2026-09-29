@@ -126,6 +126,44 @@ export const BILLING_CHECKOUT_STATE_COPY: Readonly<
   },
 });
 
+/**
+ * Mode-aware bodies for the three states that describe the checkout itself.
+ * The exported map above stays the sandbox (test) copy — and the DEFAULT copy
+ * whenever the mode is unknown (a failed or in-flight read) — so a surface
+ * that cannot prove live mode never claims live mode. A LIVE-rendered panel
+ * never says "sandbox", and never calls a live payment a test payment.
+ */
+const BILLING_CHECKOUT_STATE_COPY_LIVE: Readonly<
+  Partial<Record<BillingCheckoutState, string>>
+> = Object.freeze({
+  free:
+    'No paid subscription exists for this account. Creating a checkout is the only path that writes one — ' +
+    'and it buys nothing on its own: the plan stays free until verified evidence exists AND an operator ' +
+    'authorizes the activation out of band.',
+  awaiting_verification:
+    'A checkout exists for this account and no payment has been verified yet. The plan and its price are ' +
+    'locked server-side, so creating the checkout again returns the same locked price. Free-plan limits still apply.',
+  unavailable:
+    'Billing state could not be read, or the checkout is refusing (no billing provider configured, no plan ' +
+    'registered, or a provider refusal). Nothing is offered and nothing is claimed — the account keeps the limits the ' +
+    'server last enforced.',
+});
+
+/** The state copy for the configured domain (sandbox copy unless live is proven). */
+function billingStateCopy(
+  state: BillingCheckoutState,
+  mode: 'test' | 'live' | null,
+): { label: string; tone: 'neutral' | 'success' | 'warning' | 'danger' | 'info'; body: string } {
+  const base = BILLING_CHECKOUT_STATE_COPY[state];
+  // `unavailable` can render without a read answer (mode unknown); its live
+  // body is deliberately domain-neutral, so it serves both — while the two
+  // payment states, which only exist after a read, keep their mode.
+  const override = mode === 'live' || (mode === null && state === 'unavailable');
+  if (!override) return base;
+  const body = BILLING_CHECKOUT_STATE_COPY_LIVE[state];
+  return body === undefined ? base : { ...base, body };
+}
+
 /** Why a verification did not produce evidence, in user-facing words. */
 export const BILLING_VERIFICATION_FAILURE_COPY: Readonly<
   Record<BillingPaymentReconciliationFailureReason, string>
@@ -152,6 +190,18 @@ export const BILLING_VERIFICATION_FAILURE_COPY: Readonly<
     'The provider report is not from the configured billing provider. Nothing was recorded — contact support.',
   domain_mismatch:
     'The provider report is not from the sandbox (test) domain. Nothing was recorded — contact support.',
+});
+
+/**
+ * The live-mode wording for the ONE failure that names a domain. The exported
+ * map above stays the sandbox copy (and the default when the mode is
+ * unknown); a live-mode panel must never call a live payment a test payment.
+ */
+export const BILLING_VERIFICATION_FAILURE_COPY_LIVE: Readonly<
+  Partial<Record<BillingPaymentReconciliationFailureReason, string>>
+> = Object.freeze({
+  domain_mismatch:
+    'The provider report is not from the configured live domain. Nothing was recorded — contact support.',
 });
 
 export interface BillingCheckoutPanelProps {
@@ -190,7 +240,9 @@ export function BillingCheckoutPanel({
 
   const state = resolveBillingCheckoutState({ billing, evidenceRecorded, unavailable });
   const offered = billingCheckoutOffered(state);
-  const copy = BILLING_CHECKOUT_STATE_COPY[state];
+  /** The server-reported provider domain; null until a read answers. */
+  const mode = billing?.mode ?? null;
+  const copy = billingStateCopy(state, mode);
   const loading = billing === null && !unavailable;
 
   /**
@@ -213,13 +265,18 @@ export function BillingCheckoutPanel({
     } catch (err) {
       setError({
         action: 'checkout',
-        message: err instanceof ApiError ? err.message : 'The sandbox checkout could not be created.',
+        message:
+          err instanceof ApiError
+            ? err.message
+            : mode === 'live'
+              ? 'The checkout could not be created.'
+              : 'The sandbox checkout could not be created.',
       });
       onBillingChange?.();
     } finally {
       setBusy('idle');
     }
-  }, [onBillingChange, selected]);
+  }, [mode, onBillingChange, selected]);
 
   /**
    * The ONLY verification path: an explicit user action. There is no timer, no
@@ -246,7 +303,7 @@ export function BillingCheckoutPanel({
   if (loading) {
     return (
       <Card>
-        <CardHeader title="Sandbox Checkout" subtitle="Billing Step 9 · Paystack sandbox (test mode)" />
+        <CardHeader title="Checkout" subtitle="Billing Step 9 · Paystack" />
         <div className="px-5 py-6 text-sm text-ink-400">Loading billing state…</div>
       </Card>
     );
@@ -255,8 +312,14 @@ export function BillingCheckoutPanel({
   return (
     <Card>
       <CardHeader
-        title="Sandbox Checkout"
-        subtitle={`Paystack sandbox (test mode) · ${BRAND.name} ${BRAND.stage} · a payment here grants no execution`}
+        title={mode === 'test' ? 'Sandbox Checkout' : 'Checkout'}
+        subtitle={`${
+          mode === 'live'
+            ? 'Paystack live mode'
+            : mode === 'test'
+              ? 'Paystack sandbox (test mode)'
+              : 'Paystack'
+        } · ${BRAND.name} ${BRAND.stage} · a payment here grants no execution`}
         actions={<Badge tone={copy.tone}>{copy.label}</Badge>}
       />
       <div className="space-y-4 px-5 py-4">
@@ -274,11 +337,20 @@ export function BillingCheckoutPanel({
 
         {offered ? (
           <>
-            <BillingCheckoutChoices selected={selected} onSelect={setSelected} disabled={busy !== 'idle'} />
+            <BillingCheckoutChoices
+              selected={selected}
+              onSelect={setSelected}
+              disabled={busy !== 'idle'}
+              mode={mode === 'live' ? 'live' : 'test'}
+            />
 
             <div className="flex flex-wrap items-center gap-3">
               <Button onClick={() => void createCheckout()} disabled={busy !== 'idle'}>
-                {busy === 'checkout' ? 'Creating checkout…' : 'Create sandbox checkout'}
+                {busy === 'checkout'
+                  ? 'Creating checkout…'
+                  : mode === 'live'
+                    ? 'Create checkout'
+                    : 'Create sandbox checkout'}
               </Button>
               <span className="text-[11px] text-ink-500">
                 The exact amount and FX rate are provided by the server when the checkout is created.
@@ -292,6 +364,7 @@ export function BillingCheckoutPanel({
                 verification={verification}
                 busy={busy}
                 onVerify={() => void verifyPayment()}
+                mode={mode === 'live' ? 'live' : 'test'}
               />
             ) : null}
           </>
@@ -305,10 +378,20 @@ export function BillingCheckoutPanel({
         ) : null}
 
         <div className="rounded-md border border-amber-450/20 bg-amber-450/5 px-3 py-2.5 text-[11px] leading-snug text-ink-400">
-          <strong className="text-amber-450">Sandbox only:</strong> this surface uses the provider&rsquo;s test
-          environment. It never polls the provider, never confirms a payment by itself and never activates a plan —
-          activation is an out-of-band operator action. Automation, live execution and broker execution remain
-          unavailable on every plan.
+          <strong className="text-amber-450">
+            {mode === 'live' ? 'Live mode:' : mode === 'test' ? 'Sandbox only:' : 'Billing:'}
+          </strong>{' '}
+          {mode === 'live'
+            ? 'this surface uses the provider’s live environment and real money can move. It never polls the ' +
+              'provider, never confirms a payment by itself and never activates a plan — activation is an out-of-band ' +
+              'operator action. Automation, live execution and broker execution remain unavailable on every plan.'
+            : mode === 'test'
+              ? 'this surface uses the provider’s test environment. It never polls the provider, never confirms a ' +
+                'payment by itself and never activates a plan — activation is an out-of-band operator action. ' +
+                'Automation, live execution and broker execution remain unavailable on every plan.'
+              : 'this surface uses the provider environment the server has configured. It never polls the provider, ' +
+                'never confirms a payment by itself and never activates a plan — activation is an out-of-band ' +
+                'operator action. Automation, live execution and broker execution remain unavailable on every plan.'}
         </div>
       </div>
     </Card>
@@ -324,15 +407,18 @@ export function BillingCheckoutChoices({
   selected,
   onSelect,
   disabled = false,
+  mode = 'test',
 }: {
   selected: BillingCheckoutRequestDto;
   onSelect?: (choice: BillingCheckoutRequestDto) => void;
   disabled?: boolean;
+  /** The configured provider domain (defaults to the sandbox copy). */
+  mode?: 'test' | 'live';
 }) {
   return (
     <fieldset className="space-y-2" disabled={disabled}>
       <legend className="mb-1 text-xs font-medium uppercase tracking-wider text-ink-300">
-        Plan &amp; interval — four sandbox choices
+        Plan &amp; interval — {mode === 'live' ? 'four choices' : 'four sandbox choices'}
       </legend>
       {BILLING_CHECKOUT_CHOICES.map((choice) => {
         const key = `${choice.cataloguePlan}:${choice.interval}`;
@@ -392,12 +478,15 @@ export function BillingCheckoutSessionDisclosure({
   verification,
   busy,
   onVerify,
+  mode = 'test',
 }: {
   session: BillingCheckoutSessionDto;
   selected?: BillingCheckoutRequestDto;
   verification?: BillingVerificationSummary | null;
   busy?: 'idle' | 'checkout' | 'verify';
   onVerify?: () => void;
+  /** The configured provider domain (defaults to the sandbox copy). */
+  mode?: 'test' | 'live';
 }) {
   const initialized = session.status === 'initialized' && session.authorizationUrl !== null;
   const lockedPlanDiffers =
@@ -452,7 +541,7 @@ export function BillingCheckoutSessionDisclosure({
             Authorize payment
           </a>
           <p className="text-[11px] leading-snug text-ink-500">
-            Opens the provider&rsquo;s sandbox payment page:
+            Opens the provider&rsquo;s {mode === 'live' ? 'payment page' : 'sandbox payment page'}:
             <span className="ml-1 font-mono text-ink-300">{session.authorizationUrl}</span>
           </p>
           <div className="flex flex-wrap items-center gap-3">
@@ -472,7 +561,7 @@ export function BillingCheckoutSessionDisclosure({
         </Alert>
       )}
 
-      {verification ? <BillingVerificationNotice verification={verification} /> : null}
+      {verification ? <BillingVerificationNotice verification={verification} mode={mode} /> : null}
 
       <p className="text-[11px] leading-snug text-ink-500">
         Created {formatDateTime(session.initializedAt)}. A checkout session is an offer to pay: it confirms no payment,
@@ -483,7 +572,14 @@ export function BillingCheckoutSessionDisclosure({
 }
 
 /** The structured verification outcome — no provider identifier, no hash. */
-export function BillingVerificationNotice({ verification }: { verification: BillingVerificationSummary }) {
+export function BillingVerificationNotice({
+  verification,
+  mode = 'test',
+}: {
+  verification: BillingVerificationSummary;
+  /** The configured provider domain (defaults to the sandbox copy). */
+  mode?: 'test' | 'live';
+}) {
   if (verification.verified) {
     return (
       <Alert tone="success" role="status" title="Payment evidence recorded">
@@ -496,7 +592,11 @@ export function BillingVerificationNotice({ verification }: { verification: Bill
   const reason = verification.failureReason;
   return (
     <Alert tone="warning" role="status" title="Payment not verified">
-      {reason !== null ? BILLING_VERIFICATION_FAILURE_COPY[reason] : verification.failureMessage ?? 'Verification failed.'}
+      {reason !== null
+        ? (mode === 'live'
+            ? BILLING_VERIFICATION_FAILURE_COPY_LIVE[reason] ?? BILLING_VERIFICATION_FAILURE_COPY[reason]
+            : BILLING_VERIFICATION_FAILURE_COPY[reason])
+        : verification.failureMessage ?? 'Verification failed.'}
       {reason !== null ? <span className="ml-1 font-mono text-[11px]">({reason})</span> : null}
       {' '}
       No evidence was recorded and no entitlement changed.

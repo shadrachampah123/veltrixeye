@@ -93,8 +93,15 @@ export class BillingCheckoutService {
     // one atomic unit of work.
     let candidate: BillingPricingSnapshot | null = null;
     if (rows.length === 0) {
-      const plans = new BillingProviderPlanStore(db);
-      const epoch = await plans.findActive(providerPlanKey(requested.cataloguePlan, requested.interval))
+      // The configured provider domain travels with the REGISTERED adapter
+      // (composition injects it): the store, the directory key and the epoch
+      // parse below all resolve in that domain, so a live deployment can
+      // never select a test epoch and a test deployment never selects a live
+      // one. No default is consulted here — `provider.mode` is explicit.
+      const plans = new BillingProviderPlanStore(db, undefined, provider.mode);
+      const epoch = await plans.findActive(
+        providerPlanKey(requested.cataloguePlan, requested.interval, { mode: provider.mode }),
+      )
         .catch((error: unknown) => {
           if (isBillingProviderPlanError(error) && error.reason === 'not_found') {
             throw new BillingCheckoutError('plan_not_registered');
@@ -120,6 +127,7 @@ export class BillingCheckoutService {
         // Snapshots are shared pricing decisions; per-user references belong to
         // checkout requests, not the globally deduplicated snapshot row.
         providerReference: null,
+        mode: provider.mode,
       });
       // Pure decision, no write: `obtainLock` persists it inside the
       // subscription/lock transaction it belongs to.

@@ -1801,3 +1801,64 @@ clauses and the lookup `SELECT` project the explicit column list).
 Registration does not notify anyone, synchronize anything or confirm any
 payment: it only makes the four epochs *selectable* by checkout. AC5 clears
 when these four epochs exist **and** the dashboard plans match them.
+
+
+## Live mode is configuration, not a go-live procedure (`PAYSTACK_MODE`)
+
+Setting `PAYSTACK_MODE=live` (with a matching `sk_live_` key) does **not**
+make a deployment go-live. It only selects the provider domain this build is
+configured for; every other precondition of a real-money deployment is an
+**operator action performed outside this repository**, and none of them is
+performed by flipping the variable.
+
+**What the mode does** (all of it configuration/composition-level; no business
+code reads the environment):
+
+- `PAYSTACK_MODE` defaults to `test` — the sandbox remains the default and
+  stays fail-closed exactly as before. An absent variable is a test-mode
+  deployment. A prefix mismatch (`sk_test_` in live, `sk_live_` in test) or an
+  unknown mode **fails startup**; an empty key stays fail-closed/disabled in
+  either mode.
+- The adapter derives its key prefix, its expected webhook/transaction domain,
+  its `describe()`/name (`paystack-sandbox` vs `paystack-live`) and its
+  configured-domain guards from the injected mode. `BillingProvider.live`
+  stays **`false` in both modes** — the registry execution gate never flips.
+- Provider-plan directory resolution, checkout, provisioning,
+  reconciliation, confirmation, verified-transaction and activation paths all
+  receive the configured mode by injection: a live deployment never selects a
+  test epoch (and vice versa), evidence records its domain, and the
+  out-of-band activation CLI (`npm run billing:activate`) accepts only
+  evidence from the configured domain — with no silent cross-domain fallback
+  in either direction.
+- Web billing UI copy renders from the server-reported mode: a live build
+  never displays "Sandbox Checkout" and never calls a live payment a test
+  payment; an unreadable state claims neither domain.
+
+**What `PAYSTACK_MODE=live` does NOT do** (each item remains an operator-only
+production step):
+
+1. It does **not** publish an FX rate. Live checkout still refuses with a
+   missing/stale rate until an operator publishes one (D-9).
+2. It does **not** create the four live Paystack plans in the provider
+   dashboard, and it does **not** register the four live provider-plan epochs
+   (`mode='live'`) with their real `PLN_…` codes — see *Sandbox plan
+   provisioning (Step 4)* for the analogous test-mode runbook; live epochs
+   require the live plans to exist first.
+3. It does **not** configure the webhook. The endpoint URL is an operator-set
+   entry in the Paystack dashboard. Each delivery arrives with
+   `x-paystack-signature` = HMAC-SHA512 of the raw body keyed by the account
+   **secret key** — the same `PAYSTACK_SECRET_KEY` this deployment already
+   holds — so there is **no separate webhook signing secret to configure**;
+   the receiver only exists when a key is configured, and its signature check
+   is always the authority.
+4. It does **not** provision, migrate or sanitize production data. A fresh
+   production database is strongly recommended so test-domain evidence,
+   subscriptions and activation history are never mixed with live-domain rows
+   in one deployment.
+5. It does **not** activate anything, confirm anything automatically or grant
+   execution: activation stays the out-of-band CLI with a named operator and
+   a reason, evidence stays a receipt, and `canAccessAutomation` stays
+   `false` for every plan.
+
+Refunds, proration, dunning, automatic payment confirmation and batch
+reconciliation remain **out of scope** in live mode exactly as in test mode.

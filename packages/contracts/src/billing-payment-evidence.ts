@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { BILLING_PROVIDER } from './billing-catalogue.js';
-import { billingIsoDateTimeSchema, billingUuidSchema, providerEventReferenceSchema, providerReferenceSchema, sha256HexSchema } from './billing-refs.js';
+import { billingIsoDateTimeSchema, billingProviderModeSchema, billingUuidSchema, providerEventReferenceSchema, providerReferenceSchema, sha256HexSchema } from './billing-refs.js';
 import { billingPaymentCurrencySchema } from './billing-payment.js';
 
 /**
@@ -119,7 +119,14 @@ export const billingPaymentEvidenceSchema = z
     paymentCurrency: billingPaymentCurrencySchema,
     paymentAmountExponent: z.number().int().min(0).max(3),
     providerStatus: z.string().min(1).max(64),
-    providerDomain: z.literal('test'),
+    /**
+     * Provider domain the transaction was verified in: `test` (sandbox) or
+     * `live` (production) — the two-value domain widened by migration 0035.
+     * The application persists only the configured mode's domain (default
+     * `test`); a value from any other domain is refused before it reaches
+     * this schema's consumers.
+     */
+    providerDomain: billingProviderModeSchema,
     providerCustomerId: providerReferenceSchema.nullable(),
     providerCustomerCode: providerReferenceSchema.nullable(),
     paidAt: billingIsoDateTimeSchema,

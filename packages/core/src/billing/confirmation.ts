@@ -5,6 +5,7 @@ import {
   BILLING_PROVIDER,
   billingPaymentVerificationResultSchema,
   type BillingPaymentVerificationResult,
+  type BillingProviderMode,
   type BillingVerifiedTransaction,
 } from '@veltrixeye/contracts';
 import { billingCheckoutReference } from './checkout.js';
@@ -49,6 +50,13 @@ export interface BillingPaymentConfirmationOptions {
   db: Pool;
   providers: BillingProviderRegistry;
   now?: () => Date;
+  /**
+   * The configured provider mode verification runs in (`test` by default;
+   * `live` only when composition injects it). Every verified fact this
+   * service records — the evidence domain, the reconciliation expectation and
+   * the store it writes to — is stamped with THIS mode.
+   */
+  mode?: BillingProviderMode;
 }
 
 interface SubscriptionRow {
@@ -62,7 +70,11 @@ interface SubscriptionRow {
 }
 
 export class BillingPaymentConfirmationService {
-  constructor(private readonly options: BillingPaymentConfirmationOptions) {}
+  private readonly mode: BillingProviderMode;
+
+  constructor(private readonly options: BillingPaymentConfirmationOptions) {
+    this.mode = options.mode ?? 'test';
+  }
 
   async confirm(userId: string): Promise<BillingPaymentVerificationResult> {
     const user = z.string().uuid().parse(userId);
@@ -173,7 +185,7 @@ export class BillingPaymentConfirmationService {
       providerReference: observed.providerReference ?? expectedReference,
       providerTransactionId: (observed as { providerTransactionId?: string | null }).providerTransactionId ?? null,
       providerStatus: transactionStatus,
-      providerDomain: 'test',
+      providerDomain: this.mode,
       paymentCurrency: (observed.payment?.paymentCurrency as 'GHS') ?? snapshot.payment.paymentCurrency,
       paymentAmountMinor: observed.payment?.paymentAmountMinor ?? snapshot.payment.paymentAmountMinor,
       paymentAmountExponent: observed.payment?.paymentAmountExponent ?? snapshot.payment.paymentAmountExponent,
@@ -188,6 +200,7 @@ export class BillingPaymentConfirmationService {
       expectedReference,
       snapshot,
       localCustomer,
+      expectedProviderDomain: this.mode,
     });
 
     if (!reconciliation.ok) {
@@ -206,7 +219,7 @@ export class BillingPaymentConfirmationService {
       });
     }
 
-    const store = new BillingVerifiedTransactionStore(this.options.db);
+    const store = new BillingVerifiedTransactionStore(this.options.db, this.mode);
     let evidence: import('@veltrixeye/contracts').BillingPaymentEvidence;
     let replayed = false;
     try {
@@ -223,7 +236,8 @@ export class BillingPaymentConfirmationService {
           existingByKey.paymentAmountMinor !== verified.paymentAmountMinor ||
           existingByKey.paymentCurrency !== verified.paymentCurrency ||
           existingByKey.providerStatus !== verified.providerStatus ||
-          existingByKey.paidAt !== verified.paidAt
+          existingByKey.paidAt !== verified.paidAt ||
+          existingByKey.providerDomain !== this.mode
         ) {
           throw new BillingPaymentConfirmationError(
             'verification_unavailable',

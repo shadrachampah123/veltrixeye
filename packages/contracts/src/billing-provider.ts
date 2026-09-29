@@ -97,10 +97,13 @@ import {
 
 export {
   BILLING_CREDENTIAL_SHAPED_RE,
+  BILLING_PROVIDER_MODES,
+  billingProviderModeSchema,
   providerEventReferenceSchema,
   providerReferenceSchema,
   SHA256_HEX_RE,
   sha256HexSchema,
+  type BillingProviderMode,
 } from './billing-refs.js';
 
 const isoDateTime = billingIsoDateTimeSchema;

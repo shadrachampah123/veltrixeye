@@ -372,6 +372,15 @@ Webhook signing secrets and push subscription keys are now encrypted at rest via
   them, and the code contains no invented production values.
 - `DATABASE_SSL_MODE` (`disable | require | verify-full`) is explicit per
   environment; production is expected to run `verify-full`.
+- **Paystack key posture is mode-checked at boot.** `PAYSTACK_MODE` (absent =
+  `test`, the fail-closed default) selects which key prefix is acceptable:
+  `sk_test_` for test, `sk_live_` for live, a mismatch refuses startup and the
+  rejected key is never echoed. An empty key stays disabled in either mode.
+  Setting `PAYSTACK_MODE=live` is configuration only — not a go-live
+  procedure (see `docs/billing.md` → *Live mode is configuration, not a
+  go-live procedure*).
+  Only the configuration/composition layer reads these variables; no provider,
+  service or route reads the environment.
 - The web app calls the API **same-origin** (Next rewrites `/api/*` to
   the internal API base, `API_INTERNAL_BASE`) — no cross-origin exposure,
   no browser-visible backend URL, cookies work without CORS acrobatics.

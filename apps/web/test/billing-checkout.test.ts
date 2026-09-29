@@ -69,8 +69,12 @@ function billingState(args: {
   provider?: string | null;
   providerState?: string | null;
   paymentConfirmed?: boolean;
+  /** The server-reported provider domain (default: the sandbox test domain). */
+  mode?: 'test' | 'live';
 } = {}): BillingStateDto {
   return billingStateDtoSchema.parse({
+    // The default provider domain: mode-aware copy renders sandbox text.
+    mode: args.mode ?? 'test',
     subscription: {
       id: SUBSCRIPTION_ID,
       plan: args.plan ?? 'free',
@@ -645,5 +649,88 @@ describe('Billing Step 9 — api client request shapes', () => {
       }
       assert.ok(refused, `must refuse a response carrying ${JSON.stringify(Object.keys(extra))}`);
     }
+  });
+});
+
+/* ========================================================================== */
+/* Mode-aware copy: a live billing state is never called a sandbox            */
+/* ========================================================================== */
+
+describe('Billing Step 9 — mode-aware copy', () => {
+  test('a live billing state never displays sandbox vocabulary', () => {
+    const markup = renderPanel({ billing: billingState({ mode: 'live' }) });
+    assert.doesNotMatch(markup, /Sandbox Checkout/, 'the live header is not the sandbox header');
+    assert.match(markup, />Checkout</, 'the neutral live title');
+    assert.match(markup, /Paystack live mode/, 'the subtitle says live mode');
+    assert.match(markup, /Create checkout/, 'the live action is not a sandbox checkout');
+    assert.doesNotMatch(markup, /Create sandbox checkout/);
+    assert.match(markup, /Live mode:/, 'the domain notice states live mode');
+    assert.doesNotMatch(markup, /Sandbox only:/);
+    assert.doesNotMatch(markup, /four sandbox choices/);
+    assert.doesNotMatch(markup, /sandbox payment page/);
+    assert.doesNotMatch(markup, /Creating a sandbox checkout/);
+    assert.doesNotMatch(markup, /A sandbox checkout exists/);
+  });
+
+  test('a test billing state keeps every sandbox assertion from the existing suite', () => {
+    const markup = renderPanel({ billing: billingState({ mode: 'test' }) });
+    assert.match(markup, /Sandbox Checkout/);
+    assert.match(markup, /Create sandbox checkout/);
+    assert.match(markup, /Sandbox only:/);
+    assert.match(markup, /four sandbox choices/);
+    assert.doesNotMatch(markup, /Paystack live mode/);
+    assert.doesNotMatch(markup, /Live mode:/);
+  });
+
+  test('an unreadable billing state claims NEITHER domain', () => {
+    const loading = renderPanel({ billing: null });
+    assert.doesNotMatch(loading, /Sandbox Checkout/, 'loading never claims the sandbox');
+    assert.doesNotMatch(loading, /live mode/i, 'loading never claims live mode either');
+    const failed = renderPanel({ billing: null, unavailable: true });
+    assert.doesNotMatch(failed, /Sandbox Checkout/);
+    assert.doesNotMatch(failed, /Live mode:/);
+  });
+
+  test('a live verification failure names the live domain, not the sandbox domain', () => {
+    const summary = toVerificationSummary(
+      verificationResult({ verified: false, evidence: null, failureReason: 'domain_mismatch' as never }),
+    );
+    const live = renderToStaticMarkup(
+      React.createElement(BillingVerificationNotice, { verification: summary, mode: 'live' }),
+    );
+    assert.match(live, /configured live domain/);
+    assert.doesNotMatch(live, /sandbox \(test\) domain/);
+
+    const test = renderToStaticMarkup(
+      React.createElement(BillingVerificationNotice, { verification: summary, mode: 'test' }),
+    );
+    assert.match(test, /sandbox \(test\) domain/);
+    assert.doesNotMatch(test, /configured live domain/);
+  });
+
+  test('the disclosure and the choices default to the sandbox copy for direct renders', () => {
+    const disclosure = renderToStaticMarkup(
+      React.createElement(BillingCheckoutSessionDisclosure, { session: sessionDto() }),
+    );
+    assert.match(disclosure, /sandbox payment page/);
+
+    const liveDisclosure = renderToStaticMarkup(
+      React.createElement(BillingCheckoutSessionDisclosure, { session: sessionDto(), mode: 'live' }),
+    );
+    assert.match(liveDisclosure, /Opens the provider['\u2019]s payment page/);
+    assert.doesNotMatch(liveDisclosure, /sandbox payment page/);
+
+    const choices = renderToStaticMarkup(
+      React.createElement(BillingCheckoutChoices, { selected: { cataloguePlan: 'pro', interval: 'monthly' } }),
+    );
+    assert.match(choices, /four sandbox choices/);
+
+    const liveChoices = renderToStaticMarkup(
+      React.createElement(BillingCheckoutChoices, {
+        selected: { cataloguePlan: 'pro', interval: 'monthly' },
+        mode: 'live',
+      }),
+    );
+    assert.doesNotMatch(liveChoices, /four sandbox choices/);
   });
 });

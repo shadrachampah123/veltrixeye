@@ -82,8 +82,12 @@ function billingState(args: {
   providerState?: string | null;
   /** Whether the durable activation FACT confirms the payment (Step 8). */
   paymentConfirmed?: boolean;
+  /** The server-reported provider domain (default: the sandbox test domain). */
+  mode?: 'test' | 'live';
 }): BillingStateDto {
   return billingStateDtoSchema.parse({
+    // The default provider domain: mode-aware copy renders sandbox text.
+    mode: args.mode ?? 'test',
     subscription: {
       id: SUBSCRIPTION_ID,
       plan: args.plan,
@@ -459,4 +463,47 @@ test('sellability is pinned to BILLING_CHECKOUT_SELLABLE_PLANS and never restate
   const source = readFileSync(new URL('../components/subscription-panel.tsx', import.meta.url), 'utf8');
   assert.match(source, /BILLING_CHECKOUT_SELLABLE_PLANS/, 'the component uses the shared constant');
   assert.doesNotMatch(source, /\[\s*'pro'\s*,\s*'elite'\s*\]/, 'no restated sellable-plan literal');
+});
+
+/* -------------------------------------------------------------------------- */
+/* Mode-aware copy: a live billing state is never called a sandbox            */
+/* -------------------------------------------------------------------------- */
+
+test('mode-aware copy: live never says sandbox, test keeps the sandbox note, unknown claims neither', () => {
+  // The domain note lives on the catalogue card (PlanComparison).
+  const live = renderComparison('pro');
+  const liveMode = renderToStaticMarkup(
+    React.createElement(PlanComparison, { currentPlan: 'pro', mode: 'live' }),
+  );
+  assert.match(liveMode, /Live billing:/);
+  assert.match(liveMode, /<em>live-mode<\/em>/);
+  assert.doesNotMatch(liveMode, /Sandbox billing only:/);
+  assert.doesNotMatch(liveMode, /<em>sandbox<\/em>/);
+
+  // The default render (direct, no mode) keeps every sandbox assertion.
+  assert.match(live, /Sandbox billing only:/);
+  assert.match(live, /<em>sandbox<\/em> \(test-mode\)/);
+  assert.doesNotMatch(live, /Live billing:/);
+
+  // An unknown mode claims neither domain.
+  const unknown = renderToStaticMarkup(
+    React.createElement(PlanComparison, { currentPlan: 'pro', mode: null }),
+  );
+  assert.doesNotMatch(unknown, /Sandbox billing only:/);
+  assert.doesNotMatch(unknown, /Live billing:/);
+  assert.match(unknown, /<strong class="text-amber-450">Billing:<\/strong>/);
+
+  // The unreadable-state card names the configured checkout domain.
+  const sandboxRefusal = render(
+    billingState({ plan: 'free', status: 'active', entitlements: FREE_ENTITLEMENTS, mode: 'test' }),
+    { unavailable: true },
+  );
+  assert.match(sandboxRefusal, /the sandbox checkout is refusing/);
+
+  const liveRefusal = render(
+    billingState({ plan: 'free', status: 'active', entitlements: FREE_ENTITLEMENTS, mode: 'live' }),
+    { unavailable: true },
+  );
+  assert.match(liveRefusal, /the checkout is refusing/);
+  assert.doesNotMatch(liveRefusal, /the sandbox checkout is refusing/);
 });

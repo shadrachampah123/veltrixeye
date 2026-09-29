@@ -60,7 +60,7 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
   const checkout = composeBillingCheckout(ctx.pool, ctx.billingProviders, config);
   const sync = composeBillingSync(ctx.pool, ctx.billingProviders);
   const customers = composeBillingCustomers(ctx.pool, ctx.billingProviders);
-  const verify = composeBillingVerify(ctx.pool, ctx.billingProviders);
+  const verify = composeBillingVerify(ctx.pool, ctx.billingProviders, config);
 
   // Billing Step 5.2 — the secure webhook receiver route. Signature-verified,
   // never session-authenticated; registered only when a billing provider
@@ -242,9 +242,13 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
     if (!ok) return;
     
     const { user } = req as AuthenticatedRequest;
-    const state = await getBillingState(ctx.pool, user.id);
-    
+    const state = await getBillingState(ctx.pool, user.id, { mode: config.billing.mode });
+
     const dto: BillingStateDto = {
+      // The configured provider mode this response is served in (display-only:
+      // the web UI derives sandbox vs live copy from it and never claims a
+      // domain the server did not state).
+      mode: state.mode,
       subscription: state.subscription,
       entitlements: state.entitlements,
       // Display-only provider state: it tells the client whether the row came

@@ -1,6 +1,7 @@
 export {
   PAYSTACK_API_BASE_URL,
   PAYSTACK_LIVE,
+  PAYSTACK_LIVE_KEY_PREFIX,
   PAYSTACK_TEST_KEY_PREFIX,
   PaystackClient,
   type PaystackClientConfig,
