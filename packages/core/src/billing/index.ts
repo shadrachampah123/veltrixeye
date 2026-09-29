@@ -5,6 +5,7 @@ export * from './fx-rate-versions.js';
 export * from './pricing.js';
 export * from './provider-plans.js';
 export * from './provisioning.js';
+export * from './live-plan-registration.js';
 export * from './provider.js';
 export * from './subscriptions.js';
 export * from './snapshots.js';

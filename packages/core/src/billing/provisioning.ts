@@ -1,6 +1,7 @@
 import type { Pool } from 'pg';
 import { z } from 'zod';
 import {
+  BILLING_CREDENTIAL_SHAPED_RE,
   BILLING_PAYMENT_AMOUNT_EXPONENT,
   billingIntervalSchema,
   commercialPlanIdSchema,
@@ -8,6 +9,7 @@ import {
   type BillingPaymentCurrency,
   type BillingProviderMode,
 } from '@veltrixeye/contracts';
+import { recordAuditEvent } from '../audit.js';
 import { BILLING_CATALOGUE_VERSION, cataloguePriceMinor } from './catalogue.js';
 import {
   assertFxRateVersionFresh,
@@ -121,7 +123,14 @@ export type BillingProvisioningFailureReason =
   /** The derived amount is below the documented provider minimum. */
   | 'below_minimum'
   /** The registration instant is missing or malformed. */
-  | 'invalid_instant';
+  | 'invalid_instant'
+  /**
+   * A LIVE registration (`mode: 'live'`) was requested without the operator
+   * audit descriptor. A live epoch is a real-money charge target: it is never
+   * written without a named operator, a stated reason and the transactional
+   * audit event that records both.
+   */
+  | 'audit_required';
 
 export class BillingProvisioningError extends Error {
   readonly code = 'billing_provisioning_refused' as const;
@@ -730,19 +739,73 @@ export interface BillingPlanProvisioningOptions {
   mode?: BillingProviderMode;
 }
 
+/**
+ * The transactional audit action a provider-plan registration writes.
+ *
+ * ONE event per registered batch, inserted on the SAME client/transaction as
+ * the epochs: an epoch batch that commits without its audit event is
+ * unrepresentable, and a rolled-back batch leaves no audit row either.
+ */
+export const BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION =
+  'billing.provider_plans_registered' as const;
+
+/**
+ * The operator descriptor a registration needs in order to be auditable: who
+ * authorized this run and why. It carries a named human identity and a stated
+ * reason — NEVER a credential (credential-shaped values are refused) — and it
+ * is written into `audit_events`, never into the epoch row.
+ *
+ * REQUIRED for a LIVE registration (`mode: 'live'`): a live epoch is a
+ * real-money charge target, so it cannot be created by an anonymous or
+ * unexplained run. Optional for the sandbox (`test`) path, which keeps its
+ * historical behaviour byte-for-byte.
+ */
+export const provisioningAuditDescriptorSchema = z
+  .object({
+    /** The named human (or named operator run) that authorized the batch. */
+    operatorId: z.string().trim().min(1).max(128),
+    /** Why this batch was registered. */
+    reason: z.string().trim().min(1).max(500),
+  })
+  .strict();
+export type ProvisioningAuditDescriptor = z.infer<typeof provisioningAuditDescriptorSchema>;
+
 export interface RegisterSandboxPlanEpochsInput {
   /** The operator-selected authoritative FX version id (must already exist). */
   fxRateVersionId: string;
   /** The four operator/provider evidence entries (validated in full). */
   evidence: readonly unknown[];
+  /**
+   * Operator identity + reason, recorded as ONE transactional
+   * `billing.provider_plans_registered` audit event. MANDATORY in live mode.
+   */
+  audit?: ProvisioningAuditDescriptor;
 }
 
 const registerSandboxPlanEpochsInputSchema = z
   .object({
     fxRateVersionId: z.string().uuid(),
     evidence: z.array(z.unknown()).min(1),
+    audit: provisioningAuditDescriptorSchema.optional(),
   })
   .strict();
+
+/** Refuse credential-shaped operator text before it can reach the audit log. */
+function assertAuditTextIsNotCredentialShaped(audit: ProvisioningAuditDescriptor): void {
+  const offending =
+    BILLING_CREDENTIAL_SHAPED_RE.test(audit.operatorId)
+      ? 'operatorId'
+      : BILLING_CREDENTIAL_SHAPED_RE.test(audit.reason)
+        ? 'reason'
+        : null;
+  if (offending !== null) {
+    throw new BillingProvisioningError(
+      'audit_required',
+      `The registration audit descriptor's "${offending}" is credential-shaped and is refused: the ` +
+        'audit record names a human operator and a reason, never key or token material.',
+    );
+  }
+}
 
 /**
  * The Step 4 provisioning service: validate the complete four-plan batch,
@@ -761,6 +824,11 @@ const registerSandboxPlanEpochsInputSchema = z
  *    the combination, or a provider code already registered) is surfaced as
  *    the store's typed conflict and rolls the whole batch back: no upsert, no
  *    automatic retirement, no partial batch.
+ *  - when an operator audit descriptor is supplied (MANDATORY for a live
+ *    batch), ONE `billing.provider_plans_registered` audit event on the SAME
+ *    transaction, naming the operator, the reason, the shared FX version and
+ *    every registered epoch. The facts and their audit record commit
+ *    together or not at all.
  *
  * WHAT IT NEVER DOES
  *  - no Paystack call of any kind (this module has no transport, imports no
@@ -787,7 +855,9 @@ export class BillingPlanProvisioningService {
    * register the four epochs. REJECTS (before any write) on: a missing,
    * malformed, wrong-pair, not-yet-effective or stale (>900 s) FX version;
    * any shape, mapping, mode, currency, cap, code, exclusion or amount
-   * violation in the evidence. A write-time conflict rolls everything back.
+   * violation in the evidence; and — in LIVE mode only — a missing or
+   * credential-shaped operator audit descriptor (`audit_required`). A
+   * write-time conflict rolls everything back.
    */
   async registerSandboxPlanEpochs(input: unknown): Promise<readonly BillingProviderPlan[]> {
     const parsed = registerSandboxPlanEpochsInputSchema.safeParse(input);
@@ -799,6 +869,22 @@ export class BillingPlanProvisioningService {
           .join('; ')}`,
         { cause: parsed.error },
       );
+    }
+
+    // LIVE registrations are auditable by construction: the operator identity
+    // and the reason are mandatory, and the audit event is written on the same
+    // transaction as the epochs. Refused here — before the connection, before
+    // the FX read, before the first INSERT.
+    if (this.mode === 'live' && parsed.data.audit === undefined) {
+      throw new BillingProvisioningError(
+        'audit_required',
+        'A live provider-plan registration requires the operator audit descriptor ' +
+          '(an operator id and a stated reason). A live epoch is a real-money charge target: it is never ' +
+          'registered anonymously or without a reason recorded in the same transaction. Nothing was registered.',
+      );
+    }
+    if (parsed.data.audit !== undefined) {
+      assertAuditTextIsNotCredentialShaped(parsed.data.audit);
     }
 
     // ONE registration instant per batch: the freshness window is measured
@@ -882,6 +968,54 @@ export class BillingPlanProvisioningService {
             );
           }
           throw error;
+        }
+      }
+
+      // The transactional audit event — on the SAME client/transaction as the
+      // four epochs, and only after all four registered. A batch that cannot
+      // record who authorized it does not exist.
+      const audit = parsed.data.audit;
+      if (audit !== undefined) {
+        try {
+          await recordAuditEvent(client, {
+            action: BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION,
+            entityType: 'billing_provider_plan',
+            // The batch identity is the ONE FX version all four epochs pin;
+            // every epoch id is listed in the metadata below.
+            entityId: registered[0]?.fxRateVersionId ?? parsed.data.fxRateVersionId,
+            metadata: {
+              mode: this.mode,
+              operatorId: audit.operatorId,
+              reason: audit.reason,
+              fxRateVersionId: parsed.data.fxRateVersionId,
+              registeredAt: registeredAt.toISOString(),
+              pricingPolicyVersion: registered[0]?.pricingPolicyVersion ?? null,
+              catalogueVersion: registered[0]?.catalogueVersion ?? null,
+              epochs: registered.map((epoch) => ({
+                id: epoch.id,
+                cataloguePlan: epoch.cataloguePlan,
+                billingInterval: epoch.interval,
+                providerInterval: PROVIDER_INTERVAL_FOR_BILLING_INTERVAL[epoch.interval],
+                providerPlanId: epoch.providerPlanId,
+                paymentCurrency: epoch.paymentCurrency,
+                // Minor units are written as strings: money is an integer and
+                // JSON has no BigInt, so the audit record never rounds.
+                paymentAmountMinor: epoch.paymentAmountMinor.toString(),
+                validFrom: epoch.validFrom.toISOString(),
+              })),
+              // Pinned: registering an epoch grants no execution and confirms
+              // no payment.
+              grantsExecution: false,
+              paymentConfirmed: false,
+            },
+          });
+        } catch (error) {
+          throw new BillingProvisioningError(
+            'audit_required',
+            'The provider-plan registration was refused: the transactional audit event could not be ' +
+              'written, so no epoch was registered.',
+            { cause: error },
+          );
         }
       }
 
