@@ -802,16 +802,35 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     assert.match(syncCore, /SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE/);
 
     // Billing Step 5.2 added the webhook RECEIVER at exactly one sanctioned
-    // place (apps/api/src/billing-webhook.ts + core's billing/webhook.ts) —
-    // and it must still be receipt-only: no entitlement, no status change, no
-    // confirmation and no execution grant anywhere near it.
+    // place (apps/api/src/billing-webhook.ts + core's billing/webhook.ts).
+    // Part 2 permits one post-ledger identity-metadata update only: bind the
+    // already-normalized subscription code and bump state_version. Neither the
+    // route nor the receiver may change lifecycle, entitlement, or sync state.
     const receiverRoute = read(REPO_ROOT, 'apps', 'api', 'src', 'billing-webhook.ts');
     const receiverCore = read(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'webhook.ts');
     for (const source of [receiverRoute, receiverCore]) {
       assert.doesNotMatch(source, /resolveEntitlements|getEntitlements|FREE_ENTITLEMENTS/);
-      assert.doesNotMatch(source, /UPDATE\s+subscriptions/i, 'the receiver never moves a subscription');
       assert.doesNotMatch(source, /canAccessAutomation|grantsExecution:\s*true/);
     }
+    assert.doesNotMatch(receiverRoute, /UPDATE\s+subscriptions/i, 'the API route never writes subscriptions');
+
+    const receiverCoreCode = codeOnly(receiverCore);
+    const subscriptionUpdates = [...receiverCoreCode.matchAll(/UPDATE\s+subscriptions\s+SET([\s\S]*?)WHERE/gi)];
+    assert.equal(subscriptionUpdates.length, 1, 'the receiver has exactly one approved subscription metadata update');
+    const bindingColumns = [...subscriptionUpdates[0]![1]!.matchAll(/([\w]+)\s*=/g)]
+      .map((match) => match[1]!)
+      .sort();
+    assert.deepEqual(bindingColumns, ['provider_subscription_code', 'state_version'],
+      'the receiver may bind only the subscription code and advance its CAS version');
+    assert.match(receiverCoreCode,
+      /WHERE id = \$1\s+AND user_id = \$2\s+AND provider = \$4\s+AND provider_subscription_code IS NULL\s+AND \(provider_subscription_id IS NULL OR provider_subscription_id = \$3\)/,
+      'the metadata write remains guarded by resolved row/user/provider identity and existing-id coherence');
+    assert.doesNotMatch(receiverCoreCode, /\b(?:INSERT\s+INTO|DELETE\s+FROM)\s+subscriptions\b/i,
+      'the receiver cannot create or delete subscription rows');
+    const ledgerRecord = receiverCoreCode.indexOf('await this.safeRecord({');
+    const codeBinding = receiverCoreCode.indexOf('subscriptionCodeBinding: await this.bindSubscriptionCode(');
+    assert.ok(ledgerRecord >= 0 && codeBinding > ledgerRecord,
+      'the code-binding write must remain after durable ledger recording');
     // Code only: prose must not satisfy (or trip) the column-name check.
     const billingState = codeOnly(read(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'subscriptions.ts'));
     assert.match(billingState, /paymentConfirmed/, 'paymentConfirmed is still reported');
