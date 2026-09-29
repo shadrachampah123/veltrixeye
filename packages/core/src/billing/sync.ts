@@ -16,7 +16,11 @@ import {
   type SubscriptionSyncResult,
 } from '@veltrixeye/contracts';
 import { billingCheckoutReference } from './checkout.js';
-import { billingSubscriptionVerifyRequestSchema, type BillingProviderRegistry } from './provider.js';
+import {
+  billingSubscriptionQuerySchema,
+  billingSubscriptionVerifyRequestSchema,
+  type BillingProviderRegistry,
+} from './provider.js';
 import {
   claimReceivedBillingProviderEvents,
   settleBillingProviderEvents,
@@ -33,8 +37,10 @@ import {
  *   1. read the local row (no lock held across the network);
  *   2. derive OUR checkout reference from the locked pricing snapshot, through
  *      the SAME `billingCheckoutReference` checkout uses;
- *   3. ask the provider — through the canonical seam only — to VERIFY that
- *      reference (`verifySubscription`, one documented read);
+ *   3. when a local provider subscription code/id is known, read that exact
+ *      subscription (`findSubscription`, one documented read); otherwise
+ *      verify OUR checkout reference (`verifySubscription`, one documented
+ *      transaction read, whose lifecycle state remains unknown);
  *   4. in ONE transaction: claim the `received` ledger rows bound to the
  *      subscription, apply the verified state through
  *      `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE` (the ONLY path from provider
@@ -47,10 +53,11 @@ import {
  * WHAT IT NEVER DOES
  * ---------------------------------------------------------------------------
  *  - It never writes `plan` (the entitlement identity), `catalogue_plan`,
- *    `billing_interval`, the price lock, periods or cancellation fields. The
- *    only columns it moves are `status` (via the canonical mapping, and only
- *    when a mapping exists), `provider_state` (the canonical lifecycle value),
- *    and the 0031 synchronization bookkeeping (`sync_state`, `sync_required`,
+ *    `billing_interval`, the price lock, periods or cancellation fields. It may
+ *    bind a previously-null `provider_subscription_id` from an identity-checked
+ *    subscription read; it also moves `status` (via the canonical mapping, and
+ *    only when a mapping exists), `provider_state` (the canonical lifecycle
+ *    value), and 0031 synchronization bookkeeping (`sync_state`, `sync_required`,
  *    `last_sync_source`, `last_synced_at`, `last_event_idempotency_key`,
  *    `state_version`).
  *  - It never widens an entitlement. A provider-backed row still resolves to
@@ -61,8 +68,9 @@ import {
  *    the mapping sends to `null`) leave `status` exactly as it is and flag the
  *    row for manual review (`sync_state = 'conflict'`, `sync_required = true`).
  *  - It never infers cancellation, periods or a plan from a provider response,
- *    and it never persists a provider payload: only canonical values reach the
- *    database, and the verified observation itself is not stored.
+ *    and it never persists a provider payload/full observation: only the
+ *    canonical lifecycle value and (from an exact subscription read) its
+ *    identity-checked provider id may reach the database.
  *  - It is not called by the webhook receiver. Receipt stays receipt-only; the
  *    receiver performs no verification and moves no state.
  *  - It performs no transport and reads no environment: the provider and the
@@ -132,6 +140,7 @@ interface SyncSubscriptionRow {
   status: string;
   provider: string | null;
   provider_subscription_id: string | null;
+  provider_subscription_code: string | null;
   state_version: number;
   pricing_idempotency_key: string | null;
 }
@@ -147,6 +156,8 @@ interface SyncPlan {
   toStatus: SubscriptionStatus | null;
   /** Canonical lifecycle value to persist, or null to leave `provider_state` untouched. */
   providerState: BillingLifecycleState | null;
+  /** Identity-checked id to bind only when it came from a subscription read. */
+  providerSubscriptionIdToBind: string | null;
   syncState: Exclude<BillingSyncState, 'never_synced'>;
   syncRequired: boolean;
   reason: string | null;
@@ -204,27 +215,49 @@ export class BillingSubscriptionSyncService {
     }
 
     const reference = billingCheckoutReference(row.user_id, row.pricing_idempotency_key);
-    const request = billingSubscriptionVerifyRequestSchema.parse({
-      provider: BILLING_PROVIDER,
-      userId: user,
-      providerReference: reference,
-      idempotencyKey: billingSyncVerificationKey(row.id, row.state_version),
-      requestedAt: this.now().toISOString(),
-    });
+    const subscriptionIdentifier = row.provider_subscription_code ?? row.provider_subscription_id;
 
-    // ONE provider read, outside any transaction. Any failure — transport,
-    // provider refusal, reference/domain conflict, malformed response — is an
-    // unknown outcome: nothing is written and the ledger rows stay `received`.
+    // ONE provider read, outside any transaction. Prefer the already-bound
+    // subscription code, then the provider id. Only rows without either known
+    // identity fall back to the original checkout transaction verification.
+    // A null subscription read is not proof that local state is cancelled or
+    // absent: it is an unusable view and writes nothing.
     let observed: ProviderSubscriptionState;
     try {
-      observed = providerSubscriptionStateSchema.parse(await provider.verifySubscription(request));
+      if (subscriptionIdentifier !== null) {
+        const query = billingSubscriptionQuerySchema.parse({
+          provider: BILLING_PROVIDER,
+          userId: user,
+          providerSubscriptionId: subscriptionIdentifier,
+        });
+        const found = await provider.findSubscription(query);
+        if (found === null) throw new Error('The provider returned no subscription for the local identity.');
+        observed = providerSubscriptionStateSchema.parse(found);
+      } else {
+        const request = billingSubscriptionVerifyRequestSchema.parse({
+          provider: BILLING_PROVIDER,
+          userId: user,
+          providerReference: reference,
+          idempotencyKey: billingSyncVerificationKey(row.id, row.state_version),
+          requestedAt: this.now().toISOString(),
+        });
+        observed = providerSubscriptionStateSchema.parse(await provider.verifySubscription(request));
+      }
     } catch (error) {
       throw new BillingSubscriptionSyncError('verification_unavailable', { cause: error });
     }
 
     const customer = await readLocalCustomer(db, user);
     const fromStatus = subscriptionStatusSchema.parse(row.status);
-    const plan = planSync(fromStatus, observed, { reference, row, customer });
+    const planned = planSync(fromStatus, observed, { reference, row, customer });
+    const plan: SyncPlan = {
+      ...planned,
+      // A numeric/provider id is learned from the subscription read, not from
+      // transaction verification. Keep the code binding as the lookup key and
+      // bind this additional identity only after all identity checks pass.
+      providerSubscriptionIdToBind:
+        subscriptionIdentifier !== null && planned.outcome !== 'conflict' ? observed.providerSubscriptionId : null,
+    };
     return this.apply(row, fromStatus, plan);
   }
 
@@ -235,13 +268,24 @@ export class BillingSubscriptionSyncService {
   ): Promise<SubscriptionSyncResult> {
     const syncedAt = this.now().toISOString();
     const client = await this.options.db.connect();
+    let retryAsIdentityConflict = false;
     try {
       await client.query('BEGIN');
+      let appliedPlan = plan;
+      if (plan.providerSubscriptionIdToBind !== null) {
+        const owner = await client.query<{ id: string }>(
+          `SELECT id FROM subscriptions
+            WHERE provider = $1 AND provider_subscription_id = $2 AND id <> $3
+            LIMIT 1`,
+          [BILLING_PROVIDER, plan.providerSubscriptionIdToBind, row.id],
+        );
+        if (owner.rows.length > 0) appliedPlan = subscriptionIdentityConflictPlan();
+      }
       const claimed = await claimReceivedBillingProviderEvents(client, {
         subscriptionId: row.id,
         userId: row.user_id,
       });
-      const settlement = settlementFor(plan, claimed);
+      const settlement = settlementFor(appliedPlan, claimed);
       const lastAppliedKey = settlement.processed.at(-1)?.idempotencyKey ?? null;
 
       // Optimistic concurrency: the write lands only on the version that was
@@ -250,6 +294,7 @@ export class BillingSubscriptionSyncService {
         `UPDATE subscriptions
             SET status = COALESCE($3, status),
                 provider_state = COALESCE($4, provider_state),
+                provider_subscription_id = COALESCE(provider_subscription_id, $10),
                 sync_state = $5,
                 sync_required = $6,
                 last_sync_source = 'verification',
@@ -257,17 +302,19 @@ export class BillingSubscriptionSyncService {
                 last_event_idempotency_key = COALESCE($8, last_event_idempotency_key),
                 state_version = state_version + 1
           WHERE id = $1 AND state_version = $2 AND provider = $9
+            AND ($10::text IS NULL OR provider_subscription_id IS NULL OR provider_subscription_id = $10)
           RETURNING state_version`,
         [
           row.id,
           row.state_version,
-          plan.outcome === 'updated' ? plan.toStatus : null,
-          plan.providerState,
-          plan.syncState,
-          plan.syncRequired,
+          appliedPlan.outcome === 'updated' ? appliedPlan.toStatus : null,
+          appliedPlan.providerState,
+          appliedPlan.syncState,
+          appliedPlan.syncRequired,
           syncedAt,
           lastAppliedKey,
           BILLING_PROVIDER,
+          appliedPlan.providerSubscriptionIdToBind,
         ],
       );
       const written = updated.rows[0];
@@ -288,21 +335,21 @@ export class BillingSubscriptionSyncService {
       }
 
       await settle(client, settlement.processed, 'processed', syncedAt, null);
-      await settle(client, settlement.ignored, 'ignored', syncedAt, plan.reason);
-      await settle(client, settlement.failed, 'failed', syncedAt, plan.reason);
+      await settle(client, settlement.ignored, 'ignored', syncedAt, appliedPlan.reason);
+      await settle(client, settlement.failed, 'failed', syncedAt, appliedPlan.reason);
       await client.query('COMMIT');
 
       return subscriptionSyncResultSchema.parse({
         provider: BILLING_PROVIDER,
         userId: row.user_id,
         subscriptionId: row.id,
-        outcome: plan.outcome,
+        outcome: appliedPlan.outcome,
         fromStatus,
-        toStatus: plan.toStatus,
-        providerState: plan.providerState,
+        toStatus: appliedPlan.toStatus,
+        providerState: appliedPlan.providerState,
         appliedEventIdempotencyKeys: settlement.processed.map((event) => event.idempotencyKey),
-        requiresManualReview: plan.outcome === 'requires_manual_review' || plan.outcome === 'conflict',
-        reason: plan.reason,
+        requiresManualReview: appliedPlan.outcome === 'requires_manual_review' || appliedPlan.outcome === 'conflict',
+        reason: appliedPlan.reason,
         syncedAt,
         stateVersion: written.state_version,
         planChanged: false,
@@ -311,10 +358,22 @@ export class BillingSubscriptionSyncService {
       });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
-      throw error;
+      if (plan.providerSubscriptionIdToBind !== null && isProviderSubscriptionIdUniqueViolation(error)) {
+        // A concurrent sync bound the same provider id to another row after
+        // our ownership probe. Roll back the attempted status/ledger changes,
+        // then record a normal identity conflict without binding the id.
+        retryAsIdentityConflict = true;
+      } else {
+        throw error;
+      }
     } finally {
       client.release();
     }
+
+    if (retryAsIdentityConflict) {
+      return this.apply(row, fromStatus, subscriptionIdentityConflictPlan());
+    }
+    throw new Error('Synchronization transaction ended without a result.');
   }
 
   private now(): Date {
@@ -336,16 +395,23 @@ export function planSync(
   observed: ProviderSubscriptionState,
   local: {
     reference: string;
-    row: { provider_subscription_id: string | null };
+    row: { provider_subscription_id: string | null; provider_subscription_code: string | null };
     customer: LocalCustomerRow | null;
   },
 ): SyncPlan {
   const disagrees = (remote: string | null, mine: string | null | undefined): boolean =>
     remote !== null && mine !== null && mine !== undefined && remote !== mine;
+  const expectedSubscriptionIdentityMissing =
+    local.row.provider_subscription_code !== null
+      ? observed.providerSubscriptionCode !== local.row.provider_subscription_code
+      : local.row.provider_subscription_id !== null &&
+        observed.providerSubscriptionId !== local.row.provider_subscription_id;
   if (
     observed.provider !== BILLING_PROVIDER ||
+    expectedSubscriptionIdentityMissing ||
     disagrees(observed.providerReference, local.reference) ||
     disagrees(observed.providerSubscriptionId, local.row.provider_subscription_id) ||
+    disagrees(observed.providerSubscriptionCode, local.row.provider_subscription_code) ||
     disagrees(observed.providerCustomerCode, local.customer?.provider_customer_code) ||
     disagrees(observed.providerCustomerId, local.customer?.provider_customer_id)
   ) {
@@ -353,6 +419,7 @@ export function planSync(
       outcome: 'conflict',
       toStatus: null,
       providerState: null,
+      providerSubscriptionIdToBind: null,
       syncState: 'conflict',
       syncRequired: true,
       reason: BILLING_SYNC_REASONS.identityConflict,
@@ -367,6 +434,7 @@ export function planSync(
         outcome: 'ignored',
         toStatus: null,
         providerState: observed.state,
+        providerSubscriptionIdToBind: null,
         syncState: 'pending',
         syncRequired: false,
         reason: BILLING_SYNC_REASONS.unprovisioned,
@@ -376,6 +444,7 @@ export function planSync(
       outcome: 'requires_manual_review',
       toStatus: null,
       providerState: observed.state,
+      providerSubscriptionIdToBind: null,
       syncState: 'conflict',
       syncRequired: true,
       reason: BILLING_SYNC_REASONS.reviewRequired,
@@ -385,10 +454,32 @@ export function planSync(
     outcome: target === fromStatus ? 'unchanged' : 'updated',
     toStatus: target,
     providerState: observed.state,
+    providerSubscriptionIdToBind: null,
     syncState: 'synced',
     syncRequired: false,
     reason: null,
   };
+}
+
+/** A persisted provider id already belongs to another local subscription. */
+function subscriptionIdentityConflictPlan(): SyncPlan {
+  return {
+    outcome: 'conflict',
+    toStatus: null,
+    providerState: null,
+    providerSubscriptionIdToBind: null,
+    syncState: 'conflict',
+    syncRequired: true,
+    reason: BILLING_SYNC_REASONS.identityConflict,
+  };
+}
+
+function isProviderSubscriptionIdUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === 'object' && error !== null &&
+    'code' in error && error.code === '23505' &&
+    'constraint' in error && error.constraint === 'subscriptions_provider_subscription_uniq'
+  );
 }
 
 /** Which claimed ledger rows move where, for one plan. */
@@ -419,7 +510,8 @@ function settlementFor(
 
 async function readSubscription(db: Pool, userId: string): Promise<SyncSubscriptionRow | undefined> {
   const { rows } = await db.query<SyncSubscriptionRow>(
-    `SELECT s.id, s.user_id, s.status, s.provider, s.provider_subscription_id, s.state_version,
+    `SELECT s.id, s.user_id, s.status, s.provider, s.provider_subscription_id,
+            s.provider_subscription_code, s.state_version,
             p.idempotency_key AS pricing_idempotency_key
        FROM subscriptions s
        LEFT JOIN billing_pricing_snapshots p ON p.id = s.locked_pricing_snapshot_id

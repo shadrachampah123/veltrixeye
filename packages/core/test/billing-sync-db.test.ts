@@ -5,6 +5,7 @@ import {
   BILLING_LIFECYCLE_STATES,
   BILLING_PROVIDER,
   SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE,
+  projectBillingPortalSummary,
   subscriptionSyncResultSchema,
   type BillingEventType,
   type BillingLifecycleState,
@@ -27,7 +28,9 @@ import {
   createUnimplementedBillingProvider,
   getBillingState,
   isBillingSubscriptionSyncError,
+  readBillingPortalFacts,
   type BillingProviderRawEvent,
+  type BillingSubscriptionQuery,
   type BillingSubscriptionVerifyRequest,
 } from '../src/index.js';
 import {
@@ -39,9 +42,9 @@ import {
    database (embedded PG, migrations 0001–0032; no new migration).
 
    The provider is a stub behind the canonical seam, so every canonical
-   lifecycle state can be exercised (the Paystack adapter itself only ever
-   reports `unknown`: its verify read publishes no subscription status — see
-   packages/providers/paystack/test/verify.test.ts).
+   lifecycle state can be exercised. The transaction-verify fallback still
+   reports `unknown`; when a locally bound provider subscription id/code is
+   available, Part 3 exercises the subscription-read path separately.
    ========================================================================== */
 
 const SECRET = 'sk_test_0123456789abcdef0123456789abcdef01234567';
@@ -50,7 +53,7 @@ const NOW = new Date('2027-06-01T12:00:00.000Z');
 /** The columns synchronization is allowed to move — nothing else. */
 const SYNC_WRITABLE_COLUMNS = new Set([
   'status', 'provider_state', 'sync_state', 'sync_required', 'last_sync_source',
-  'last_synced_at', 'last_event_idempotency_key', 'state_version', 'updated_at',
+  'last_synced_at', 'last_event_idempotency_key', 'provider_subscription_id', 'state_version', 'updated_at',
 ]);
 
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
@@ -129,6 +132,13 @@ function observed(overrides: Partial<ProviderSubscriptionState> = {}): ProviderS
   };
 }
 
+async function bindSubscriptionCode(fixture: Fixture, code = 'SUB_bound00001'): Promise<void> {
+  await db.pool.query(
+    `UPDATE subscriptions SET provider_subscription_code = $2, state_version = state_version + 1 WHERE id = $1`,
+    [fixture.subscriptionId, code],
+  );
+}
+
 function serviceWith(
   verify: (request: BillingSubscriptionVerifyRequest) => Promise<ProviderSubscriptionState>,
   extras: { normalizeEvent?: (request: BillingProviderRawEvent) => Promise<NormalizedBillingEvent> } = {},
@@ -142,6 +152,25 @@ function serviceWith(
       return verify(request);
     },
     ...extras,
+  });
+  return {
+    calls,
+    registry,
+    service: new BillingSubscriptionSyncService({ db: db.pool, providers: registry, now: () => NOW }),
+  };
+}
+
+function serviceWithSubscriptionRead(
+  read: (query: BillingSubscriptionQuery) => Promise<ProviderSubscriptionState | null>,
+) {
+  const calls: BillingSubscriptionQuery[] = [];
+  const registry = createBillingProviderRegistry();
+  registry.register({
+    ...createUnimplementedBillingProvider(),
+    findSubscription: async (query: BillingSubscriptionQuery) => {
+      calls.push(query);
+      return read(query);
+    },
   });
   return {
     calls,
@@ -284,6 +313,100 @@ describe('PR #7 (db) — verification request', () => {
     assert.equal(request.providerSubscriptionId, undefined);
     assert.equal(request.idempotencyKey, billingSyncVerificationKey(fixture.subscriptionId, 1));
     assert.equal(request.requestedAt, NOW.toISOString());
+  });
+});
+
+describe('Part 3 (db) — a bound provider code drives the exact subscription read', () => {
+  it('prefers the bound code, applies provider lifecycle state and binds the read provider id', async () => {
+    const fixture = await providerBacked();
+    const code = 'SUB_part300001';
+    await bindSubscriptionCode(fixture, code);
+    const before = await subscriptionRow(fixture.subscriptionId);
+    const { service, calls } = serviceWithSubscriptionRead(async () => observed({
+      state: 'cancelled',
+      providerSubscriptionId: '292646',
+      providerSubscriptionCode: code,
+      providerCustomerCode: fixture.customerCode,
+    }));
+
+    const result = await service.synchronize(fixture.userId);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0], {
+      provider: 'paystack', userId: fixture.userId, providerSubscriptionId: code,
+    });
+    assert.equal(result.outcome, 'updated');
+    assert.equal(result.providerState, 'cancelled');
+    assert.equal(result.toStatus, 'canceled');
+
+    const afterRow = await subscriptionRow(fixture.subscriptionId);
+    assert.equal(afterRow.provider_subscription_id, '292646');
+    assert.equal(afterRow.provider_subscription_code, code);
+    assert.equal(afterRow.status, 'canceled');
+    assert.equal(afterRow.state_version, Number(before.state_version) + 1);
+
+    // Existing portal projection consumes only its current summary facts: a
+    // verified non-live lifecycle cannot expose raw provider state/id/code or
+    // become an activation/receipt claim.
+    const portal = projectBillingPortalSummary(await readBillingPortalFacts(db.pool, fixture.userId));
+    assert.equal(portal.state, 'unknown');
+    assert.equal(portal.plan, null);
+    assert.equal(portal.periodEnd, null);
+    assert.equal(portal.cancelAtPeriodEnd, null);
+    assert.equal('providerState' in portal, false);
+    assert.equal('providerSubscriptionId' in portal, false);
+
+    for (const column of changedColumns(before, afterRow)) {
+      assert.ok(SYNC_WRITABLE_COLUMNS.has(column), `synchronization must not write ${column}`);
+    }
+    for (const column of ['plan', 'catalogue_plan', 'billing_interval', 'locked_pricing_snapshot_id',
+      'provider_plan_id', 'current_period_start', 'current_period_end', 'cancel_at', 'cancelled_at',
+      'cancellation_reason', 'cancel_at_period_end', 'provider_reference', 'provider_customer_id',
+      'provider_subscription_code']) {
+      assert.deepEqual(afterRow[column], before[column], `${column} unchanged`);
+    }
+  });
+
+  it('refuses to bind an id already owned by another subscription and records a conflict', async () => {
+    const fixture = await providerBacked();
+    const other = await providerBacked();
+    const code = 'SUB_part300002';
+    await bindSubscriptionCode(fixture, code);
+    await bindSubscriptionCode(other, 'SUB_part300003');
+    await db.pool.query(
+      `UPDATE subscriptions SET provider_subscription_id = $2, state_version = state_version + 1 WHERE id = $1`,
+      [other.subscriptionId, '555999'],
+    );
+    const before = await subscriptionRow(fixture.subscriptionId);
+    const { service } = serviceWithSubscriptionRead(async () => observed({
+      state: 'active',
+      providerSubscriptionId: '555999',
+      providerSubscriptionCode: code,
+      providerCustomerCode: fixture.customerCode,
+    }));
+
+    const result = await service.synchronize(fixture.userId);
+    assert.equal(result.outcome, 'conflict');
+    assert.equal(result.requiresManualReview, true);
+    assert.equal(result.reason, BILLING_SYNC_REASONS.identityConflict);
+    const afterRow = await subscriptionRow(fixture.subscriptionId);
+    assert.equal(afterRow.provider_subscription_id, null);
+    assert.equal(afterRow.provider_subscription_code, code);
+    assert.equal(afterRow.status, before.status);
+    assert.equal(afterRow.provider_state, before.provider_state);
+    assert.equal(afterRow.sync_state, 'conflict');
+    assert.equal(afterRow.sync_required, true);
+  });
+
+  it('a null exact-subscription read is unavailable and writes neither row nor ledger', async () => {
+    const fixture = await providerBacked();
+    await bindSubscriptionCode(fixture, 'SUB_part300004');
+    const before = await subscriptionRow(fixture.subscriptionId);
+    const { service } = serviceWithSubscriptionRead(async () => null);
+    await assert.rejects(
+      service.synchronize(fixture.userId),
+      (error: unknown) => isBillingSubscriptionSyncError(error) && error.reason === 'verification_unavailable',
+    );
+    assert.deepEqual(await subscriptionRow(fixture.subscriptionId), before);
   });
 });
 
@@ -504,7 +627,7 @@ describe('PR #7 (db) — entitlement boundary and redaction', () => {
     }
   });
 
-  it('never persists the verified observation (amounts, provider ids, observedAt)', async () => {
+  it('transaction verification persists no payment, customer-id or observation-time payload fields', async () => {
     const fixture = await providerBacked();
     const paid = await recordEvent(fixture, 'payment.succeeded');
     const { service } = serviceWith(async () => observed({

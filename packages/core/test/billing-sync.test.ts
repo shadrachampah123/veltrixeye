@@ -55,9 +55,13 @@ const observed = (overrides: Partial<ProviderSubscriptionState> = {}): ProviderS
   ...overrides,
 });
 
-const local = (customer: { provider_customer_id: string | null; provider_customer_code: string | null } | null = null, providerSubscriptionId: string | null = null) => ({
+const local = (
+  customer: { provider_customer_id: string | null; provider_customer_code: string | null } | null = null,
+  providerSubscriptionId: string | null = null,
+  providerSubscriptionCode: string | null = null,
+) => ({
   reference: REFERENCE,
-  row: { provider_subscription_id: providerSubscriptionId },
+  row: { provider_subscription_id: providerSubscriptionId, provider_subscription_code: providerSubscriptionCode },
   customer,
 });
 
@@ -109,6 +113,7 @@ describe('PR #7 — identity disagreement applies nothing', () => {
     ['different customer code', { state: 'active', providerCustomerCode: 'CUS_theirs' }, local(customer)],
     ['different customer id', { state: 'active', providerCustomerId: '43' }, local(customer)],
     ['different subscription id', { state: 'active', providerSubscriptionId: 'SUB_theirs' }, local(customer, 'SUB_mine')],
+    ['different subscription code', { state: 'active', providerSubscriptionCode: 'SUB_theirs' }, local(customer, null, 'SUB_mine')],
   ];
   for (const [label, overrides, context] of cases) {
     it(label, () => {
@@ -120,6 +125,24 @@ describe('PR #7 — identity disagreement applies nothing', () => {
       assert.equal(plan.reason, BILLING_SYNC_REASONS.identityConflict);
     });
   }
+
+  it('a known subscription lookup key must be echoed exactly', () => {
+    const missingCode = planSync(
+      'active',
+      observed({ state: 'active', providerSubscriptionId: '292646', providerSubscriptionCode: null }),
+      local(null, null, 'SUB_mine'),
+    );
+    assert.equal(missingCode.outcome, 'conflict');
+    assert.equal(missingCode.providerState, null);
+
+    const missingId = planSync(
+      'active',
+      observed({ state: 'active', providerSubscriptionId: null, providerSubscriptionCode: 'SUB_remote' }),
+      local(null, '292646'),
+    );
+    assert.equal(missingId.outcome, 'conflict');
+    assert.equal(missingId.providerState, null);
+  });
 
   it('absent identifiers on either side are not a disagreement', () => {
     assert.equal(planSync('active', observed({ state: 'active', providerReference: null }), local()).outcome, 'unchanged');
@@ -167,7 +190,7 @@ describe('PR #7 — source boundaries', () => {
     const assigned = [...updates[0]!.matchAll(/(\w+)\s*=/g)].map((m) => m[1]!).sort();
     assert.deepEqual(assigned, [
       'last_event_idempotency_key', 'last_sync_source', 'last_synced_at', 'provider_state',
-      'state_version', 'status', 'sync_required', 'sync_state',
+      'provider_subscription_id', 'state_version', 'status', 'sync_required', 'sync_state',
     ]);
     assert.doesNotMatch(SYNC_SOURCE, /INSERT INTO subscriptions/);
     assert.doesNotMatch(SYNC_SOURCE, /UPDATE users/i);
@@ -181,7 +204,9 @@ describe('PR #7 — source boundaries', () => {
     assert.doesNotMatch(SYNC_CODE, /\bfetch\s*\(/);
     assert.doesNotMatch(SYNC_CODE, /https?:\/\//);
     assert.doesNotMatch(SYNC_CODE, /getEntitlements|resolveEntitlements|canAccessAutomation|FREE_ENTITLEMENTS/);
+    assert.match(SYNC_SOURCE, /provider\.findSubscription\(query\)/);
     assert.match(SYNC_SOURCE, /provider\.verifySubscription\(request\)/);
+    assert.match(SYNC_SOURCE, /provider_subscription_code \?\? row\.provider_subscription_id/, 'bound code is preferred');
   });
 
   it('the webhook receiver stays receipt-only: no verification, no claim/settle, no state write', () => {
