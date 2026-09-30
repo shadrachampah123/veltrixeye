@@ -33,6 +33,7 @@ See `docs/provider-abstraction.md` and `docs/market-data.md` for the abstraction
 **Mechanism:**
 
 - Database-backed advisory locking: `pg_try_advisory_lock(875421009)` — pinned key `SCANNER_ADVISORY_LOCK_KEY`
+- Advisory unlock reliability (M7 audit finding F5): `SELECT pg_advisory_unlock(875421009) as unlocked` is never silently swallowed; any query error or `unlocked: false` response is logged with sanitized diagnostics (no credentials, tokens, or tenant/strategy UUIDs) and the pooled client is terminated and evicted (`release(true)`) so a leaked session-level lock can never block future scans
 - Only one scanner run executes at a time across all processes/instances; concurrent triggers return `skipped: true, reason: 'already_running'` with last run info
 - Runs are recorded in `scanner_runs` table (append-only ledger): status `running → completed|failed|partial`, provider slug, metrics, error, metadata
 - Cursors in `scanner_cursors` table: per `(strategy_version_id, instrument_id, timeframe)` last processed candle time — prevents re-processing same closed candle, survives restarts
@@ -170,6 +171,7 @@ Comprehensive tests added:
   - Security & entitlements (free cannot access, pro can, rejects unsupported symbols, credentials not exposed in health)
   - Observability (metrics without secrets)
   - F4 tenant privacy (`describe('F4: Scanner tenant privacy')`): `redactScannerRunMetadata` pure unit tests (own run passes through, other-tenant and system runs drop `triggeredBy`/`strategyId`/`errors`, input not mutated), `listRuns(query, viewerUserId)` owner scoping (own run visible, other tenant's run + their user/strategy UUIDs absent, system runs hidden, `status` filter composes with scoping, unscoped read still returns the whole ledger), `getHealth(viewerUserId)` redaction (global last run kept, tenant identifiers dropped, own identifiers preserved), and a real `triggerScan` run being visible to its owner only
+  - F5 advisory unlock reliability (`describe('F5: Advisory unlock reliability')`): `sanitizeScannerUnlockError` pure unit tests (preserves safe message/code, redacts URL credentials, bearer tokens, key-value secrets and tenant/strategy UUIDs, bounds length), clean unlock returns pooled client intact without error logs, thrown unlock query error and native PostgreSQL `25P02` aborted-transaction unlock error and `unlocked: false` response are logged safely without secrets or tenant UUIDs, evict/destroy the pooled connection (`release(true)`), clear the session-level advisory lock in `pg_locks`, allow immediate subsequent scans to recover, and preserve single-instance advisory-lock skipping when held
 
 - `apps/api/test/scanner.test.ts` — API integration:
   - Unauthenticated 401, free user 403, pro user can access health (real state), list runs, trigger scanner with advisory locking, validates strategy ownership, rejects unsupported instruments, health does not expose secrets, rate limited

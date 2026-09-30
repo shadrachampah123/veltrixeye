@@ -124,6 +124,46 @@ export function redactScannerRunForViewer(run: ScannerRunDto, viewerUserId: stri
   return { ...run, metadata: redactScannerRunMetadata(run.metadata, viewerUserId) };
 }
 
+const UNLOCK_ERROR_UUID_PATTERN = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const UNLOCK_ERROR_URL_CREDENTIALS_PATTERN = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
+const UNLOCK_ERROR_BEARER_PATTERN = /\b(bearer)\s+[^\s,;]+/gi;
+const UNLOCK_ERROR_SECRET_ASSIGNMENT_PATTERN =
+  /\b(password|passwd|pwd|secret|token|api[_-]?key|authorization)\b(\s*[:=]\s*)([^\s,;]+)/gi;
+const UNLOCK_ERROR_MAX_CHARS = 256;
+
+/**
+ * Extract safe, bounded diagnostic details from an advisory-unlock error
+ * without leaking credentials, tokens, connection strings, or tenant/strategy
+ * UUIDs (M7 audit finding F5). Pure and deterministic — no I/O.
+ */
+export function sanitizeScannerUnlockError(err: unknown): { error: string; code?: string } {
+  const raw =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+        ? err
+        : 'unknown_error';
+  const collapsed = raw.replace(/\s+/g, ' ').trim() || 'unknown_error';
+  const redacted = collapsed
+    .replace(UNLOCK_ERROR_URL_CREDENTIALS_PATTERN, '$1[redacted]@')
+    .replace(UNLOCK_ERROR_BEARER_PATTERN, '$1 [redacted]')
+    .replace(UNLOCK_ERROR_SECRET_ASSIGNMENT_PATTERN, '$1$2[redacted]')
+    .replace(UNLOCK_ERROR_UUID_PATTERN, '[redacted-id]');
+  const error =
+    redacted.length > UNLOCK_ERROR_MAX_CHARS
+      ? `${redacted.slice(0, UNLOCK_ERROR_MAX_CHARS)}…`
+      : redacted;
+  const code =
+    err !== null &&
+    typeof err === 'object' &&
+    'code' in err &&
+    typeof (err as { code?: unknown }).code === 'string' &&
+    /^[A-Z0-9_]{1,32}$/i.test((err as { code: string }).code)
+      ? (err as { code: string }).code
+      : undefined;
+  return code !== undefined ? { error, code } : { error };
+}
+
 export interface ScanRunResult {
   run: ScannerRunDto;
   skipped?: boolean;
@@ -314,6 +354,7 @@ export class ScannerService {
 
     // Try advisory lock
     const lockClient = await this.pool.connect();
+    let destroyLockClient = false;
     try {
       const lockRes = await lockClient.query<{ acquired: boolean }>(
         `SELECT pg_try_advisory_lock($1) as acquired`,
@@ -336,10 +377,67 @@ export class ScannerService {
       try {
         return await this.executeScan(args, nowMs);
       } finally {
-        await lockClient.query(`SELECT pg_advisory_unlock($1)`, [SCANNER_ADVISORY_LOCK_KEY]).catch(() => {});
+        destroyLockClient = !(await this.releaseAdvisoryLock(lockClient));
       }
     } finally {
-      lockClient.release();
+      if (destroyLockClient) {
+        if (typeof (lockClient as { end?: unknown }).end === 'function') {
+          await (lockClient as unknown as { end: () => Promise<void> }).end().catch(() => {});
+        }
+        lockClient.release(true);
+      } else {
+        lockClient.release();
+      }
+    }
+  }
+
+  /**
+   * Release the session-level scanner advisory lock held by `lockClient`.
+   *
+   * `pg_try_advisory_lock` is session-scoped: if `pg_advisory_unlock` throws or
+   * reports `unlocked = false` and the client is returned to `pg.Pool` intact,
+   * the pooled backend session keeps holding `SCANNER_ADVISORY_LOCK_KEY` and
+   * silently blocks all future scans (M7 audit finding F5).
+   *
+   * Returns `true` when PostgreSQL confirms the lock was released, or `false`
+   * after logging safe diagnostics (no secrets, no tenant identifiers) so the
+   * caller destroys and evicts the pooled client instead of returning it to
+   * the pool.
+   */
+  private async releaseAdvisoryLock(lockClient: pg.PoolClient): Promise<boolean> {
+    try {
+      const unlockRes = await lockClient.query<{ unlocked?: boolean; pg_advisory_unlock?: boolean }>(
+        `SELECT pg_advisory_unlock($1) as unlocked`,
+        [SCANNER_ADVISORY_LOCK_KEY],
+      );
+      const row = unlockRes?.rows?.[0];
+      const unlocked =
+        typeof row?.unlocked === 'boolean'
+          ? row.unlocked
+          : typeof row?.pg_advisory_unlock === 'boolean'
+            ? row.pg_advisory_unlock
+            : false;
+      if (!unlocked) {
+        this.logger.error('scanner advisory unlock failed', {
+          lockKey: SCANNER_ADVISORY_LOCK_KEY,
+          unlocked: false,
+          reason: 'unlock_returned_false',
+          connectionDestroyed: true,
+        });
+        return false;
+      }
+      return true;
+    } catch (err) {
+      const { error, code } = sanitizeScannerUnlockError(err);
+      this.logger.error('scanner advisory unlock failed', {
+        lockKey: SCANNER_ADVISORY_LOCK_KEY,
+        unlocked: false,
+        reason: 'query_error',
+        error,
+        ...(code !== undefined ? { code } : {}),
+        connectionDestroyed: true,
+      });
+      return false;
     }
   }
 

@@ -46,6 +46,7 @@ import {
   hashPassword,
   redactScannerRunMetadata,
   SCANNER_TENANT_SENSITIVE_METADATA_KEYS,
+  sanitizeScannerUnlockError,
 } from '../src/index.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -785,5 +786,351 @@ describe('M7.5: Observability', () => {
     assert.ok(!metaStr.toLowerCase().includes('password'));
     assert.ok(!metaStr.toLowerCase().includes('secret'));
     assert.ok(!metaStr.toLowerCase().includes('api_key'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F5: Advisory unlock reliability (M7 final verification audit, finding F5)
+// ---------------------------------------------------------------------------
+
+describe('F5: Advisory unlock reliability', () => {
+  const TENANT_USER_ID = '44444444-4444-4444-8444-444444444444';
+  const TENANT_STRATEGY_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+  const FAKE_SECRET = 'sk_live_super_secret_987654321';
+  const FAKE_DB_PASS = 'dbPassw0rd!Secret';
+
+  interface LoggedCall {
+    message: string;
+    meta?: Record<string, unknown>;
+  }
+
+  function createTrackedScanner(customPool: ReturnType<typeof createPool> = pool) {
+    const infoLogs: LoggedCall[] = [];
+    const warnLogs: LoggedCall[] = [];
+    const errorLogs: LoggedCall[] = [];
+    const svc = new ScannerService(
+      customPool,
+      providerRegistry,
+      candleStore,
+      ingestion,
+      evaluation,
+      setups,
+      scoring,
+      alerts,
+      {
+        logger: {
+          info: (message, meta) => infoLogs.push({ message, meta }),
+          warn: (message, meta) => warnLogs.push({ message, meta }),
+          error: (message, meta) => errorLogs.push({ message, meta }),
+        },
+        maxRetries: 1,
+        providerTimeoutMs: 100,
+      },
+    );
+    return { svc, infoLogs, warnLogs, errorLogs };
+  }
+
+  async function countGrantedScannerLocks(): Promise<number> {
+    const res = await pool.query<{ cnt: number }>(
+      `SELECT count(*)::int AS cnt
+         FROM pg_locks
+        WHERE locktype = 'advisory'
+          AND objid = $1
+          AND granted = true`,
+      [SCANNER_ADVISORY_LOCK_KEY],
+    );
+    return res.rows[0]?.cnt ?? 0;
+  }
+
+  function wrapLockClientPool(
+    customizeLockClient: (lockClient: any) => void,
+  ): ReturnType<typeof createPool> {
+    const origConnect = pool.connect.bind(pool);
+    return Object.create(pool, {
+      connect: {
+        value: (cb?: unknown) => {
+          if (typeof cb === 'function') {
+            return origConnect(cb as any);
+          }
+          return origConnect().then((client) => {
+            customizeLockClient(client);
+            return client;
+          });
+        },
+      },
+    });
+  }
+
+  describe('sanitizeScannerUnlockError (pure)', () => {
+    test('preserves safe diagnostic message and SQLSTATE/errno code', () => {
+      const err = Object.assign(new Error('current transaction is aborted'), { code: '25P02' });
+      assert.deepEqual(sanitizeScannerUnlockError(err), {
+        error: 'current transaction is aborted',
+        code: '25P02',
+      });
+    });
+
+    test('redacts URL credentials, bearer tokens, key-value secrets, and tenant/strategy UUIDs', () => {
+      const err = Object.assign(
+        new Error(
+          `unlock failed on postgres://veltrix:${FAKE_DB_PASS}@db.internal:5432/prod ` +
+            `api_key=${FAKE_SECRET} password: ${FAKE_DB_PASS} Authorization: Bearer tok_secret_xyz ` +
+            `user=${TENANT_USER_ID} strategy=${TENANT_STRATEGY_ID}`,
+        ),
+        { code: '57P01' },
+      );
+      const out = sanitizeScannerUnlockError(err);
+      assert.equal(out.code, '57P01');
+      assert.ok(!out.error.includes(FAKE_DB_PASS), 'DB password must be redacted');
+      assert.ok(!out.error.includes(FAKE_SECRET), 'API key must be redacted');
+      assert.ok(!out.error.includes('tok_secret_xyz'), 'Bearer token must be redacted');
+      assert.ok(!out.error.includes(TENANT_USER_ID), 'tenant user UUID must be redacted');
+      assert.ok(!out.error.includes(TENANT_STRATEGY_ID), 'strategy UUID must be redacted');
+      assert.ok(out.error.includes('postgres://[redacted]@db.internal:5432/prod'));
+      assert.ok(out.error.includes('[redacted-id]'));
+    });
+
+    test('drops unsafe code values and bounds long error messages', () => {
+      const longMsg = `connection error ${'x'.repeat(400)}`;
+      const err = Object.assign(new Error(longMsg), { code: `secret-${FAKE_SECRET}-not-a-code-at-all-too-long` });
+      const out = sanitizeScannerUnlockError(err);
+      assert.equal(out.code, undefined);
+      assert.ok(out.error.length <= 257);
+    });
+  });
+
+  test('clean advisory unlock returns connection to pool without error logs and leaves no lock held', async () => {
+    const releaseArgs: (boolean | Error | undefined)[] = [];
+    const proxyPool = wrapLockClientPool((client) => {
+      const origRelease = client.release.bind(client);
+      client.release = (err?: boolean | Error) => {
+        releaseArgs.push(err);
+        return origRelease(err);
+      };
+    });
+
+    const { svc, errorLogs } = createTrackedScanner(proxyPool);
+    const result = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
+    assert.ok(result.run);
+    assert.equal(result.skipped, undefined);
+    assert.equal(errorLogs.length, 0, 'clean unlock must not log any errors');
+    assert.deepEqual(releaseArgs, [undefined], 'clean unlock must return client to pool without destroying it');
+    assert.equal(await countGrantedScannerLocks(), 0, 'advisory lock must be released in pg_locks');
+  });
+
+  test('advisory unlock query error is logged safely, destroys the pooled connection, and subsequent scans recover', async () => {
+    const releaseArgs: (boolean | Error | undefined)[] = [];
+    let failNextUnlock = true;
+
+    const proxyPool = wrapLockClientPool((client) => {
+      const origQuery = client.query.bind(client);
+      const origRelease = client.release.bind(client);
+
+      client.query = async (text: unknown, values?: unknown) => {
+        if (failNextUnlock && typeof text === 'string' && text.includes('pg_advisory_unlock')) {
+          failNextUnlock = false;
+          // Leave the real PostgreSQL session-level advisory lock held on `client`
+          // while throwing an error that embeds secrets and tenant identifiers:
+          // only destroying the pooled connection will release the lock in Postgres.
+          throw Object.assign(
+            new Error(
+              `simulated unlock failure on postgres://admin:${FAKE_DB_PASS}@127.0.0.1:5440/db ` +
+                `api_key=${FAKE_SECRET} user=${TENANT_USER_ID} strategy=${TENANT_STRATEGY_ID}`,
+            ),
+            { code: '57P01' },
+          );
+        }
+        return origQuery(text, values);
+      };
+
+      client.release = (err?: boolean | Error) => {
+        releaseArgs.push(err);
+        client.query = origQuery;
+        return origRelease(err);
+      };
+    });
+
+    const { svc, errorLogs } = createTrackedScanner(proxyPool);
+
+    // 1. First scan succeeds functionally, but its advisory unlock throws.
+    const first = await svc.triggerScan({
+      force: true,
+      initiatedBy: TENANT_USER_ID,
+    });
+    assert.ok(first.run);
+    assert.equal(first.skipped, undefined);
+
+    // 2. Failure was NOT silently swallowed: diagnostic error logged with safe metadata.
+    const unlockErrors = errorLogs.filter((e) => e.message === 'scanner advisory unlock failed');
+    assert.equal(unlockErrors.length, 1, 'unlock error must be logged exactly once');
+    const logged = unlockErrors[0]!;
+    assert.equal(logged.meta?.lockKey, SCANNER_ADVISORY_LOCK_KEY);
+    assert.equal(logged.meta?.unlocked, false);
+    assert.equal(logged.meta?.reason, 'query_error');
+    assert.equal(logged.meta?.code, '57P01');
+    assert.equal(logged.meta?.connectionDestroyed, true);
+    assert.equal(typeof logged.meta?.error, 'string');
+
+    // 3. No secrets or tenant/strategy identifiers leaked into the diagnostic log.
+    const serializedLog = JSON.stringify(logged);
+    assert.ok(!serializedLog.includes(FAKE_DB_PASS), 'DB password must never appear in unlock log');
+    assert.ok(!serializedLog.includes(FAKE_SECRET), 'API key must never appear in unlock log');
+    assert.ok(!serializedLog.includes(TENANT_USER_ID), 'tenant user UUID must never appear in unlock log');
+    assert.ok(!serializedLog.includes(TENANT_STRATEGY_ID), 'strategy UUID must never appear in unlock log');
+
+    // 4. Pooled connection was destroyed (release(true)) and the real Postgres advisory lock is gone.
+    assert.deepEqual(releaseArgs, [true], 'failed unlock must destroy/evict the pooled connection');
+    assert.equal(
+      await countGrantedScannerLocks(),
+      0,
+      'destroying the pooled connection must release the session-level advisory lock in PostgreSQL',
+    );
+
+    // 5. Subsequent scan recovers immediately and is NOT blocked by a leaked lock.
+    const second = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
+    assert.ok(second.run);
+    assert.equal(second.skipped, undefined, 'subsequent scan must not be skipped after unlock failure recovery');
+    assert.notEqual(second.run.id, first.run.id, 'subsequent scan must execute a new run');
+    assert.deepEqual(releaseArgs, [true, undefined], 'recovered scan releases its healthy connection normally');
+  });
+
+  test('real PostgreSQL aborted-transaction unlock failure (25P02) evicts connection and unblocks next scan', async () => {
+    let poisonNextSessionBeforeUnlock = true;
+
+    const proxyPool = wrapLockClientPool((client) => {
+      const origQuery = client.query.bind(client);
+      const origRelease = client.release.bind(client);
+
+      client.query = async (text: unknown, values?: unknown) => {
+        if (poisonNextSessionBeforeUnlock && typeof text === 'string' && text.includes('pg_advisory_unlock')) {
+          poisonNextSessionBeforeUnlock = false;
+          // Put the real PostgreSQL backend session into an aborted transaction state
+          // (25P02) while it still holds the session-level advisory lock, then let the
+          // real `SELECT pg_advisory_unlock($1) as unlocked` execute and fail natively in Postgres.
+          await origQuery('BEGIN');
+          await origQuery('SELECT 1 / 0').catch(() => {});
+        }
+        return origQuery(text, values);
+      };
+
+      client.release = (err?: boolean | Error) => {
+        client.query = origQuery;
+        return origRelease(err);
+      };
+    });
+
+    const { svc, errorLogs } = createTrackedScanner(proxyPool);
+
+    const first = await svc.triggerScan({ force: true });
+    assert.ok(first.run);
+    assert.equal(first.skipped, undefined);
+
+    const unlockErrors = errorLogs.filter((e) => e.message === 'scanner advisory unlock failed');
+    assert.equal(unlockErrors.length, 1);
+    assert.equal(unlockErrors[0]!.meta?.reason, 'query_error');
+    assert.equal(unlockErrors[0]!.meta?.code, '25P02');
+    assert.equal(unlockErrors[0]!.meta?.connectionDestroyed, true);
+    assert.equal(await countGrantedScannerLocks(), 0, 'session advisory lock must be cleared after session teardown');
+
+    const second = await svc.triggerScan({ force: true });
+    assert.ok(second.run);
+    assert.equal(second.skipped, undefined, 'next scan must succeed after native 25P02 unlock failure');
+    assert.notEqual(second.run.id, first.run.id);
+  });
+
+  test('unlocked=false response is logged, destroys the pooled connection, and allows subsequent scans', async () => {
+    const releaseArgs: (boolean | Error | undefined)[] = [];
+    let forceFalseNextUnlock = true;
+
+    const proxyPool = wrapLockClientPool((client) => {
+      const origQuery = client.query.bind(client);
+      const origRelease = client.release.bind(client);
+
+      client.query = async (text: unknown, values?: unknown) => {
+        if (forceFalseNextUnlock && typeof text === 'string' && text.includes('pg_advisory_unlock')) {
+          forceFalseNextUnlock = false;
+          // Do NOT run pg_advisory_unlock — return unlocked: false while the backend still holds the lock.
+          return { rows: [{ unlocked: false }], rowCount: 1 };
+        }
+        return origQuery(text, values);
+      };
+
+      client.release = (err?: boolean | Error) => {
+        releaseArgs.push(err);
+        client.query = origQuery;
+        return origRelease(err);
+      };
+    });
+
+    const { svc, errorLogs } = createTrackedScanner(proxyPool);
+
+    const first = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
+    assert.ok(first.run);
+    assert.equal(first.skipped, undefined);
+
+    const unlockErrors = errorLogs.filter((e) => e.message === 'scanner advisory unlock failed');
+    assert.equal(unlockErrors.length, 1);
+    assert.deepEqual(unlockErrors[0]!.meta, {
+      lockKey: SCANNER_ADVISORY_LOCK_KEY,
+      unlocked: false,
+      reason: 'unlock_returned_false',
+      connectionDestroyed: true,
+    });
+    assert.ok(!JSON.stringify(unlockErrors[0]).includes(TENANT_USER_ID));
+    assert.deepEqual(releaseArgs, [true]);
+    assert.equal(await countGrantedScannerLocks(), 0, 'destroying connection must release the un-unlocked session lock');
+
+    const second = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
+    assert.ok(second.run);
+    assert.equal(second.skipped, undefined);
+    assert.notEqual(second.run.id, first.run.id);
+  });
+
+  test('preserves single-instance advisory-lock behavior when lock is already held', async () => {
+    const holder = await pool.connect();
+    try {
+      const lockRes = await holder.query<{ acquired: boolean }>(
+        `SELECT pg_try_advisory_lock($1) as acquired`,
+        [SCANNER_ADVISORY_LOCK_KEY],
+      );
+      assert.equal(lockRes.rows[0]?.acquired, true);
+
+      const releaseArgs: (boolean | Error | undefined)[] = [];
+      let unlockAttempted = false;
+      const proxyPool = wrapLockClientPool((client) => {
+        const origQuery = client.query.bind(client);
+        const origRelease = client.release.bind(client);
+
+        client.query = async (text: unknown, values?: unknown) => {
+          if (typeof text === 'string' && text.includes('pg_advisory_unlock')) {
+            unlockAttempted = true;
+          }
+          return origQuery(text, values);
+        };
+
+        client.release = (err?: boolean | Error) => {
+          releaseArgs.push(err);
+          client.query = origQuery;
+          return origRelease(err);
+        };
+      });
+
+      const { svc, errorLogs } = createTrackedScanner(proxyPool);
+      const skipped = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
+      assert.equal(skipped.skipped, true);
+      assert.equal(skipped.reason, 'already_running');
+      assert.equal(unlockAttempted, false, 'non-acquiring caller must never attempt pg_advisory_unlock');
+      assert.equal(errorLogs.length, 0, 'skipped scan must not log unlock errors');
+      assert.deepEqual(releaseArgs, [undefined], 'skipped scan must return client to pool intact');
+
+      await holder.query(`SELECT pg_advisory_unlock($1)`, [SCANNER_ADVISORY_LOCK_KEY]);
+
+      const afterUnlock = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
+      assert.ok(afterUnlock.run);
+      assert.equal(afterUnlock.skipped, undefined);
+    } finally {
+      await holder.query(`SELECT pg_advisory_unlock($1)`, [SCANNER_ADVISORY_LOCK_KEY]).catch(() => {});
+      holder.release();
+    }
   });
 });
