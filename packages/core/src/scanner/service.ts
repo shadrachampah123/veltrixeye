@@ -504,17 +504,44 @@ export class ScannerService {
       return;
     }
 
-    // Cursor check: avoid processing same candle repeatedly
+    // F14 MTF Anchor Alignment:
+    // The detection anchor must be the CLOSE time of the latest fully-closed
+    // setup candle (time + period), not the OPEN time of the latest returned
+    // bar. Twelve Data may return a forming final bar labeled closed; using
+    // its open as anchor is semantically a forming-bar open while signal math
+    // only ever consumes fully-closed candles (time+period ≤ asOf). Aligning
+    // to the close makes the recorded anchor match the actual evaluation
+    // boundary and matches backtest anchor semantics (setup closes in
+    // [fromMs, toMs)). Cursors store the OPEN of the latest closed candle
+    // so they re-arm exactly when the bar rolls.
+    const setupPeriodMs = timeframeMinutes(setupTf) * 60_000;
+    let latestClosedSetupCandle: (typeof setupCandles)[number] | undefined;
+    for (let i = setupCandles.length - 1; i >= 0; i--) {
+      const c = setupCandles[i];
+      if (!c) continue;
+      if (c.time + setupPeriodMs <= nowMs) {
+        latestClosedSetupCandle = c;
+        break;
+      }
+    }
+    // Fallback: if no candle is fully closed at nowMs (e.g., very first fetch
+    // or clock skew), use the last returned candle's close as anchor — still
+    // better than its open, and freshness will reject if too stale.
+    const anchorCandle = latestClosedSetupCandle ?? setupCandles[setupCandles.length - 1];
+    const asOfMs = anchorCandle ? anchorCandle.time + setupPeriodMs : nowMs;
+
+    // Cursor check: avoid re-processing same closed candle
     if (!args.force) {
-      const latestSetupCandle = setupCandles[setupCandles.length - 1];
-      if (latestSetupCandle) {
+      if (anchorCandle) {
         const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
-        if (cursor && cursor.last_candle_time === latestSetupCandle.time) {
+        // Cursor stores the OPEN time of the last processed closed candle
+        if (cursor && cursor.last_candle_time === anchorCandle.time) {
           this.logger.info('skipping duplicate candle', {
             strategyId: strategy.strategyId,
             instrument: `${instrument.assetClass}/${instrument.symbol}`,
             timeframe: setupTf,
-            lastCandleTime: latestSetupCandle.time,
+            lastCandleTime: anchorCandle.time,
+            anchor: asOfMs,
           });
           return;
         }
@@ -525,8 +552,6 @@ export class ScannerService {
     // Market structure detection, liquidity sweep, ChoCH, break & retest,
     // S/R confirmation, order-block logic, etc. are all inside the evaluation engine.
     // We use SetupService.detect which internally calls EvaluationService.
-
-    const asOfMs = setupCandles[setupCandles.length - 1]?.time ?? nowMs;
 
     // Detect long and short
     const directions: ('long' | 'short')[] = ['long', 'short'];
@@ -592,10 +617,10 @@ export class ScannerService {
       }
     }
 
-    // Update cursor
-    const latestCandle = setupCandles[setupCandles.length - 1];
-    if (latestCandle) {
-      await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, latestCandle.time, nowMs);
+    // Update cursor — store OPEN of the latest closed candle so cursor re-arms
+    // exactly when that candle's close rolls to the next open.
+    if (anchorCandle) {
+      await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, anchorCandle.time, nowMs);
     }
   }
 
