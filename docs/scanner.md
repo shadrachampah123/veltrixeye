@@ -33,9 +33,11 @@ See `docs/provider-abstraction.md` and `docs/market-data.md` for the abstraction
 **Mechanism:**
 
 - Database-backed advisory locking: `pg_try_advisory_lock(875421009)` — pinned key `SCANNER_ADVISORY_LOCK_KEY`
+- Advisory unlock reliability (M7 audit finding F5): `SELECT pg_advisory_unlock(875421009) as unlocked` is never silently swallowed; any query error or `unlocked: false` response is logged with sanitized diagnostics (no credentials, tokens, or tenant/strategy UUIDs) and the pooled client is terminated and evicted (`release(true)`) so a leaked session-level lock can never block future scans
 - Only one scanner run executes at a time across all processes/instances; concurrent triggers return `skipped: true, reason: 'already_running'` with last run info
 - Runs are recorded in `scanner_runs` table (append-only ledger): status `running → completed|failed|partial`, provider slug, metrics, error, metadata
-- Cursors in `scanner_cursors` table: per `(strategy_version_id, instrument_id, timeframe)` last processed candle time — prevents re-processing same closed candle, survives restarts
+- Cursors in `scanner_cursors` table: per `(strategy_version_id, instrument_id, timeframe)` last processed closed candle open time — prevents re-processing same closed candle, survives restarts
+- MTF anchor alignment (M7 audit finding F14): detection and scoring anchor `asOfMs` to the **close time** (`time + period`) of the latest fully-closed setup candle (`c.time + setupPeriodMs <= nowMs`), never a forming bar's open or future close (zero lookahead, aligned with backtest anchor semantics)
 - Recovery on restart: `recoverStaleRuns()` marks runs older than 30 minutes that are still `running` as `failed` (crash/deploy safety)
 - In-process ticker (optional): when `SCANNER_ENABLED=true`, the API starts an interval timer (`SCANNER_INTERVAL_MS`) that calls `scanner.runOnce()` — safe to run alongside manual triggers due to advisory locking
 - Manual trigger via `POST /api/scanner/trigger` (session-authenticated, entitlement-gated, rate limited 10/min)
@@ -131,7 +133,7 @@ Logs never contain API keys, credentials, tokens, sensitive user data, or full p
 **API (session-authenticated, entitlement-gated):**
 
 - `GET /api/scanner/health` — real production state: status `idle|running|degraded|unavailable`, lastRun, lastSuccessfulRun, provider, isProviderAvailable, expectedIntervalMs, activeRuns, recentFailures, dataFreshness (newestCandleTime, staleRejectionCount)
-- `GET /api/scanner/runs?status=&limit=` — list recent runs (observability)
+- `GET /api/scanner/runs?status=&limit=` — list recent runs (observability), **owner-scoped**: only runs the session user initiated
 - `POST /api/scanner/trigger` — manual trigger with optional `strategyId`, `instruments` (validated against universe), `force` boolean; uses advisory locking, returns 201 created or 200 skipped; rate limited 10/min; audited as `scanner.triggered` / `scanner.trigger_skipped`
 
 All endpoints check `canAccessScanner` entitlement server-side (free → 403).
@@ -148,6 +150,7 @@ All endpoints check `canAccessScanner` entitlement server-side (free → 403).
 - Provider credentials remain server-side: `TWELVE_DATA_API_KEY` never logged, never returned by any route, only used in provider client
 - Users cannot select arbitrary unsupported provider symbols to bypass market universe: `normalizeSymbol` + `instruments` table check, 400 on unsupported
 - Scanner endpoints remain authenticated/authorized: session auth required, 401 unauthenticated, 403 free users, strategy ownership check for filtered scans
+- Scanner run ledger is tenant-private (M7 audit finding F4): `scanner_runs` is a single global table whose `metadata` holds `triggeredBy` (user UUID) and `strategyId` (strategy UUID), so `ScannerService.listRuns(query, viewerUserId)` filters rows to the caller's own runs, and `ScannerService.getHealth(viewerUserId)` — which stays global because the scanner is one shared pipeline — runs the embedded `lastRun`/`lastSuccessfulRun` DTOs through `redactScannerRunMetadata`, dropping `triggeredBy`, `strategyId` and `errors` (entries embed `strategy <uuid>: …`) unless the run belongs to the viewer. System runs (`triggeredBy = 'system'`) belong to no tenant and are never returned to one. Omitting `viewerUserId` keeps the previous unscoped behaviour for trusted in-process/operator callers; no HTTP route does so, and the architecture defines no admin role.
 - Subscription limits remain server-authoritative: `getEntitlements(plan, status)` checked in scanner service and API routes, `maxSavedSetups` enforced in `SetupService`, `maxAlerts` etc. enforced
 - No client-controlled signal generation is trusted: scanner generates signals server-side only from validated, fresh, normalized production data; alert payload rendered from persisted alert + published version config, never from request input
 
@@ -168,9 +171,13 @@ Comprehensive tests added:
   - Scanner execution & concurrency (advisory locking prevents overlapping, duplicate prevention via cursors, restart/recovery marks stale running as failed, health reflects real state, listRuns)
   - Security & entitlements (free cannot access, pro can, rejects unsupported symbols, credentials not exposed in health)
   - Observability (metrics without secrets)
+  - F4 tenant privacy (`describe('F4: Scanner tenant privacy')`): `redactScannerRunMetadata` pure unit tests (own run passes through, other-tenant and system runs drop `triggeredBy`/`strategyId`/`errors`, input not mutated), `listRuns(query, viewerUserId)` owner scoping (own run visible, other tenant's run + their user/strategy UUIDs absent, system runs hidden, `status` filter composes with scoping, unscoped read still returns the whole ledger), `getHealth(viewerUserId)` redaction (global last run kept, tenant identifiers dropped, own identifiers preserved), and a real `triggerScan` run being visible to its owner only
+  - F5 advisory unlock reliability (`describe('F5: Advisory unlock reliability')`): `sanitizeScannerUnlockError` pure unit tests (preserves safe message/code, redacts URL credentials, bearer tokens, key-value secrets and tenant/strategy UUIDs, bounds length), clean unlock returns pooled client intact without error logs, thrown unlock query error and native PostgreSQL `25P02` aborted-transaction unlock error and `unlocked: false` response are logged safely without secrets or tenant UUIDs, evict/destroy the pooled connection (`release(true)`), clear the session-level advisory lock in `pg_locks`, allow immediate subsequent scans to recover, and preserve single-instance advisory-lock skipping when held
+  - F14 MTF anchor alignment (`describe('F14: MTF anchor alignment (no lookahead)')`): forming tail setup candle is excluded so detection anchors at the close (`time + period`) of the latest fully-closed setup candle (`<= nowMs`, never a future close), cursor stores the open of that closed candle and re-arms on roll, and all-closed setup batches anchor at the latest candle's close matching backtest semantics
 
 - `apps/api/test/scanner.test.ts` — API integration:
   - Unauthenticated 401, free user 403, pro user can access health (real state), list runs, trigger scanner with advisory locking, validates strategy ownership, rejects unsupported instruments, health does not expose secrets, rate limited
+  - F4 tenant privacy (HTTP): `GET /api/scanner/runs` returns only the session user's runs and never another tenant's user/strategy UUID; `GET /api/scanner/health` keeps the global last-run view but redacts other tenants' identifiers while preserving the viewer's own; a run triggered via `POST /api/scanner/trigger` is listed for its owner and invisible to another tenant
 
 **Results:**
 

@@ -16,7 +16,7 @@ import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js
  * | Route | Auth | Notes |
  * |---|---|---|
  * | GET /api/scanner/health | session | Real production state: provider availability, last run, last successful, active runs, data freshness. Never mock/static. |
- * | GET /api/scanner/runs | session | List recent scanner runs (observability). |
+ * | GET /api/scanner/runs | session | List recent scanner runs (observability), owner-scoped. |
  * | POST /api/scanner/trigger | session | Manual trigger (entitlement-gated). Uses advisory locking to prevent overlapping. |
  *
  * Security:
@@ -25,6 +25,16 @@ import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js
  *  - No client-controlled signal generation — scanner always uses server-side validated data
  *  - Provider credentials remain server-side, never exposed
  *  - Users cannot bypass market universe (symbols validated against instruments table)
+ *
+ * Tenant privacy (M7 audit finding F4):
+ *  - `scanner_runs` is a global ledger whose `metadata` carries `triggeredBy`
+ *    (user UUID) and `strategyId` (strategy UUID), so it is never read globally
+ *    on behalf of a tenant: `listRuns` is owner-scoped to the session user.
+ *  - `getHealth` stays global (the scanner is one shared pipeline) but redacts
+ *    tenant-identifying metadata from the embedded last-run DTOs.
+ *  - There is no admin/operator role in the architecture, so no HTTP caller
+ *    receives the unredacted global ledger; the unscoped service entry points
+ *    remain for trusted in-process/operator use only.
  */
 
 export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, config: AppConfig): Promise<void> {
@@ -68,7 +78,8 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
     }
 
-    const health = await ctx.scanner.getHealth();
+    // Tenant read: global operational state, minus other tenants' identifiers.
+    const health = await ctx.scanner.getHealth(user.id);
     return health;
   });
 
@@ -115,7 +126,9 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       return;
     }
 
-    return ctx.scanner.listRuns(parsed.data);
+    // Tenant read: owner-scoped. The run ledger is global and its metadata
+    // carries `triggeredBy`/`strategyId`, so it is never listed across tenants.
+    return ctx.scanner.listRuns(parsed.data, user.id);
   });
 
   // POST /api/scanner/trigger — manual trigger

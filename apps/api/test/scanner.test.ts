@@ -140,6 +140,26 @@ after(async () => {
   await stopDb?.();
 });
 
+/** Shape of a scanner run as returned by the HTTP API (subset used by tests). */
+interface ScannerRunLike {
+  id: string;
+  status: string;
+  metadata: Record<string, unknown>;
+}
+
+/**
+ * Insert a scanner run row directly, so privacy tests control `metadata`
+ * deterministically instead of depending on a real scan.
+ */
+async function insertRun(metadata: Record<string, unknown>, status = 'completed'): Promise<string> {
+  const res = await pool.query<{ id: string }>(
+    `INSERT INTO scanner_runs (status, provider_slug, metadata)
+     VALUES ($1, 'twelve-data', $2::jsonb) RETURNING id`,
+    [status, JSON.stringify(metadata)],
+  );
+  return res.rows[0]!.id;
+}
+
 async function registerUser(plan: 'free' | 'pro' = 'pro'): Promise<{ cookie: string; user: { id: string; email: string } }> {
   const email = uniqueEmail();
   const res = await app.inject({
@@ -265,6 +285,124 @@ describe('M7.5: Scanner API', () => {
     assert.ok(!body.includes('api_key'));
     assert.ok(!body.includes('password'));
     assert.ok(!body.includes('secret'));
+  });
+
+  test('GET /api/scanner/runs is owner-scoped — never returns another tenant’s runs or UUIDs', async () => {
+    const a = await registerUser('pro');
+    const b = await registerUser('pro');
+    const strategyA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const strategyB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+    await insertRun({ triggeredBy: a.user.id, strategyId: strategyA, force: true });
+    const runB = await insertRun({ triggeredBy: b.user.id, strategyId: strategyB, force: false });
+    await insertRun({ triggeredBy: 'system', strategyId: null, force: false });
+
+    const resA = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(resA.statusCode, 200, resA.body);
+    const runsA: ScannerRunLike[] = resA.json().runs;
+    assert.ok(runsA.some((r) => r.metadata?.triggeredBy === a.user.id), 'owner must see their own run');
+    assert.ok(!runsA.some((r) => r.id === runB), 'owner must not see another tenant run');
+    assert.ok(
+      !runsA.some((r) => r.metadata?.triggeredBy === 'system'),
+      'system runs belong to no tenant and are not returned to one',
+    );
+    const payloadA = JSON.stringify(runsA);
+    assert.ok(!payloadA.includes(b.user.id), 'other tenant user UUID must not appear in the response');
+    assert.ok(!payloadA.includes(strategyB), 'other tenant strategy UUID must not appear in the response');
+
+    const resB = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100',
+      headers: { cookie: b.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(resB.statusCode, 200, resB.body);
+    const runsB: ScannerRunLike[] = resB.json().runs;
+    assert.ok(runsB.some((r) => r.metadata?.triggeredBy === b.user.id));
+    assert.ok(!JSON.stringify(runsB).includes(a.user.id));
+    assert.ok(!JSON.stringify(runsB).includes(strategyA));
+  });
+
+  test('GET /api/scanner/health keeps global state but redacts other tenants run identifiers', async () => {
+    const a = await registerUser('pro');
+    const b = await registerUser('pro');
+    const strategyB = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+    const runB = await insertRun({ triggeredBy: b.user.id, strategyId: strategyB, force: false });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/health',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const health = res.json();
+    assert.equal(health.lastRun.id, runB, 'the global last-run view is preserved');
+    assert.equal(health.lastRun.metadata.triggeredBy, undefined);
+    assert.equal(health.lastRun.metadata.strategyId, undefined);
+    assert.equal(health.lastRun.metadata.force, false, 'non-identifying metadata is preserved');
+    assert.ok(!res.body.includes(b.user.id), 'other tenant user UUID must not appear in the response');
+    assert.ok(!res.body.includes(strategyB), 'other tenant strategy UUID must not appear in the response');
+    // Operational value survives redaction.
+    assert.ok(typeof health.lastRun.status === 'string');
+    assert.ok(typeof health.lastRun.startedAt === 'string');
+    assert.ok(typeof health.status === 'string');
+  });
+
+  test('GET /api/scanner/health still shows the viewer their own run identifiers', async () => {
+    const a = await registerUser('pro');
+    const strategyA = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const runA = await insertRun({ triggeredBy: a.user.id, strategyId: strategyA, force: true });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/health',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const health = res.json();
+    assert.equal(health.lastRun.id, runA);
+    assert.equal(health.lastRun.metadata.triggeredBy, a.user.id);
+    assert.equal(health.lastRun.metadata.strategyId, strategyA);
+  });
+
+  test('a triggered run is listed for its owner and hidden from other tenants', async () => {
+    const a = await registerUser('pro');
+    const b = await registerUser('pro');
+
+    const trig = await app.inject({
+      method: 'POST',
+      url: '/api/scanner/trigger',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+      payload: { force: true },
+    });
+    assert.ok([200, 201].includes(trig.statusCode), trig.body);
+    const triggered = trig.json();
+    assert.ok(!triggered.skipped, 'no concurrent scan is expected in a sequential suite');
+    assert.equal(triggered.run.metadata.triggeredBy, a.user.id);
+
+    const resA = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    const runsA: ScannerRunLike[] = resA.json().runs;
+    assert.ok(
+      runsA.some((r) => r.id === triggered.run.id),
+      'the owner must see the run they triggered',
+    );
+
+    const resB = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100',
+      headers: { cookie: b.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(resB.statusCode, 200, resB.body);
+    const runsB: ScannerRunLike[] = resB.json().runs;
+    assert.ok(!runsB.some((r) => r.id === triggered.run.id));
+    assert.ok(!JSON.stringify(runsB).includes(a.user.id));
   });
 
   test('scanner endpoints are rate limited', async () => {

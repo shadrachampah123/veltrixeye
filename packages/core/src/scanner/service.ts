@@ -79,6 +79,91 @@ export interface ScanTriggerArgs {
   nowMs?: number;
 }
 
+/**
+ * Tenant-privacy: `scanner_runs` is a single global ledger shared by every
+ * tenant and by the scheduled system runner, and `metadata` records
+ * tenant-identifying values. These keys must never be returned to a viewer who
+ * does not own the run (M7 final verification audit, finding F4):
+ *
+ *  - `triggeredBy` — UUID of the user who initiated the run (or `'system'`).
+ *  - `strategyId`  — UUID of the strategy the run was scoped to.
+ *  - `errors`      — entries are serialized as `strategy <uuid>: <message>`
+ *                    (see `executeScan`), so the strings embed strategy UUIDs.
+ *
+ * Owner-scoped reads (see `listRuns`) already filter rows down to the caller's
+ * own runs; redaction is the second layer, applied to the shared/global read
+ * paths (health) that must keep showing the whole ledger's operational state.
+ */
+export const SCANNER_TENANT_SENSITIVE_METADATA_KEYS = ['triggeredBy', 'strategyId', 'errors'] as const;
+
+/**
+ * Strip tenant-identifying scanner-run metadata unless the run belongs to
+ * `viewerUserId`. Pure and deterministic — no I/O.
+ *
+ * A run is the viewer's own when `metadata.triggeredBy` equals their user id;
+ * system runs (`triggeredBy = 'system'`) belong to no tenant and are redacted
+ * for every tenant viewer. Everything non-identifying (status-bearing counts,
+ * `force`, and any future non-sensitive key) is preserved so the run stays
+ * operationally useful for triage.
+ */
+export function redactScannerRunMetadata(
+  metadata: Record<string, unknown>,
+  viewerUserId: string,
+): Record<string, unknown> {
+  if (metadata.triggeredBy === viewerUserId) return { ...metadata };
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if ((SCANNER_TENANT_SENSITIVE_METADATA_KEYS as readonly string[]).includes(key)) continue;
+    redacted[key] = value;
+  }
+  return redacted;
+}
+
+/** Redact a fully-mapped run DTO for a tenant viewer. Pure — no I/O. */
+export function redactScannerRunForViewer(run: ScannerRunDto, viewerUserId: string): ScannerRunDto {
+  return { ...run, metadata: redactScannerRunMetadata(run.metadata, viewerUserId) };
+}
+
+const UNLOCK_ERROR_UUID_PATTERN = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const UNLOCK_ERROR_URL_CREDENTIALS_PATTERN = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
+const UNLOCK_ERROR_BEARER_PATTERN = /\b(bearer)\s+[^\s,;]+/gi;
+const UNLOCK_ERROR_SECRET_ASSIGNMENT_PATTERN =
+  /\b(password|passwd|pwd|secret|token|api[_-]?key|authorization)\b(\s*[:=]\s*)([^\s,;]+)/gi;
+const UNLOCK_ERROR_MAX_CHARS = 256;
+
+/**
+ * Extract safe, bounded diagnostic details from an advisory-unlock error
+ * without leaking credentials, tokens, connection strings, or tenant/strategy
+ * UUIDs (M7 audit finding F5). Pure and deterministic — no I/O.
+ */
+export function sanitizeScannerUnlockError(err: unknown): { error: string; code?: string } {
+  const raw =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+        ? err
+        : 'unknown_error';
+  const collapsed = raw.replace(/\s+/g, ' ').trim() || 'unknown_error';
+  const redacted = collapsed
+    .replace(UNLOCK_ERROR_URL_CREDENTIALS_PATTERN, '$1[redacted]@')
+    .replace(UNLOCK_ERROR_BEARER_PATTERN, '$1 [redacted]')
+    .replace(UNLOCK_ERROR_SECRET_ASSIGNMENT_PATTERN, '$1$2[redacted]')
+    .replace(UNLOCK_ERROR_UUID_PATTERN, '[redacted-id]');
+  const error =
+    redacted.length > UNLOCK_ERROR_MAX_CHARS
+      ? `${redacted.slice(0, UNLOCK_ERROR_MAX_CHARS)}…`
+      : redacted;
+  const code =
+    err !== null &&
+    typeof err === 'object' &&
+    'code' in err &&
+    typeof (err as { code?: unknown }).code === 'string' &&
+    /^[A-Z0-9_]{1,32}$/i.test((err as { code: string }).code)
+      ? (err as { code: string }).code
+      : undefined;
+  return code !== undefined ? { error, code } : { error };
+}
+
 export interface ScanRunResult {
   run: ScannerRunDto;
   skipped?: boolean;
@@ -140,8 +225,17 @@ export class ScannerService {
   /**
    * Get scanner health/status for UI/API.
    * Reflects real production state, not mock/static.
+   *
+   * `viewerUserId` (tenant read) keeps the health view global — the scanner is
+   * one shared pipeline and its operational state is not per-tenant — but
+   * redacts tenant-identifying metadata from the embedded `lastRun` /
+   * `lastSuccessfulRun` DTOs (M7 audit finding F4). Omit it for trusted
+   * internal/operator reads that need the unredacted ledger.
    */
-  async getHealth(): Promise<ScannerHealthDto> {
+  async getHealth(viewerUserId?: string): Promise<ScannerHealthDto> {
+    const toRunDto = (row: ScannerRunRow): ScannerRunDto =>
+      viewerUserId === undefined ? toScannerRunDto(row) : redactScannerRunForViewer(toScannerRunDto(row), viewerUserId);
+
     const provider = this.requireProviderSafe();
     const isProviderAvailable = provider !== null;
 
@@ -158,12 +252,12 @@ export class ScannerService {
     const lastRunRes = await this.pool.query<ScannerRunRow>(
       `SELECT * FROM scanner_runs ORDER BY started_at DESC LIMIT 1`,
     );
-    const lastRun = lastRunRes.rows[0] ? toScannerRunDto(lastRunRes.rows[0]) : null;
+    const lastRun = lastRunRes.rows[0] ? toRunDto(lastRunRes.rows[0]) : null;
 
     const lastSuccessfulRes = await this.pool.query<ScannerRunRow>(
       `SELECT * FROM scanner_runs WHERE status = 'completed' ORDER BY finished_at DESC LIMIT 1`,
     );
-    const lastSuccessfulRun = lastSuccessfulRes.rows[0] ? toScannerRunDto(lastSuccessfulRes.rows[0]) : null;
+    const lastSuccessfulRun = lastSuccessfulRes.rows[0] ? toRunDto(lastSuccessfulRes.rows[0]) : null;
 
     const newestCandleRes = await this.pool.query<{ latest: string | null }>(
       `SELECT max(ts)::text as latest FROM candles`,
@@ -196,9 +290,30 @@ export class ScannerService {
     };
   }
 
-  async listRuns(query: ScannerRunListQuery): Promise<{ runs: ScannerRunDto[] }> {
+  /**
+   * List recent scanner runs.
+   *
+   * `scanner_runs` is a global ledger, and `metadata` records the
+   * tenant-identifying `triggeredBy` user UUID and `strategyId` strategy UUID,
+   * so an unscoped read would expose other tenants' identifiers to any
+   * entitled caller (M7 final verification audit, finding F4).
+   *
+   * Pass `viewerUserId` for every tenant-facing read: the result is restricted
+   * to runs that user initiated, which is both the privacy boundary and the
+   * only meaningful subset for them. System runs (`triggeredBy = 'system'`)
+   * belong to no tenant and are therefore not returned to any tenant viewer —
+   * global operational state remains visible via `getHealth`.
+   *
+   * Omit `viewerUserId` only for trusted internal/operator reads that must see
+   * the whole ledger (ops scripts, diagnostics).
+   */
+  async listRuns(query: ScannerRunListQuery, viewerUserId?: string): Promise<{ runs: ScannerRunDto[] }> {
     const values: unknown[] = [];
     const where: string[] = [];
+    if (viewerUserId !== undefined) {
+      values.push(viewerUserId);
+      where.push(`metadata->>'triggeredBy' = $${values.length}`);
+    }
     if (query.status) {
       values.push(query.status);
       where.push(`status = $${values.length}`);
@@ -239,6 +354,7 @@ export class ScannerService {
 
     // Try advisory lock
     const lockClient = await this.pool.connect();
+    let destroyLockClient = false;
     try {
       const lockRes = await lockClient.query<{ acquired: boolean }>(
         `SELECT pg_try_advisory_lock($1) as acquired`,
@@ -261,10 +377,67 @@ export class ScannerService {
       try {
         return await this.executeScan(args, nowMs);
       } finally {
-        await lockClient.query(`SELECT pg_advisory_unlock($1)`, [SCANNER_ADVISORY_LOCK_KEY]).catch(() => {});
+        destroyLockClient = !(await this.releaseAdvisoryLock(lockClient));
       }
     } finally {
-      lockClient.release();
+      if (destroyLockClient) {
+        if (typeof (lockClient as { end?: unknown }).end === 'function') {
+          await (lockClient as unknown as { end: () => Promise<void> }).end().catch(() => {});
+        }
+        lockClient.release(true);
+      } else {
+        lockClient.release();
+      }
+    }
+  }
+
+  /**
+   * Release the session-level scanner advisory lock held by `lockClient`.
+   *
+   * `pg_try_advisory_lock` is session-scoped: if `pg_advisory_unlock` throws or
+   * reports `unlocked = false` and the client is returned to `pg.Pool` intact,
+   * the pooled backend session keeps holding `SCANNER_ADVISORY_LOCK_KEY` and
+   * silently blocks all future scans (M7 audit finding F5).
+   *
+   * Returns `true` when PostgreSQL confirms the lock was released, or `false`
+   * after logging safe diagnostics (no secrets, no tenant identifiers) so the
+   * caller destroys and evicts the pooled client instead of returning it to
+   * the pool.
+   */
+  private async releaseAdvisoryLock(lockClient: pg.PoolClient): Promise<boolean> {
+    try {
+      const unlockRes = await lockClient.query<{ unlocked?: boolean; pg_advisory_unlock?: boolean }>(
+        `SELECT pg_advisory_unlock($1) as unlocked`,
+        [SCANNER_ADVISORY_LOCK_KEY],
+      );
+      const row = unlockRes?.rows?.[0];
+      const unlocked =
+        typeof row?.unlocked === 'boolean'
+          ? row.unlocked
+          : typeof row?.pg_advisory_unlock === 'boolean'
+            ? row.pg_advisory_unlock
+            : false;
+      if (!unlocked) {
+        this.logger.error('scanner advisory unlock failed', {
+          lockKey: SCANNER_ADVISORY_LOCK_KEY,
+          unlocked: false,
+          reason: 'unlock_returned_false',
+          connectionDestroyed: true,
+        });
+        return false;
+      }
+      return true;
+    } catch (err) {
+      const { error, code } = sanitizeScannerUnlockError(err);
+      this.logger.error('scanner advisory unlock failed', {
+        lockKey: SCANNER_ADVISORY_LOCK_KEY,
+        unlocked: false,
+        reason: 'query_error',
+        error,
+        ...(code !== undefined ? { code } : {}),
+        connectionDestroyed: true,
+      });
+      return false;
     }
   }
 
@@ -504,20 +677,51 @@ export class ScannerService {
       return;
     }
 
-    // Cursor check: avoid processing same candle repeatedly
+    // F14 MTF Anchor Alignment (no lookahead):
+    // The detection anchor (`asOfMs`) must be the CLOSE time (`time + period`)
+    // of the latest fully-closed setup candle (`c.time + setupPeriodMs <= nowMs`),
+    // never a forming bar's open or future close. Both `EvaluationService.readRole`
+    // (`ts < asOfMs`) and `EvaluationEngine.closedCandles` (`time + period <= asOfMs`)
+    // evaluate candles closed at `asOfMs`, matching backtest anchor semantics.
+    // Cursors store the OPEN time (`latestClosedSetupCandle.time`) of that last
+    // closed candle so duplicate forming-bar polls are skipped and the cursor
+    // re-arms as soon as the next setup bar closes.
+    const setupPeriodMs = timeframeMinutes(setupTf) * 60_000;
+    let latestClosedSetupCandle: (typeof setupCandles)[number] | undefined;
+    for (let i = setupCandles.length - 1; i >= 0; i--) {
+      const c = setupCandles[i];
+      if (!c) continue;
+      if (c.time + setupPeriodMs <= nowMs) {
+        latestClosedSetupCandle = c;
+        break;
+      }
+    }
+
+    if (!latestClosedSetupCandle) {
+      metrics.staleRejections += 1;
+      this.logger.info('no closed setup candle at scan time', {
+        strategyId: strategy.strategyId,
+        instrument: `${instrument.assetClass}/${instrument.symbol}`,
+        timeframe: setupTf,
+        nowMs,
+      });
+      return;
+    }
+
+    const asOfMs = latestClosedSetupCandle.time + setupPeriodMs;
+
+    // Cursor check: avoid re-processing same closed candle
     if (!args.force) {
-      const latestSetupCandle = setupCandles[setupCandles.length - 1];
-      if (latestSetupCandle) {
-        const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
-        if (cursor && cursor.last_candle_time === latestSetupCandle.time) {
-          this.logger.info('skipping duplicate candle', {
-            strategyId: strategy.strategyId,
-            instrument: `${instrument.assetClass}/${instrument.symbol}`,
-            timeframe: setupTf,
-            lastCandleTime: latestSetupCandle.time,
-          });
-          return;
-        }
+      const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
+      if (cursor && cursor.last_candle_time === latestClosedSetupCandle.time) {
+        this.logger.info('skipping duplicate candle', {
+          strategyId: strategy.strategyId,
+          instrument: `${instrument.assetClass}/${instrument.symbol}`,
+          timeframe: setupTf,
+          lastCandleTime: latestClosedSetupCandle.time,
+          anchor: asOfMs,
+        });
+        return;
       }
     }
 
@@ -525,8 +729,6 @@ export class ScannerService {
     // Market structure detection, liquidity sweep, ChoCH, break & retest,
     // S/R confirmation, order-block logic, etc. are all inside the evaluation engine.
     // We use SetupService.detect which internally calls EvaluationService.
-
-    const asOfMs = setupCandles[setupCandles.length - 1]?.time ?? nowMs;
 
     // Detect long and short
     const directions: ('long' | 'short')[] = ['long', 'short'];
@@ -592,11 +794,9 @@ export class ScannerService {
       }
     }
 
-    // Update cursor
-    const latestCandle = setupCandles[setupCandles.length - 1];
-    if (latestCandle) {
-      await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, latestCandle.time, nowMs);
-    }
+    // Update cursor — store OPEN of the latest closed setup candle so cursor
+    // re-arms when the next setup candle closes.
+    await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, latestClosedSetupCandle.time, nowMs);
   }
 
   private async fetchValidatedCandles(args: {
