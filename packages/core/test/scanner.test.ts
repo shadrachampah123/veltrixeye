@@ -1134,3 +1134,223 @@ describe('F5: Advisory unlock reliability', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// F14: MTF anchor alignment (no lookahead)
+// ---------------------------------------------------------------------------
+
+describe('F14: MTF anchor alignment (no lookahead)', () => {
+  const HOUR_MS = 60 * 60_000;
+  const MIN15_MS = 15 * 60_000;
+  const HOUR4_MS = 4 * 60 * 60_000;
+
+  async function createPublishedScannerStrategy() {
+    const email = uniqueEmail();
+    const passwordHash = await hashPassword(PASSWORD);
+    const user = await users.create({ email, passwordHash, name: 'F14 Anchor User' });
+    await makePro(user.id);
+
+    const created = await strategies.createStrategy(user.id, {
+      name: `F14 Strat ${Date.now()}`,
+      description: 'F14 anchor alignment test',
+      version: {
+        timeframes: { htf_bias: '4h', setup: '1h', entry: '15m' },
+        marketScope: {
+          mode: 'instruments',
+          instruments: [{ assetClass: 'forex', symbol: 'EURUSD' }],
+        },
+        sessionFilters: [],
+        risk: {
+          minRr: 2,
+          stopLossMethod: 'structure',
+          stopLossBuffer: 1,
+          stopLossBufferUnit: 'pips',
+          takeProfitMethod: 'rr',
+          tp1Rr: 1,
+          tp2Rr: 2,
+          tp3Rr: 3,
+          minQualityScore: 70,
+        },
+        filters: [],
+        ruleGroups: [
+          {
+            name: 'Structure',
+            logic: 'AND',
+            position: 0,
+            conditions: [
+              {
+                conditionType: 'htf_alignment',
+                classification: 'required',
+                timeframeRole: 'htf_bias',
+                params: { direction: 'bullish' },
+                position: 0,
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const versionId = created.versions[0]!.id;
+    await strategies.publishVersion(user.id, created.id, versionId);
+    await strategies.updateStrategy(user.id, created.id, { status: 'active' });
+    return { user, strategyId: created.id, versionId };
+  }
+
+  test('forming tail setup candle is excluded: anchor is last closed setup candle close (<= nowMs) and cursor re-arms on roll', async () => {
+    const { user, strategyId, versionId } = await createPublishedScannerStrategy();
+    const inst = await candleStore.resolveInstrument('forex', 'EURUSD');
+    assert.ok(inst);
+
+    // Fixed reference wall clock: 10:20 UTC on an exact hour boundary T_BAR_OPEN.
+    // The 09:00–10:00 1h candle (open = T_BAR_OPEN - HOUR_MS) is fully closed at T_BAR_OPEN.
+    // The 10:00–11:00 1h candle (open = T_BAR_OPEN) is still forming at nowMs = T_BAR_OPEN + 20m.
+    const T_BAR_OPEN = 1_780_000_800_000; // divisible by 4h (14_400_000)
+    const LAST_CLOSED_OPEN = T_BAR_OPEN - HOUR_MS;
+    const LAST_CLOSED_CLOSE = T_BAR_OPEN; // LAST_CLOSED_OPEN + HOUR_MS
+    const FORMING_OPEN = T_BAR_OPEN;
+    const FORMING_CLOSE = T_BAR_OPEN + HOUR_MS;
+
+    const customIngestion = {
+      getCandles: async (q: { timeframe: Timeframe; to: number }) => {
+        if (q.timeframe === '4h') {
+          return { candles: makeCandles(60, T_BAR_OPEN - 59 * HOUR4_MS, HOUR4_MS) };
+        }
+        if (q.timeframe === '1h') {
+          // 119 closed 1h candles ending at LAST_CLOSED_OPEN, plus 1 forming candle at FORMING_OPEN
+          return { candles: makeCandles(120, FORMING_OPEN - 119 * HOUR_MS, HOUR_MS) };
+        }
+        const latest15mOpen = Math.floor(q.to / MIN15_MS) * MIN15_MS - MIN15_MS;
+        return { candles: makeCandles(120, latest15mOpen - 119 * MIN15_MS, MIN15_MS) };
+      },
+    } as unknown as IngestionService;
+
+    const detectedAsOfs: number[] = [];
+    const customSetups = {
+      detect: async (args: { asOf: number; direction: 'long' | 'short' }) => {
+        detectedAsOfs.push(args.asOf);
+        return { detections: [{ direction: args.direction, qualified: false, setup: null, created: false }] };
+      },
+    } as unknown as SetupService;
+
+    const svc = new ScannerService(
+      pool,
+      providerRegistry,
+      candleStore,
+      customIngestion,
+      evaluation,
+      customSetups,
+      scoring,
+      alerts,
+      { logger: { info: () => {}, warn: () => {}, error: () => {} }, maxRetries: 0, providerTimeoutMs: 500 },
+    );
+
+    // 1. Scan at T + 20m while 10:00–11:00 bar is forming:
+    const nowDuringForming = T_BAR_OPEN + 20 * 60_000;
+    const run1 = await svc.triggerScan({
+      strategyId,
+      force: false,
+      initiatedBy: user.id,
+      nowMs: nowDuringForming,
+    });
+    assert.equal(run1.run.status, 'completed');
+    assert.deepEqual(
+      detectedAsOfs,
+      [LAST_CLOSED_CLOSE, LAST_CLOSED_CLOSE],
+      'detection anchor must equal close of last closed setup candle, never forming open or future close',
+    );
+    for (const asOf of detectedAsOfs) {
+      assert.ok(asOf <= nowDuringForming, 'anchor asOfMs must never exceed nowMs (no lookahead)');
+      assert.notEqual(asOf, FORMING_CLOSE, 'anchor must never be the forming candle future close');
+    }
+
+    const cursor1 = await pool.query<{ last_candle_time: string }>(
+      `SELECT last_candle_time FROM scanner_cursors
+        WHERE strategy_version_id = $1 AND instrument_id = $2 AND timeframe = '1h'`,
+      [versionId, inst!.id],
+    );
+    assert.equal(
+      Number(cursor1.rows[0]?.last_candle_time),
+      LAST_CLOSED_OPEN,
+      'cursor must store OPEN time of last closed setup candle',
+    );
+
+    // 2. Second non-forced scan at T + 45m while 10:00–11:00 bar is STILL forming:
+    detectedAsOfs.length = 0;
+    await svc.triggerScan({
+      strategyId,
+      force: false,
+      initiatedBy: user.id,
+      nowMs: T_BAR_OPEN + 45 * 60_000,
+    });
+    assert.equal(detectedAsOfs.length, 0, 'must skip duplicate closed candle while forming bar has not rolled');
+
+    // 3. Third non-forced scan at T + 65m after 10:00–11:00 bar has closed (FORMING_CLOSE <= nowMs):
+    const nowAfterClose = T_BAR_OPEN + 65 * 60_000;
+    await svc.triggerScan({
+      strategyId,
+      force: false,
+      initiatedBy: user.id,
+      nowMs: nowAfterClose,
+    });
+    assert.deepEqual(
+      detectedAsOfs,
+      [FORMING_CLOSE, FORMING_CLOSE],
+      'once the bar closes, cursor re-arms and anchors at the newly closed candle close',
+    );
+    assert.ok(FORMING_CLOSE <= nowAfterClose);
+
+    const cursor2 = await pool.query<{ last_candle_time: string }>(
+      `SELECT last_candle_time FROM scanner_cursors
+        WHERE strategy_version_id = $1 AND instrument_id = $2 AND timeframe = '1h'`,
+      [versionId, inst!.id],
+    );
+    assert.equal(Number(cursor2.rows[0]?.last_candle_time), FORMING_OPEN);
+  });
+
+  test('all-closed setup batch anchors at latest candle close (time + period), matching backtest semantics', async () => {
+    const { user, strategyId } = await createPublishedScannerStrategy();
+    const T_CLOSE = 1_780_015_200_000;
+    const LAST_OPEN = T_CLOSE - HOUR_MS;
+    const nowMs = T_CLOSE + 5 * 60_000; // 5m after last candle closed
+
+    const customIngestion = {
+      getCandles: async (q: { timeframe: Timeframe }) => {
+        if (q.timeframe === '4h') {
+          return { candles: makeCandles(60, T_CLOSE - 60 * HOUR4_MS, HOUR4_MS) };
+        }
+        if (q.timeframe === '1h') {
+          return { candles: makeCandles(120, T_CLOSE - 120 * HOUR_MS, HOUR_MS) };
+        }
+        return { candles: makeCandles(120, T_CLOSE - 120 * MIN15_MS, MIN15_MS) };
+      },
+    } as unknown as IngestionService;
+
+    const detectedAsOfs: number[] = [];
+    const customSetups = {
+      detect: async (args: { asOf: number; direction: 'long' | 'short' }) => {
+        detectedAsOfs.push(args.asOf);
+        return { detections: [{ direction: args.direction, qualified: false, setup: null, created: false }] };
+      },
+    } as unknown as SetupService;
+
+    const svc = new ScannerService(
+      pool,
+      providerRegistry,
+      candleStore,
+      customIngestion,
+      evaluation,
+      customSetups,
+      scoring,
+      alerts,
+      { logger: { info: () => {}, warn: () => {}, error: () => {} }, maxRetries: 0, providerTimeoutMs: 500 },
+    );
+
+    await svc.triggerScan({ strategyId, force: true, initiatedBy: user.id, nowMs });
+    assert.deepEqual(
+      detectedAsOfs,
+      [LAST_OPEN + HOUR_MS, LAST_OPEN + HOUR_MS],
+      'anchor must be close (open + period) of the latest closed setup candle, not its open',
+    );
+  });
+});
+

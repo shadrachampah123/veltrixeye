@@ -677,20 +677,51 @@ export class ScannerService {
       return;
     }
 
-    // Cursor check: avoid processing same candle repeatedly
+    // F14 MTF Anchor Alignment (no lookahead):
+    // The detection anchor (`asOfMs`) must be the CLOSE time (`time + period`)
+    // of the latest fully-closed setup candle (`c.time + setupPeriodMs <= nowMs`),
+    // never a forming bar's open or future close. Both `EvaluationService.readRole`
+    // (`ts < asOfMs`) and `EvaluationEngine.closedCandles` (`time + period <= asOfMs`)
+    // evaluate candles closed at `asOfMs`, matching backtest anchor semantics.
+    // Cursors store the OPEN time (`latestClosedSetupCandle.time`) of that last
+    // closed candle so duplicate forming-bar polls are skipped and the cursor
+    // re-arms as soon as the next setup bar closes.
+    const setupPeriodMs = timeframeMinutes(setupTf) * 60_000;
+    let latestClosedSetupCandle: (typeof setupCandles)[number] | undefined;
+    for (let i = setupCandles.length - 1; i >= 0; i--) {
+      const c = setupCandles[i];
+      if (!c) continue;
+      if (c.time + setupPeriodMs <= nowMs) {
+        latestClosedSetupCandle = c;
+        break;
+      }
+    }
+
+    if (!latestClosedSetupCandle) {
+      metrics.staleRejections += 1;
+      this.logger.info('no closed setup candle at scan time', {
+        strategyId: strategy.strategyId,
+        instrument: `${instrument.assetClass}/${instrument.symbol}`,
+        timeframe: setupTf,
+        nowMs,
+      });
+      return;
+    }
+
+    const asOfMs = latestClosedSetupCandle.time + setupPeriodMs;
+
+    // Cursor check: avoid re-processing same closed candle
     if (!args.force) {
-      const latestSetupCandle = setupCandles[setupCandles.length - 1];
-      if (latestSetupCandle) {
-        const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
-        if (cursor && cursor.last_candle_time === latestSetupCandle.time) {
-          this.logger.info('skipping duplicate candle', {
-            strategyId: strategy.strategyId,
-            instrument: `${instrument.assetClass}/${instrument.symbol}`,
-            timeframe: setupTf,
-            lastCandleTime: latestSetupCandle.time,
-          });
-          return;
-        }
+      const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
+      if (cursor && cursor.last_candle_time === latestClosedSetupCandle.time) {
+        this.logger.info('skipping duplicate candle', {
+          strategyId: strategy.strategyId,
+          instrument: `${instrument.assetClass}/${instrument.symbol}`,
+          timeframe: setupTf,
+          lastCandleTime: latestClosedSetupCandle.time,
+          anchor: asOfMs,
+        });
+        return;
       }
     }
 
@@ -698,8 +729,6 @@ export class ScannerService {
     // Market structure detection, liquidity sweep, ChoCH, break & retest,
     // S/R confirmation, order-block logic, etc. are all inside the evaluation engine.
     // We use SetupService.detect which internally calls EvaluationService.
-
-    const asOfMs = setupCandles[setupCandles.length - 1]?.time ?? nowMs;
 
     // Detect long and short
     const directions: ('long' | 'short')[] = ['long', 'short'];
@@ -765,11 +794,9 @@ export class ScannerService {
       }
     }
 
-    // Update cursor
-    const latestCandle = setupCandles[setupCandles.length - 1];
-    if (latestCandle) {
-      await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, latestCandle.time, nowMs);
-    }
+    // Update cursor — store OPEN of the latest closed setup candle so cursor
+    // re-arms when the next setup candle closes.
+    await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, latestClosedSetupCandle.time, nowMs);
   }
 
   private async fetchValidatedCandles(args: {
