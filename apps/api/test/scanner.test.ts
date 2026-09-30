@@ -9,9 +9,18 @@ import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 import type pg from 'pg';
 import { buildApp, createAppContext } from '../src/app.js';
 import { loadConfig, type AppConfig } from '../src/config.js';
+import {
+  SCANNER_WORKER_TOKEN_HEADER,
+  scannerTokenMatches,
+  hasScannerWorkerToken,
+} from '../src/routes/scanner.js';
+import { startScannerWorkerTicker } from '../src/scanner-worker.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 import {
   TIMEFRAMES,
+  SCANNER_ADVISORY_LOCK_KEY,
+  scannerInternalRunResponseSchema,
+  scannerInternalMaintenanceResponseSchema,
   type Candle,
   type MarketDataProvider,
   type NormalizedInstrument,
@@ -421,5 +430,316 @@ describe('M7.5: Scanner API', () => {
       if (lastStatus === 429) break;
     }
     assert.equal(lastStatus, 429);
+  });
+});
+
+describe('F3: Internal scanner worker endpoints & ticker', () => {
+  const WORKER_TOKEN = 'test-scanner-worker-token-secret-999';
+
+  async function buildWorkerApp(token: string) {
+    const config = makeConfig({
+      DATABASE_URL: dbUrl,
+      SCANNER_WORKER_TOKEN: token,
+      SCANNER_LEASE_MS: '600000',
+    });
+    const localCtx = createAppContext(pool, config);
+    localCtx.providerRegistry.register(new MockProvider());
+    const localApp = await buildApp(config, localCtx);
+    await localApp.ready();
+    return { app: localApp, ctx: localCtx, config };
+  }
+
+  test('token-unset behavior: /api/internal/scanner/run and /maintenance return 404 when SCANNER_WORKER_TOKEN is unset', async () => {
+    const { cookie } = await registerUser('pro');
+    for (const url of ['/api/internal/scanner/run', '/api/internal/scanner/maintenance']) {
+      // Unset in default `app`
+      const r1 = await app.inject({
+        method: 'POST',
+        url,
+        headers: { 'x-forwarded-for': freshIp() },
+        payload: {},
+      });
+      assert.equal(r1.statusCode, 404, `${url} without token must return 404 when unconfigured`);
+
+      const r2 = await app.inject({
+        method: 'POST',
+        url,
+        headers: {
+          cookie,
+          [SCANNER_WORKER_TOKEN_HEADER]: 'any-token',
+          'x-forwarded-for': freshIp(),
+        },
+        payload: {},
+      });
+      assert.equal(r2.statusCode, 404, `${url} with token/cookie must still return 404 when unconfigured`);
+    }
+  });
+
+  test('missing/wrong token: returns 401 and compares tokens in constant time over SHA-256 digests', async () => {
+    const { app: workerApp, config } = await buildWorkerApp(WORKER_TOKEN);
+    try {
+      const { cookie } = await registerUser('pro');
+
+      assert.equal(hasScannerWorkerToken(config), true);
+      assert.equal(
+        scannerTokenMatches({ headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN } }, config),
+        true,
+      );
+      assert.equal(
+        scannerTokenMatches({ headers: { [SCANNER_WORKER_TOKEN_HEADER]: 'wrong' } }, config),
+        false,
+      );
+      assert.equal(
+        scannerTokenMatches({ headers: { [SCANNER_WORKER_TOKEN_HEADER]: '' } }, config),
+        false,
+      );
+      assert.equal(
+        scannerTokenMatches(
+          { headers: { [SCANNER_WORKER_TOKEN_HEADER]: [WORKER_TOKEN, WORKER_TOKEN] } },
+          config,
+        ),
+        false,
+        'multi-valued token header must be rejected',
+      );
+
+      for (const url of ['/api/internal/scanner/run', '/api/internal/scanner/maintenance']) {
+        // Missing header
+        const missing = await workerApp.inject({
+          method: 'POST',
+          url,
+          headers: { 'x-forwarded-for': freshIp() },
+          payload: {},
+        });
+        assert.equal(missing.statusCode, 401);
+
+        // Wrong header
+        const wrong = await workerApp.inject({
+          method: 'POST',
+          url,
+          headers: { [SCANNER_WORKER_TOKEN_HEADER]: 'wrong-token', 'x-forwarded-for': freshIp() },
+          payload: {},
+        });
+        assert.equal(wrong.statusCode, 401);
+
+        // Session cookie alone (without worker token)
+        const sessionOnly = await workerApp.inject({
+          method: 'POST',
+          url,
+          headers: { cookie, 'x-forwarded-for': freshIp() },
+          payload: {},
+        });
+        assert.equal(sessionOnly.statusCode, 401);
+      }
+    } finally {
+      await workerApp.close();
+    }
+  });
+
+  test('strict request schema: internal endpoints reject strategyId, instruments, unknown fields, and out-of-range leaseMs', async () => {
+    const { app: workerApp } = await buildWorkerApp(WORKER_TOKEN);
+    try {
+      const badRunBodies = [
+        { strategyId: '11111111-1111-4111-8111-111111111111' },
+        { instruments: [{ assetClass: 'forex', symbol: 'EURUSD' }] },
+        { leaseMs: 1000 }, // below 60_000
+        { leaseMs: 9_999_999 }, // above 3_600_000
+        { unknownField: 'nope' },
+      ];
+      for (const payload of badRunBodies) {
+        const res = await workerApp.inject({
+          method: 'POST',
+          url: '/api/internal/scanner/run',
+          headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+          payload,
+        });
+        assert.equal(res.statusCode, 400, `expected 400 for run payload ${JSON.stringify(payload)}`);
+      }
+
+      const badMaint = await workerApp.inject({
+        method: 'POST',
+        url: '/api/internal/scanner/maintenance',
+        headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+        payload: { extra: true },
+      });
+      assert.equal(badMaint.statusCode, 400);
+    } finally {
+      await workerApp.close();
+    }
+  });
+
+  test('valid external invocation & sleep-resume recovery: /api/internal/scanner/run recovers stale run and executes scan with redacted response', async () => {
+    const { app: workerApp } = await buildWorkerApp(WORKER_TOKEN);
+    try {
+      await pool.query(`DELETE FROM scanner_runs WHERE status = 'running'`);
+      const staleRes = await pool.query<{ id: string }>(
+        `INSERT INTO scanner_runs (status, provider_slug, started_at, metadata)
+         VALUES ('running', 'twelve-data', now() - interval '25 minutes', '{"triggeredBy":"system"}')
+         RETURNING id`,
+      );
+
+      const res = await workerApp.inject({
+        method: 'POST',
+        url: '/api/internal/scanner/run',
+        headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+        payload: { force: true, leaseMs: 600_000 },
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      const body = res.json();
+      const parsed = scannerInternalRunResponseSchema.safeParse(body);
+      assert.equal(parsed.success, true, 'response must satisfy scannerInternalRunResponseSchema');
+      assert.equal(body.recovered, 1, 'stale running scan from before sleep must be recovered');
+      assert.equal(body.skipped, false);
+      assert.ok(body.run !== null);
+      assert.equal('triggeredBy' in body.run.metadata, false);
+      assert.equal('strategyId' in body.run.metadata, false);
+      assert.equal('errors' in body.run.metadata, false);
+
+      // Verify stale row in DB was marked failed
+      const dbStale = await pool.query<{ status: string; error: string | null }>(
+        `SELECT status, error FROM scanner_runs WHERE id = $1`,
+        [staleRes.rows[0]!.id],
+      );
+      assert.equal(dbStale.rows[0]?.status, 'failed');
+      assert.equal(dbStale.rows[0]?.error, 'recovered: stale running run after restart');
+
+      // Also verify /api/internal/scanner/maintenance
+      const maintRes = await workerApp.inject({
+        method: 'POST',
+        url: '/api/internal/scanner/maintenance',
+        headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+        payload: { leaseMs: 600_000 },
+      });
+      assert.equal(maintRes.statusCode, 200, maintRes.body);
+      const maintBody = maintRes.json();
+      assert.equal(
+        scannerInternalMaintenanceResponseSchema.safeParse(maintBody).success,
+        true,
+        'maintenance response must satisfy scannerInternalMaintenanceResponseSchema',
+      );
+      assert.equal(maintBody.recovered, 0);
+      assert.equal(maintBody.activeRuns, 0);
+    } finally {
+      await workerApp.close();
+    }
+  });
+
+  test('lock contention over HTTP: /api/internal/scanner/run returns skipped=true when advisory lock is held', async () => {
+    const { app: workerApp } = await buildWorkerApp(WORKER_TOKEN);
+    const lockClient = await pool.connect();
+    try {
+      const lockRes = await lockClient.query<{ acquired: boolean }>(
+        `SELECT pg_try_advisory_lock($1) AS acquired`,
+        [SCANNER_ADVISORY_LOCK_KEY],
+      );
+      assert.equal(lockRes.rows[0]?.acquired, true);
+
+      const res = await workerApp.inject({
+        method: 'POST',
+        url: '/api/internal/scanner/run',
+        headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+        payload: { force: false },
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      const body = res.json();
+      assert.equal(body.skipped, true);
+      assert.equal(body.run, null);
+      assert.equal(body.reason, 'already_running');
+    } finally {
+      await lockClient.query(`SELECT pg_advisory_unlock($1)`, [SCANNER_ADVISORY_LOCK_KEY]);
+      lockClient.release();
+      await workerApp.close();
+    }
+  });
+
+  test('startScannerWorkerTicker: prevents overlapping ticks, sanitizes errors, and awaits in-flight work on stop()', async () => {
+    let activeCalls = 0;
+    let maxConcurrentCalls = 0;
+    let totalCalls = 0;
+    let maintenanceCalls = 0;
+    let waitForInFlightCalled = false;
+    let unblockFirstTick!: () => void;
+    const firstTickGate = new Promise<void>((resolve) => {
+      unblockFirstTick = resolve;
+    });
+    let firstTickStarted!: () => void;
+    const firstTickStartedPromise = new Promise<void>((resolve) => {
+      firstTickStarted = resolve;
+    });
+
+    const loggedErrors: Array<{ message: string; meta?: Record<string, unknown> }> = [];
+    const secretVal = 'super-secret-api-key-12345';
+
+    const target = {
+      async runWorkerOnce() {
+        totalCalls += 1;
+        activeCalls += 1;
+        if (activeCalls > maxConcurrentCalls) maxConcurrentCalls = activeCalls;
+        try {
+          if (totalCalls === 1) {
+            firstTickStarted();
+            await firstTickGate;
+            throw new Error(`provider failure apikey=${secretVal} for 11111111-2222-4333-8444-555555555555`);
+          }
+          return {
+            run: null,
+            skipped: true,
+            reason: 'Already scanned',
+            recovered: 0,
+          };
+        } finally {
+          activeCalls -= 1;
+        }
+      },
+      async runMaintenance() {
+        maintenanceCalls += 1;
+        return {
+          recovered: 0,
+          activeRuns: 0,
+          recentFailures: 0,
+          status: 'idle' as const,
+          isProviderAvailable: true,
+        };
+      },
+      async waitForInFlight() {
+        waitForInFlightCalled = true;
+      },
+    };
+
+    const ticker = startScannerWorkerTicker(target, {
+      intervalMs: 20,
+      maintenanceEveryRuns: 1,
+      runImmediately: true,
+      redact: (t) => t.split(secretVal).join('[REDACTED]'),
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: (message, meta) => loggedErrors.push({ message, meta }),
+      },
+    });
+
+    await firstTickStartedPromise;
+    // Wait long enough for several 20ms interval ticks to fire while tick 1 is blocked
+    await new Promise((r) => setTimeout(r, 70));
+    assert.equal(maxConcurrentCalls, 1, 'overlap guard must prevent concurrent in-process ticks');
+    assert.equal(totalCalls, 1, 'no second tick may start while the first tick is in flight');
+
+    // Call stop() while the first tick is still in flight
+    let stopResolved = false;
+    const stopPromise = ticker.stop().then(() => {
+      stopResolved = true;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(stopResolved, false, 'stop() must wait for the in-flight tick to finish');
+
+    unblockFirstTick();
+    await stopPromise;
+    assert.equal(stopResolved, true);
+    assert.equal( ticker.running, false);
+    assert.equal(waitForInFlightCalled, true, 'stop() must await target.waitForInFlight()');
+    assert.equal(maintenanceCalls, 1);
+    assert.equal(loggedErrors.length, 1);
+    const errText = JSON.stringify(loggedErrors[0]);
+    assert.ok(!errText.includes(secretVal), 'logged tick error must scrub secrets');
+    assert.ok(!errText.includes('11111111-2222-4333-8444-555555555555'), 'logged tick error must scrub UUIDs');
   });
 });

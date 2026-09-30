@@ -265,6 +265,9 @@ disagree. The failing `schema` block is included in the response.
 | `VAPID_SUBJECT` | for push (M9.2) | VAPID subject `mailto:` or `https://` (`sync: false`). |
 | `PUSH_ENABLED` | no (default true) | `false` disables push provider (jobs become `unavailable`). |
 | `PUSH_PROVIDER_TIMEOUT_MS` | no (default 15000) | Per-attempt push timeout. |
+| `SCANNER_WORKER_TOKEN` | for scheduled scanning (F3) | Shared secret for `POST /api/internal/scanner/run` and `POST /api/internal/scanner/maintenance`. **Empty = those routes return 404.** Set it so an external scheduler (Render Cron Job) can wake a sleeping instance and run a scan cycle safely. |
+| `SCANNER_ENABLED` | no (default `false`; `true` in `render.yaml`) | `true` starts the overlap-safe in-process scanner ticker (`startScannerWorkerTicker`) every `SCANNER_INTERVAL_MS`. Safe alongside external scheduler invocations via advisory lock `875421009`. |
+| `SCANNER_INTERVAL_MS` / `SCANNER_LEASE_MS` | no (default `300000` / `1800000`) | Scan cadence (5 m) and stale-run recovery horizon (30 m). |
 
 Missing or malformed values make the API **fail at boot** with an itemized
 error (`loadConfig` zod validation) instead of misbehaving at runtime.
@@ -354,6 +357,21 @@ migrations are unaffected.
   deliveries are stuck or being rejected; the row's `failure_category`,
   `provider_response_code` and redacted `last_error` say which. See
   [notification-delivery.md](./notification-delivery.md).
+
+### Live scanner operations (M7.5 / F3)
+
+- **Scheduled scanning across spin-downs** — the in-process ticker
+  (`startScannerWorkerTicker`) runs every `SCANNER_INTERVAL_MS` (5 m) while the
+  instance is awake. On a free or scale-to-zero instance, point a **Render Cron
+  Job** (or external scheduler) at `POST /api/internal/scanner/run` with the
+  `x-veltrixeye-worker-token: <SCANNER_WORKER_TOKEN>` header every 5 minutes.
+  Both paths serialize through PostgreSQL advisory lock `875421009` and
+  `scanner_cursors` closed-candle watermarks, so concurrent or back-to-back
+  invocations never double-scan a closed bar.
+- **Maintenance & recovery** — `POST /api/internal/scanner/maintenance` (same
+  header) recovers stale `running` scans past `SCANNER_LEASE_MS` and returns
+  bounded operational status without tenant identifiers or secrets. See
+  [scanner.md](./scanner.md).
 
 ### Operations
 

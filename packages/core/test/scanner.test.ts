@@ -45,8 +45,12 @@ import {
   checkMultiTimeframeFreshness,
   hashPassword,
   redactScannerRunMetadata,
+  redactScannerRunForOperator,
   SCANNER_TENANT_SENSITIVE_METADATA_KEYS,
+  sanitizeScannerError,
   sanitizeScannerUnlockError,
+  SCANNER_ERROR_MAX_CHARS,
+  SCANNER_RUN_ERROR_MAX_CHARS,
 } from '../src/index.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -1354,3 +1358,406 @@ describe('F14: MTF anchor alignment (no lookahead)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// 8. F3: External scheduler invocation, sleep-resume recovery & graceful shutdown
+// ---------------------------------------------------------------------------
+
+describe('F3: External scheduler invocation, sleep-resume recovery & graceful shutdown', () => {
+  test('redactScannerRunForOperator and sanitizeScannerError scrub secrets, UUIDs, and cap length', () => {
+    const tenantId = 'a1a1a1a1-1111-4111-8111-111111111111';
+    const stratId = 'b2b2b2b2-2222-4222-8222-222222222222';
+    const rawSecret = 'td-live-secret-key-999';
+    const rawError =
+      `fetch https://user:pw123@api.twelvedata.com/time_series?apikey=${rawSecret} ` +
+      `Bearer tok_xyz_789 for strategy ${stratId} user ${tenantId} ` +
+      'x'.repeat(400);
+
+    const sanitized = sanitizeScannerError(new Error(rawError), (t) =>
+      t.split(rawSecret).join('[REDACTED]'),
+    );
+    assert.ok(sanitized.length <= SCANNER_ERROR_MAX_CHARS, 'error length is bounded');
+    assert.ok(!sanitized.includes(rawSecret), 'configured secret redacted');
+    assert.ok(!sanitized.includes('pw123'), 'URL password redacted');
+    assert.ok(!sanitized.includes('tok_xyz_789'), 'bearer token redacted');
+    assert.ok(!sanitized.includes(tenantId), 'tenant UUID redacted');
+    assert.ok(!sanitized.includes(stratId), 'strategy UUID redacted');
+
+    const redactedRun = redactScannerRunForOperator(
+      {
+        id: 'c3c3c3c3-3333-4333-8333-333333333333',
+        startedAt: '2026-09-30T10:00:00.000Z',
+        finishedAt: '2026-09-30T10:00:02.000Z',
+        status: 'partial',
+        providerSlug: 'twelve-data',
+        strategiesScanned: 2,
+        instrumentsScanned: 2,
+        candlesFetched: 240,
+        setupsDetected: 1,
+        setupsCreated: 1,
+        alertsCreated: 0,
+        staleRejections: 0,
+        providerFailures: 1,
+        error: rawError,
+        symbolsProcessed: ['EURUSD'],
+        timeframesProcessed: ['4h', '1h', '15m'],
+        metadata: {
+          triggeredBy: tenantId,
+          strategyId: stratId,
+          force: true,
+          errors: [`strategy ${stratId}: ${rawError}`],
+        },
+        createdAt: '2026-09-30T10:00:00.000Z',
+        updatedAt: '2026-09-30T10:00:02.000Z',
+      },
+      (t) => t.split(rawSecret).join('[REDACTED]'),
+    );
+
+    assert.equal('triggeredBy' in redactedRun.metadata, false);
+    assert.equal('strategyId' in redactedRun.metadata, false);
+    assert.equal('errors' in redactedRun.metadata, false);
+    assert.equal(redactedRun.metadata.force, true);
+    assert.ok(redactedRun.error !== null);
+    assert.ok(redactedRun.error.length <= SCANNER_RUN_ERROR_MAX_CHARS);
+    const serialized = JSON.stringify(redactedRun);
+    assert.ok(!serialized.includes(tenantId));
+    assert.ok(!serialized.includes(stratId));
+    assert.ok(!serialized.includes(rawSecret));
+    assert.ok(!serialized.includes('pw123'));
+  });
+
+  test('recoverStaleRuns(leaseMs) and runMaintenance({ leaseMs }) recover stale running rows while preserving fresh running rows', async () => {
+    await pool.query(`DELETE FROM scanner_runs WHERE status = 'running'`);
+
+    const staleIns = await pool.query<{ id: string }>(
+      `INSERT INTO scanner_runs (status, provider_slug, started_at, metadata)
+       VALUES ('running', 'twelve-data', now() - interval '15 minutes', '{"triggeredBy":"system"}')
+       RETURNING id`,
+    );
+    const freshIns = await pool.query<{ id: string }>(
+      `INSERT INTO scanner_runs (status, provider_slug, started_at, metadata)
+       VALUES ('running', 'twelve-data', now() - interval '1 minute', '{"triggeredBy":"system"}')
+       RETURNING id`,
+    );
+
+    // Lease of 5 minutes (300_000 ms): 15-minute-old row is recovered, 1-minute-old row stays running
+    const maint = await scanner.runMaintenance({ leaseMs: 300_000 });
+    assert.equal(maint.recovered, 1);
+    assert.equal(maint.activeRuns, 1);
+    assert.equal(maint.status, 'running');
+    assert.equal(typeof maint.isProviderAvailable, 'boolean');
+
+    const staleRow = await pool.query<{ status: string; error: string | null }>(
+      `SELECT status, error FROM scanner_runs WHERE id = $1`,
+      [staleIns.rows[0]!.id],
+    );
+    assert.equal(staleRow.rows[0]?.status, 'failed');
+    assert.equal(staleRow.rows[0]?.error, 'recovered: stale running run after restart');
+
+    const freshRow = await pool.query<{ status: string }>(
+      `SELECT status FROM scanner_runs WHERE id = $1`,
+      [freshIns.rows[0]!.id],
+    );
+    assert.equal(freshRow.rows[0]?.status, 'running');
+
+    // Clean up the fresh row
+    await pool.query(`UPDATE scanner_runs SET status = 'completed', finished_at = now() WHERE id = $1`, [
+      freshIns.rows[0]!.id,
+    ]);
+  });
+
+  test('sleep-resume invocation: runWorkerOnce recovers abandoned stale run and executes a fresh scan in one call', async () => {
+    await pool.query(`DELETE FROM scanner_runs WHERE status = 'running'`);
+    // Simulate an instance that went to sleep mid-scan 20 minutes ago
+    const abandoned = await pool.query<{ id: string }>(
+      `INSERT INTO scanner_runs (status, provider_slug, started_at, metadata)
+       VALUES ('running', 'twelve-data', now() - interval '20 minutes', '{"triggeredBy":"system"}')
+       RETURNING id`,
+    );
+
+    const res = await scanner.runWorkerOnce({ force: true, leaseMs: 600_000 });
+    assert.equal(res.recovered, 1, 'stale run from before sleep must be recovered');
+    assert.equal(res.skipped, false, 'fresh scan must execute immediately after recovery');
+    assert.ok(res.run !== null, 'run DTO must be returned');
+    assert.notEqual(res.run.id, abandoned.rows[0]!.id);
+    assert.ok(res.run.status === 'completed' || res.run.status === 'partial');
+    assert.equal('triggeredBy' in res.run.metadata, false, 'operator run DTO must omit triggeredBy');
+    assert.equal('strategyId' in res.run.metadata, false, 'operator run DTO must omit strategyId');
+    assert.equal('errors' in res.run.metadata, false, 'operator run DTO must omit strategy errors');
+
+    const checkAbandoned = await pool.query<{ status: string; error: string | null }>(
+      `SELECT status, error FROM scanner_runs WHERE id = $1`,
+      [abandoned.rows[0]!.id],
+    );
+    assert.equal(checkAbandoned.rows[0]?.status, 'failed');
+    assert.equal(checkAbandoned.rows[0]?.error, 'recovered: stale running run after restart');
+  });
+
+  test('lock contention & concurrent invocation: runWorkerOnce skips cleanly when advisory lock is held', async () => {
+    const lockClient = await pool.connect();
+    try {
+      const lockRes = await lockClient.query<{ acquired: boolean }>(
+        `SELECT pg_try_advisory_lock($1) AS acquired`,
+        [SCANNER_ADVISORY_LOCK_KEY],
+      );
+      assert.equal(lockRes.rows[0]?.acquired, true);
+
+      const res = await scanner.runWorkerOnce({ force: true });
+      assert.equal(res.skipped, true);
+      assert.equal(res.run, null);
+      assert.equal(res.reason, 'already_running');
+      assert.equal(typeof res.recovered, 'number');
+    } finally {
+      await lockClient.query(`SELECT pg_advisory_unlock($1)`, [SCANNER_ADVISORY_LOCK_KEY]);
+      lockClient.release();
+    }
+  });
+
+  test('retry/fail-closed + redaction: provider failure with secret/UUID in error fails closed and persists sanitized error', async () => {
+    const rawSecret = 'td-super-secret-token-777';
+    const leakedUuid = 'd4d4d4d4-4444-4444-8444-444444444444';
+    let attempts = 0;
+
+    const failingIngestion = {
+      getCandles: async () => {
+        attempts += 1;
+        throw new ProviderError(
+          'unavailable',
+          `provider upstream https://admin:${rawSecret}@api.twelvedata.com/time_series unavailable for ${leakedUuid} apikey=${rawSecret}`,
+        );
+      },
+    } as unknown as IngestionService;
+
+    const failScanner = new ScannerService(
+      pool,
+      providerRegistry,
+      candleStore,
+      failingIngestion,
+      evaluation,
+      setups,
+      scoring,
+      alerts,
+      {
+        maxRetries: 1,
+        retryBaseMs: 5,
+        retryMaxMs: 10,
+        providerTimeoutMs: 500,
+        redact: (text) => text.split(rawSecret).join('[REDACTED]'),
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+      },
+    );
+
+    const res = await failScanner.runWorkerOnce({ force: true });
+    assert.equal(res.skipped, false);
+    assert.ok(res.run !== null);
+    assert.ok(attempts >= 2, 'must retry transient provider error before failing closed');
+    assert.equal(res.run.alertsCreated, 0, 'fail-closed: zero alerts on provider failure');
+    assert.ok(res.run.providerFailures > 0, 'providerFailures counter incremented');
+
+    const serialized = JSON.stringify(res);
+    assert.ok(!serialized.includes(rawSecret), 'secret must not appear in response');
+    assert.ok(!serialized.includes(leakedUuid), 'UUID must not appear in response');
+
+    // Verify persisted scanner_runs row also scrubbed the secret and UUID
+    const dbRow = await pool.query<{ error: string | null; metadata: Record<string, unknown> }>(
+      `SELECT error, metadata FROM scanner_runs WHERE id = $1`,
+      [res.run.id],
+    );
+    const dbSerialized = JSON.stringify(dbRow.rows[0]);
+    assert.ok(!dbSerialized.includes(rawSecret), 'secret must never be persisted to scanner_runs');
+    assert.ok(!dbSerialized.includes(leakedUuid), 'leaked UUID in provider error must be scrubbed');
+  });
+
+  test('graceful shutdown: waitForInFlight resolves only after an active scan finishes and releases the lock', async () => {
+    let releaseFetch!: () => void;
+    const fetchStarted = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    let unblockGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      unblockGate = resolve;
+    });
+
+    const slowIngestion = {
+      getCandles: async (q: any) => {
+        releaseFetch();
+        await gate;
+        return ingestion.getCandles(q);
+      },
+    } as unknown as IngestionService;
+
+    const slowScanner = new ScannerService(
+      pool,
+      providerRegistry,
+      candleStore,
+      slowIngestion,
+      evaluation,
+      setups,
+      scoring,
+      alerts,
+      {
+        maxRetries: 0,
+        providerTimeoutMs: 5000,
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+      },
+    );
+
+    const runPromise = slowScanner.runWorkerOnce({ force: true });
+    await fetchStarted;
+
+    let waitResolved = false;
+    const waitPromise = slowScanner.waitForInFlight().then(() => {
+      waitResolved = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 25));
+    assert.equal(waitResolved, false, 'waitForInFlight must remain pending while scan is in flight');
+
+    unblockGate();
+    await waitPromise;
+    assert.equal(waitResolved, true, 'waitForInFlight resolves once in-flight scan finishes');
+
+    const runRes = await runPromise;
+    assert.equal(runRes.skipped, false);
+
+    // Advisory lock must be released when waitForInFlight resolves
+    const heldRows = await pool.query<{ cnt: string }>(
+      `SELECT count(*)::text AS cnt FROM pg_locks WHERE locktype = 'advisory' AND objid = $1`,
+      [SCANNER_ADVISORY_LOCK_KEY],
+    );
+    assert.equal(Number(heldRows.rows[0]?.cnt ?? '0'), 0);
+  });
+
+  test('duplicate/concurrent runWorkerOnce invocations serialize via advisory lock without duplicate runs', async () => {
+    let releaseFirstFetch!: () => void;
+    const firstFetchStarted = new Promise<void>((resolve) => {
+      releaseFirstFetch = resolve;
+    });
+    let unblockFirst!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      unblockFirst = resolve;
+    });
+    let fetchCalls = 0;
+
+    const gatedIngestion = {
+      getCandles: async (q: any) => {
+        fetchCalls += 1;
+        if (fetchCalls === 1) {
+          releaseFirstFetch();
+          await gate;
+        }
+        return ingestion.getCandles(q);
+      },
+    } as unknown as IngestionService;
+
+    const concurrentScanner = new ScannerService(
+      pool,
+      providerRegistry,
+      candleStore,
+      gatedIngestion,
+      evaluation,
+      setups,
+      scoring,
+      alerts,
+      {
+        maxRetries: 0,
+        providerTimeoutMs: 5000,
+        logger: { info: () => {}, warn: () => {}, error: () => {} },
+      },
+    );
+
+    const p1 = concurrentScanner.runWorkerOnce({ force: true });
+    await firstFetchStarted;
+
+    // Concurrent second invocation while p1 holds the advisory lock
+    const r2 = await concurrentScanner.runWorkerOnce({ force: true });
+    assert.equal(r2.skipped, true);
+    assert.equal(r2.run, null);
+    assert.equal(r2.reason, 'already_running');
+
+    unblockFirst();
+    const r1 = await p1;
+    assert.equal(r1.skipped, false);
+    assert.ok(r1.run !== null);
+  });
+
+  test('cursor correctness & F14 closed-candle interaction under runWorkerOnce', async () => {
+    const HOUR_MS = 60 * 60_000;
+    const MIN15_MS = 15 * 60_000;
+    const HOUR4_MS = 4 * 60 * 60_000;
+    const T_BAR_OPEN = 1_785_008_400_000;
+    const LAST_CLOSED_OPEN = T_BAR_OPEN - HOUR_MS;
+    const LAST_CLOSED_CLOSE = T_BAR_OPEN;
+    const FORMING_OPEN = T_BAR_OPEN;
+    const FORMING_CLOSE = T_BAR_OPEN + HOUR_MS;
+    const nowDuringForming = T_BAR_OPEN + 25 * 60_000;
+
+    await pool.query(`DELETE FROM scanner_cursors`);
+
+    const customIngestion = {
+      getCandles: async (q: { timeframe: Timeframe; to: number }) => {
+        if (q.timeframe === '4h') {
+          return { candles: makeCandles(60, T_BAR_OPEN - 59 * HOUR4_MS, HOUR4_MS) };
+        }
+        if (q.timeframe === '1h') {
+          return { candles: makeCandles(120, FORMING_OPEN - 119 * HOUR_MS, HOUR_MS) };
+        }
+        const latest15mOpen = Math.floor(q.to / MIN15_MS) * MIN15_MS - MIN15_MS;
+        return { candles: makeCandles(120, latest15mOpen - 119 * MIN15_MS, MIN15_MS) };
+      },
+    } as unknown as IngestionService;
+
+    const detectedAsOfs: number[] = [];
+    const customSetups = {
+      detect: async (args: { asOf: number; direction: 'long' | 'short' }) => {
+        detectedAsOfs.push(args.asOf);
+        return { detections: [{ direction: args.direction, qualified: false, setup: null, created: false }] };
+      },
+    } as unknown as SetupService;
+
+    const workerScanner = new ScannerService(
+      pool,
+      providerRegistry,
+      candleStore,
+      customIngestion,
+      evaluation,
+      customSetups,
+      scoring,
+      alerts,
+      { logger: { info: () => {}, warn: () => {}, error: () => {} }, maxRetries: 0, providerTimeoutMs: 500 },
+    );
+
+    // 1. First worker invocation during forming candle: anchors at LAST_CLOSED_CLOSE (<= nowMs)
+    const r1 = await workerScanner.runWorkerOnce({ force: false, nowMs: nowDuringForming });
+    assert.equal(r1.skipped, false);
+    assert.ok(detectedAsOfs.length > 0);
+    for (const asOf of detectedAsOfs) {
+      assert.equal(asOf, LAST_CLOSED_CLOSE);
+      assert.ok(asOf <= nowDuringForming);
+      assert.notEqual(asOf, FORMING_CLOSE);
+    }
+    const cursorsAfterR1 = await pool.query<{ last_candle_time: string }>(
+      `SELECT last_candle_time FROM scanner_cursors WHERE timeframe = '1h'`,
+    );
+    assert.ok(cursorsAfterR1.rows.some((c) => Number(c.last_candle_time) === LAST_CLOSED_OPEN));
+
+    // 2. Duplicate worker invocation while same bar is still forming: cursor prevents re-evaluation
+    detectedAsOfs.length = 0;
+    const r2 = await workerScanner.runWorkerOnce({ force: false, nowMs: T_BAR_OPEN + 45 * 60_000 });
+    assert.equal(r2.skipped, false);
+    assert.equal(detectedAsOfs.length, 0, 'cursor must skip already-processed closed candle');
+
+    // 3. Worker invocation after forming bar closes: cursor advances and evaluates newly closed bar
+    const nowAfterClose = T_BAR_OPEN + 65 * 60_000;
+    const r3 = await workerScanner.runWorkerOnce({ force: false, nowMs: nowAfterClose });
+    assert.equal(r3.skipped, false);
+    assert.ok(detectedAsOfs.length > 0);
+    for (const asOf of detectedAsOfs) {
+      assert.equal(asOf, FORMING_CLOSE);
+      assert.ok(asOf <= nowAfterClose);
+    }
+    const cursors = await pool.query<{ last_candle_time: string }>(
+      `SELECT last_candle_time FROM scanner_cursors WHERE timeframe = '1h'`,
+    );
+    assert.ok(cursors.rows.some((c) => Number(c.last_candle_time) === FORMING_OPEN));
+  });
+});
