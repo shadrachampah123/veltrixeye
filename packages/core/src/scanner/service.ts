@@ -521,12 +521,23 @@ export class ScannerService {
       }
     }
 
-    // Run through existing strategy pipeline:
-    // Market structure detection, liquidity sweep, ChoCH, break & retest,
-    // S/R confirmation, order-block logic, etc. are all inside the evaluation engine.
-    // We use SetupService.detect which internally calls EvaluationService.
+    // F14 FIX: MTF Anchor Alignment
+    // Use the last FULLY CLOSED candle as the anchor, not the latest (possibly forming) candle.
+    // The evaluation engine only processes closed candles (time + period <= asOfMs).
+    // We need to find the last candle that is fully closed at nowMs.
+    const setupPeriodMs = timeframeMinutes(setupTf) * 60_000;
+    const closedSetupCandles = setupCandles.filter(c => c.time + setupPeriodMs <= nowMs);
+    const asOfMs = closedSetupCandles[closedSetupCandles.length - 1]?.time ?? nowMs;
 
-    const asOfMs = setupCandles[setupCandles.length - 1]?.time ?? nowMs;
+    // If no closed candles available, skip this instrument
+    if (closedSetupCandles.length === 0) {
+      metrics.staleRejections += 1;
+      this.logger.info('no closed candles for detection', {
+        strategyId: strategy.strategyId,
+        instrument: `${instrument.assetClass}/${instrument.symbol}`,
+      });
+      return;
+    }
 
     // Detect long and short
     const directions: ('long' | 'short')[] = ['long', 'short'];
