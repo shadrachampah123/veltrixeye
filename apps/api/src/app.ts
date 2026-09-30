@@ -431,6 +431,22 @@ export function createAppContext(
 
   // M7.5 — live scanner (production market-data and scanner pipeline)
   const scanner = new ScannerService(pool, providerRegistry, candles, ingestion, evaluation, setups, scoring, alerts, {
+    providerTimeoutMs: config.scanner.providerTimeoutMs,
+    maxRetries: config.scanner.maxRetries,
+    retryBaseMs: config.scanner.retryBaseMs,
+    retryMaxMs: config.scanner.retryMaxMs,
+    expectedIntervalMs: config.scanner.intervalMs,
+    leaseMs: config.scanner.leaseMs,
+    redact: (text) =>
+      redactSecrets(text, [
+        config.TWELVE_DATA_API_KEY,
+        config.scanner.workerToken,
+        config.notification.worker.token,
+        config.notification.email.pass,
+        config.notification.push.privateKey,
+        config.notification.secret.encryptionKey,
+        config.PAYSTACK_SECRET_KEY,
+      ]),
     logger: {
       info: (msg, meta) => {
         if (config.NODE_ENV === 'production') {
@@ -522,11 +538,14 @@ export async function runStartupDeliveryRecovery(
 }
 
 /**
- * One-shot scanner recovery (M7.5): mark stale running scanner runs as failed
+ * One-shot scanner recovery (M7.5 / F3): mark stale running scanner runs as failed
  * after a crash/restart. Cheap: one bounded UPDATE, no provider I/O.
  */
-export async function runStartupScannerRecovery(ctx: AppContext): Promise<{ recovered: number }> {
-  return ctx.scanner.recoverStaleRuns();
+export async function runStartupScannerRecovery(
+  ctx: AppContext,
+  leaseMs?: number,
+): Promise<{ recovered: number }> {
+  return ctx.scanner.recoverStaleRuns(leaseMs);
 }
 
 /**
@@ -630,6 +649,10 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await reconciliationRoutes(app, ctx, config);
   await safetyRoutes(app, ctx, config);
   await riskRoutes(app, ctx, config);
+
+  app.addHook('onClose', async () => {
+    await ctx.scanner.waitForInFlight().catch(() => {});
+  });
 
   return app;
 }

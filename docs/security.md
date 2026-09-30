@@ -345,6 +345,25 @@ Webhook signing secrets and push subscription keys are now encrypted at rest via
   `failed` (120 d) rows; `pending`, `processing` and `unavailable` rows are
   never deleted.
 
+## Live scanner external invocation (M7.5 / F3)
+
+- **Administrative routes are invisible until configured.**
+  `POST /api/internal/scanner/{run,maintenance}` require the
+  `x-veltrixeye-worker-token` header; when `SCANNER_WORKER_TOKEN` is unset they
+  return **404** (not 401), so an unconfigured deployment advertises no
+  administrative surface. The token is compared in constant time over SHA-256
+  digests, session cookies alone return **401**, and the routes are rate
+  limited (30/min per IP).
+- **Strict request contracts.** `POST /api/internal/scanner/run` accepts only
+  `{ force?: boolean, leaseMs?: number }` and `POST /api/internal/scanner/maintenance`
+  accepts only `{ leaseMs?: number }` (`.strict()`). Strategy IDs, user IDs,
+  symbols and custom payloads are rejected with 400.
+- **Bounded, redacted responses and logs.** Internal scanner responses strip
+  tenant/strategy identifiers (`triggeredBy`, `strategyId`, `errors`) via
+  `redactScannerRunForOperator` and sanitize error text (`sanitizeScannerError`,
+  max 240 chars, scrubbing URLs, bearer tokens, key-value secrets, deployment
+  secrets, and UUIDs) before persistence, logging, or HTTP serialization.
+
 ## Data integrity as security
 
 - Strategy version immutability (0007 triggers) — published history

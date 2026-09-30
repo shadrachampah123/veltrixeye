@@ -11,7 +11,10 @@ import {
   DEFAULT_NOTIFICATION_MAX_BACKOFF_MS,
   DEFAULT_NOTIFICATION_TIMEOUT_MS,
   DEFAULT_NOTIFICATION_WORKER_INTERVAL_MS,
+  DEFAULT_SCANNER_LEASE_MS,
   MAX_NOTIFICATION_BATCH_SIZE,
+  MAX_SCANNER_LEASE_MS,
+  MIN_SCANNER_LEASE_MS,
 } from '@veltrixeye/contracts';
 import type { SmtpEmailConfig as SmtpEmailConfigShape } from '@veltrixeye/core';
 import { BILLING_FX_POLICY, validateExecutionTransportConfig } from '@veltrixeye/core';
@@ -230,6 +233,14 @@ const baseEnvSchema = z.object({
   SCANNER_MAX_RETRIES: intEnv(0, 10, 3),
   SCANNER_RETRY_BASE_MS: intEnv(100, 60_000, 1_000),
   SCANNER_RETRY_MAX_MS: intEnv(1_000, 120_000, 10_000),
+  /** How long a running scanner run may stay `running` before it is recovered. */
+  SCANNER_LEASE_MS: intEnv(MIN_SCANNER_LEASE_MS, MAX_SCANNER_LEASE_MS, DEFAULT_SCANNER_LEASE_MS),
+  /**
+   * Shared secret for `POST /api/internal/scanner/{run,maintenance}` (F3).
+   * EMPTY = those routes do not exist (404), so an unconfigured deployment
+   * exposes no administrative surface at all.
+   */
+  SCANNER_WORKER_TOKEN: z.string().max(256).default(''),
 
   /* ---------------------------------------------------------------------- */
   /* M8.6 — kill-switch & safety controls                                      */
@@ -433,6 +444,9 @@ export interface ScannerConfig {
   maxRetries: number;
   retryBaseMs: number;
   retryMaxMs: number;
+  leaseMs: number;
+  /** Empty ⇒ the internal scanner worker routes are not registered (404). */
+  workerToken: string;
 }
 
 /**
@@ -536,6 +550,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       maxRetries: values.SCANNER_MAX_RETRIES,
       retryBaseMs: values.SCANNER_RETRY_BASE_MS,
       retryMaxMs: values.SCANNER_RETRY_MAX_MS,
+      leaseMs: values.SCANNER_LEASE_MS,
+      workerToken: values.SCANNER_WORKER_TOKEN,
     },
     billing: {
       provider: 'paystack',

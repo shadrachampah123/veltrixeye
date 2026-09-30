@@ -215,3 +215,79 @@ export const SCANNER_MAX_INSTRUMENTS_PER_RUN = 100;
 
 /** Max strategies per scan batch. */
 export const SCANNER_MAX_STRATEGIES_PER_RUN = 50;
+
+/**
+ * Stale-run recovery lease bounds (M7 audit finding F3).
+ *
+ * A `scanner_runs` row still in `status = 'running'` past its lease is an
+ * orphaned run from a crashed or sleeping instance and is recovered to
+ * `failed` before new scans execute.
+ */
+export const DEFAULT_SCANNER_LEASE_MS = 30 * 60_000;
+export const MIN_SCANNER_LEASE_MS = 30_000;
+export const MAX_SCANNER_LEASE_MS = 2 * 60 * 60_000;
+
+/**
+ * Body of the internal scanner worker trigger (`POST /api/internal/scanner/run`).
+ *
+ * Strictly forbids tenant/content parameters (`strategyId`, `userId`,
+ * `instruments`, `payload`, etc.): an external scheduler can only ask to run
+ * a platform scan cycle, never target a tenant.
+ */
+export const scannerInternalRunRequestSchema = z
+  .object({
+    /** Force re-scan even if cursors indicate no new closed candle. */
+    force: z.boolean().optional(),
+    /** Optional stale-run recovery lease override (ms). */
+    leaseMs: z.number().int().min(MIN_SCANNER_LEASE_MS).max(MAX_SCANNER_LEASE_MS).optional(),
+  })
+  .strict();
+export type ScannerInternalRunRequest = z.infer<typeof scannerInternalRunRequestSchema>;
+export type ScannerInternalRunRequestInput = z.input<typeof scannerInternalRunRequestSchema>;
+
+/**
+ * Result of one internal scanner worker invocation (`POST /api/internal/scanner/run`).
+ *
+ * `run` is redacted for operator/scheduler consumption (no tenant or strategy
+ * UUIDs, no unredacted error text) and is `null` when skipped before a run row
+ * exists (e.g. provider unavailable or lock contention on an empty ledger).
+ */
+export const scannerInternalRunResponseSchema = z
+  .object({
+    run: scannerRunDtoSchema.nullable(),
+    skipped: z.boolean(),
+    reason: z.string().min(1).max(64).optional(),
+    /** Stale `running` runs recovered prior to this invocation. */
+    recovered: z.number().int().min(0),
+  })
+  .strict();
+export type ScannerInternalRunResponse = z.infer<typeof scannerInternalRunResponseSchema>;
+
+/**
+ * Body of the internal scanner maintenance trigger (`POST /api/internal/scanner/maintenance`).
+ */
+export const scannerInternalMaintenanceRequestSchema = z
+  .object({
+    /** Stale-run recovery lease (ms). */
+    leaseMs: z.number().int().min(MIN_SCANNER_LEASE_MS).max(MAX_SCANNER_LEASE_MS).optional(),
+  })
+  .strict();
+export type ScannerInternalMaintenanceRequest = z.infer<typeof scannerInternalMaintenanceRequestSchema>;
+export type ScannerInternalMaintenanceRequestInput = z.input<typeof scannerInternalMaintenanceRequestSchema>;
+
+/**
+ * Result of internal scanner maintenance (`POST /api/internal/scanner/maintenance`).
+ *
+ * Reports stale recovery and operational counts only — never tenant identifiers,
+ * credentials, or raw error text.
+ */
+export const scannerInternalMaintenanceResponseSchema = z
+  .object({
+    recovered: z.number().int().min(0),
+    activeRuns: z.number().int().min(0),
+    recentFailures: z.number().int().min(0),
+    status: z.enum(['idle', 'running', 'degraded', 'unavailable']),
+    isProviderAvailable: z.boolean(),
+  })
+  .strict();
+export type ScannerInternalMaintenanceResponse = z.infer<typeof scannerInternalMaintenanceResponseSchema>;

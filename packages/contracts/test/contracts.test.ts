@@ -32,6 +32,13 @@ import {
   strategyCreateSchema,
   DEFAULT_MIN_RR,
   DEFAULT_MIN_QUALITY_SCORE,
+  DEFAULT_SCANNER_LEASE_MS,
+  MIN_SCANNER_LEASE_MS,
+  MAX_SCANNER_LEASE_MS,
+  scannerInternalRunRequestSchema,
+  scannerInternalRunResponseSchema,
+  scannerInternalMaintenanceRequestSchema,
+  scannerInternalMaintenanceResponseSchema,
 } from '../src/index.js';
 
 // ---------------------------------------------------------------------------
@@ -426,4 +433,74 @@ test('market-data: ProviderError kinds + error code registry', () => {
     assert.ok(isProviderError(err));
   }
   assert.equal(isProviderError(new Error('x')), false);
+});
+
+test('scanner (F3): internal worker run/maintenance schemas enforce strict bounds', () => {
+  assert.equal(DEFAULT_SCANNER_LEASE_MS, 1_800_000);
+  assert.equal(MIN_SCANNER_LEASE_MS, 30_000);
+  assert.equal(MAX_SCANNER_LEASE_MS, 7_200_000);
+
+  // Run request schema: defaults + bounds + strictness
+  const emptyRun = scannerInternalRunRequestSchema.safeParse({});
+  assert.equal(emptyRun.success, true);
+  if (emptyRun.success) {
+    assert.equal(emptyRun.data.force, undefined);
+    assert.equal(emptyRun.data.leaseMs, undefined);
+  }
+  const explicitRun = scannerInternalRunRequestSchema.safeParse({
+    force: true,
+    leaseMs: MIN_SCANNER_LEASE_MS,
+  });
+  assert.equal(explicitRun.success, true);
+  assert.equal(
+    scannerInternalRunRequestSchema.safeParse({ leaseMs: MIN_SCANNER_LEASE_MS - 1 }).success,
+    false,
+  );
+  assert.equal(
+    scannerInternalRunRequestSchema.safeParse({ leaseMs: MAX_SCANNER_LEASE_MS + 1 }).success,
+    false,
+  );
+  assert.equal(
+    scannerInternalRunRequestSchema.safeParse({ strategyId: '11111111-1111-4111-8111-111111111111' }).success,
+    false,
+    'internal run request must reject caller-supplied strategyId',
+  );
+  assert.equal(
+    scannerInternalRunRequestSchema.safeParse({ instruments: [{ assetClass: 'forex', symbol: 'EURUSD' }] }).success,
+    false,
+    'internal run request must reject caller-supplied instruments',
+  );
+
+  // Maintenance request schema: bounds + strictness
+  assert.equal(scannerInternalMaintenanceRequestSchema.safeParse({}).success, true);
+  assert.equal(
+    scannerInternalMaintenanceRequestSchema.safeParse({ leaseMs: DEFAULT_SCANNER_LEASE_MS }).success,
+    true,
+  );
+  assert.equal(
+    scannerInternalMaintenanceRequestSchema.safeParse({ leaseMs: MIN_SCANNER_LEASE_MS - 1 }).success,
+    false,
+  );
+  assert.equal(
+    scannerInternalMaintenanceRequestSchema.safeParse({ extraField: true }).success,
+    false,
+  );
+
+  // Run & maintenance response schemas
+  const skippedResp = scannerInternalRunResponseSchema.safeParse({
+    run: null,
+    skipped: true,
+    reason: 'Another scanner run is currently in progress',
+    recovered: 1,
+  });
+  assert.equal(skippedResp.success, true);
+
+  const maintResp = scannerInternalMaintenanceResponseSchema.safeParse({
+    recovered: 2,
+    activeRuns: 0,
+    recentFailures: 1,
+    status: 'idle',
+    isProviderAvailable: true,
+  });
+  assert.equal(maintResp.success, true);
 });

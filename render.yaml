@@ -89,6 +89,27 @@ services:
         value: 'true'
       - key: PUSH_PROVIDER_TIMEOUT_MS
         value: '15000'
+      # --- M7.5 / F3 live scanner + external scheduler invocation ---
+      # Shared secret for POST /api/internal/scanner/run and
+      # POST /api/internal/scanner/maintenance so an external scheduler can
+      # wake a sleeping instance and run a scan cycle safely. Empty = those
+      # routes return 404 (no administrative surface).
+      - key: SCANNER_WORKER_TOKEN
+        sync: false
+      - key: SCANNER_ENABLED
+        value: 'true'
+      - key: SCANNER_INTERVAL_MS
+        value: '300000'
+      - key: SCANNER_LEASE_MS
+        value: '1800000'
+      - key: SCANNER_PROVIDER_TIMEOUT_MS
+        value: '15000'
+      - key: SCANNER_MAX_RETRIES
+        value: '2'
+      - key: SCANNER_RETRY_BASE_MS
+        value: '1000'
+      - key: SCANNER_RETRY_MAX_MS
+        value: '10000'
       # --- M8.6 deployment-level global kill switch ---
       # 'true' pins the platform-wide emergency stop ON for every account
       # regardless of database state (new execution + paper simulation

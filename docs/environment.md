@@ -71,12 +71,14 @@ git-ignored and never contain values you would commit.
 | `VAPID_SUBJECT` | string, mailto/https | *(empty = push unavailable)* | M9.2 VAPID subject claim, e.g. `mailto:alerts@example.com`. |
 | `PUSH_ENABLED` | `true` \| `false` | `true` | M9.2 enable push channel. `false` disables push provider (jobs become `unavailable`). |
 | `PUSH_PROVIDER_TIMEOUT_MS` | int 1000–120000 | `15000` | M9.2 per-attempt push provider budget. |
-| `SCANNER_ENABLED` | `true` \| `false` | `false` | M7.5 live scanner. `false` (dev default) ⇔ scanner only runs when triggered via API; `true` starts an in-process ticker that calls `scanner.runOnce()` every `SCANNER_INTERVAL_MS`. Safe with concurrent triggers due to advisory locking. |
+| `SCANNER_ENABLED` | `true` \| `false` | `false` | M7.5 / F3 live scanner. `false` (dev default) ⇔ scanner only runs when triggered via API; `true` starts an overlap-safe in-process ticker that calls `scanner.runWorkerOnce()` every `SCANNER_INTERVAL_MS`. Safe with concurrent triggers and external scheduler invocations due to advisory locking. |
 | `SCANNER_INTERVAL_MS` | int 30000–3600000 | `300000` | Interval between scanner runs when `SCANNER_ENABLED=true` (5m default). |
+| `SCANNER_LEASE_MS` | int 30000–7200000 | `1800000` | How long a `running` scan may remain open before `recoverStaleRuns` / `runWorkerOnce` marks it `failed` (`recovered: stale running run after restart`). |
 | `SCANNER_PROVIDER_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-request provider timeout for scanner fetches. |
 | `SCANNER_MAX_RETRIES` | int 0–10 | `3` | Retry attempts for transient provider failures. |
 | `SCANNER_RETRY_BASE_MS` | int 100–60000 | `1000` | Base backoff for retries. |
 | `SCANNER_RETRY_MAX_MS` | int 1000–120000 | `10000` | Max backoff cap. |
+| `SCANNER_WORKER_TOKEN` | secret, ≤256 chars | *(empty)* | Shared secret for `POST /api/internal/scanner/run` and `POST /api/internal/scanner/maintenance` (external scheduler). **Empty ⇒ those routes return 404.** |
 | `EXECUTION_GLOBAL_KILL_SWITCH` | `true` \| `false` (strict) | `false` | M8.6 deployment-level global kill switch. `true` pins the platform-wide emergency stop ON for EVERY account regardless of database state: new execution (automation gates and paper simulation) is refused, `GET /api/execution/automation` reports `global_kill_switch_forced_by_environment`, and no API can clear the pin — only changing this value and redeploying. It GRANTS nothing; live execution remains impossible either way. |
 
 Empty-string values (a platform dashboard often writes one for a skipped

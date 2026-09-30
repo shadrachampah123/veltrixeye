@@ -1,5 +1,6 @@
 import type pg from 'pg';
 import {
+  DEFAULT_SCANNER_LEASE_MS,
   SCANNER_ADVISORY_LOCK_KEY,
   SCANNER_MAX_RETRIES,
   SCANNER_RETRY_BASE_MS,
@@ -12,6 +13,8 @@ import {
   type ScannerRunDto,
   type ScannerHealthDto,
   type ScannerRunListQuery,
+  type ScannerInternalRunResponse,
+  type ScannerInternalMaintenanceResponse,
   type AssetClass,
   timeframeMinutes,
 } from '@veltrixeye/contracts';
@@ -56,7 +59,13 @@ export interface ScannerServiceOptions {
   retryBaseMs?: number;
   retryMaxMs?: number;
   expectedIntervalMs?: number;
+  leaseMs?: number;
   logger?: ScannerLogger;
+  /**
+   * Optional secret-redaction callback (defence in depth) applied to error
+   * strings before they are stored on `scanner_runs` or written to logs.
+   */
+  redact?: (text: string) => string;
 }
 
 export interface ScannerLogger {
@@ -121,7 +130,36 @@ export function redactScannerRunMetadata(
 
 /** Redact a fully-mapped run DTO for a tenant viewer. Pure — no I/O. */
 export function redactScannerRunForViewer(run: ScannerRunDto, viewerUserId: string): ScannerRunDto {
-  return { ...run, metadata: redactScannerRunMetadata(run.metadata, viewerUserId) };
+  const isOwner = run.metadata.triggeredBy === viewerUserId;
+  return {
+    ...run,
+    error:
+      run.error === null
+        ? null
+        : isOwner
+          ? sanitizeScannerError(run.error, undefined, SCANNER_RUN_ERROR_MAX_CHARS, false)
+          : sanitizeScannerError(run.error, undefined, SCANNER_RUN_ERROR_MAX_CHARS, true),
+    metadata: redactScannerRunMetadata(run.metadata, viewerUserId),
+  };
+}
+
+/**
+ * Redact a fully-mapped run DTO for operator/scheduler consumption
+ * (e.g. `POST /api/internal/scanner/run`).
+ *
+ * Strips all tenant-identifying metadata (`triggeredBy`, `strategyId`, `errors`)
+ * and sanitizes `error` so no tenant/strategy UUIDs or secrets are returned.
+ * Pure and deterministic — no I/O.
+ */
+export function redactScannerRunForOperator(
+  run: ScannerRunDto,
+  redact?: (text: string) => string,
+): ScannerRunDto {
+  return {
+    ...run,
+    error: run.error === null ? null : sanitizeScannerError(run.error, redact, SCANNER_RUN_ERROR_MAX_CHARS, true),
+    metadata: redactScannerRunMetadata(run.metadata, ''),
+  };
 }
 
 const UNLOCK_ERROR_UUID_PATTERN = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
@@ -129,7 +167,46 @@ const UNLOCK_ERROR_URL_CREDENTIALS_PATTERN = /([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/
 const UNLOCK_ERROR_BEARER_PATTERN = /\b(bearer)\s+[^\s,;]+/gi;
 const UNLOCK_ERROR_SECRET_ASSIGNMENT_PATTERN =
   /\b(password|passwd|pwd|secret|token|api[_-]?key|authorization)\b(\s*[:=]\s*)([^\s,;]+)/gi;
+const SCANNER_SECRET_ASSIGNMENT_PATTERN =
+  /\b(password|passwd|pwd|secret|token|api[_-]?key|authorization|x-veltrixeye-worker-token)\b(\s*[:=]\s*)([^\s,&;]+)/gi;
+const SCANNER_SECRET_KEY_PREFIX_PATTERN = /\bsk_(?:live|test)_[A-Za-z0-9_-]+/g;
 const UNLOCK_ERROR_MAX_CHARS = 256;
+export const SCANNER_ERROR_MAX_CHARS = 500;
+export const SCANNER_RUN_ERROR_MAX_CHARS = 2000;
+
+/**
+ * Sanitize and bound a scanner / provider / worker error string without leaking
+ * URL credentials, Bearer tokens, API keys, worker tokens, configured secrets,
+ * or (when `redactUuids` is true) tenant/strategy UUIDs (M7 audit findings F3/F4/F5).
+ * Pure and deterministic — no I/O.
+ */
+export function sanitizeScannerError(
+  err: unknown,
+  redact?: (text: string) => string,
+  maxChars = SCANNER_ERROR_MAX_CHARS,
+  redactUuids = true,
+): string {
+  const raw =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+        ? err
+        : 'unknown_error';
+  const collapsed = raw.replace(/\s+/g, ' ').trim() || 'unknown_error';
+  const customRedacted = redact ? redact(collapsed) : collapsed;
+  const patternRedacted = customRedacted
+    .replace(UNLOCK_ERROR_URL_CREDENTIALS_PATTERN, '$1[redacted]@')
+    .replace(UNLOCK_ERROR_BEARER_PATTERN, '$1 [redacted]')
+    .replace(SCANNER_SECRET_ASSIGNMENT_PATTERN, '$1$2[redacted]')
+    .replace(SCANNER_SECRET_KEY_PREFIX_PATTERN, '[redacted]');
+  const finalRedacted = redactUuids
+    ? patternRedacted.replace(UNLOCK_ERROR_UUID_PATTERN, '[redacted-id]')
+    : patternRedacted;
+  const limit = Math.max(2, Math.trunc(maxChars));
+  return finalRedacted.length > limit
+    ? `${finalRedacted.slice(0, limit - 1)}…`
+    : finalRedacted;
+}
 
 /**
  * Extract safe, bounded diagnostic details from an advisory-unlock error
@@ -201,7 +278,10 @@ export class ScannerService {
   private readonly retryBaseMs: number;
   private readonly retryMaxMs: number;
   private readonly expectedIntervalMs: number;
+  private readonly leaseMs: number;
   private readonly logger: ScannerLogger;
+  private readonly redact: (text: string) => string;
+  private readonly inFlightRuns = new Set<Promise<unknown>>();
 
   constructor(
     private readonly pool: pg.Pool,
@@ -219,7 +299,24 @@ export class ScannerService {
     this.retryBaseMs = options.retryBaseMs ?? SCANNER_RETRY_BASE_MS;
     this.retryMaxMs = options.retryMaxMs ?? SCANNER_RETRY_MAX_MS;
     this.expectedIntervalMs = options.expectedIntervalMs ?? SCANNER_EXPECTED_INTERVAL_MS;
+    this.leaseMs = options.leaseMs ?? DEFAULT_SCANNER_LEASE_MS;
     this.logger = options.logger ?? DEFAULT_LOGGER;
+    this.redact = options.redact ?? ((text: string) => text);
+  }
+
+  /** Number of currently in-flight scan invocations on this service instance. */
+  get activeInFlightCount(): number {
+    return this.inFlightRuns.size;
+  }
+
+  /**
+   * Wait for all currently in-flight scan invocations to finish and release
+   * their advisory locks before shutdown closes the database pool.
+   */
+  async waitForInFlight(): Promise<void> {
+    while (this.inFlightRuns.size > 0) {
+      await Promise.allSettled([...this.inFlightRuns]);
+    }
   }
 
   /**
@@ -328,13 +425,13 @@ export class ScannerService {
   }
 
   /**
-   * Recover stale running runs (e.g., after process restart).
+   * Recover stale running runs (e.g., after process restart or container sleep).
    * Marks runs older than lease as failed.
    */
-  async recoverStaleRuns(leaseMs = 30 * 60_000): Promise<{ recovered: number }> {
+  async recoverStaleRuns(leaseMs = this.leaseMs): Promise<{ recovered: number }> {
     const res = await this.pool.query(
       `UPDATE scanner_runs SET status = 'failed', finished_at = now(), error = 'recovered: stale running run after restart', updated_at = now()
-       WHERE status = 'running' AND started_at < now() - ($1::int * interval '1 millisecond')
+       WHERE status = 'running' AND started_at < now() - ($1::bigint * interval '1 millisecond')
        RETURNING id`,
       [leaseMs],
     );
@@ -347,9 +444,20 @@ export class ScannerService {
 
   /**
    * Trigger a scan (manual or scheduled).
-   * Uses advisory locking to prevent overlapping scans.
+   * Uses advisory locking to prevent overlapping scans and tracks in-flight
+   * executions so graceful shutdown can await completion before pool teardown.
    */
   async triggerScan(args: ScanTriggerArgs = {}): Promise<ScanRunResult> {
+    const p = this.triggerScanInternal(args);
+    this.inFlightRuns.add(p);
+    try {
+      return await p;
+    } finally {
+      this.inFlightRuns.delete(p);
+    }
+  }
+
+  private async triggerScanInternal(args: ScanTriggerArgs = {}): Promise<ScanRunResult> {
     const nowMs = args.nowMs ?? Date.now();
 
     // Try advisory lock
@@ -448,6 +556,93 @@ export class ScannerService {
     return this.triggerScan(args);
   }
 
+  /**
+   * Sleep-safe worker invocation (M7 audit finding F3).
+   *
+   * Safe to invoke from an external cron scheduler (`POST /api/internal/scanner/run`)
+   * or the in-process ticker simultaneously:
+   *  1. Recovers stale `running` runs past `leaseMs` (crash / sleep-resume recovery).
+   *  2. Fails closed (`skipped: true, reason: 'provider_unavailable'`) if no
+   *     market-data provider is registered.
+   *  3. Executes one system scan cycle under `SCANNER_ADVISORY_LOCK_KEY`,
+   *     returning `skipped: true, reason: 'already_running'` on contention.
+   *  4. Redacts all tenant/strategy identifiers and sanitizes error text on the
+   *     returned run DTO.
+   */
+  async runWorkerOnce(
+    args: { force?: boolean; leaseMs?: number; nowMs?: number } = {},
+  ): Promise<ScannerInternalRunResponse> {
+    const leaseMs = args.leaseMs ?? this.leaseMs;
+    const { recovered } = await this.recoverStaleRuns(leaseMs);
+
+    if (!this.requireProviderSafe()) {
+      this.logger.warn('scanner worker skipped: provider unavailable', { recovered });
+      return {
+        run: null,
+        skipped: true,
+        reason: 'provider_unavailable',
+        recovered,
+      };
+    }
+
+    try {
+      const result = await this.triggerScan({
+        force: args.force,
+        initiatedBy: 'system',
+        nowMs: args.nowMs,
+      });
+      if (result.skipped) {
+        return {
+          run: null,
+          skipped: true,
+          reason: result.reason ?? 'already_running',
+          recovered,
+        };
+      }
+      return {
+        run: redactScannerRunForOperator(result.run, this.redact),
+        skipped: false,
+        ...(result.reason !== undefined ? { reason: result.reason } : {}),
+        recovered,
+      };
+    } catch (err) {
+      if (
+        err !== null &&
+        typeof err === 'object' &&
+        'code' in err &&
+        (err as { code?: unknown }).code === 'conflict'
+      ) {
+        return {
+          run: null,
+          skipped: true,
+          reason: 'already_running',
+          recovered,
+        };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Internal scanner maintenance (`POST /api/internal/scanner/maintenance`, F3):
+   * recovers stale `running` runs and returns bounded, tenant-free operational
+   * status.
+   */
+  async runMaintenance(
+    args: { leaseMs?: number } = {},
+  ): Promise<ScannerInternalMaintenanceResponse> {
+    const leaseMs = args.leaseMs ?? this.leaseMs;
+    const { recovered } = await this.recoverStaleRuns(leaseMs);
+    const health = await this.getHealth();
+    return {
+      recovered,
+      activeRuns: health.activeRuns,
+      recentFailures: health.recentFailures,
+      status: health.status,
+      isProviderAvailable: health.isProviderAvailable,
+    };
+  }
+
   private async executeScan(args: ScanTriggerArgs, nowMs: number): Promise<ScanRunResult> {
     const provider = this.requireProvider();
     const runId = await this.createRun(provider.id, args);
@@ -495,14 +690,14 @@ export class ScannerService {
         try {
           await this.scanStrategy(strategy, args, nowMs, metrics);
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          metrics.errors.push(`strategy ${strategy.strategyId}: ${msg}`);
+          const safeMsg = sanitizeScannerError(err, this.redact);
+          metrics.errors.push(`strategy ${strategy.strategyId}: ${safeMsg}`);
           metrics.providerFailures += 1;
           this.logger.warn('strategy scan failed', {
             runId,
             strategyId: strategy.strategyId,
             versionId: strategy.versionId,
-            error: msg,
+            error: safeMsg,
           });
           finalStatus = 'partial';
         }
@@ -533,9 +728,9 @@ export class ScannerService {
 
       return { run };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.logger.error('scan failed', { runId, error: msg });
-      await this.completeRun(runId, 'failed', metrics, msg);
+      const safeMsg = sanitizeScannerError(err, this.redact);
+      this.logger.error('scan failed', { runId, error: safeMsg });
+      await this.completeRun(runId, 'failed', metrics, safeMsg);
       const run = await this.getRun(runId);
       return { run };
     }
@@ -555,16 +750,16 @@ export class ScannerService {
       try {
         await this.scanInstrument(strategy, inst, args, nowMs, metrics);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const safeMsg = sanitizeScannerError(err, this.redact);
         // Don't fail whole strategy for one instrument failure
-        metrics.errors.push(`instrument ${inst.assetClass}/${inst.symbol}: ${msg}`);
+        metrics.errors.push(`instrument ${inst.assetClass}/${inst.symbol}: ${safeMsg}`);
         if (isProviderFailure(err)) {
           metrics.providerFailures += 1;
         }
         this.logger.warn('instrument scan failed', {
           strategyId: strategy.strategyId,
           instrument: `${inst.assetClass}/${inst.symbol}`,
-          error: msg,
+          error: safeMsg,
         });
       }
     }
@@ -904,7 +1099,7 @@ export class ScannerService {
               attempt: attempt + 1,
               maxRetries: this.maxRetries,
               delayMs: Math.round(delayMs),
-              error: err instanceof Error ? err.message : String(err),
+              error: sanitizeScannerError(err, this.redact),
             });
             await new Promise((r) => setTimeout(r, delayMs));
             continue;
@@ -969,6 +1164,13 @@ export class ScannerService {
     metrics: ScanMetrics,
     error: string | null,
   ): Promise<void> {
+    const safeError =
+      error === null
+        ? null
+        : sanitizeScannerError(error, this.redact, SCANNER_RUN_ERROR_MAX_CHARS, false);
+    const safeErrors = metrics.errors
+      .slice(0, 10)
+      .map((entry) => sanitizeScannerError(entry, this.redact, SCANNER_ERROR_MAX_CHARS, false));
     await this.pool.query(
       `UPDATE scanner_runs SET status = $2, finished_at = now(),
               strategies_scanned = $3, instruments_scanned = $4, candles_fetched = $5,
@@ -991,8 +1193,8 @@ export class ScannerService {
         metrics.providerFailures,
         JSON.stringify([...metrics.symbolsProcessed]),
         JSON.stringify([...metrics.timeframesProcessed]),
-        error,
-        JSON.stringify({ errors: metrics.errors.slice(0, 10) }),
+        safeError,
+        JSON.stringify({ errors: safeErrors }),
       ],
     );
   }

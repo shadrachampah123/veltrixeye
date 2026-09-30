@@ -1,27 +1,32 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import {
+  scannerInternalMaintenanceRequestSchema,
+  scannerInternalRunRequestSchema,
   scannerRunListQuerySchema,
   scannerTriggerRequestSchema,
   type UserPlan,
 } from '@veltrixeye/contracts';
-import { Errors, resolveEntitlements } from '@veltrixeye/core';
+import { Errors, redactScannerRunForViewer, resolveEntitlements } from '@veltrixeye/core';
 import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
 import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js';
 
 /**
- * Scanner routes (M7.5) — live scanner / production market flow.
+ * Scanner routes (M7.5 / F3) — live scanner / production market flow.
  *
  * | Route | Auth | Notes |
  * |---|---|---|
  * | GET /api/scanner/health | session | Real production state: provider availability, last run, last successful, active runs, data freshness. Never mock/static. |
  * | GET /api/scanner/runs | session | List recent scanner runs (observability), owner-scoped. |
  * | POST /api/scanner/trigger | session | Manual trigger (entitlement-gated). Uses advisory locking to prevent overlapping. |
+ * | POST /api/internal/scanner/run | worker token | Sleep-safe external scheduler trigger: recovers stale runs and executes one system scan under advisory lock. 404 when no token is configured. |
+ * | POST /api/internal/scanner/maintenance | worker token | Stale-run recovery + bounded operational status. 404 when no token is configured. |
  *
  * Security:
- *  - All routes are session-authenticated
- *  - canAccessScanner entitlement enforced server-side (free users get 403)
+ *  - User routes are session-authenticated; canAccessScanner entitlement enforced server-side (free users get 403)
+ *  - Internal worker routes return 404 when SCANNER_WORKER_TOKEN is unset, and compare the token in constant time over SHA-256 digests
  *  - No client-controlled signal generation — scanner always uses server-side validated data
  *  - Provider credentials remain server-side, never exposed
  *  - Users cannot bypass market universe (symbols validated against instruments table)
@@ -32,13 +37,16 @@ import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js
  *    on behalf of a tenant: `listRuns` is owner-scoped to the session user.
  *  - `getHealth` stays global (the scanner is one shared pipeline) but redacts
  *    tenant-identifying metadata from the embedded last-run DTOs.
- *  - There is no admin/operator role in the architecture, so no HTTP caller
- *    receives the unredacted global ledger; the unscoped service entry points
- *    remain for trusted in-process/operator use only.
+ *  - Internal worker endpoints strip all tenant/strategy identifiers and
+ *    sanitize error text before responding.
  */
+
+/** Header carrying the shared scanner worker secret. */
+export const SCANNER_WORKER_TOKEN_HEADER = 'x-veltrixeye-worker-token';
 
 export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, config: AppConfig): Promise<void> {
   const requireAuth = createSessionAuth(config, ctx);
+  const adminRateLimit = { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } };
 
   // GET /api/scanner/health — scanner health/status (real production state)
   app.get('/api/scanner/health', async (req, reply) => {
@@ -213,7 +221,79 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
         },
       });
 
-      return reply.code(result.skipped ? 200 : 201).send(result);
+      return reply.code(result.skipped ? 200 : 201).send({
+        ...result,
+        run: redactScannerRunForViewer(result.run, user.id),
+      });
     },
   );
+
+  // POST /api/internal/scanner/run — sleep-safe external scheduler trigger (F3)
+  app.post('/api/internal/scanner/run', adminRateLimit, async (req, reply) => {
+    if (!hasScannerWorkerToken(config)) return notFound(reply);
+    if (!scannerTokenMatches(req, config)) return unauthorized(reply);
+
+    const parsed = scannerInternalRunRequestSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'body');
+      return;
+    }
+
+    const result = await ctx.scanner.runWorkerOnce({
+      force: parsed.data.force,
+      leaseMs: parsed.data.leaseMs ?? config.scanner.leaseMs,
+    });
+    return reply.code(200).send(result);
+  });
+
+  // POST /api/internal/scanner/maintenance — stale-run recovery + operational status (F3)
+  app.post('/api/internal/scanner/maintenance', adminRateLimit, async (req, reply) => {
+    if (!hasScannerWorkerToken(config)) return notFound(reply);
+    if (!scannerTokenMatches(req, config)) return unauthorized(reply);
+
+    const parsed = scannerInternalMaintenanceRequestSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendZodError(reply, parsed.error, 'body');
+      return;
+    }
+
+    const result = await ctx.scanner.runMaintenance({
+      leaseMs: parsed.data.leaseMs ?? config.scanner.leaseMs,
+    });
+    return reply.code(200).send(result);
+  });
+}
+
+/**
+ * Constant-time token comparison over SHA-256 digests: comparing raw strings
+ * leaks length and prefix through timing; hashing first makes both inputs 32
+ * bytes so `timingSafeEqual` is constant-time regardless of token length.
+ */
+export function scannerTokenMatches(
+  req: { headers: Record<string, string | string[] | undefined> },
+  config: AppConfig,
+): boolean {
+  if (!hasScannerWorkerToken(config)) return false;
+  const presented = req.headers[SCANNER_WORKER_TOKEN_HEADER];
+  const value = Array.isArray(presented)
+    ? presented.length === 1
+      ? presented[0]
+      : undefined
+    : presented;
+  if (typeof value !== 'string' || value.trim() === '') return false;
+  const a = createHash('sha256').update(value, 'utf8').digest();
+  const b = createHash('sha256').update(config.scanner.workerToken, 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
+export function hasScannerWorkerToken(config: AppConfig): boolean {
+  return config.scanner.workerToken.trim() !== '';
+}
+
+function notFound(reply: { code: (status: number) => { send: (body: unknown) => unknown } }): unknown {
+  return reply.code(404).send({ error: { code: 'not_found', message: 'Route not found' } });
+}
+
+function unauthorized(reply: { code: (status: number) => { send: (body: unknown) => unknown } }): unknown {
+  return reply.code(401).send({ error: { code: 'unauthorized', message: 'Authentication required' } });
 }
