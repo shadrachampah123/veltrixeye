@@ -122,14 +122,18 @@ export class AutomationService {
     // fail-closed entitlement gate: a provider-backed subscription row is an
     // unconfirmed checkout — not a purchase — until an operator has authorized
     // an immutable activation fact for it (Billing Step 8, migration 0034), so
-    // without one it resolves to the free tier.
+    // without one it resolves to the free tier. The non-commercial operator
+    // grant (migration 0036) is read alongside them, and the query is anchored
+    // on `users` so a granted account with no subscription row still resolves.
     const res = await this.pool.query<{
-      plan: string; status: string; provider: string | null; automation_enabled: boolean;
-      activated: boolean;
+      plan: string | null; status: string | null; provider: string | null; automation_enabled: boolean;
+      activated: boolean; granted_plan: string | null;
     }>(
       `SELECT sub.plan, sub.status, sub.provider, u.automation_enabled,
               EXISTS (SELECT 1 FROM billing_subscription_activations a
-                       WHERE a.subscription_id = sub.id) AS activated
+                       WHERE a.subscription_id = sub.id) AS activated,
+              (SELECT g.plan FROM billing_entitlement_grants g
+                WHERE g.user_id = u.id) AS granted_plan
        FROM users u
        LEFT JOIN subscriptions sub ON sub.user_id = u.id
        WHERE u.id = $1`,
@@ -140,9 +144,15 @@ export class AutomationService {
     const plan = (row.plan ?? 'free') as UserPlan;
     const status = row.status ?? 'active';
     return {
-      // `canAccessAutomation` is false in every tier, activated or not: no
-      // activation fact can ever grant execution.
-      entitlements: resolveEntitlements(plan, status, row.provider, row.activated === true),
+      // `canAccessAutomation` is false in every tier, activated, granted or
+      // not: no activation fact and no grant can ever grant execution.
+      entitlements: resolveEntitlements(
+        plan,
+        status,
+        row.provider,
+        row.activated === true,
+        row.granted_plan as UserPlan | null,
+      ),
       automationEnabled: row.automation_enabled,
     };
   }

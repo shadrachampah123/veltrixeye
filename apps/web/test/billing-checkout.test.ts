@@ -88,6 +88,9 @@ function billingState(args: {
       providerState: args.providerState ?? null,
       paymentConfirmed: args.paymentConfirmed ?? false,
     },
+    // A non-commercial operator grant is always disclosed when one exists; none
+    // of these fixtures has one.
+    entitlementGrant: null,
   });
 }
 

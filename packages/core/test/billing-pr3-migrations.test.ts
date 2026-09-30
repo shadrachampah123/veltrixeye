@@ -315,9 +315,11 @@ describe('Billing PR3 — 0032 file conventions and history integrity', () => {
     assert.equal(files.filter((file) => file.startsWith('0033_')).length, 1, 'exactly one 0033 migration (Step 7)');
     assert.equal(files.filter((file) => file.startsWith('0034_')).length, 1, 'exactly one 0034 migration (Step 8)');
     assert.equal(files.filter((file) => file.startsWith('0035_')).length, 1, 'exactly one 0035 migration (live mode)');
-    assert.equal(files.at(-1), '0035_billing_live_mode.sql', '0035 is the newest migration (live-mode widening)');
+    // 0035 is the newest migration OF THIS STEP; 0036 (non-commercial operator
+    // grants) is a later migration and is named here deliberately.
+    assert.equal(files.filter((file) => file.startsWith('0036_')).length, 1, 'exactly one 0036 migration (non-commercial grants)');
     assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 35).length,
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 36).length,
       0,
       'nothing is numbered after 0035',
     );

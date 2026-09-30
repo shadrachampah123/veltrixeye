@@ -136,10 +136,12 @@ after(async () => {
 /* ========================================================================== */
 
 describe('0035 — fresh database: files, constraints and the coherence trigger', () => {
-  it('applies through 0035: 35 files, both domains in both CHECKs', async () => {
+  it('applies through 0036: every file, both domains in both CHECKs', async () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
-    assert.equal(status.expectedCount, 35, '0035_billing_live_mode.sql exists');
-    assert.equal(status.appliedCount, 35, 'the fresh database is fully migrated');
+    // 0036 (non-commercial operator grants) is a later migration than this
+    // step's 0035; the fresh database is expected to carry it too.
+    assert.equal(status.expectedCount, 36, 'the whole shipped file set exists');
+    assert.equal(status.appliedCount, 36, 'the fresh database is fully migrated');
     assert.equal(status.pending.length, 0);
 
     const constraintDef = async (name: string): Promise<string> => {
@@ -224,8 +226,10 @@ describe('0035 — fresh database: files, constraints and the coherence trigger'
         const full = await migrationStatus(upgrade, MIGRATIONS_DIR);
         assert.equal(status.expectedCount, 34, 'the base file set is exactly 0001-0034');
         assert.equal(status.pending.length, 0, 'the base set is fully applied');
-        assert.equal(full.appliedCount, 35, 'the upgraded database matches the full set');
-        assert.equal(full.pending.length, 0);
+        assert.equal(full.appliedCount, 35, 'the upgrade path ends at 0035, this step’s tip');
+        // Only 0036 — the non-commercial grant ledger this step knows nothing
+        // about — is still pending, and it is exactly that one file.
+        assert.deepEqual(full.pending, ['0036_billing_entitlement_grants.sql']);
         assert.equal(full.latestApplied, '0035_billing_live_mode.sql', '0035 is the newest applied migration');
       } finally {
         await upgrade.end();

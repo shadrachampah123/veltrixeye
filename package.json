@@ -18,6 +18,7 @@
     "db:dev": "node scripts/db/dev-up.mjs",
     "db:migrate": "tsx scripts/db/migrate-cli.ts",
     "billing:activate": "tsx scripts/billing/activate.ts",
+    "billing:grant": "tsx scripts/billing/grant-entitlements.ts",
     "billing:provision:live": "tsx scripts/billing/provision-live.ts",
     "billing:remediate:legacy-free-row": "tsx scripts/billing/remediate-legacy-free-row.ts",
     "api:dev": "npm run dev --workspace @veltrixeye/api",

@@ -72,6 +72,45 @@ export const billingProviderStatusDtoSchema = z
   .strict();
 export type BillingProviderStatusDto = z.infer<typeof billingProviderStatusDtoSchema>;
 
+/**
+ * A non-commercial, operator-authorized entitlement grant in force for the
+ * session's own account (migration 0036, `billing_entitlement_grants`).
+ *
+ * This is DISCLOSURE, never authority and never a payment. It exists so an
+ * account that holds a commercial entitlement tier WITHOUT having bought
+ * anything is told why its limits are what they are, rather than being shown a
+ * "free plan" card with Pro limits on it.
+ *
+ * What it deliberately does NOT carry — and the strict schema is what enforces
+ * it, so the omission is a property of the code rather than a convention at a
+ * call site:
+ *  - no operator identity and no reason: an account learns the fact of its own
+ *    entitlement, never who decided it or why (the same discipline the
+ *    read-only billing overview already applies);
+ *  - no id, no idempotency key, no grant kind, no instant;
+ *  - and above all **no payment fact of any kind** — a grant is not a purchase,
+ *    so there is no provider, reference, amount, currency or confirmation to
+ *    carry even in principle.
+ *
+ * Its presence does **not** move `providerStatus.paymentConfirmed`. That field
+ * is derived from the activation fact (0034) alone and stays `false` for a
+ * granted account, permanently and correctly: no money changed hands.
+ */
+export const billingEntitlementGrantDtoSchema = z
+  .object({
+    /**
+     * The INTERNAL plan value whose enforced tier is granted: `pro` (commercial
+     * Pro) or `premium` (commercial Elite). `free` is ungrantable and Starter
+     * has no enforced tier, so neither can appear here.
+     */
+    plan: userPlanSchema,
+  })
+  .strict();
+export type BillingEntitlementGrantDto = z.infer<typeof billingEntitlementGrantDtoSchema>;
+
+/** Alias used inside core, where the DTO is the disclosure projection. */
+export type BillingEntitlementGrantDisclosure = BillingEntitlementGrantDto;
+
 export const billingStateDtoSchema = z.object({
   /**
    * The configured provider mode this response is served in: `test`
@@ -84,5 +123,15 @@ export const billingStateDtoSchema = z.object({
   subscription: subscriptionDtoSchema,
   entitlements: entitlementsDtoSchema,
   providerStatus: billingProviderStatusDtoSchema,
+  /**
+   * The non-commercial operator grant in force for this account, or `null`.
+   *
+   * Always present (`null` when there is none) so a client never has to
+   * distinguish "no grant" from "this build does not know about grants".
+   * `entitlements` above is still the ONLY capability statement in this
+   * response — this field explains it, it never widens it, and it never
+   * confirms a payment.
+   */
+  entitlementGrant: billingEntitlementGrantDtoSchema.nullable(),
 });
 export type BillingStateDto = z.infer<typeof billingStateDtoSchema>;

@@ -875,7 +875,31 @@ canonical billing contracts and the Paystack provider seam — see
   authoritative cancellation state, `null` when the server cannot state it —
   no renewal arithmetic, no request-supplied identity and no action of any
   kind). It adds no migration, no provider operation and no authority change:
-  `canAccessAutomation` / `grantsExecution` stay `false`.
+  `canAccessAutomation` / `grantsExecution` stay `false`. **Migration `0036`
+  added the NON-COMMERCIAL OPERATOR GRANT** (`BillingEntitlementGrantService`,
+  `npm run billing:grant`) — a separate, append-only, operator-named authority
+  (`billing.entitlement_granted` audit event) that lets a designated
+  owner/super-admin account hold a commercial tier **without a purchase**. It
+  exists because the payment path is deliberately closed to any account that has
+  not paid (activation requires verified evidence, and evidence requires a real
+  provider read), so reaching the owner benefit that way would mean fabricating
+  payment evidence. The grant is beside the payment path, not through it: no
+  provider call, no key, no `PAYSTACK_MODE`, no subscription/evidence/activation/
+  epoch/FX write, no HTTP surface (no route, no admin role, no token), no
+  payment-shaped column in the fact table at all, and `paymentConfirmed` still
+  derived from the 0034 activation fact alone — so a granted account reads
+  `paymentConfirmed: false`, permanently. `canAccessAutomation` / `grantsExecution`
+  stay `false` and automation, live and broker execution stay OFF. It is
+  disclosed read-only as `entitlementGrant: { plan }` — the tier, no operator, no
+  reason, no id, no payment field — and has no revoke: a re-grant, a tier change
+  or a mistake is a manual review, exactly like a mistaken activation fact. A
+  grant may only **add** a tier: one that would narrow a higher tier the account
+  already holds is refused (`would_narrow_paid_tier`, resolved through the same
+  paid-tier rule the readers use, inside the grant transaction and in the dry
+  run), so the authority can never be used to take an entitlement away. The
+  owner case is unaffected — an account with no subscription row, which is the
+  normal state since Model C, resolves to free and is never refused. See
+  [billing.md](./billing.md#non-commercial-operator-grant-npm-run-billinggrant).
 - **Explicitly deferred to later billing PRs:** self-serve billing management
   (cancellation, invoices, payment methods, plan changes). **Billing Step 9b
   has since scoped that work without implementing any of it**: cancellation and

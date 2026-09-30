@@ -809,19 +809,27 @@ export class ScannerService {
     _filterInstruments?: { assetClass: string; symbol: string }[],
   ): Promise<EligibleStrategy[]> {
     // Query strategies that are active, have published version, and owner has scanner entitlement
+    // The subscription is LEFT-joined (not inner-joined) because a granted
+    // account characteristically has NO subscription row at all: since Model C
+    // that absence IS the free state, and a non-commercial operator grant
+    // (migration 0036) is an ACCOUNT-level authority that must still reach this
+    // read. The resolver is the single gate, so a row-less account resolves
+    // through exactly the same rules as one with a row.
     let query = `
       SELECT s.id as strategy_id, s.user_id, s.status as strategy_status,
              v.id as version_id, v.version_number,
              sub.plan, sub.status as sub_status, sub.provider as sub_provider,
              EXISTS (SELECT 1 FROM billing_subscription_activations a
                       WHERE a.subscription_id = sub.id) AS sub_activated,
+             (SELECT g.plan FROM billing_entitlement_grants g
+               WHERE g.user_id = s.user_id) AS granted_plan,
              (SELECT timeframe FROM strategy_timeframes WHERE version_id = v.id AND role = 'htf_bias') as htf_bias,
              (SELECT timeframe FROM strategy_timeframes WHERE version_id = v.id AND role = 'setup') as setup_tf,
              (SELECT timeframe FROM strategy_timeframes WHERE version_id = v.id AND role = 'entry') as entry_tf,
              ms.mode as scope_mode
       FROM strategies s
       JOIN strategy_versions v ON v.strategy_id = s.id AND v.status = 'published'
-      JOIN subscriptions sub ON sub.user_id = s.user_id
+      LEFT JOIN subscriptions sub ON sub.user_id = s.user_id
       LEFT JOIN strategy_market_scopes ms ON ms.version_id = v.id
       WHERE s.status = 'active'
     `;
@@ -838,10 +846,11 @@ export class ScannerService {
       strategy_status: string;
       version_id: string;
       version_number: number;
-      plan: string;
-      sub_status: string;
+      plan: string | null;
+      sub_status: string | null;
       sub_provider: string | null;
       sub_activated: boolean;
+      granted_plan: string | null;
       htf_bias: string | null;
       setup_tf: string | null;
       entry_tf: string | null;
@@ -853,9 +862,14 @@ export class ScannerService {
       // A provider-backed owner row is an unconfirmed checkout until an
       // immutable activation fact exists for it (Billing Step 8, migration
       // 0034): without one it resolves to the free tier, so its strategies are
-      // never eligible for a scan.
+      // never eligible for a scan. A non-commercial operator grant (migration
+      // 0036) is a separate, account-level authority and is read alongside it.
       const entitlements = resolveEntitlements(
-        row.plan as UserPlan, row.sub_status, row.sub_provider, row.sub_activated === true,
+        (row.plan ?? 'free') as UserPlan,
+        row.sub_status ?? 'active',
+        row.sub_provider,
+        row.sub_activated === true,
+        row.granted_plan as UserPlan | null,
       );
       if (!entitlements.canAccessScanner) continue;
 
@@ -874,7 +888,7 @@ export class ScannerService {
         versionId: row.version_id,
         versionNumber: row.version_number,
         userId: row.user_id,
-        plan: row.plan as UserPlan,
+        plan: (row.plan ?? 'free') as UserPlan,
         status: row.strategy_status,
         timeframes: { htf_bias: htf, setup, entry },
         marketScope: { mode: (row.scope_mode as 'all' | 'instruments') ?? 'all' },

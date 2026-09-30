@@ -256,6 +256,11 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
       // durable activation fact (Billing Step 8) — never from the provider
       // state, never from client input. It grants nothing.
       providerStatus: state.providerStatus,
+      // Disclosure of a non-commercial operator grant (migration 0036): which
+      // tier the account was granted, and nothing else — no operator, no
+      // reason, no id, and no payment fact of any kind. It explains
+      // `entitlements`, never widens them, and never confirms a payment.
+      entitlementGrant: state.entitlementGrant,
     };
     
     return reply.send(dto);

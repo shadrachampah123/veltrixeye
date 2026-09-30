@@ -36,7 +36,10 @@ import {
   type RealtimeCandleStream,
   type RealtimeSubscription,
 } from '@veltrixeye/contracts';
-import { BillingPricingSnapshotStore, CandleStore, getEntitlements, verifyPricingSnapshot } from '@veltrixeye/core';
+import {
+  BillingEntitlementGrantService, BillingPricingSnapshotStore, CandleStore, getEntitlements,
+  verifyPricingSnapshot,
+} from '@veltrixeye/core';
 import { createPaystackProvider } from '@veltrixeye/provider-paystack';
 import { buildApp, createAppContext } from '../src/app.js';
 import { loadConfig, type AppConfig } from '../src/config.js';
@@ -431,6 +434,7 @@ describe('GET /api/billing/me — provider-backed rows are never a confirmed sub
       },
       entitlements: FREE_LIMITS,
       providerStatus: { provider: 'paystack', providerState: 'active', paymentConfirmed },
+      entitlementGrant: null,
     });
     assert.equal(shape(true).success, true, 'a confirmed payment is representable');
     assert.equal(shape(false).success, true);
@@ -925,6 +929,120 @@ describe('automation — canAccessAutomation is unchanged for everyone', () => {
       assert.equal(toggle.statusCode, 403, toggle.body);
       const row = await db.pool.query('SELECT automation_enabled FROM users WHERE id=$1', [userId]);
       assert.equal(row.rows[0]!.automation_enabled, false, 'the switch never moved');
+    }
+  });
+});
+
+/* ==========================================================================
+   Non-commercial operator grant (migration 0036) — the HTTP surface
+   ========================================================================== */
+
+describe('a non-commercial operator grant, over HTTP', () => {
+  /** Record a grant out of band, exactly as the operator CLI does. */
+  async function grant(userId: string, plan: 'pro' | 'premium'): Promise<void> {
+    const service = new BillingEntitlementGrantService({ db: db.pool });
+    const result = await service.grant({
+      user: userId, plan, operatorId: 'ops-owner-01',
+      reason: 'designated owner account: commercial benefit without a purchase',
+    });
+    assert.equal(result.outcome, 'granted');
+  }
+
+  test('a granted account gets the paid limits and the server says so', async () => {
+    const { cookie, userId } = await register();
+    // Nothing was ever sold — the Model C free state is the ABSENCE of a row,
+    // and that is exactly the state a granted owner account is in.
+    const row = await db.pool.query('SELECT count(*)::int AS c FROM subscriptions WHERE user_id=$1', [userId]);
+    assert.equal(row.rows[0]!.c, 0);
+
+    const before = await billingMe(cookie);
+    assert.deepEqual(before.entitlements, FREE_LIMITS);
+    assert.equal(before.entitlementGrant, null);
+
+    await grant(userId, 'premium');
+
+    const after = await billingMe(cookie);
+    assert.equal(after.entitlements.maxStrategies, 1000, 'the elite limit is the one enforced');
+    assert.equal(after.entitlements.canAccessScanner, true);
+    assert.equal(after.entitlements.canAccessAutomation, false, 'a grant never grants execution');
+    assert.deepEqual(after.entitlementGrant, { plan: 'premium' }, 'and the tier is disclosed');
+  });
+
+  test('a grant is never a payment: paymentConfirmed stays false and no subscription appears', async () => {
+    const { cookie, userId } = await register();
+    await grant(userId, 'pro');
+    const state = await billingMe(cookie);
+    assert.equal(state.providerStatus.paymentConfirmed, false, 'only an activation fact ever confirms');
+    assert.equal(state.providerStatus.provider, null);
+    assert.equal(state.subscription.id, '', 'no subscription was invented');
+    assert.equal(state.subscription.plan, 'free');
+    assert.equal(state.subscription.currentPeriodEnd, null, 'and no renewal date is ever derived');
+  });
+
+  test('the response discloses the tier and nothing else — no operator, no reason, no id', async () => {
+    const { cookie, userId } = await register();
+    await grant(userId, 'pro');
+    const res = await app.inject({
+      method: 'GET', url: '/api/billing/me', headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200);
+    // Asserted on the RAW wire body, not on a parsed view.
+    const body = res.body;
+    assert.match(body, /"entitlementGrant":\{"plan":"pro"\}/, 'exactly the tier, nothing else');
+    for (const forbidden of [
+      'ops-owner-01', 'designated owner account', 'billing_entitlement_grants',
+      'idempotencyKey', 'grantId', 'paymentConfirmed":true', 'authorization', 'Bearer ',
+    ]) {
+      assert.equal(body.includes(forbidden), false, `${forbidden} must not leave through /api/billing/me`);
+    }
+  });
+
+  test('the scanner gates honour the grant, and automation still refuses', async () => {
+    const { cookie, userId } = await register();
+    await grant(userId, 'pro');
+    const health = await app.inject({
+      method: 'GET', url: '/api/scanner/health', headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(health.statusCode, 200, health.body);
+    // The strategy limit is the GRANTED one, not the free one.
+    const created = await app.inject({
+      method: 'POST', url: '/api/strategies', headers: { cookie, 'x-forwarded-for': freshIp() },
+      payload: { name: 'Granted owner strategy' },
+    });
+    assert.equal(created.statusCode, 201, created.body);
+    const status = await app.inject({
+      method: 'GET', url: '/api/execution/automation', headers: { cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(status.statusCode, 200, status.body);
+    assert.equal(status.json().entitled, false, 'a paid tier still never grants execution');
+    assert.equal(status.json().effective, false);
+    assert.ok((status.json().reasons as string[]).includes('entitlement_not_granted'));
+  });
+
+  test('a grant does not stand in for an activation on an unpaid checkout', async () => {
+    const { cookie, userId } = await register();
+    await makeProviderBacked(userId, 'premium', 'active', 'pending');
+    assert.deepEqual((await billingMe(cookie)).entitlements, FREE_LIMITS, 'an unpaid checkout buys nothing');
+
+    await grant(userId, 'pro');
+    const state = await billingMe(cookie);
+    assert.equal(state.entitlements.maxStrategies, 500, 'the GRANT is the authority, and only for its own tier');
+    assert.equal(state.providerStatus.paymentConfirmed, false, 'and it still confirms no payment');
+    assert.equal(state.providerStatus.providerState, 'pending', 'the provider state is untouched');
+  });
+
+  test('there is no HTTP surface for a grant', async () => {
+    for (const [method, url] of [
+      ['POST', '/api/billing/grant'],
+      ['POST', '/api/billing/entitlement-grant'],
+      ['PUT', '/api/billing/grant'],
+    ] as const) {
+      const { cookie } = await register();
+      const res = await app.inject({
+        method, url, headers: { cookie, 'x-forwarded-for': freshIp() },
+        payload: { plan: 'premium' },
+      });
+      assert.equal(res.statusCode, 404, `${method} ${url} must not exist, even for the owner`);
     }
   });
 });

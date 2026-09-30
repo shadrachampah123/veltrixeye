@@ -41,16 +41,28 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
     // entitlement gate: a provider-backed row is an unconfirmed checkout and
     // never buys scanner access until an operator has authorized an immutable
     // activation fact for it (Billing Step 8, migration 0034).
-    const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null; activated: boolean }>(
-      `SELECT plan, status, provider,
+    const billing = await ctx.pool.query<{
+      plan: string | null; status: string | null; provider: string | null;
+      activated: boolean; granted_plan: string | null;
+    }>(
+      `SELECT sub.plan, sub.status, sub.provider,
               EXISTS (SELECT 1 FROM billing_subscription_activations a
-                       WHERE a.subscription_id = subscriptions.id) AS activated
-         FROM subscriptions WHERE user_id = $1`,
+                       WHERE a.subscription_id = sub.id) AS activated,
+              (SELECT g.plan FROM billing_entitlement_grants g
+                WHERE g.user_id = u.id) AS granted_plan
+         FROM users u
+         LEFT JOIN subscriptions sub ON sub.user_id = u.id
+        WHERE u.id = $1`,
       [user.id],
     );
-    const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null, activated: false };
+    const sub = billing.rows[0]
+      ?? { plan: null, status: null, provider: null, activated: false, granted_plan: null };
     const entitlements = resolveEntitlements(
-      sub.plan as UserPlan, sub.status, sub.provider, sub.activated === true,
+      (sub.plan ?? 'free') as UserPlan,
+      sub.status ?? 'active',
+      sub.provider,
+      sub.activated === true,
+      sub.granted_plan as UserPlan | null,
     );
     if (!entitlements.canAccessScanner) {
       throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
@@ -70,16 +82,28 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
     // entitlement gate: a provider-backed row is an unconfirmed checkout and
     // never buys scanner access until an operator has authorized an immutable
     // activation fact for it (Billing Step 8, migration 0034).
-    const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null; activated: boolean }>(
-      `SELECT plan, status, provider,
+    const billing = await ctx.pool.query<{
+      plan: string | null; status: string | null; provider: string | null;
+      activated: boolean; granted_plan: string | null;
+    }>(
+      `SELECT sub.plan, sub.status, sub.provider,
               EXISTS (SELECT 1 FROM billing_subscription_activations a
-                       WHERE a.subscription_id = subscriptions.id) AS activated
-         FROM subscriptions WHERE user_id = $1`,
+                       WHERE a.subscription_id = sub.id) AS activated,
+              (SELECT g.plan FROM billing_entitlement_grants g
+                WHERE g.user_id = u.id) AS granted_plan
+         FROM users u
+         LEFT JOIN subscriptions sub ON sub.user_id = u.id
+        WHERE u.id = $1`,
       [user.id],
     );
-    const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null, activated: false };
+    const sub = billing.rows[0]
+      ?? { plan: null, status: null, provider: null, activated: false, granted_plan: null };
     const entitlements = resolveEntitlements(
-      sub.plan as UserPlan, sub.status, sub.provider, sub.activated === true,
+      (sub.plan ?? 'free') as UserPlan,
+      sub.status ?? 'active',
+      sub.provider,
+      sub.activated === true,
+      sub.granted_plan as UserPlan | null,
     );
     if (!entitlements.canAccessScanner) {
       throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
@@ -106,17 +130,31 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       // `provider` and the durable activation fact are read for the fail-closed
       // entitlement gate: a provider-backed row is an unconfirmed checkout and
       // never buys scanner access until an operator has authorized an immutable
-      // activation fact for it (Billing Step 8, migration 0034).
-      const billing = await ctx.pool.query<{ plan: string; status: string; provider: string | null; activated: boolean }>(
-        `SELECT plan, status, provider,
+      // activation fact for it (Billing Step 8, migration 0034). The
+      // non-commercial operator grant (migration 0036) is an account-level
+      // authority read alongside them.
+      const billing = await ctx.pool.query<{
+        plan: string | null; status: string | null; provider: string | null;
+        activated: boolean; granted_plan: string | null;
+      }>(
+        `SELECT sub.plan, sub.status, sub.provider,
                 EXISTS (SELECT 1 FROM billing_subscription_activations a
-                         WHERE a.subscription_id = subscriptions.id) AS activated
-           FROM subscriptions WHERE user_id = $1`,
+                         WHERE a.subscription_id = sub.id) AS activated,
+                (SELECT g.plan FROM billing_entitlement_grants g
+                  WHERE g.user_id = u.id) AS granted_plan
+           FROM users u
+           LEFT JOIN subscriptions sub ON sub.user_id = u.id
+          WHERE u.id = $1`,
         [user.id],
       );
-      const sub = billing.rows[0] ?? { plan: 'free', status: 'active', provider: null, activated: false };
+      const sub = billing.rows[0]
+        ?? { plan: null, status: null, provider: null, activated: false, granted_plan: null };
       const entitlements = resolveEntitlements(
-        sub.plan as UserPlan, sub.status, sub.provider, sub.activated === true,
+        (sub.plan ?? 'free') as UserPlan,
+        sub.status ?? 'active',
+        sub.provider,
+        sub.activated === true,
+        sub.granted_plan as UserPlan | null,
       );
       if (!entitlements.canAccessScanner) {
         throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
