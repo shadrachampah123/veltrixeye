@@ -421,7 +421,7 @@ describe('M7.5: Provider Failure Handling', () => {
     const strategy = await strategies.createStrategy(user.id, { name: `Test Strat ${Date.now()}`, description: 'test' });
 
     // For this test we just check that scanner run handles provider failure
-    const result = await scanner.triggerScan({ strategyId: strategy.id, force: true, nowMs: Date.now() });
+    const result = await scanner.triggerScan({ strategyId: strategy.id, force: true, nowMs: Date.now(), userId: user.id });
 
     assert.ok(result.run);
     // Even if provider fails, run should be completed/partial/failed, not throw
@@ -442,14 +442,14 @@ describe('M7.5: Provider Failure Handling', () => {
     const strategy = await strategies.createStrategy(user.id, { name: `Recovery Strat ${Date.now()}`, description: 'test' });
 
     // First run fails
-    const failedRun = await scanner.triggerScan({ strategyId: strategy.id, force: true });
+    const failedRun = await scanner.triggerScan({ strategyId: strategy.id, force: true, userId: user.id });
     assert.ok(failedRun.run);
 
     // Recovery
     mockProvider.shouldFail = false;
     mockProvider.candles = makeCandles(100, Date.now() - 100 * 60_000, 60_000);
 
-    const recoveredRun = await scanner.triggerScan({ strategyId: strategy.id, force: true });
+    const recoveredRun = await scanner.triggerScan({ strategyId: strategy.id, force: true, userId: user.id });
     assert.ok(recoveredRun.run);
   });
 });
@@ -460,6 +460,14 @@ describe('M7.5: Provider Failure Handling', () => {
 
 describe('M7.5: Scanner Execution & Concurrency', () => {
   test('advisory locking prevents overlapping scans', async () => {
+    const email = uniqueEmail();
+    const passwordHash = await hashPassword(PASSWORD);
+    const user = await users.create({ email, passwordHash, name: 'Lock Test' });
+    await makePro(user.id);
+
+    // Ensure user has at least one run so scoped lastRun query returns something (F4 tenant privacy)
+    await pool.query(`INSERT INTO scanner_runs (status, provider_slug, user_id) VALUES ('completed', 'twelve-data', $1)`, [user.id]);
+
     const client = await pool.connect();
     try {
       // Acquire lock manually
@@ -467,7 +475,7 @@ describe('M7.5: Scanner Execution & Concurrency', () => {
       assert.equal(lockRes.rows[0].acquired, true);
 
       // Try to trigger scan while lock held — should be skipped
-      const result = await scanner.triggerScan({ force: true });
+      const result = await scanner.triggerScan({ force: true, userId: user.id });
       assert.equal(result.skipped, true);
       assert.equal(result.reason, 'already_running');
 
@@ -604,7 +612,7 @@ describe('M7.5: Observability', () => {
       },
     });
 
-    const result = await scanner.triggerScan({ strategyId: strategy.id, force: true });
+    const result = await scanner.triggerScan({ strategyId: strategy.id, force: true, userId: user.id });
 
     assert.ok(result.run);
     assert.ok(typeof result.run.strategiesScanned === 'number');

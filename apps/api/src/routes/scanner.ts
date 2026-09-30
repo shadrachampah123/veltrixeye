@@ -68,7 +68,7 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       throw Errors.forbidden('Scanner access requires a Pro or Premium subscription');
     }
 
-    const health = await ctx.scanner.getHealth();
+    const health = await ctx.scanner.getHealth(user.id);
     return health;
   });
 
@@ -115,7 +115,7 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       return;
     }
 
-    return ctx.scanner.listRuns(parsed.data);
+    return ctx.scanner.listRuns(parsed.data, user.id);
   });
 
   // POST /api/scanner/trigger — manual trigger
@@ -182,6 +182,7 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
         instruments: parsed.data.instruments,
         force: parsed.data.force,
         initiatedBy: user.id,
+        userId: user.id,
       });
 
       await ctx.audit.log({

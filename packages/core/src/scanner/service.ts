@@ -77,6 +77,7 @@ export interface ScanTriggerArgs {
   force?: boolean;
   initiatedBy?: string;
   nowMs?: number;
+  userId?: string;
 }
 
 export interface ScanRunResult {
@@ -140,28 +141,41 @@ export class ScannerService {
   /**
    * Get scanner health/status for UI/API.
    * Reflects real production state, not mock/static.
+   * Now filtered by user for tenant privacy (F4 fix).
    */
-  async getHealth(): Promise<ScannerHealthDto> {
+  async getHealth(userId?: string): Promise<ScannerHealthDto> {
     const provider = this.requireProviderSafe();
     const isProviderAvailable = provider !== null;
 
+    const hasUser = userId !== undefined && userId !== null;
+    const userFilter = hasUser ? `AND user_id = $1` : '';
+    const userParam = hasUser ? [userId!] : [];
+
     const activeRunsRes = await this.pool.query<{ count: string }>(
-      `SELECT count(*)::text as count FROM scanner_runs WHERE status = 'running'`,
+      `SELECT count(*)::text as count FROM scanner_runs WHERE status = 'running' ${userFilter}`,
+      userParam,
     );
     const activeRuns = Number(activeRunsRes.rows[0]?.count ?? 0);
 
     const recentFailuresRes = await this.pool.query<{ count: string }>(
-      `SELECT count(*)::text as count FROM scanner_runs WHERE status = 'failed' AND started_at > now() - interval '1 hour'`,
+      `SELECT count(*)::text as count FROM scanner_runs WHERE status = 'failed' AND started_at > now() - interval '1 hour' ${userFilter}`,
+      userParam,
     );
     const recentFailures = Number(recentFailuresRes.rows[0]?.count ?? 0);
 
     const lastRunRes = await this.pool.query<ScannerRunRow>(
-      `SELECT * FROM scanner_runs ORDER BY started_at DESC LIMIT 1`,
+      hasUser
+        ? `SELECT * FROM scanner_runs WHERE user_id = $1 ORDER BY started_at DESC LIMIT 1`
+        : `SELECT * FROM scanner_runs ORDER BY started_at DESC LIMIT 1`,
+      userParam,
     );
     const lastRun = lastRunRes.rows[0] ? toScannerRunDto(lastRunRes.rows[0]) : null;
 
     const lastSuccessfulRes = await this.pool.query<ScannerRunRow>(
-      `SELECT * FROM scanner_runs WHERE status = 'completed' ORDER BY finished_at DESC LIMIT 1`,
+      hasUser
+        ? `SELECT * FROM scanner_runs WHERE status = 'completed' AND user_id = $1 ORDER BY finished_at DESC LIMIT 1`
+        : `SELECT * FROM scanner_runs WHERE status = 'completed' ORDER BY finished_at DESC LIMIT 1`,
+      userParam,
     );
     const lastSuccessfulRun = lastSuccessfulRes.rows[0] ? toScannerRunDto(lastSuccessfulRes.rows[0]) : null;
 
@@ -171,7 +185,8 @@ export class ScannerService {
     const newestCandleTime = newestCandleRes.rows[0]?.latest ? Number(newestCandleRes.rows[0].latest) : null;
 
     const staleStatsRes = await this.pool.query<{ count: string; oldest: string | null }>(
-      `SELECT count(*)::text as count, min(started_at)::text as oldest FROM scanner_runs WHERE stale_rejections > 0 AND started_at > now() - interval '24 hours'`,
+      `SELECT count(*)::text as count, min(started_at)::text as oldest FROM scanner_runs WHERE stale_rejections > 0 AND started_at > now() - interval '24 hours' ${userFilter}`,
+      userParam,
     );
 
     let status: ScannerHealthDto['status'] = 'idle';
@@ -196,12 +211,16 @@ export class ScannerService {
     };
   }
 
-  async listRuns(query: ScannerRunListQuery): Promise<{ runs: ScannerRunDto[] }> {
+  async listRuns(query: ScannerRunListQuery, userId?: string): Promise<{ runs: ScannerRunDto[] }> {
     const values: unknown[] = [];
     const where: string[] = [];
     if (query.status) {
       values.push(query.status);
       where.push(`status = $${values.length}`);
+    }
+    if (userId) {
+      values.push(userId);
+      where.push(`user_id = $${values.length}`);
     }
     values.push(query.limit);
     const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
@@ -247,10 +266,15 @@ export class ScannerService {
       const acquired = lockRes.rows[0]?.acquired ?? false;
       if (!acquired) {
         this.logger.info('scan skipped: already running', { lockKey: SCANNER_ADVISORY_LOCK_KEY });
-        // Return last run info
-        const lastRunRes = await this.pool.query<ScannerRunRow>(
-          `SELECT * FROM scanner_runs ORDER BY started_at DESC LIMIT 1`,
-        );
+        // Return last run info — scoped to owner if userId provided (F4 tenant privacy)
+        const lastRunRes = args.userId
+          ? await this.pool.query<ScannerRunRow>(
+              `SELECT * FROM scanner_runs WHERE user_id = $1 ORDER BY started_at DESC LIMIT 1`,
+              [args.userId],
+            )
+          : await this.pool.query<ScannerRunRow>(
+              `SELECT * FROM scanner_runs ORDER BY started_at DESC LIMIT 1`,
+            );
         const lastRun = lastRunRes.rows[0] ? toScannerRunDto(lastRunRes.rows[0]) : null;
         if (lastRun) {
           return { run: lastRun, skipped: true, reason: 'already_running' };
@@ -261,7 +285,17 @@ export class ScannerService {
       try {
         return await this.executeScan(args, nowMs);
       } finally {
-        await lockClient.query(`SELECT pg_advisory_unlock($1)`, [SCANNER_ADVISORY_LOCK_KEY]).catch(() => {});
+        // F5 FIX: advisory unlock reliability — do not silently swallow unlock failures.
+        // If unlock fails, the lock may remain held for the pooled connection and stall future scans.
+        // Log warning with error detail so operators can observe, and attempt best-effort release.
+        try {
+          await lockClient.query(`SELECT pg_advisory_unlock($1)`, [SCANNER_ADVISORY_LOCK_KEY]);
+        } catch (unlockErr) {
+          this.logger.warn('advisory unlock failed — lock may remain held on pooled connection', {
+            lockKey: SCANNER_ADVISORY_LOCK_KEY,
+            error: unlockErr instanceof Error ? unlockErr.message : String(unlockErr),
+          });
+        }
       }
     } finally {
       lockClient.release();
@@ -415,15 +449,6 @@ export class ScannerService {
       throw Errors.invalidInput(`Invalid timeframe configuration for strategy ${strategy.strategyId}`);
     }
 
-    // Check cursor to avoid re-processing same candle
-    if (!args.force) {
-      const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
-      if (cursor) {
-        // We will fetch latest candle and compare; skip if same
-        // We still need to fetch to know latest time, but we can skip heavy work later
-      }
-    }
-
     // Fetch candles for each timeframe with retry/backoff and validation
     const htfCandles = await this.fetchValidatedCandles({
       assetClass: instrument.assetClass,
@@ -504,30 +529,13 @@ export class ScannerService {
       return;
     }
 
-    // Cursor check: avoid processing same candle repeatedly
-    if (!args.force) {
-      const latestSetupCandle = setupCandles[setupCandles.length - 1];
-      if (latestSetupCandle) {
-        const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
-        if (cursor && cursor.last_candle_time === latestSetupCandle.time) {
-          this.logger.info('skipping duplicate candle', {
-            strategyId: strategy.strategyId,
-            instrument: `${instrument.assetClass}/${instrument.symbol}`,
-            timeframe: setupTf,
-            lastCandleTime: latestSetupCandle.time,
-          });
-          return;
-        }
-      }
-    }
-
     // F14 FIX: MTF Anchor Alignment
     // Use the last FULLY CLOSED candle as the anchor, not the latest (possibly forming) candle.
     // The evaluation engine only processes closed candles (time + period <= asOfMs).
-    // We need to find the last candle that is fully closed at nowMs.
+    // Previously cursor check and upsert used the latest (possibly forming) candle open time,
+    // causing misalignment across timeframes and duplicate processing. Now we filter first.
     const setupPeriodMs = timeframeMinutes(setupTf) * 60_000;
-    const closedSetupCandles = setupCandles.filter(c => c.time + setupPeriodMs <= nowMs);
-    const asOfMs = closedSetupCandles[closedSetupCandles.length - 1]?.time ?? nowMs;
+    const closedSetupCandles = setupCandles.filter((c) => c.time + setupPeriodMs <= nowMs);
 
     // If no closed candles available, skip this instrument
     if (closedSetupCandles.length === 0) {
@@ -537,6 +545,24 @@ export class ScannerService {
         instrument: `${instrument.assetClass}/${instrument.symbol}`,
       });
       return;
+    }
+
+    const latestClosedCandle = closedSetupCandles[closedSetupCandles.length - 1]!;
+    const asOfMs = latestClosedCandle.time;
+
+    // Cursor check: avoid processing same CLOSED candle repeatedly (F14 anchor)
+    if (!args.force) {
+      const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
+      if (cursor && cursor.last_candle_time === latestClosedCandle.time) {
+        this.logger.info('skipping duplicate candle', {
+          strategyId: strategy.strategyId,
+          instrument: `${instrument.assetClass}/${instrument.symbol}`,
+          timeframe: setupTf,
+          lastCandleTime: latestClosedCandle.time,
+          anchor: 'closed',
+        });
+        return;
+      }
     }
 
     // Detect long and short
@@ -603,11 +629,8 @@ export class ScannerService {
       }
     }
 
-    // Update cursor
-    const latestCandle = setupCandles[setupCandles.length - 1];
-    if (latestCandle) {
-      await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, latestCandle.time, nowMs);
-    }
+    // Update cursor with latest CLOSED candle time (F14 anchor alignment)
+    await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, latestClosedCandle.time, nowMs);
   }
 
   private async fetchValidatedCandles(args: {
@@ -764,10 +787,14 @@ export class ScannerService {
   }
 
   private async createRun(providerSlug: string, args: ScanTriggerArgs): Promise<string> {
+    // F4 FIX: remove cross-user UUID exposure in metadata.
+    // user_id column holds owner for tenant privacy; metadata should not contain raw user UUIDs.
+    // triggeredBy is now a role string ('user' | 'system'), not a UUID.
+    const triggeredByRole = args.initiatedBy ? 'user' : 'system';
     const res = await this.pool.query<{ id: string }>(
-      `INSERT INTO scanner_runs (status, provider_slug, metadata)
-       VALUES ('running', $1, $2) RETURNING id`,
-      [providerSlug, JSON.stringify({ triggeredBy: args.initiatedBy ?? 'system', strategyId: args.strategyId ?? null, force: args.force ?? false })],
+      `INSERT INTO scanner_runs (status, provider_slug, user_id, metadata)
+       VALUES ('running', $1, $2, $3) RETURNING id`,
+      [providerSlug, args.userId ?? null, JSON.stringify({ triggeredBy: triggeredByRole, strategyId: args.strategyId ?? null, force: args.force ?? false })],
     );
     const id = res.rows[0]?.id;
     if (!id) throw Errors.internal('Failed to create scanner run');
