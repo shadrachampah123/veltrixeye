@@ -579,6 +579,19 @@ remediation path, no migration, no backfill and no repair job** for those rows;
 they are handled by operators out of band. Do not "fix" one by editing the
 trigger.
 
+**The out-of-band handling for those rows is now an operator CLI:** the
+`npm run billing:remediate:legacy-free-row` command deletes
+ONE legacy free placeholder row — `free`/`active`, provider-less, no catalogue
+plan, no pricing lock, no period/cancellation/sync fact and no evidence — after
+re-asserting that whole predicate in the DELETE's own `WHERE` clause, and it
+writes one `billing.legacy_free_row_removed` audit event in the SAME
+transaction (dry run by default; `--apply` commits). It never UPDATEs a
+subscription (the lock and the 0032 trigger are untouched), never deletes a
+sold or evidenced row and never runs automatically. This is a *row-specific
+repair*, not a migration/backfill/repair job as those terms are used above:
+nothing deploys it, and it does nothing until a named operator runs it against
+one named account. See *Legacy free placeholder remediation* below.
+
 **Adjacent steps stay separate and unimplemented here.**
 
 - **Step 4 operator provisioning remains a prerequisite:** no provider-plan
@@ -1933,3 +1946,99 @@ supplied `PLN_…` codes, plus one `billing.provider_plans_registered` audit
 event naming the operator. `--dry-run` performs the whole validation and writes
 nothing; on any refusal, fix the input and rerun the batch — never retry a
 conflicting input, upsert or auto-retire.
+
+## Legacy free placeholder remediation (`npm run billing:remediate:legacy-free-row`)
+
+**The production symptom this closes.** A valid live checkout reaches
+`POST /api/billing/checkout` and answers **409** `pricing_lock_required`. The
+account has bought nothing — it carries a *placeholder* `subscriptions` row
+(`plan = 'free'`, `status = 'active'`, `provider IS NULL`,
+`locked_pricing_snapshot_id IS NULL`) written by migration 0014's backfill or by
+the removed eager-registration behaviour, both of which predate Model C. 0032
+makes the lock immutable at creation, so that row can never become commercial:
+its only possible effect is to make the first checkout fail closed. Live mode
+did not cause this — going live merely exposed it on accounts that already
+existed (§ *Live mode is configuration, not a go-live procedure*).
+
+**Why deletion is the fix, and why it is entitlement-neutral.** Since Model C
+the free state IS the absence of a commercial record: `getBillingState` and
+every entitlement reader resolve a missing row to the same free answer
+(`plan: 'free'`, `status: 'active'`, `paymentConfirmed: false`,
+`FREE_ENTITLEMENTS`, `canAccessAutomation: false`). A placeholder row resolves
+to the same plan, status, period, cancellation and provider facts and the same
+entitlements; the only reported difference after removal is the commercial
+identity, which becomes the documented `subscription.id = ''` ("nothing was
+ever sold"). Removing the placeholder therefore restores the supported free
+state, and the next checkout takes the normal row-less path (active epoch →
+pinned FX pricing decision → snapshot + sold subscription + immutable lock,
+atomically).
+
+**The entry point** (`scripts/billing/remediate-legacy-free-row.ts`, composed by
+`packages/core/src/billing/legacy-free-row-remediation.ts`):
+
+```bash
+npm run billing:remediate:legacy-free-row -- --user <email|uuid> --by <operator-id> \
+  --reason "<ticket/why>" [--apply]
+```
+
+Without `--apply` this is a **read-only dry run**: the whole operation is
+validated and nothing is written (`--dry-run` is accepted as the explicit form).
+Exit codes: **0** dry run validated, removal recorded, or the account already has
+no row (`absent` — the supported free state); **1** typed refusal (nothing was
+written); **2** usage/configuration error. `DATABASE_URL` is the only
+configuration: a placeholder row carries no provider domain, so no
+`PAYSTACK_MODE` (and no key) is consulted, and stdout is exactly one JSON
+document.
+
+**The eligibility predicate — full, positive-match, fail-closed.** The row is
+removable only if ALL of the following hold, and the identical predicate is
+re-asserted in the `DELETE`'s own `WHERE` clause (a row that changed after the
+check is refused, not deleted on stale terms; the whole thing is one
+transaction per account):
+
+- `plan = 'free'`, `status = 'active'`, provider-less and with every provider
+  identity NULL in the binding the database itself enforces when `provider IS
+  NULL` (`provider_state`, `provider_customer_id`, `provider_subscription_id`,
+  `provider_subscription_code`, `provider_reference`, `provider_plan_id`) and no
+  `billing_customer_id`;
+- no sale facts: `catalogue_plan`, `billing_interval`, `catalogue_version` NULL
+  and `locked_pricing_snapshot_id IS NULL`;
+- no period or cancellation facts: `current_period_start`, `current_period_end`,
+  `cancel_at`, `cancelled_at`, `cancellation_reason` NULL and
+  `cancel_at_period_end = false`;
+- no sync facts beyond the creation defaults: `sync_state = 'never_synced'`,
+  `last_sync_source = 'none'`, `last_synced_at IS NULL`, `sync_required = false`,
+  `last_event_idempotency_key IS NULL`, `state_version = 1`;
+- the owning account's enforcement column still says `users.plan = 'free'`;
+- **zero rows in the three tables that reference `subscriptions` `ON DELETE
+  CASCADE`** — `billing_provider_events`, `billing_verified_transactions`,
+  `billing_subscription_activations`. A `DELETE` could otherwise cascade
+  evidence away silently: this tool refuses on ANY provider event (including a
+  `processed` one the database's own retention trigger would allow to cascade),
+  on any verified transaction and on any activation.
+
+Any single failure refuses the whole operation and **names the failed
+predicates**, leaving the row, its evidence and the audit log untouched; a
+refusal writes no audit event at all.
+
+**What it never does.** It never weakens, bypasses, clears or writes the pricing
+lock (the 0032 trigger is a `BEFORE UPDATE` guard and this tool never issues an
+`UPDATE`); it never upgrades the row in place; it never touches `users.plan`,
+epochs, FX, customers or entitlements; it never deletes a sold row or evidence;
+it never runs automatically; and it has no HTTP surface, no admin role and no
+job — the database connection is the whole trust boundary, exactly like
+`billing:activate` and `billing:provision:live`.
+
+**Audited, transactionally.** Each removal writes exactly one
+`billing.legacy_free_row_removed` audit event naming the operator, the reason and
+a snapshot of the removed row's facts (id, plan, status, provider/catalogue/
+interval/lock nulls, timestamps) plus the verified zero-count cascade guard — on
+the SAME client, inside the SAME transaction as the `DELETE`. There is no
+unattributed removal: if the audit write fails, the row survives.
+
+**Verify after a run:** the account has **no** `subscriptions` row; one
+`billing.legacy_free_row_removed` audit event names the operator and the removed
+subscription id; `users.plan` and the account's `billing_customers` row are
+unchanged; and the next live checkout initializes against the active live epoch
+and writes the locked commercial row. Re-running on an already remediated
+account reports `absent` and writes nothing.

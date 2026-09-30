@@ -19,6 +19,7 @@
     "db:migrate": "tsx scripts/db/migrate-cli.ts",
     "billing:activate": "tsx scripts/billing/activate.ts",
     "billing:provision:live": "tsx scripts/billing/provision-live.ts",
+    "billing:remediate:legacy-free-row": "tsx scripts/billing/remediate-legacy-free-row.ts",
     "api:dev": "npm run dev --workspace @veltrixeye/api",
     "api:build": "npm run build --workspace @veltrixeye/api",
     "api:start": "npm run start --workspace @veltrixeye/api",
