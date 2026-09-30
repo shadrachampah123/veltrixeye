@@ -44,6 +44,8 @@ import {
   checkFreshness,
   checkMultiTimeframeFreshness,
   hashPassword,
+  redactScannerRunMetadata,
+  SCANNER_TENANT_SENSITIVE_METADATA_KEYS,
 } from '../src/index.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -536,6 +538,171 @@ describe('M7.5: Scanner Execution & Concurrency', () => {
     const list = await scanner.listRuns({ limit: 5 });
     assert.ok(Array.isArray(list.runs));
     assert.ok(list.runs.length >= 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4: Scanner tenant privacy (M7 final verification audit, finding F4)
+// ---------------------------------------------------------------------------
+
+describe('F4: Scanner tenant privacy', () => {
+  const USER_A = '11111111-1111-4111-8111-111111111111';
+  const USER_B = '22222222-2222-4222-8222-222222222222';
+  const STRATEGY_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const STRATEGY_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+  describe('redactScannerRunMetadata (pure)', () => {
+    test('own run keeps every metadata key, including identifiers', () => {
+      const metadata = {
+        triggeredBy: USER_A,
+        strategyId: STRATEGY_A,
+        force: true,
+        errors: [`strategy ${STRATEGY_A}: boom`],
+      };
+      assert.deepEqual(redactScannerRunMetadata(metadata, USER_A), metadata);
+    });
+
+    test("another tenant's run drops triggeredBy, strategyId and errors", () => {
+      const metadata = {
+        triggeredBy: USER_B,
+        strategyId: STRATEGY_B,
+        force: true,
+        errors: [`strategy ${STRATEGY_B}: boom`],
+      };
+      assert.deepEqual(redactScannerRunMetadata(metadata, USER_A), { force: true });
+    });
+
+    test('system runs are redacted for every tenant viewer', () => {
+      const metadata = { triggeredBy: 'system', strategyId: null, force: false };
+      assert.deepEqual(redactScannerRunMetadata(metadata, USER_A), { force: false });
+      assert.deepEqual(redactScannerRunMetadata(metadata, USER_B), { force: false });
+    });
+
+    test('non-sensitive keys are preserved and input is never mutated', () => {
+      const metadata: Record<string, unknown> = { triggeredBy: USER_B, strategyId: STRATEGY_B, force: true };
+      const out = redactScannerRunMetadata(metadata, USER_A);
+      assert.equal(out.force, true);
+      // original object untouched (no shared-state surprises for callers)
+      assert.equal(metadata.triggeredBy, USER_B);
+      assert.equal(metadata.strategyId, STRATEGY_B);
+    });
+
+    test('sensitive keys are covered by the exported constant', () => {
+      assert.deepEqual([...SCANNER_TENANT_SENSITIVE_METADATA_KEYS], ['triggeredBy', 'strategyId', 'errors']);
+    });
+  });
+
+  describe('listRuns owner scoping', () => {
+    test("tenant reads never return another tenant's runs, system runs, or their identifiers", async () => {
+      const insertRun = async (metadata: Record<string, unknown>, status = 'completed') => {
+        const res = await pool.query<{ id: string }>(
+          `INSERT INTO scanner_runs (status, provider_slug, metadata)
+           VALUES ($1, 'twelve-data', $2::jsonb) RETURNING id`,
+          [status, JSON.stringify(metadata)],
+        );
+        return res.rows[0]!.id;
+      };
+
+      const runA = await insertRun({ triggeredBy: USER_A, strategyId: STRATEGY_A, force: true });
+      const runB = await insertRun({ triggeredBy: USER_B, strategyId: STRATEGY_B, force: false });
+      await insertRun({ triggeredBy: 'system', strategyId: null, force: false });
+
+      const forA = await scanner.listRuns({ limit: 100 }, USER_A);
+      const idsA = forA.runs.map((r) => r.id);
+      assert.ok(idsA.includes(runA), 'viewer A must see their own run');
+      assert.ok(!idsA.includes(runB), 'viewer A must not see B run');
+      assert.ok(
+        forA.runs.every((r) => r.metadata.triggeredBy === USER_A),
+        'every returned run must belong to viewer A',
+      );
+      const payloadA = JSON.stringify(forA.runs);
+      assert.ok(!payloadA.includes(USER_B), 'B user UUID must not appear in A payload');
+      assert.ok(!payloadA.includes(STRATEGY_B), 'B strategy UUID must not appear in A payload');
+
+      const forB = await scanner.listRuns({ limit: 100 }, USER_B);
+      assert.ok(forB.runs.some((r) => r.id === runB));
+      assert.ok(!forB.runs.some((r) => r.id === runA));
+      assert.ok(!JSON.stringify(forB.runs).includes(USER_A));
+      assert.ok(!JSON.stringify(forB.runs).includes(STRATEGY_A));
+
+      // No runs at all for a tenant who never triggered one.
+      const forUnknown = await scanner.listRuns({ limit: 100 }, '33333333-3333-4333-8333-333333333333');
+      assert.deepEqual(forUnknown.runs, []);
+    });
+
+    test('status filter composes with owner scoping', async () => {
+      await pool.query(
+        `INSERT INTO scanner_runs (status, provider_slug, metadata)
+         VALUES ('failed', 'twelve-data', $1::jsonb)`,
+        [JSON.stringify({ triggeredBy: USER_A, strategyId: STRATEGY_A, errors: [`strategy ${STRATEGY_A}: boom`] })],
+      );
+      const failed = await scanner.listRuns({ status: 'failed', limit: 100 }, USER_A);
+      assert.ok(failed.runs.length >= 1);
+      assert.ok(failed.runs.every((r) => r.status === 'failed' && r.metadata.triggeredBy === USER_A));
+    });
+
+    test('unscoped read still returns the whole ledger (trusted internal callers)', async () => {
+      const all = await scanner.listRuns({ limit: 500 });
+      const tenantRun = all.runs.find((r) => r.metadata.triggeredBy === USER_A);
+      assert.ok(tenantRun, 'unscoped read must still see tenant-triggered runs');
+      const systemRun = all.runs.find((r) => r.metadata.triggeredBy === 'system');
+      assert.ok(systemRun, 'unscoped read must still see system runs');
+    });
+  });
+
+  describe('getHealth redaction', () => {
+    test('last run is visible globally but its tenant identifiers are redacted', async () => {
+      await pool.query(
+        `INSERT INTO scanner_runs (status, provider_slug, started_at, finished_at, metadata)
+         VALUES ('completed', 'twelve-data', now(), now(), $1::jsonb)`,
+        [JSON.stringify({ triggeredBy: USER_B, strategyId: STRATEGY_B, force: false })],
+      );
+
+      const health = await scanner.getHealth(USER_A);
+      assert.ok(health.lastRun, 'health must still report the last run');
+      assert.equal(health.lastRun!.metadata.triggeredBy, undefined);
+      assert.equal(health.lastRun!.metadata.strategyId, undefined);
+      assert.equal(health.lastRun!.metadata.force, false, 'non-identifying metadata is preserved');
+      assert.ok(!JSON.stringify(health.lastRun).includes(USER_B));
+      assert.ok(!JSON.stringify(health.lastRun).includes(STRATEGY_B));
+      // Operational value survives redaction
+      assert.ok(typeof health.lastRun!.status === 'string');
+      assert.ok(typeof health.lastRun!.startedAt === 'string');
+    });
+
+    test('the viewer still sees their own identifiers in health', async () => {
+      await pool.query(
+        `INSERT INTO scanner_runs (status, provider_slug, started_at, finished_at, metadata)
+         VALUES ('completed', 'twelve-data', now(), now(), $1::jsonb)`,
+        [JSON.stringify({ triggeredBy: USER_A, strategyId: STRATEGY_A, force: true })],
+      );
+      const health = await scanner.getHealth(USER_A);
+      assert.ok(health.lastRun);
+      assert.equal(health.lastRun!.metadata.triggeredBy, USER_A);
+      assert.equal(health.lastRun!.metadata.strategyId, STRATEGY_A);
+    });
+
+    test('unscoped health keeps the full metadata (trusted internal callers)', async () => {
+      const health = await scanner.getHealth();
+      assert.ok(health.lastRun);
+      assert.equal(health.lastRun!.metadata.triggeredBy, USER_A);
+    });
+  });
+
+  test('real triggerScan persists the initiating user as the run owner', async () => {
+    const email = uniqueEmail();
+    const passwordHash = await hashPassword(PASSWORD);
+    const user = await users.create({ email, passwordHash, name: 'F4 Owner' });
+    await makePro(user.id);
+
+    const result = await scanner.triggerScan({ force: true, initiatedBy: user.id });
+    assert.equal(result.run.metadata.triggeredBy, user.id);
+
+    const list = await scanner.listRuns({ limit: 100 }, user.id);
+    assert.ok(list.runs.some((r) => r.id === result.run.id), 'triggered run must be visible to its owner');
+
+    const other = await scanner.listRuns({ limit: 100 }, USER_B);
+    assert.ok(!other.runs.some((r) => r.id === result.run.id), 'triggered run must be invisible to other tenants');
   });
 });
 

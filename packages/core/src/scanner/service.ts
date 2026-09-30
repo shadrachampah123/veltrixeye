@@ -79,6 +79,51 @@ export interface ScanTriggerArgs {
   nowMs?: number;
 }
 
+/**
+ * Tenant-privacy: `scanner_runs` is a single global ledger shared by every
+ * tenant and by the scheduled system runner, and `metadata` records
+ * tenant-identifying values. These keys must never be returned to a viewer who
+ * does not own the run (M7 final verification audit, finding F4):
+ *
+ *  - `triggeredBy` — UUID of the user who initiated the run (or `'system'`).
+ *  - `strategyId`  — UUID of the strategy the run was scoped to.
+ *  - `errors`      — entries are serialized as `strategy <uuid>: <message>`
+ *                    (see `executeScan`), so the strings embed strategy UUIDs.
+ *
+ * Owner-scoped reads (see `listRuns`) already filter rows down to the caller's
+ * own runs; redaction is the second layer, applied to the shared/global read
+ * paths (health) that must keep showing the whole ledger's operational state.
+ */
+export const SCANNER_TENANT_SENSITIVE_METADATA_KEYS = ['triggeredBy', 'strategyId', 'errors'] as const;
+
+/**
+ * Strip tenant-identifying scanner-run metadata unless the run belongs to
+ * `viewerUserId`. Pure and deterministic — no I/O.
+ *
+ * A run is the viewer's own when `metadata.triggeredBy` equals their user id;
+ * system runs (`triggeredBy = 'system'`) belong to no tenant and are redacted
+ * for every tenant viewer. Everything non-identifying (status-bearing counts,
+ * `force`, and any future non-sensitive key) is preserved so the run stays
+ * operationally useful for triage.
+ */
+export function redactScannerRunMetadata(
+  metadata: Record<string, unknown>,
+  viewerUserId: string,
+): Record<string, unknown> {
+  if (metadata.triggeredBy === viewerUserId) return { ...metadata };
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if ((SCANNER_TENANT_SENSITIVE_METADATA_KEYS as readonly string[]).includes(key)) continue;
+    redacted[key] = value;
+  }
+  return redacted;
+}
+
+/** Redact a fully-mapped run DTO for a tenant viewer. Pure — no I/O. */
+export function redactScannerRunForViewer(run: ScannerRunDto, viewerUserId: string): ScannerRunDto {
+  return { ...run, metadata: redactScannerRunMetadata(run.metadata, viewerUserId) };
+}
+
 export interface ScanRunResult {
   run: ScannerRunDto;
   skipped?: boolean;
@@ -140,8 +185,17 @@ export class ScannerService {
   /**
    * Get scanner health/status for UI/API.
    * Reflects real production state, not mock/static.
+   *
+   * `viewerUserId` (tenant read) keeps the health view global — the scanner is
+   * one shared pipeline and its operational state is not per-tenant — but
+   * redacts tenant-identifying metadata from the embedded `lastRun` /
+   * `lastSuccessfulRun` DTOs (M7 audit finding F4). Omit it for trusted
+   * internal/operator reads that need the unredacted ledger.
    */
-  async getHealth(): Promise<ScannerHealthDto> {
+  async getHealth(viewerUserId?: string): Promise<ScannerHealthDto> {
+    const toRunDto = (row: ScannerRunRow): ScannerRunDto =>
+      viewerUserId === undefined ? toScannerRunDto(row) : redactScannerRunForViewer(toScannerRunDto(row), viewerUserId);
+
     const provider = this.requireProviderSafe();
     const isProviderAvailable = provider !== null;
 
@@ -158,12 +212,12 @@ export class ScannerService {
     const lastRunRes = await this.pool.query<ScannerRunRow>(
       `SELECT * FROM scanner_runs ORDER BY started_at DESC LIMIT 1`,
     );
-    const lastRun = lastRunRes.rows[0] ? toScannerRunDto(lastRunRes.rows[0]) : null;
+    const lastRun = lastRunRes.rows[0] ? toRunDto(lastRunRes.rows[0]) : null;
 
     const lastSuccessfulRes = await this.pool.query<ScannerRunRow>(
       `SELECT * FROM scanner_runs WHERE status = 'completed' ORDER BY finished_at DESC LIMIT 1`,
     );
-    const lastSuccessfulRun = lastSuccessfulRes.rows[0] ? toScannerRunDto(lastSuccessfulRes.rows[0]) : null;
+    const lastSuccessfulRun = lastSuccessfulRes.rows[0] ? toRunDto(lastSuccessfulRes.rows[0]) : null;
 
     const newestCandleRes = await this.pool.query<{ latest: string | null }>(
       `SELECT max(ts)::text as latest FROM candles`,
@@ -196,9 +250,30 @@ export class ScannerService {
     };
   }
 
-  async listRuns(query: ScannerRunListQuery): Promise<{ runs: ScannerRunDto[] }> {
+  /**
+   * List recent scanner runs.
+   *
+   * `scanner_runs` is a global ledger, and `metadata` records the
+   * tenant-identifying `triggeredBy` user UUID and `strategyId` strategy UUID,
+   * so an unscoped read would expose other tenants' identifiers to any
+   * entitled caller (M7 final verification audit, finding F4).
+   *
+   * Pass `viewerUserId` for every tenant-facing read: the result is restricted
+   * to runs that user initiated, which is both the privacy boundary and the
+   * only meaningful subset for them. System runs (`triggeredBy = 'system'`)
+   * belong to no tenant and are therefore not returned to any tenant viewer —
+   * global operational state remains visible via `getHealth`.
+   *
+   * Omit `viewerUserId` only for trusted internal/operator reads that must see
+   * the whole ledger (ops scripts, diagnostics).
+   */
+  async listRuns(query: ScannerRunListQuery, viewerUserId?: string): Promise<{ runs: ScannerRunDto[] }> {
     const values: unknown[] = [];
     const where: string[] = [];
+    if (viewerUserId !== undefined) {
+      values.push(viewerUserId);
+      where.push(`metadata->>'triggeredBy' = $${values.length}`);
+    }
     if (query.status) {
       values.push(query.status);
       where.push(`status = $${values.length}`);
