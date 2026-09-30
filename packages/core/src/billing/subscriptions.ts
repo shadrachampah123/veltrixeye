@@ -1,5 +1,6 @@
 import type { Pool } from 'pg';
 import {
+  type BillingEntitlementGrantDisclosure,
   type BillingProviderMode,
   type BillingProviderStatusDto,
   type SubscriptionDto,
@@ -7,10 +8,16 @@ import {
 } from '@veltrixeye/contracts';
 import type { Entitlements } from './entitlements.js';
 import { resolveEntitlements } from './entitlement-resolution.js';
+import { grantableEntitlementPlan } from './entitlement-grants.js';
 
 /** Columns the billing-state read needs beyond the 0014 subscription shape. */
 interface SubscriptionStateRow {
-  id: string;
+  /**
+   * `null` when the account has NO subscription row — the Model C free state.
+   * The read is anchored on `users` (LEFT JOIN) precisely so such an account
+   * still resolves its non-commercial operator grant.
+   */
+  id: string | null;
   plan: string;
   status: string;
   current_period_end: Date | null;
@@ -24,6 +31,13 @@ interface SubscriptionStateRow {
    * from a client.
    */
   activated: boolean;
+  /**
+   * The tier named by a non-commercial operator grant for this ACCOUNT
+   * (migration 0036), or `null`. It is an account-level authority, not a fact
+   * about a row — a granted account characteristically has no row at all, which
+   * is why the read is anchored on `users`.
+   */
+  granted_plan: string | null;
 }
 
 export interface BillingState {
@@ -41,6 +55,16 @@ export interface BillingState {
    * only capability statement, resolved fail-closed by `resolveEntitlements()`.
    */
   providerStatus: BillingProviderStatusDto;
+  /**
+   * The non-commercial operator grant in force for this account, or `null`.
+   *
+   * This is DISCLOSURE, never authority and never a payment: it exists so the
+   * account can be told WHY its limits are what they are, when nothing was ever
+   * sold. `providerStatus.paymentConfirmed` stays `false` for a granted account
+   * — permanently — because it is derived from the activation fact alone and no
+   * money changed hands. It carries no operator identity and no reason.
+   */
+  entitlementGrant: BillingEntitlementGrantDisclosure | null;
 }
 
 /** No subscription row at all: nothing was ever sold, so nothing is provider-backed. */
@@ -48,7 +72,7 @@ function noProviderStatus(): BillingProviderStatusDto {
   return { provider: null, providerState: null, paymentConfirmed: false };
 }
 
-function toSubscriptionDto(row: SubscriptionStateRow): SubscriptionDto {
+function toSubscriptionDto(row: SubscriptionStateRow & { id: string }): SubscriptionDto {
   return {
     id: row.id,
     plan: row.plan as UserPlan,
@@ -56,6 +80,25 @@ function toSubscriptionDto(row: SubscriptionStateRow): SubscriptionDto {
     currentPeriodEnd: row.current_period_end ? row.current_period_end.toISOString() : null,
     cancelAtPeriodEnd: row.cancel_at_period_end,
   };
+}
+
+/**
+ * The minimal projection of a grant: WHICH tier it confers, and nothing else.
+ *
+ * Deliberately NOT published: the operator identity, the reason, the row id, the
+ * idempotency key and the instant. This is the same disclosure discipline the
+ * read-only billing overview already applies — an account learns the fact of its
+ * own entitlement, never who decided it or why, and never anything
+ * payment-shaped.
+ */
+function toEntitlementGrant(row: SubscriptionStateRow): BillingEntitlementGrantDisclosure | null {
+  // Narrowed with the SAME authority the grant service validates and writes
+  // with (`grantableEntitlementPlan`), never with a second copy of the tier
+  // list: a value the resolver would honour can never be silently undeclared
+  // here, so a granted account is always disclosed.
+  if (row.granted_plan === null) return null;
+  const plan = grantableEntitlementPlan(row.granted_plan);
+  return plan === null ? null : { plan };
 }
 
 /**
@@ -83,16 +126,27 @@ export async function getBillingState(
 ): Promise<BillingState> {
   const mode = options?.mode ?? 'test';
   const { rows } = await db.query<SubscriptionStateRow>(
-    `SELECT *,
+    `SELECT sub.*,
             EXISTS (
               SELECT 1 FROM billing_subscription_activations a
-               WHERE a.subscription_id = subscriptions.id
-            ) AS activated
-       FROM subscriptions WHERE user_id = $1`,
+               WHERE a.subscription_id = sub.id
+            ) AS activated,
+            (
+              SELECT g.plan FROM billing_entitlement_grants g
+               WHERE g.user_id = u.id
+            ) AS granted_plan
+       FROM users u
+       LEFT JOIN subscriptions sub ON sub.user_id = u.id
+      WHERE u.id = $1`,
     [userId]
   );
 
-  if (rows.length === 0) {
+  // Anchored on `users` with a LEFT JOIN so a granted account — which by
+  // definition has no `subscriptions` row — still yields one row carrying its
+  // grant. A row-less account comes back with every `sub.*` column NULL, which
+  // is exactly the Model C free state.
+  const row = rows[0];
+  if (row === undefined || row.id === null) {
     // If no subscription row exists, treat as free
     const sub: SubscriptionDto = {
       id: '',
@@ -104,22 +158,41 @@ export async function getBillingState(
     return {
       mode,
       subscription: sub,
-      // provider IS NULL: the historical, unchanged free resolution.
-      entitlements: resolveEntitlements('free', 'active', null, false),
+      // provider IS NULL: the historical, unchanged free resolution — except
+      // that a non-commercial operator grant is an ACCOUNT-level authority and
+      // is honoured even with no row.
+      entitlements: resolveEntitlements(
+        'free',
+        'active',
+        null,
+        false,
+        (row?.granted_plan ?? null) as UserPlan | null,
+      ),
       providerStatus: noProviderStatus(),
+      entitlementGrant: row === undefined ? null : toEntitlementGrant(row),
     };
   }
 
-  const row = rows[0]!;
-  const sub = toSubscriptionDto(row);
+  // Narrowed above: `row.id` is non-null on this path, so the DTO is the real
+  // row (and not the documented `''` placeholder of the free state).
+  const sub = toSubscriptionDto({ ...row, id: row.id! });
   return {
     mode,
     subscription: sub,
     // A provider-backed row resolves to the free tier until an immutable
     // activation fact exists (evidence alone is never authority); a historical
-    // row is unchanged, and `users.plan` is never read or written here.
-    entitlements: resolveEntitlements(sub.plan, sub.status, row.provider, row.activated === true),
+    // row is unchanged, and `users.plan` is never read or written here. A
+    // non-commercial operator grant (migration 0036) is a separate,
+    // account-level authority and is read here as well.
+    entitlements: resolveEntitlements(
+      sub.plan,
+      sub.status,
+      row.provider,
+      row.activated === true,
+      row.granted_plan as UserPlan | null,
+    ),
     providerStatus: toProviderStatus(row),
+    entitlementGrant: toEntitlementGrant(row),
   };
 }
 

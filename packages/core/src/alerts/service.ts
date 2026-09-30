@@ -314,14 +314,32 @@ export class AlertService {
       // fail-closed entitlement gate: a provider-backed row is an unconfirmed
       // checkout — never a purchase — until an operator has authorized an
       // immutable activation fact for it (Billing Step 8, migration 0034).
+      // The non-commercial operator grant (migration 0036) is read alongside
+      // them.
       const entitlementRes = await client.query<{ plan: string; status: string; provider: string | null; activated: boolean }>(`
         SELECT plan, status, provider,
                EXISTS (SELECT 1 FROM billing_subscription_activations a
                         WHERE a.subscription_id = subscriptions.id) AS activated
           FROM subscriptions WHERE user_id = $1 FOR UPDATE
       `, [args.userId]);
+      // The non-commercial operator grant (migration 0036) is an ACCOUNT-level
+      // authority, so it is read in its own statement against the unique
+      // index: an account with no subscription row — the Model C free state,
+      // and the normal state of a granted account — still resolves its grant,
+      // and the `FOR UPDATE` row lock above is untouched. `null` fails closed.
+      const grantRes = await client.query<{ granted_plan: string | null }>(
+        'SELECT plan AS granted_plan FROM billing_entitlement_grants WHERE user_id = $1',
+        [args.userId],
+      );
       const subRow = entitlementRes.rows[0] || { plan: 'free', status: 'active', provider: null, activated: false };
-      const entitlements = resolveEntitlements(subRow.plan as UserPlan, subRow.status, subRow.provider, subRow.activated === true);
+      const grantedPlan = (grantRes.rows[0]?.granted_plan ?? null) as UserPlan | null;
+      const entitlements = resolveEntitlements(
+        subRow.plan as UserPlan,
+        subRow.status,
+        subRow.provider,
+        subRow.activated === true,
+        grantedPlan,
+      );
       const maxAlerts = entitlements.maxAlertsPerMonth;
       
       const countRes = await client.query(

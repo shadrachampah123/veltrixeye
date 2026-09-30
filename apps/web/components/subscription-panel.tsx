@@ -7,6 +7,7 @@ import {
   BILLING_CURRENCY,
   BILLING_PROVIDER,
   COMMERCIAL_PLAN_CATALOGUE,
+  commercialPlanCatalogueEntry,
   commercialPlanForInternalPlan,
   resolveBillingCheckoutState,
   type BillingCheckoutState,
@@ -91,6 +92,15 @@ export function SubscriptionPanel({
   const awaitingVerification = checkoutState === 'awaiting_verification';
   const evidenceAwaitingActivation = checkoutState === 'evidence_recorded';
   const awaitingConfirmation = awaitingVerification || evidenceAwaitingActivation;
+  // A non-commercial operator grant (migration 0036): the account holds a
+  // commercial tier WITHOUT having bought anything. The server reported it, so
+  // the limits above are genuinely the server's; this block only explains WHY,
+  // and it states plainly that no payment was made. Display-only: this panel
+  // offers no action and can change nothing.
+  const grant = billing.entitlementGrant;
+  // The commercial name comes from the frozen catalogue (Pro / Elite), never
+  // from a literal here, so a catalogue rename cannot desynchronise this copy.
+  const grantLabel = grant === null ? null : commercialPlanCatalogueEntry(grant.plan)?.name ?? grant.plan;
 
   return (
     <Card>
@@ -167,6 +177,17 @@ export function SubscriptionPanel({
             <span className="font-mono">paymentConfirmed: false</span>. Evidence is a receipt, never an activation, so
             the free-plan limits shown above are what the server enforces until an operator records the activation out
             of band. Nothing on this page can do that.
+          </div>
+        ) : null}
+
+        {grant !== null ? (
+          <div className="rounded-md border border-signal-500/30 bg-signal-500/10 px-3 py-2.5 text-[11px] leading-snug text-ink-300">
+            <strong className="text-signal-400">Operator grant &mdash; no payment was made:</strong> this account holds
+            the {grantLabel} entitlement tier by a standing, non-commercial grant an operator recorded out of band, so
+            the limits shown above are the ones the server enforces. This is <strong>not</strong> a purchase: no
+            checkout exists, nothing was charged, and the server still reports{' '}
+            <span className="font-mono">paymentConfirmed: false</span>. Automation, live execution and broker execution
+            stay off for every plan regardless.
           </div>
         ) : null}
 

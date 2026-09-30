@@ -33,6 +33,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import {
   BILLING_CHECKOUT_SELLABLE_PLANS,
   COMMERCIAL_PLAN_CATALOGUE,
+  billingEntitlementGrantDtoSchema,
   billingStateDtoSchema,
   type BillingStateDto,
   type UserPlan,
@@ -84,6 +85,12 @@ function billingState(args: {
   paymentConfirmed?: boolean;
   /** The server-reported provider domain (default: the sandbox test domain). */
   mode?: 'test' | 'live';
+  /**
+   * A non-commercial operator grant disclosed by the server (migration 0036),
+   * or `null`. It is the ONLY thing that can give this account paid limits
+   * without a purchase, and it never confirms a payment.
+   */
+  entitlementGrant?: { plan: 'pro' | 'premium' } | null;
 }): BillingStateDto {
   return billingStateDtoSchema.parse({
     // The default provider domain: mode-aware copy renders sandbox text.
@@ -101,6 +108,7 @@ function billingState(args: {
       providerState: args.providerState ?? null,
       paymentConfirmed: args.paymentConfirmed ?? false,
     },
+    entitlementGrant: args.entitlementGrant ?? null,
   });
 }
 
@@ -506,4 +514,68 @@ test('mode-aware copy: live never says sandbox, test keeps the sandbox note, unk
   );
   assert.match(liveRefusal, /the checkout is refusing/);
   assert.doesNotMatch(liveRefusal, /the sandbox checkout is refusing/);
+});
+
+
+/* ==========================================================================
+   Non-commercial operator grant (migration 0036) — read-only disclosure
+   ========================================================================== */
+
+test('a granted account is told WHY it holds paid limits, and that no payment was made', () => {
+  const markup = render(billingState({
+    // Nothing was ever sold: the Model C free state is the absence of a row,
+    // and the panel still renders the synthetic free subscription identity.
+    plan: 'free', status: 'active', entitlements: PREMIUM_ENTITLEMENTS,
+    entitlementGrant: { plan: 'premium' },
+  }));
+  assert.match(markup, /Operator grant/i, 'the panel names the reason it cannot otherwise show');
+  assert.match(markup, /no payment was made/i, 'and says plainly that nothing was charged');
+  assert.match(markup, /paymentConfirmed: false/, 'the server still confirms no payment');
+  assert.match(markup, /Elite/, 'the commercial name of the granted tier is shown');
+  // The limits shown really are the granted ones, not the free ones.
+  assert.match(markup, />1000</, 'the elite strategy limit is rendered');
+  assert.doesNotMatch(markup, />100</, 'the free strategy limit is not');
+  // It offers nothing and changes nothing: the block is prose, not a control.
+  assert.doesNotMatch(markup, /<button/i, 'the grant notice is not an action');
+  assert.doesNotMatch(markup, /<a\s/i, 'and it is not a link');
+});
+
+test('a grant never reads as a purchase, and an ungranted account is unaffected', () => {
+  const granted = render(billingState({
+    plan: 'free', status: 'active', entitlements: PRO_ENTITLEMENTS,
+    entitlementGrant: { plan: 'pro' },
+  }));
+  assert.doesNotMatch(granted, /Payment not confirmed/, 'there is no checkout to be unconfirmed');
+  assert.doesNotMatch(granted, /awaiting verification|awaiting operator activation/,
+    'a grant is not a checkout state');
+
+  const ungranted = render(billingState({
+    plan: 'free', status: 'active', entitlements: FREE_ENTITLEMENTS,
+  }));
+  assert.doesNotMatch(ungranted, /Operator grant/i, 'no grant, no grant notice');
+  assert.match(ungranted, />100</, 'and the free limits are unchanged');
+});
+
+test('the grant disclosure carries no operator, reason or payment identifier', () => {
+  const billing = billingState({
+    plan: 'free', status: 'active', entitlements: PRO_ENTITLEMENTS,
+    entitlementGrant: { plan: 'pro' },
+  });
+  // The projection itself is strict, server-side: an account learns the tier and
+  // nothing else.
+  assert.deepEqual(Object.keys(billing.entitlementGrant!), ['plan']);
+  assert.equal(
+    billingEntitlementGrantDtoSchema.safeParse({ plan: 'pro', operatorId: 'ops-1' }).success, false,
+    'the schema refuses an operator identity',
+  );
+  assert.equal(
+    billingEntitlementGrantDtoSchema.safeParse({ plan: 'pro', reason: 'because' }).success, false,
+    'the schema refuses a reason',
+  );
+  assert.equal(
+    billingEntitlementGrantDtoSchema.safeParse({ plan: 'starter' }).success, false,
+    'starter has no enforced tier, so it is not representable as a grant',
+  );
+  const markup = render(billing);
+  assert.doesNotMatch(markup, /ops-1/, 'and no operator identity reaches the markup');
 });

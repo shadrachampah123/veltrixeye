@@ -142,7 +142,7 @@ describe('resolveEntitlements — provider IS NULL preserves the existing matrix
     for (const plan of USER_PLANS) {
       for (const status of [...LIVE_STATUSES, ...LAPSED_STATUSES, 'anything-else', '']) {
         assert.deepEqual(
-          resolveEntitlements(plan, status, null, false),
+          resolveEntitlements(plan, status, null, false, null),
           getEntitlements(plan, status),
           `${plan}/${status} with provider NULL must be unchanged`,
         );
@@ -153,24 +153,24 @@ describe('resolveEntitlements — provider IS NULL preserves the existing matrix
   it('keeps the paid tiers for historical live subscriptions', () => {
     for (const plan of PAID_PLANS) {
       for (const status of LIVE_STATUSES) {
-        const entitlements = resolveEntitlements(plan, status, null, false);
+        const entitlements = resolveEntitlements(plan, status, null, false, null);
         assert.equal(entitlements.canAccessScanner, true, `${plan}/${status} keeps scanner access`);
         assert.equal(entitlements.canAccessAdvancedStrategies, true);
         assert.equal(entitlements.canAccessAdvancedAlerts, true);
         assert.deepEqual(entitlements, getEntitlements(plan, status));
       }
     }
-    assert.equal(resolveEntitlements('pro', 'active', null, false).maxStrategies, 500);
-    assert.equal(resolveEntitlements('premium', 'active', null, false).maxStrategies, 1000);
+    assert.equal(resolveEntitlements('pro', 'active', null, false, null).maxStrategies, 500);
+    assert.equal(resolveEntitlements('premium', 'active', null, false, null).maxStrategies, 1000);
   });
 
   it('keeps the existing free fallback for lapsed historical subscriptions', () => {
     for (const plan of PAID_PLANS) {
       for (const status of LAPSED_STATUSES) {
-        assert.deepEqual(resolveEntitlements(plan, status, null, false), FREE_ENTITLEMENTS);
+        assert.deepEqual(resolveEntitlements(plan, status, null, false, null), FREE_ENTITLEMENTS);
       }
     }
-    assert.deepEqual(resolveEntitlements('free', 'active', null, false), FREE_ENTITLEMENTS);
+    assert.deepEqual(resolveEntitlements('free', 'active', null, false, null), FREE_ENTITLEMENTS);
   });
 
   it('fails closed if an activation fact is ever claimed for a provider-null row', () => {
@@ -179,7 +179,7 @@ describe('resolveEntitlements — provider IS NULL preserves the existing matrix
     for (const plan of PAID_PLANS) {
       for (const status of LIVE_STATUSES) {
         assert.equal(
-          resolveEntitlements(plan, status, null, true),
+          resolveEntitlements(plan, status, null, true, null),
           FREE_ENTITLEMENTS,
           `${plan}/${status}/activated must not escalate a non-commercial row`,
         );
@@ -191,7 +191,7 @@ describe('resolveEntitlements — provider IS NULL preserves the existing matrix
 describe('resolveEntitlements — provider IS NOT NULL is fail-closed until activated', () => {
   it('returns the very FREE_ENTITLEMENTS object, not a copy or a new matrix', () => {
     // Reference equality: there is exactly one definition of the free tier.
-    assert.equal(resolveEntitlements('premium', 'active', 'paystack', false), FREE_ENTITLEMENTS);
+    assert.equal(resolveEntitlements('premium', 'active', 'paystack', false, null), FREE_ENTITLEMENTS);
     assert.equal(FREE_ENTITLEMENTS, getEntitlements('free', 'active'));
   });
 
@@ -199,7 +199,7 @@ describe('resolveEntitlements — provider IS NOT NULL is fail-closed until acti
     for (const plan of USER_PLANS) {
       for (const status of [...LIVE_STATUSES, ...LAPSED_STATUSES]) {
         for (const provider of ['paystack', IMPOSSIBLE_PROVIDER]) {
-          const entitlements = resolveEntitlements(plan, status, provider, false);
+          const entitlements = resolveEntitlements(plan, status, provider, false, null);
           assert.equal(entitlements, FREE_ENTITLEMENTS, `${plan}/${status}/${provider}`);
           assert.equal(entitlements.canAccessScanner, false);
           assert.equal(entitlements.canAccessAdvancedStrategies, false);
@@ -217,7 +217,7 @@ describe('resolveEntitlements — provider IS NOT NULL is fail-closed until acti
   it('grants the plan entitlement only when an activation fact exists', () => {
     for (const plan of PAID_PLANS) {
       for (const status of LIVE_STATUSES) {
-        const entitlements = resolveEntitlements(plan, status, 'paystack', true);
+        const entitlements = resolveEntitlements(plan, status, 'paystack', true, null);
         assert.deepEqual(
           entitlements,
           getEntitlements(plan, status),
@@ -229,7 +229,7 @@ describe('resolveEntitlements — provider IS NOT NULL is fail-closed until acti
     // A lapsed subscription is still lapsed: an activation is not a lifecycle.
     for (const status of LAPSED_STATUSES) {
       assert.deepEqual(
-        resolveEntitlements('premium', status, 'paystack', true),
+        resolveEntitlements('premium', status, 'paystack', true, null),
         FREE_ENTITLEMENTS,
         `an activation is not a lifecycle: ${status} stays free`,
       );
@@ -237,24 +237,24 @@ describe('resolveEntitlements — provider IS NOT NULL is fail-closed until acti
   });
 
   it('never reads provider_state: the gate is the provider column plus the activation fact', () => {
-    // The resolver takes exactly four arguments — plan, status, provider and
-    // the durable activation state. There is no provider_state parameter to
-    // misread as a confirmation.
-    assert.equal(resolveEntitlements.length, 4);
+    // The resolver takes exactly five arguments — plan, status, provider, the
+    // durable activation state and the non-commercial grant tier. There is no
+    // provider_state parameter to misread as a confirmation.
+    assert.equal(resolveEntitlements.length, 5);
   });
 
   it('fails closed when a reader forgets to select the provider column', () => {
     // `undefined` is `!== null`, so an unwired reader resolves to free rather
     // than silently escalating to a paid tier.
     const forgotten = undefined as unknown as string | null;
-    assert.equal(resolveEntitlements('premium', 'active', forgotten, false), FREE_ENTITLEMENTS);
+    assert.equal(resolveEntitlements('premium', 'active', forgotten, false, null), FREE_ENTITLEMENTS);
   });
 
   it('fails closed when a reader forgets the activation state', () => {
     // `undefined` is not `true`, so a reader that forgets to ask whether an
     // activation fact exists can never reach a paid tier.
     const forgotten = undefined as unknown as boolean;
-    assert.equal(resolveEntitlements('premium', 'active', 'paystack', forgotten), FREE_ENTITLEMENTS);
+    assert.equal(resolveEntitlements('premium', 'active', 'paystack', forgotten, null), FREE_ENTITLEMENTS);
   });
 
   it('leaves canAccessAutomation false for every plan, status, provider and activation', () => {
@@ -263,7 +263,7 @@ describe('resolveEntitlements — provider IS NOT NULL is fail-closed until acti
         for (const provider of [null, 'paystack']) {
           for (const activated of [false, true]) {
             assert.equal(
-              resolveEntitlements(plan, status, provider, activated).canAccessAutomation,
+              resolveEntitlements(plan, status, provider, activated, null).canAccessAutomation,
               false,
               `${plan}/${status}/${provider}/activated=${activated}`,
             );
@@ -398,7 +398,7 @@ describe('getBillingState — provider-backed subscriptions are fail-closed', ()
     // cannot escalate. (A provider-backed row WITH an activation fact is
     // pinned to `paystack` by migration 0034's coherence trigger, which
     // requires the fact's provider to equal the subscription's.)
-    const entitlements = resolveEntitlements('premium', 'active', IMPOSSIBLE_PROVIDER, false);
+    const entitlements = resolveEntitlements('premium', 'active', IMPOSSIBLE_PROVIDER, false, null);
     assert.equal(entitlements, FREE_ENTITLEMENTS);
   });
 
@@ -520,6 +520,10 @@ describe('billing-state DTO — paymentConfirmed is derived, never client input'
     mode: 'test' as const,
     entitlements: FREE_ENTITLEMENTS,
     providerStatus: { provider: 'paystack', providerState: 'pending', paymentConfirmed: false as const },
+    // A non-commercial operator grant is disclosed when one exists and is
+    // always present, so a client never has to tell 'no grant' apart from
+    // 'this build does not know about grants'.
+    entitlementGrant: null as { plan: 'pro' | 'premium' } | null,
   };
 
   it('carries a real boolean, because the activation fact can exist', () => {
@@ -685,11 +689,18 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
   });
 
   it('the resolver is the only bridge, and it delegates rather than restating limits', () => {
+    // It reaches the matrix and nothing else: the paid policy is now stated
+    // once, in `resolvePaidTier`, so the resolver no longer needs the free tier
+    // object itself — only `getEntitlements` and the contracts vocabulary.
     assert.deepEqual(importsOf(RESOLUTION).sort(), ['@veltrixeye/contracts', './entitlements.js'].sort());
     assert.match(codeOnly(RESOLUTION), /if \(provider !== null\) \{/);
-    assert.match(codeOnly(RESOLUTION), /if \(activated !== true\) return FREE_ENTITLEMENTS;/);
-    assert.match(codeOnly(RESOLUTION), /if \(activated === true\) return FREE_ENTITLEMENTS;/);
-    assert.match(codeOnly(RESOLUTION), /return getEntitlements\(plan, status\);/);
+    assert.match(codeOnly(RESOLUTION), /if \(activated !== true\) return 'free';/);
+    assert.match(codeOnly(RESOLUTION), /return activated === true \? 'free' : plan;/);
+    assert.match(
+      codeOnly(RESOLUTION),
+      /return getEntitlements\(resolvePaidTier\(plan, provider, activated\), status\);/,
+    );
+    assert.match(codeOnly(RESOLUTION), /if \(grantedPlan != null\) return getEntitlements\(grantedPlan, status\);/);
     // No second matrix: the resolver declares no limit of its own.
     assert.doesNotMatch(
       codeOnly(RESOLUTION),
@@ -742,11 +753,11 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     assert.deepEqual(offenders, [], 'every reader goes through resolveEntitlements');
   });
 
-  it('adds migration 0034 (the activation-fact ledger) plus 0035 (live-mode widening), leaving 0001–0033 untouched', () => {
+  it('adds 0034 (the activation-fact ledger), 0035 (live-mode widening) and 0036 (non-commercial grants), leaving 0001–0033 untouched', () => {
     const files = readdirSync(MIGRATIONS_DIR).sort();
-    assert.equal(files.length, 35, `unexpected migration set: ${files.join(', ')}`);
+    assert.equal(files.length, 36, `unexpected migration set: ${files.join(', ')}`);
     assert.equal(files[0], '0001_identity_and_audit.sql');
-    assert.equal(files[files.length - 1], '0035_billing_live_mode.sql');
+    assert.equal(files[files.length - 1], '0036_billing_entitlement_grants.sql');
   });
 
   it('leaves the checkout INSERT shape and the pricing lock untouched', () => {

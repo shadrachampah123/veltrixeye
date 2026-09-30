@@ -96,6 +96,8 @@
 > selling (Step 10a records that as a decision, not as a pending gap).
 > **Receipt is still not confirmation**: the webhook receiver records deliveries; `POST /api/billing/sync` applies the canonical status mapping without confirming payment; `POST /api/billing/verify` records verified-transaction evidence after reconciliation — none of them changes subscription plan or grants execution. The only payment-confirmation authority is the out-of-band activation fact, written by a named operator with a stated reason.
 >
+> **A non-commercial operator grant exists, and it is deliberately NOT a payment.** `npm run billing:grant` (`scripts/billing/grant-entitlements.ts` → `BillingEntitlementGrantService`, migration `0036_billing_entitlement_grants.sql`) records one immutable, append-only **non-commercial grant** for a named account — a standing operator authorization of a commercial entitlement tier for an account that made no purchase. It exists because the payment path is *correctly* closed to any account that has not paid: `BillingActivationService` refuses without verified payment evidence, and that evidence is only ever produced by a **real** provider read. The grant is therefore a **separate authority beside the payment path, not a shortcut through it**: it calls no provider, reads no key, consults no `PAYSTACK_MODE`, writes no subscription/evidence/activation/epoch/FX row, and has **no HTTP surface** (no route, no admin role, no token — `DATABASE_URL` is the whole trust boundary). `paymentConfirmed` remains derived from the 0034 activation fact alone and stays **`false`** for a granted account; `canAccessAutomation` stays `false` and automation/live/broker execution stay OFF. `GET /api/billing/me` discloses it read-only as `entitlementGrant: { plan }` (the tier, nothing else — no operator, no reason, no id, no payment field). See *Non-commercial operator grant*.
+>
 > **Account capabilities are only partially verified.** Whether this account
 > can transact in **GHS** (AC1) or run **GHS recurring** subscriptions (AC2) is
 > unverified, and no recurring end-to-end run has happened (AC7). The account's
@@ -734,23 +736,31 @@ writes out of band (see *Activation authority (Billing Step 8)* below).
 
 | Subscription row | Activation fact | Entitlements |
 | --- | --- | --- |
-| **no row at all** (every user who has never checked out — the Model C free state) | — | `FREE_ENTITLEMENTS` via `resolveEntitlements('free', 'active', null, false)` — reported as free/active/unconfirmed |
+| **no row at all** (every user who has never checked out — the Model C free state) | — | `FREE_ENTITLEMENTS` via `resolveEntitlements('free', 'active', null, false, null)` — reported as free/active/unconfirmed |
 | `provider IS NULL` (every historical row) | none (the database refuses one for such a row) | `getEntitlements(plan, status)` — **unchanged** |
 | `provider IS NULL` | one exists | `FREE_ENTITLEMENTS` — incoherent, fail closed |
 | `provider IS NOT NULL` (any checkout row) | none — no evidence, no verification, no sync and no `provider_state` value substitutes | `FREE_ENTITLEMENTS` — regardless of `status` or `provider_state` |
 | `provider IS NOT NULL` | one exists (Billing Step 8) | `getEntitlements(plan, status)` — the paid tier the operator authorized |
+| **any row, or no row at all** | — (a **non-commercial operator grant** exists, Billing Step 0036) | `getEntitlements(grant, status)` — the granted tier, still gated by the authoritative lifecycle, and `paymentConfirmed` stays `false` |
 
 ### The implementation
 
 - **`packages/core/src/billing/entitlement-resolution.ts`** — one function,
-  `resolveEntitlements(plan, status, provider, activated)`. It is the only place
-  the `provider` column may influence an entitlement, and it can only ever
-  narrow one. `provider` is a required third argument compared with `!== null`
-  and `activated` is a required fourth argument compared with `=== true`, so a
+  `resolveEntitlements(plan, status, provider, activated, grantedPlan)`. It is
+  the only place the `provider` column or a grant may influence an entitlement.
+  `provider` is a required third argument compared with `!== null` and
+  `activated` is a required fourth argument compared with `=== true`, so a
   reader that forgets to SELECT the column — or to ask whether an activation
   fact exists — resolves to free, never to paid. A paid entitlement for a
   provider-backed row is reachable ONLY by explicitly passing the durable
-  activation state; there is no other path.
+  activation state; there is no other path. `grantedPlan` is a required fifth
+  argument carrying the non-commercial grant's **own tier** (see *Non-commercial
+  operator grant*); a reader that forgets to ask passes `undefined`, which is
+  not a plan, and therefore takes the ordinary free path. The grant branch is
+  checked first because it is an ACCOUNT-level authority, not a statement about
+  one subscription row; it still defers to `getEntitlements(grantPlan, status)`,
+  so the authoritative lifecycle status and `canAccessAutomation: false` are
+  unchanged.
 - **`packages/core/src/billing/entitlements.ts`** — unchanged and still
   provider-agnostic. It only gained `export` on the existing
   `FREE_ENTITLEMENTS`, so the resolver returns *that* object instead of
@@ -761,7 +771,11 @@ writes out of band (see *Activation authority (Billing Step 8)* below).
   `SetupService.insertOrGetSetup`, `AlertService.generateAlert`,
   `BacktestService.createBacktest`, `ScannerService.getEligibleStrategies`, the
   three scanner route gates (`health` / `runs` / `trigger`) and
-  `AutomationService.readState`.
+  `AutomationService.readState`. Since migration 0036 each of them also selects
+  the non-commercial grant; the locking readers keep their
+  `SELECT … FROM subscriptions … FOR UPDATE` row lock untouched and read the
+  grant as a separate unique-index lookup against the account id, so no
+  reader's transactional shape changed and a row-less account still resolves.
 - **`GET /api/billing/me`** additionally publishes `providerStatus`:
   `{ provider, providerState, paymentConfirmed }`. The first two are the stored
   columns as **display information**; `paymentConfirmed` is a **derived
@@ -1136,7 +1150,7 @@ The architecture, end to end:
 verified payment evidence   (0033, billing_verified_transactions — EVIDENCE, never authority)
   → explicit out-of-band operator authorization   (BillingActivationService, via the CLI)
   → immutable activation fact                     (0034, billing_subscription_activations)
-  → read-side paid entitlement                    (resolveEntitlements(plan, status, provider, activated))
+  → read-side paid entitlement                    (resolveEntitlements(plan, status, provider, activated, grantedPlan))
 ```
 
 **Evidence is never authority.** A verified transaction proves money moved and nothing more. The step from evidence to entitlement is a *human decision*, recorded with a name and a reason — which is why the only writer is a DB-connected CLI an operator runs, and why there is no HTTP surface at all.
@@ -1148,7 +1162,7 @@ verified payment evidence   (0033, billing_verified_transactions — EVIDENCE, n
 | Coherence | same migration | `billing_subscription_activations_coherent` (BEFORE INSERT) re-derives, from the live rows, that the fact agrees with its subscription, its locked snapshot and its verified evidence on **user, subscription, snapshot, catalogue plan, interval, provider, provider plan, reference, currency, amount, exponent and evidence hash** — and that the evidence is a **successful sandbox (`test`)** transaction. It also refuses Starter (not sellable) and the excluded capability-evidence provider plan (`PLN_…` GHS 2.00 test plan — capability evidence only, never an epoch). The database is the last line of defence behind the service. |
 | Service | `packages/core/src/billing/activation.ts` | `BillingActivationService.activate({ user, operatorId, reason, evidenceId?, activatedAt? })` — the 18 numbered guarantees, in order: (1) explicit operator identity AND reason, (2) locate the commercial subscription by the user's email or uuid, (3) refuse a legacy NULL-lock row (`pricing_lock_required`), (4) validate the locked pricing snapshot through the existing strict validator, (5) refuse Starter (`forbidden_plan`) and the excluded provider plan (`excluded_provider_plan`), (6) locate matching verified evidence, (7) require a successful sandbox transaction, (8) **re-run the exact pure payment reconciliation from the stored evidence** — a wrong amount, currency, exponent, reference or customer is refused exactly as verification would refuse it, (9) one client and one transaction, (10) `SELECT … FOR UPDATE` on the subscription row, (11) insert exactly one fact, (12) insert the transactional `billing.subscription_activated` audit event on the same transaction, (13) commit both together, (14) roll everything back on any failure, (15) return an idempotent replay (`outcome: 'already_activated'`) for an already-activated subscription, (16) never write the subscription's `plan` / `status` / `provider_state`, (17) never write `users.plan`, (18) never call Paystack — the service holds no provider at all. Every refusal is a typed `BillingActivationError` with a reason from `BILLING_ACTIVATION_ERROR_REASONS`, and **nothing is written** when one is thrown. |
 | Store | same file | `BillingActivationStore` — thin read access (`findById`, `findBySubscriptionId`, `isActivated`). Never writes. |
-| Read side | `packages/core/src/billing/entitlement-resolution.ts` + `subscriptions.ts` | `resolveEntitlements(plan, status, provider, activated)` gains the required fourth argument, and `getBillingState` derives `activated` (and therefore `paymentConfirmed`) with `EXISTS (SELECT 1 FROM billing_subscription_activations WHERE subscription_id = …)`. |
+| Read side | `packages/core/src/billing/entitlement-resolution.ts` + `subscriptions.ts` | `resolveEntitlements(plan, status, provider, activated, grantedPlan)` gains the required fourth argument, and `getBillingState` derives `activated` (and therefore `paymentConfirmed`) with `EXISTS (SELECT 1 FROM billing_subscription_activations WHERE subscription_id = …)`. |
 | Contracts | `packages/contracts/src/billing.ts` | `paymentConfirmed` becomes `z.boolean()` — a real boolean that is **DERIVED**, never accepted as input and never stored as a second mutable authority. `grantsExecution` / `planChanged` / `entitlementsChanged` are pinned `false` in the activation result. |
 | CLI | `scripts/billing/activate.ts` + `npm run billing:activate` | The ONLY writer. `--user <email|uuid> --by <operator-id> --reason <text> [--evidence <uuid>]`; it parses arguments, connects to the database, calls the service and prints the outcome as JSON. Exit codes: 0 recorded or replayed, 1 typed refusal (nothing written), 2 usage error. The only configuration is `DATABASE_URL`, exactly like `npm run db:migrate`. |
 | Route | — | **None.** There is no activation route, no admin role, no operator endpoint, no activation token and no new production secret: the database connection is the whole trust boundary. `POST /api/billing/verify` (Step 7) records evidence and does NOT activate. |
@@ -1180,6 +1194,178 @@ edit and no delete: a correction is a manual review, never a silent overwrite.
 - **Never grants execution.** `canAccessAutomation` stays `false` for every plan; automation, live execution and broker execution stay OFF regardless of activation state.
 - **Never rewrites history.** Migrations 0001–0033 are byte-identical, 0034 is the only new migration and is additive/forward-only (no DROP, RENAME, TRUNCATE or data rewrite), and the fact table refuses UPDATE and DELETE.
 - **Never touches production.** No live key, no production credential, no `render.yaml`/Vercel change, no deployment, no notification, no refund/proration/dunning execution, and no Starter selling (Billing Step 10a records that Starter is not sold — see *Starter disposition*). No activation has been performed in any deployed environment.
+
+## Non-commercial operator grant (`npm run billing:grant`)
+
+**Status: delivered. It is a SEPARATE authority from the payment one — not a
+shortcut through it, and not a payment.** One migration (`0036`), one service,
+one operator CLI, one read-side argument. No provider call, no secret, no
+`PAYSTACK_MODE`, no HTTP surface, no execution grant.
+
+### The gap it closes, stated exactly
+
+The payment-confirmation authority is deliberately unreachable for an account
+that has not paid, and that is the correct design:
+
+- `BillingActivationService.activate()` refuses with
+  `payment_evidence_not_found` unless a row exists in
+  `billing_verified_transactions` (0033);
+- the ONLY writer of that table is `BillingPaymentConfirmationService.confirm()`
+  (Billing Step 7), which performs a **real** provider read
+  (`GET /transaction/verify/:reference`) and requires a successful transaction
+  that reconciles exactly against a locked pricing snapshot;
+- the subscription row and its immutable pricing lock are themselves created only
+  by `BillingCheckoutService`, against a registered provider-plan epoch.
+
+So there is no payment-free route to a paid entitlement through the payment path,
+by design. The **designated owner / super-admin account**, which is to receive
+the commercial benefit *without* a purchase, therefore needs its own authority.
+Reaching it through Step 8 would mean inserting a fabricated
+`billing_verified_transactions` row — fake payment evidence, and never done.
+
+This step is that separate authority. It sits beside the payment path; it does
+not weaken it, and no payment rule changed.
+
+### The architecture
+
+```text
+checkout + real provider read + reconciled evidence + operator activation
+  → billing_subscription_activations (0034)  → PAID, and paymentConfirmed: true
+
+named operator, stated reason, out of band
+  → billing_entitlement_grants (0036)       → PAID TIER, and paymentConfirmed: false
+```
+
+Both converge on the one resolver,
+`resolveEntitlements(plan, status, provider, activated, grantedPlan)`, which
+remains the only place a subscription or grant fact can influence an
+entitlement, and which can only ever narrow a matrix it does not own.
+
+### What a grant is — and what it is structurally not
+
+| It IS | It is NOT |
+| --- | --- |
+| An explicit, out-of-band **operator decision** by a named human with a stated reason | **Payment evidence.** The table has no `evidence_id`, `pricing_snapshot_id`, `provider`, `provider_reference`, `provider_plan_id`, currency, amount, exponent or transaction id — it is structurally incapable of representing a payment fact |
+| A **standing, account-level** concession for one named account | **A payment confirmation.** `paymentConfirmed` is derived from `billing_subscription_activations` alone and stays `false` for a granted account, permanently and correctly |
+| Recorded as ONE immutable, append-only fact plus its transactional `billing.entitlement_granted` audit event | **A subscription.** It writes no `subscriptions` row, no `subscriptions.plan` and no `users.plan`, and references no subscription at all |
+| Account-scoped, because a granted account characteristically has **no** subscription row (since Model C that absence IS the free state) | **An activation.** `billing_subscription_activations` stays the only payment-confirmation authority, and the activation service is unchanged |
+| Consulted only through the one resolver, so a reader that forgets to ask for it resolves to the ordinary free path | **An execution grant.** `canAccessAutomation` stays `false`; automation, live execution and broker execution stay OFF |
+| Disclosed read-only to the account as `entitlementGrant: { plan }` — the tier, and nothing else | **Reachable from HTTP.** No grant route, no admin role, no operator endpoint, no grant token. `DATABASE_URL` is the whole trust boundary |
+| Append-only with no revoke: a re-grant, a tier change or a mistake is a **manual review**, exactly like a mistaken activation fact | **A shortcut.** The payment rules are unchanged, evidence is still never authority, and an unpaid checkout still buys nothing on its own |
+
+### The entry point
+
+```bash
+# dry run by default: the whole operation is validated and NOTHING is written
+npm run billing:grant -- \
+  --user <email|uuid> --plan pro|premium --by <operator-id> --reason "<text>" --dry-run
+
+# a real run writes exactly one grant fact and its audit event, in one transaction
+npm run billing:grant -- \
+  --user owner@example.com --plan premium --by ops-owner-01 \
+  --reason "designated owner account: commercial benefit without a purchase"
+
+# a replay is safe and returns the existing fact
+npm run billing:grant -- --user owner@example.com --plan premium --by ops-owner-01 --reason "replay"
+```
+
+Exit codes: **0** dry run / recorded / replayed, **1** typed refusal (nothing
+written), **2** usage error. The only configuration is `DATABASE_URL`; the CLI
+reads no key and does not consult `PAYSTACK_MODE`, because a non-commercial
+grant belongs to no provider domain.
+
+Refusal reasons: `invalid_operator_input`, `invalid_input`, `user_not_found`,
+`forbidden_plan`, `grant_exists`, `would_narrow_paid_tier`, `grant_refused`.
+
+### The rules it encodes
+
+- **ONE GRANT PER ACCOUNT.** `user_id` is UNIQUE, so the read side never has to
+  rank competing grants and a re-grant is a replay, not a second row. A grant at
+  a **different** tier is refused (`grant_exists`) rather than silently handing
+  back the old tier.
+- **A GRANT MAY ONLY ADD, NEVER NARROW.** A grant confers its tier in
+  `resolveEntitlements` ahead of every paid rule, so a lower-tier grant on an
+  account that already holds a higher one would silently take an entitlement
+  away — irreversibly, since a grant is append-only. `grant()` therefore
+  refuses `would_narrow_paid_tier` when the account's **provisioned** tier
+  outranks the requested one, and writes nothing. The comparison runs through
+  the same `resolvePaidTier` the read path uses, so the guard can never
+  disagree with what a reader will see, and it is taken inside the transaction
+  after the account row is locked (and in the dry run too, so a dry run never
+  promises what a real run would refuse). An account with **no** subscription
+  row — the owner use case, and the normal state since Model C — resolves to
+  the free tier and is therefore never refused; nor is an unconfirmed
+  provider-backed checkout, which is a checkout rather than a purchase. A grant
+  that does not narrow is still refused by the append-only fact when the
+  account already holds a different grant (`grant_exists`), which is checked
+  first.
+- **OPERATOR IDENTITY AND REASON ARE RECORDED, NEVER INFERRED.** `operator_id`
+  and `grant_reason` are NOT NULL; a grant without a named operator and a stated
+  reason is unrepresentable, and credential-shaped text is refused by CHECK.
+- **SELLABLE COMMERCIAL TIERS ONLY.** `plan` is CHECK-constrained to `pro` and
+  `premium`. `starter` is refused for the same reason it is refused by checkout,
+  pricing, provisioning, activation and the portal: it has no enforced
+  entitlement tier, so granting it would hand out the free limits under a paid
+  name.
+- **IMMUTABLE + APPEND-ONLY.** Every UPDATE and every DELETE is refused by
+  trigger; a correction is a manual review, never a silent overwrite.
+- **DETERMINISTIC IDEMPOTENCY.** `idempotency_key` is the SHA-256 of a canonical
+  identity no client can supply (`grant kind | account | tier`) and is UNIQUE.
+- **STILL GATED BY THE LIFECYCLE.** A grant resolves through the existing
+  `getEntitlements(grantPlan, status)`, so an account whose authoritative status
+  does not carry a paid period still resolves to the free tier. A grant is not a
+  lifecycle.
+
+### Read side and disclosure
+
+`resolveEntitlements` takes the grant's OWN tier as a required fifth argument
+(`grantedPlan`), so a reader that forgets to ask passes `undefined`, which is not
+a plan, and therefore takes the ordinary free path. Every production reader
+selects it alongside `provider` and `activated`: `getBillingState`,
+`StrategyService`, `SetupService`, `AlertService`, `BacktestService`,
+ `ScannerService.getEligibleStrategies`, the three scanner route gates and
+`AutomationService.readState`.
+
+The paid half of that decision is `resolvePaidTier(plan, provider, activated)`,
+and `resolveEntitlements` is exactly `getEntitlements` of whichever tier it names
+(or of `grantedPlan`, when a grant exists). Splitting it out means the write
+path asks the read path's own question — "what does this account hold without a
+grant?" — instead of restating the provider/activation policy a second time.
+The grantable-tier vocabulary is likewise stated once, in
+`grantableEntitlementPlan` (`GRANTABLE_ENTITLEMENT_PLANS`): the read path
+narrows a stored tier with that helper, so a value the resolver would honour can
+never be silently undeclared and leave a granted account undisclosed.
+
+The locking readers keep their `SELECT … FROM subscriptions … FOR UPDATE` row
+lock untouched; the grant is a second, unique-index lookup against the account
+id, so no reader's transactional shape changed and an account with no
+subscription row still resolves its grant.
+
+`GET /api/billing/me` publishes `entitlementGrant: { plan } | null` — always
+present, so a client never has to tell "no grant" from "this build does not know
+about grants". The projection is `.strict()` and carries **no** operator
+identity, reason, id, idempotency key, kind, instant or payment field, and
+`SubscriptionPanel` renders one read-only notice stating the tier, that **no
+payment was made**, and that automation/live/broker execution stay off. It
+contains no button, link or action.
+
+The read-only billing overview (`GET /api/billing/portal`) is deliberately
+**unchanged**: a grant is not a subscription, so the overview keeps stating that
+nothing is owed and publishes `plan: null` for a granted account.
+
+### Boundaries this change did not cross
+
+- **No Paystack call of any kind, and no live plan registration.** No epoch, no
+  pricing snapshot, no FX version, no checkout, no evidence and no activation is
+  written. `billing:provision:live`, `billing:activate`, the webhook receiver,
+  the sync mapping, the pricing lock and the entitlement matrix are untouched.
+- **No change to `paymentConfirmed` derivation, `canAccessAutomation`, Gate 9,
+  B1, B2, the M10 transport, paper execution, MT5/Exness or any broker work.**
+- **Migrations 0001–0035 are byte-identical**; 0036 is additive and
+  forward-only (one table, its indexes, triggers and comments) and refuses to
+  apply (42704) without its foundations.
+- **No `render.yaml`/Vercel change, no deployment, no production credential, no
+  notification, no refund/proration/dunning, and no Starter selling.**
 
 ## Sandbox checkout surface (Billing Step 9)
 
