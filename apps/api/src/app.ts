@@ -15,6 +15,7 @@ import {
   createProviderRegistry,
   CandleStore,
   IngestionService,
+  ScheduledIngestionService,
   EvaluationService,
   SetupService,
   ScoringService,
@@ -96,6 +97,8 @@ export interface AppContext {
   providerRegistry: ProviderRegistry;
   candles: CandleStore;
   ingestion: IngestionService;
+  /** P1: scheduled/pre-emptive candle ingestion (cache warming before scans). */
+  scheduledIngestion: ScheduledIngestionService;
   evaluation: EvaluationService;
   setups: SetupService;
   scoring: ScoringService;
@@ -259,6 +262,19 @@ export function createAppContext(
   });
 
   const ingestion = new IngestionService(pool, providerRegistry, candles);
+  // P1 — scheduled/pre-emptive candle ingestion (cache warming).
+  const scheduledIngestion = new ScheduledIngestionService(pool, ingestion, {
+    lookbackCandles: config.scheduledIngestion.lookbackCandles,
+    logger: {
+      info: (msg, meta) => {
+        if (config.NODE_ENV === 'production') {
+          console.info(`[scheduled-ingestion] ${msg}`, meta ? JSON.stringify(meta) : '');
+        }
+      },
+      warn: (msg, meta) => console.warn(`[scheduled-ingestion] ${msg}`, meta ? JSON.stringify(meta) : ''),
+      error: (msg, meta) => console.error(`[scheduled-ingestion] ${msg}`, meta ? JSON.stringify(meta) : ''),
+    },
+  });
   const backtests = new BacktestService(pool, strategies, candles);
   const alerts = new AlertService(pool, strategies, new StubAlertSender(), notifications, preferences);
   const scoring = new ScoringService(pool, strategies, evaluation);
@@ -483,6 +499,7 @@ export function createAppContext(
     providerRegistry,
     candles,
     ingestion,
+    scheduledIngestion,
     evaluation,
     // M4: consumes the M3 evaluation service; writes setups + state events,
     // never scores, never providers.
