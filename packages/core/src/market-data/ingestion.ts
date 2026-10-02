@@ -316,7 +316,7 @@ export function missingRanges(
 ): [number, number][] {
   if (earliest === null || latest === null) return [[from, to]];
   const ranges: [number, number][] = [];
-  if (from < earliest) ranges.push([from, earliest]);
+  if (from + periodMs <= earliest) ranges.push([from, earliest]);
   if (latest + periodMs < to) ranges.push([latest, to]);
   return ranges;
 }

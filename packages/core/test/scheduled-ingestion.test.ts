@@ -209,6 +209,8 @@ describe('ScheduledIngestionService', () => {
   });
 
   test('warmCache handles missing provider gracefully (never throws)', async () => {
+    await pool.query('DELETE FROM candles');
+
     // Create a scheduled ingestion with a registry that has no provider
     const emptyRegistry = createProviderRegistry();
     const emptyIngestion = new IngestionService(pool, emptyRegistry, candleStore);
