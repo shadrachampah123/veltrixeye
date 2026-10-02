@@ -753,11 +753,11 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     assert.deepEqual(offenders, [], 'every reader goes through resolveEntitlements');
   });
 
-  it('adds 0034 (the activation-fact ledger), 0035 (live-mode widening) and 0036 (non-commercial grants), leaving 0001–0033 untouched', () => {
+  it('adds 0034 (the activation-fact ledger), 0035 (live-mode widening), 0036 (non-commercial grants) and 0037 (scheduled ingestion trigger), leaving 0001–0033 untouched', () => {
     const files = readdirSync(MIGRATIONS_DIR).sort();
-    assert.equal(files.length, 36, `unexpected migration set: ${files.join(', ')}`);
+    assert.equal(files.length, 37, `unexpected migration set: ${files.join(', ')}`);
     assert.equal(files[0], '0001_identity_and_audit.sql');
-    assert.equal(files[files.length - 1], '0036_billing_entitlement_grants.sql');
+    assert.equal(files[files.length - 1], '0037_scheduled_ingestion_trigger.sql');
   });
 
   it('leaves the checkout INSERT shape and the pricing lock untouched', () => {

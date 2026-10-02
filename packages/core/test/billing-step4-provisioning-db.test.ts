@@ -509,8 +509,8 @@ describe('Step 4 — H. migration compatibility', () => {
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((file) => file.endsWith('.sql'))
       .sort();
-    assert.equal(files.length, 36, 'no migration was added or removed by Step 4 beyond Step 8 (0034), 0035 (live mode) and 0036 (non-commercial grants)');
-    assert.equal(files.at(-1), '0036_billing_entitlement_grants.sql', '0036 is the newest migration (non-commercial operator grants)');
+    assert.equal(files.length, 37, 'no migration was added or removed by Step 4 beyond Step 8 (0034), 0035 (live mode), 0036 (non-commercial grants) and 0037 (scheduled ingestion trigger)');
+    assert.equal(files.at(-1), '0037_scheduled_ingestion_trigger.sql', '0037 is the newest migration (scheduled ingestion trigger)');
     for (const [file, sha] of Object.entries(EXPECTED)) {
       const digest = createHash('sha256').update(readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8')).digest('hex');
       assert.equal(digest, sha, `${file} is byte-identical to its pinned bytes`);

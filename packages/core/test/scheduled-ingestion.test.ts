@@ -25,8 +25,8 @@ import {
   ScheduledIngestionService,
 } from '../src/index.js';
 
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const DB_PORT = 5444;
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+const DB_PORT = 5547;
 const DB_USER = 'test';
 const DB_PASSWORD = randomBytes(16).toString('hex');
 const DB_NAME = 'veltrixeye_test_scheduled_ingestion';

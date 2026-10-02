@@ -316,12 +316,14 @@ describe('Billing PR3 — 0032 file conventions and history integrity', () => {
     assert.equal(files.filter((file) => file.startsWith('0034_')).length, 1, 'exactly one 0034 migration (Step 8)');
     assert.equal(files.filter((file) => file.startsWith('0035_')).length, 1, 'exactly one 0035 migration (live mode)');
     // 0035 is the newest migration OF THIS STEP; 0036 (non-commercial operator
-    // grants) is a later migration and is named here deliberately.
+    // grants) and 0037 (scheduled ingestion trigger) are later migrations and
+    // are named here deliberately.
     assert.equal(files.filter((file) => file.startsWith('0036_')).length, 1, 'exactly one 0036 migration (non-commercial grants)');
+    assert.equal(files.filter((file) => file.startsWith('0037_')).length, 1, 'exactly one 0037 migration (scheduled ingestion trigger)');
     assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 36).length,
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 37).length,
       0,
-      'nothing is numbered after 0035',
+      'nothing is numbered after 0037',
     );
   });
 
