@@ -436,11 +436,12 @@ describe('M7.5: Scanner API', () => {
 describe('F3: Internal scanner worker endpoints & ticker', () => {
   const WORKER_TOKEN = 'test-scanner-worker-token-secret-999';
 
-  async function buildWorkerApp(token: string) {
+  async function buildWorkerApp(token: string, scheduledIngestionEnabled = false) {
     const config = makeConfig({
       DATABASE_URL: dbUrl,
       SCANNER_WORKER_TOKEN: token,
       SCANNER_LEASE_MS: '600000',
+      INGESTION_SCHEDULE_ENABLED: scheduledIngestionEnabled ? 'true' : 'false',
     });
     const localCtx = createAppContext(pool, config);
     localCtx.providerRegistry.register(new MockProvider());
@@ -619,6 +620,114 @@ describe('F3: Internal scanner worker endpoints & ticker', () => {
       assert.equal(maintBody.recovered, 0);
       assert.equal(maintBody.activeRuns, 0);
     } finally {
+      await workerApp.close();
+    }
+  });
+
+  test('internal scanner run warms cache before the shared scan cycle when scheduled ingestion is enabled', async () => {
+    const { app: workerApp, ctx: workerCtx } = await buildWorkerApp(WORKER_TOKEN, true);
+    const calls: string[] = [];
+    workerCtx.scheduledIngestion.warmCache = async () => {
+      calls.push('warmCache');
+      return {
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        instrumentsProcessed: 0,
+        timeframesProcessed: 0,
+        pairsCompleted: 0,
+        pairsFailed: 0,
+        candlesUpserted: 0,
+        pairsAlreadyCached: 0,
+      };
+    };
+    workerCtx.scanner.runWorkerOnce = async (args) => {
+      calls.push('runWorkerOnce');
+      assert.deepEqual(args, { force: true, leaseMs: 600_000 });
+      return { run: null, skipped: true, reason: 'already_running', recovered: 0 };
+    };
+
+    try {
+      const res = await workerApp.inject({
+        method: 'POST',
+        url: '/api/internal/scanner/run',
+        headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+        payload: { force: true, leaseMs: 600_000 },
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      assert.deepEqual(calls, ['warmCache', 'runWorkerOnce']);
+      assert.equal(res.json().skipped, true);
+    } finally {
+      await workerApp.close();
+    }
+  });
+
+  test('internal scanner run skips cache warming when scheduled ingestion is disabled', async () => {
+    const { app: workerApp, ctx: workerCtx } = await buildWorkerApp(WORKER_TOKEN, false);
+    const calls: string[] = [];
+    workerCtx.scheduledIngestion.warmCache = async () => {
+      calls.push('warmCache');
+      return {
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        instrumentsProcessed: 0,
+        timeframesProcessed: 0,
+        pairsCompleted: 0,
+        pairsFailed: 0,
+        candlesUpserted: 0,
+        pairsAlreadyCached: 0,
+      };
+    };
+    workerCtx.scanner.runWorkerOnce = async (args) => {
+      calls.push('runWorkerOnce');
+      assert.deepEqual(args, { force: false, leaseMs: 600_000 });
+      return { run: null, skipped: true, reason: 'already_running', recovered: 0 };
+    };
+
+    try {
+      const res = await workerApp.inject({
+        method: 'POST',
+        url: '/api/internal/scanner/run',
+        headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+        payload: { force: false },
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      assert.deepEqual(calls, ['runWorkerOnce']);
+    } finally {
+      await workerApp.close();
+    }
+  });
+
+  test('internal scanner run logs cache-warm failure and continues with scanner execution', async () => {
+    const { app: workerApp, ctx: workerCtx } = await buildWorkerApp(WORKER_TOKEN, true);
+    const calls: string[] = [];
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: Parameters<typeof console.warn>) => {
+      warnings.push(args.map((arg) => String(arg)).join(' '));
+    };
+    workerCtx.scheduledIngestion.warmCache = async () => {
+      calls.push('warmCache');
+      throw new Error('synthetic cache warm failure');
+    };
+    workerCtx.scanner.runWorkerOnce = async (args) => {
+      calls.push('runWorkerOnce');
+      assert.deepEqual(args, { force: true, leaseMs: 600_000 });
+      return { run: null, skipped: true, reason: 'already_running', recovered: 0 };
+    };
+
+    try {
+      const res = await workerApp.inject({
+        method: 'POST',
+        url: '/api/internal/scanner/run',
+        headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+        payload: { force: true },
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      assert.deepEqual(calls, ['warmCache', 'runWorkerOnce']);
+      assert.match(warnings.join('\n'), /scheduled ingestion: cache warm failed \(scan continues\)/);
+      assert.match(warnings.join('\n'), /synthetic cache warm failure/);
+    } finally {
+      console.warn = originalWarn;
       await workerApp.close();
     }
   });

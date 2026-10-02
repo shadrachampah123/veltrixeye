@@ -12,6 +12,7 @@ import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
 import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js';
+import { consoleScannerLogger, runScannerWorkerCycle } from '../scanner-worker.js';
 
 /**
  * Scanner routes (M7.5 / F3) — live scanner / production market flow.
@@ -239,9 +240,15 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       return;
     }
 
-    const result = await ctx.scanner.runWorkerOnce({
-      force: parsed.data.force,
-      leaseMs: parsed.data.leaseMs ?? config.scanner.leaseMs,
+    const result = await runScannerWorkerCycle(ctx.scanner, {
+      runArgs: {
+        force: parsed.data.force,
+        leaseMs: parsed.data.leaseMs ?? config.scanner.leaseMs,
+      },
+      scheduledIngestion: config.scheduledIngestion.enabled
+        ? ctx.scheduledIngestion
+        : undefined,
+      logger: consoleScannerLogger('[scanner]'),
     });
     return reply.code(200).send(result);
   });

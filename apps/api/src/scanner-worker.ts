@@ -59,6 +59,19 @@ export interface ScheduledIngestionTarget {
   }>;
 }
 
+export interface ScannerWorkerCycleOptions {
+  /** Arguments forwarded to `runWorkerOnce` without changing their shape. */
+  runArgs?: {
+    force?: boolean;
+    leaseMs?: number;
+    nowMs?: number;
+  };
+  /** Optional cache-warm target run before the scan. */
+  scheduledIngestion?: ScheduledIngestionTarget;
+  logger?: ScannerLogger;
+  redact?: (text: string) => string;
+}
+
 export interface ScannerWorkerTickerOptions {
   intervalMs: number;
   leaseMs?: number;
@@ -86,6 +99,57 @@ const NOOP_LOGGER: ScannerLogger = {
   error: () => {},
 };
 
+/** Run the shared cache-warm + scanner invocation cycle used by the ticker and internal route. */
+export async function runScannerWorkerCycle(
+  scanner: ScannerWorkerTarget,
+  options: ScannerWorkerCycleOptions = {},
+): Promise<ScannerInternalRunResponse> {
+  const logger = options.logger ?? NOOP_LOGGER;
+
+  // P1: warm candle cache before the scan cycle. A warm failure must not block
+  // scanner execution, but should remain visible to operators.
+  if (options.scheduledIngestion) {
+    try {
+      const warmResult = await options.scheduledIngestion.warmCache();
+      if (warmResult.pairsCompleted > 0 || warmResult.pairsFailed > 0) {
+        logger.info('scheduled ingestion: cache warm complete', {
+          instrumentsProcessed: warmResult.instrumentsProcessed,
+          pairsCompleted: warmResult.pairsCompleted,
+          pairsFailed: warmResult.pairsFailed,
+          pairsAlreadyCached: warmResult.pairsAlreadyCached,
+          candlesUpserted: warmResult.candlesUpserted,
+        });
+      }
+    } catch (err) {
+      logger.warn('scheduled ingestion: cache warm failed (scan continues)', {
+        error: sanitizeScannerError(err, options.redact),
+      });
+    }
+  }
+
+  const result = await scanner.runWorkerOnce(options.runArgs);
+  if (!result.skipped && result.run) {
+    logger.info('scanner worker run', {
+      runId: result.run.id,
+      status: result.run.status,
+      strategiesScanned: result.run.strategiesScanned,
+      instrumentsScanned: result.run.instrumentsScanned,
+      setupsDetected: result.run.setupsDetected,
+      alertsCreated: result.run.alertsCreated,
+      staleRejections: result.run.staleRejections,
+      providerFailures: result.run.providerFailures,
+      recovered: result.recovered,
+    });
+  } else if (result.recovered > 0) {
+    logger.info('scanner worker recovery', {
+      recovered: result.recovered,
+      skipped: result.skipped,
+      reason: result.reason ?? null,
+    });
+  }
+  return result;
+}
+
 export function startScannerWorkerTicker(
   scanner: ScannerWorkerTarget,
   options: ScannerWorkerTickerOptions,
@@ -99,8 +163,6 @@ export function startScannerWorkerTicker(
   let stopped = false;
   let inFlight: Promise<void> | null = null;
   let runs = 0;
-
-  const scheduledIngestion = options.scheduledIngestion;
 
   const runOnce = async (): Promise<void> => {
     if (stopped) return;
@@ -122,50 +184,12 @@ export function startScannerWorkerTicker(
             });
           }
         }
-        // P1: warm candle cache before the scan cycle.
-        // This pre-fetches candles for the active universe so the scanner's
-        // fetch-through reads become pure cache hits during the scan.
-        // Never blocks the scan on failure — logs and continues.
-        if (scheduledIngestion) {
-          try {
-            const warmResult = await scheduledIngestion.warmCache();
-            if (warmResult.pairsCompleted > 0 || warmResult.pairsFailed > 0) {
-              logger.info('scheduled ingestion: cache warm complete', {
-                instrumentsProcessed: warmResult.instrumentsProcessed,
-                pairsCompleted: warmResult.pairsCompleted,
-                pairsFailed: warmResult.pairsFailed,
-                pairsAlreadyCached: warmResult.pairsAlreadyCached,
-                candlesUpserted: warmResult.candlesUpserted,
-              });
-            }
-          } catch (err) {
-            logger.warn('scheduled ingestion: cache warm failed (scan continues)', {
-              error: sanitizeScannerError(err, options.redact),
-            });
-          }
-        }
-        const result = await scanner.runWorkerOnce(
-          options.leaseMs !== undefined ? { leaseMs: options.leaseMs } : undefined,
-        );
-        if (!result.skipped && result.run) {
-          logger.info('scanner worker run', {
-            runId: result.run.id,
-            status: result.run.status,
-            strategiesScanned: result.run.strategiesScanned,
-            instrumentsScanned: result.run.instrumentsScanned,
-            setupsDetected: result.run.setupsDetected,
-            alertsCreated: result.run.alertsCreated,
-            staleRejections: result.run.staleRejections,
-            providerFailures: result.run.providerFailures,
-            recovered: result.recovered,
-          });
-        } else if (result.recovered > 0) {
-          logger.info('scanner worker recovery', {
-            recovered: result.recovered,
-            skipped: result.skipped,
-            reason: result.reason ?? null,
-          });
-        }
+        await runScannerWorkerCycle(scanner, {
+          runArgs: options.leaseMs !== undefined ? { leaseMs: options.leaseMs } : undefined,
+          scheduledIngestion: options.scheduledIngestion,
+          logger,
+          redact: options.redact,
+        });
       } catch (err) {
         logger.error('scanner worker tick failed', {
           error: sanitizeScannerError(err, options.redact),
