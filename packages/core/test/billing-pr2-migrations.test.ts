@@ -56,6 +56,7 @@ const RECORDED_SHA256: Readonly<Record<string, string>> = Object.freeze({
 const LATER_MIGRATIONS = [
   '0032_billing_fx_and_pricing.sql', '0033_billing_payment_evidence.sql', '0034_billing_activation.sql',
   '0035_billing_live_mode.sql', '0036_billing_entitlement_grants.sql',
+  '0037_scheduled_ingestion_trigger.sql',
 ] as const;
 /** Columns `subscriptions` had before 0031 (migration 0014). */
 const SUBSCRIPTION_COLUMNS_0014 = [

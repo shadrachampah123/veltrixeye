@@ -272,6 +272,28 @@ interface ScanMetrics {
   errors: string[];
 }
 
+/**
+ * P2 — per-scan-cycle candle cache.
+ *
+ * When multiple strategies share the same instrument × timeframe (common:
+ * EURUSD/4h used by both strategy A's HTF bias and strategy B's setup),
+ * the scanner fetches the same candles multiple times. This cache deduplicates
+ * those fetches within a single scan cycle: the first request does the full
+ * fetch-through, subsequent requests for the same key get the cached result.
+ *
+ * The cache is scoped to one scan cycle (created in `executeScan`, discarded
+ * after it completes) so it never serves stale data across cycles.
+ */
+type ScanCycleCacheKey = string; // `${assetClass}/${symbol}/${timeframe}`
+interface CachedCandleBatch {
+  candles: { time: number; open: number; high: number; low: number; close: number; volume: number | null }[];
+}
+type ScanCycleCache = Map<ScanCycleCacheKey, CachedCandleBatch>;
+
+function makeCacheKey(assetClass: string, symbol: string, timeframe: string): ScanCycleCacheKey {
+  return `${assetClass}/${symbol}/${timeframe}`;
+}
+
 export class ScannerService {
   private readonly providerTimeoutMs: number;
   private readonly maxRetries: number;
@@ -686,9 +708,13 @@ export class ScannerService {
       const strategiesToScan = eligibleStrategies.slice(0, SCANNER_MAX_STRATEGIES_PER_RUN);
       metrics.strategiesScanned = strategiesToScan.length;
 
+      // P2: per-cycle candle cache — deduplicates identical instrument×timeframe
+      // fetches across strategies within this scan cycle.
+      const cycleCache: ScanCycleCache = new Map();
+
       for (const strategy of strategiesToScan) {
         try {
-          await this.scanStrategy(strategy, args, nowMs, metrics);
+          await this.scanStrategy(strategy, args, nowMs, metrics, cycleCache);
         } catch (err) {
           const safeMsg = sanitizeScannerError(err, this.redact);
           metrics.errors.push(`strategy ${strategy.strategyId}: ${safeMsg}`);
@@ -741,6 +767,7 @@ export class ScannerService {
     args: ScanTriggerArgs,
     nowMs: number,
     metrics: ScanMetrics,
+    cycleCache: ScanCycleCache,
   ): Promise<void> {
     // Resolve instruments for this strategy
     const instruments = await this.resolveInstrumentsForStrategy(strategy, args.instruments);
@@ -748,7 +775,7 @@ export class ScannerService {
 
     for (const inst of limitedInstruments) {
       try {
-        await this.scanInstrument(strategy, inst, args, nowMs, metrics);
+        await this.scanInstrument(strategy, inst, args, nowMs, metrics, cycleCache);
       } catch (err) {
         const safeMsg = sanitizeScannerError(err, this.redact);
         // Don't fail whole strategy for one instrument failure
@@ -771,6 +798,7 @@ export class ScannerService {
     args: ScanTriggerArgs,
     nowMs: number,
     metrics: ScanMetrics,
+    cycleCache: ScanCycleCache,
   ): Promise<void> {
     const { htf_bias, setup, entry } = strategy.timeframes;
 
@@ -792,7 +820,8 @@ export class ScannerService {
       }
     }
 
-    // Fetch candles for each timeframe with retry/backoff and validation
+    // Fetch candles for each timeframe with retry/backoff and validation.
+    // P2: pass the per-cycle cache to deduplicate identical fetches across strategies.
     const htfCandles = await this.fetchValidatedCandles({
       assetClass: instrument.assetClass,
       symbol: instrument.symbol,
@@ -800,6 +829,7 @@ export class ScannerService {
       nowMs,
       instrumentId: instrument.instrumentId,
       metrics,
+      cycleCache,
     });
 
     const setupCandles = await this.fetchValidatedCandles({
@@ -809,6 +839,7 @@ export class ScannerService {
       nowMs,
       instrumentId: instrument.instrumentId,
       metrics,
+      cycleCache,
     });
 
     const entryCandles = await this.fetchValidatedCandles({
@@ -818,6 +849,7 @@ export class ScannerService {
       nowMs,
       instrumentId: instrument.instrumentId,
       metrics,
+      cycleCache,
     });
 
     metrics.instrumentsScanned += 1;
@@ -1001,6 +1033,8 @@ export class ScannerService {
     nowMs: number;
     instrumentId: string;
     metrics: ScanMetrics;
+    /** P2: per-cycle cache to deduplicate identical fetches across strategies. */
+    cycleCache?: ScanCycleCache;
   }): Promise<{ time: number; open: number; high: number; low: number; close: number; volume: number | null }[]> {
     const periodMs = timeframeMinutes(args.timeframe) * 60_000;
     // Request last N candles covering required windows
@@ -1008,6 +1042,16 @@ export class ScannerService {
     const windowCandles = 500;
     const from = args.nowMs - windowCandles * periodMs;
     const to = args.nowMs;
+
+    // P2: check per-cycle cache first. If another strategy already fetched this
+    // exact instrument × timeframe in this scan cycle, reuse the result.
+    if (args.cycleCache) {
+      const cacheKey = makeCacheKey(args.assetClass, args.symbol, args.timeframe);
+      const cached = args.cycleCache.get(cacheKey);
+      if (cached) {
+        return cached.candles;
+      }
+    }
 
     let lastError: unknown = null;
 
@@ -1087,6 +1131,13 @@ export class ScannerService {
         }
 
         args.metrics.candlesFetched += normalized.length;
+
+        // P2: store in per-cycle cache for subsequent strategies in this scan.
+        if (args.cycleCache) {
+          const cacheKey = makeCacheKey(args.assetClass, args.symbol, args.timeframe);
+          args.cycleCache.set(cacheKey, { candles: normalized });
+        }
+
         return normalized;
       } catch (err) {
         lastError = err;

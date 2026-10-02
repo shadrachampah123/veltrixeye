@@ -51,7 +51,7 @@ export const MAX_BACKFILL_CANDLES = 50_000;
 /** Max instruments per backfill request (the M2 universe is 8). */
 export const MAX_BACKFILL_INSTRUMENTS = 8;
 
-export const INGESTION_TRIGGERS = ['fetch_through', 'backfill'] as const;
+export const INGESTION_TRIGGERS = ['fetch_through', 'backfill', 'scheduled'] as const;
 export type IngestionTrigger = (typeof INGESTION_TRIGGERS)[number];
 
 export const INGESTION_STATUSES = ['running', 'completed', 'failed', 'partial'] as const;

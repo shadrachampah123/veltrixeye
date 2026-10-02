@@ -145,9 +145,9 @@ const auditRows = async (userId: string) =>
 describe('0036 — the grant fact table', () => {
   it('is applied and is the newest migration of this change', async () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
-    assert.equal(status.expectedCount, 36);
-    assert.equal(status.appliedCount, 36);
-    assert.equal(status.latestApplied, '0036_billing_entitlement_grants.sql');
+    assert.equal(status.expectedCount, 37);
+    assert.equal(status.appliedCount, 37);
+    assert.equal(status.latestApplied, '0037_scheduled_ingestion_trigger.sql');
     assert.equal(status.checksumsMatch, true);
   });
 
@@ -289,8 +289,8 @@ describe('0036 — the grant fact table', () => {
         const full = await migrationStatus(upgrade, MIGRATIONS_DIR);
         assert.equal(status.expectedCount, 35, 'the base file set is exactly 0001-0035');
         assert.equal(status.pending.length, 0, 'the base set is fully applied');
-        assert.equal(full.appliedCount, 36, 'the upgraded database matches the full set');
-        assert.equal(full.pending.length, 0);
+        assert.equal(full.appliedCount, 36, 'the upgrade path ends at 0036, this step’s tip');
+        assert.deepEqual(full.pending, ['0037_scheduled_ingestion_trigger.sql']);
         assert.equal(full.latestApplied, '0036_billing_entitlement_grants.sql');
         assert.equal(full.checksumsMatch, true, '0001-0035 are byte-identical after the upgrade');
       } finally {
@@ -309,13 +309,17 @@ describe('0036 — the grant fact table', () => {
     // still verifies every historical file. What this catches is a migration
     // set that drifted rather than grew.
     const files = readdirSync(MIGRATIONS_DIR).filter((file) => file.endsWith('.sql')).sort();
-    assert.equal(files.length, 36);
+    assert.equal(files.length, 37);
     const versions = files.map((file) => Number(/^(\d{4})_/.exec(file)![1]));
     assert.equal(new Set(versions).size, versions.length, 'no duplicate migration version');
-    for (let expected = 1; expected <= 36; expected += 1) {
+    for (let expected = 1; expected <= 37; expected += 1) {
       assert.ok(versions.includes(expected), `migration ${String(expected).padStart(4, '0')} exists`);
     }
-    assert.equal(files.at(-1), '0036_billing_entitlement_grants.sql');
+    assert.equal(
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)![1]) <= 36).at(-1),
+      '0036_billing_entitlement_grants.sql',
+    );
+    assert.equal(files.at(-1), '0037_scheduled_ingestion_trigger.sql');
   });
 });
 

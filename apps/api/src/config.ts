@@ -243,6 +243,19 @@ const baseEnvSchema = z.object({
   SCANNER_WORKER_TOKEN: z.string().max(256).default(''),
 
   /* ---------------------------------------------------------------------- */
+  /* P1 — scheduled / pre-emptive candle ingestion                           */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Run a cache-warm cycle before each scanner tick: pre-fetch candles for
+   * the active instrument universe so the scanner's fetch-through reads
+   * become pure cache hits. Disabled by default (fetch-through alone works).
+   */
+  INGESTION_SCHEDULE_ENABLED: boolEnv(false),
+  /** Max candles per instrument × timeframe per warm cycle (bounds credits). */
+  INGESTION_LOOKBACK_CANDLES: intEnv(50, 5000, 500),
+
+  /* ---------------------------------------------------------------------- */
   /* M8.6 — kill-switch & safety controls                                      */
   /* ---------------------------------------------------------------------- */
 
@@ -450,6 +463,21 @@ export interface ScannerConfig {
 }
 
 /**
+ * P1 — Scheduled/pre-emptive candle ingestion.
+ *
+ * When enabled, the scanner worker runs a cache-warm cycle before each scan,
+ * pre-fetching candles for the active universe so the scanner's fetch-through
+ * reads become pure cache hits (zero provider calls during the scan itself
+ * for already-cached ranges).
+ */
+export interface ScheduledIngestionConfig {
+  /** Enable scheduled ingestion before each scanner cycle. */
+  enabled: boolean;
+  /** Max candles to fetch per instrument × timeframe per warm cycle. */
+  lookbackCandles: number;
+}
+
+/**
  * Validated environment plus the derived values the app needs at boot.
  * `trustedProxies` is `TRUSTED_PROXY_CIDRS` parsed, validated and normalised
  * (see apps/api/src/trust-proxy.ts) — the list handed to Fastify's
@@ -462,6 +490,7 @@ export type AppConfig = z.infer<typeof envSchema> & {
   trustedProxies: string[];
   notification: NotificationConfig;
   scanner: ScannerConfig;
+  scheduledIngestion: ScheduledIngestionConfig;
   billing: BillingConfig;
 };
 
@@ -552,6 +581,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       retryMaxMs: values.SCANNER_RETRY_MAX_MS,
       leaseMs: values.SCANNER_LEASE_MS,
       workerToken: values.SCANNER_WORKER_TOKEN,
+    },
+    scheduledIngestion: {
+      enabled: values.INGESTION_SCHEDULE_ENABLED,
+      lookbackCandles: values.INGESTION_LOOKBACK_CANDLES,
     },
     billing: {
       provider: 'paystack',

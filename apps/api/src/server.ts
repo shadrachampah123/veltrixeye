@@ -157,9 +157,16 @@ async function main(): Promise<void> {
       leaseMs: config.scanner.leaseMs,
       initialDelayMs: 10_000,
       logger: consoleScannerLogger('[scanner]'),
+      // P1: scheduled ingestion warms the candle cache before each scan cycle.
+      scheduledIngestion: config.scheduledIngestion.enabled
+        ? ctx.scheduledIngestion
+        : undefined,
     });
     console.info(
-      `[api] live scanner enabled (every ${config.scanner.intervalMs}ms, lease ${config.scanner.leaseMs}ms)`,
+      `[api] live scanner enabled (every ${config.scanner.intervalMs}ms, lease ${config.scanner.leaseMs}ms)` +
+        (config.scheduledIngestion.enabled
+          ? ', scheduled ingestion warm enabled'
+          : ', scheduled ingestion disabled (INGESTION_SCHEDULE_ENABLED=false)'),
     );
   } else {
     console.info(

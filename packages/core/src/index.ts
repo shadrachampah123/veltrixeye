@@ -82,6 +82,15 @@ export {
   type BackfillRequest as IngestionBackfillRequest,
   type CandleReadRequest,
 } from './market-data/ingestion.js';
+export {
+  ScheduledIngestionService,
+  DEFAULT_SCHEDULED_TIMEFRAMES,
+  DEFAULT_SCHEDULED_LOOKBACK_CANDLES,
+  MAX_SCHEDULED_INSTRUMENTS,
+  type ScheduledIngestionResult,
+  type ScheduledIngestionOptions,
+  type ScheduledIngestionLogger,
+} from './market-data/scheduled.js';
 
 // Setup detection + lifecycle (M4)
 export { SetupService } from './setups/service.js';

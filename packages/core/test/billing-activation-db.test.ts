@@ -135,24 +135,26 @@ describe('Step 8 — 0034 file conventions and history integrity', () => {
 
     const versions = files.map((file) => Number(/^(\d{4})_/.exec(file)?.[1]));
     assert.equal(new Set(versions).size, versions.length, 'no duplicate migration version');
-    for (let expected = 1; expected <= 36; expected += 1) {
+    for (let expected = 1; expected <= 37; expected += 1) {
       assert.ok(versions.includes(expected), `migration ${String(expected).padStart(4, '0')} exists`);
     }
     assert.equal(files.filter((file) => file.startsWith('0034_')).length, 1, 'exactly one 0034 migration');
     assert.equal(files.filter((file) => file.startsWith('0035_')).length, 1, 'exactly one 0035 migration (live mode)');
-    // 0034 is the newest migration OF THIS STEP. 0035 (live-mode widening) and
-    // 0036 (non-commercial operator grants) are later migrations and are named
-    // here deliberately, so "nothing unexpected follows 0034" stays a real
-    // assertion rather than a silently drifting tip.
+    // 0034 is the newest migration OF THIS STEP. 0035 (live-mode widening),
+    // 0036 (non-commercial operator grants) and 0037 (scheduled ingestion
+    // trigger) are later migrations and are named here deliberately, so
+    // "nothing unexpected follows 0034" stays a real assertion rather than a
+    // silently drifting tip.
     assert.ok(
       files.includes('0035_billing_live_mode.sql') &&
-        files.includes('0036_billing_entitlement_grants.sql'),
+        files.includes('0036_billing_entitlement_grants.sql') &&
+        files.includes('0037_scheduled_ingestion_trigger.sql'),
       'the migrations that legitimately follow 0034 are the recorded ones',
     );
     assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 36).length,
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 37).length,
       0,
-      'nothing is numbered after 0035',
+      'nothing is numbered after 0037',
     );
   });
 
