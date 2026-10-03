@@ -27,7 +27,9 @@ import type { IngestionService } from './ingestion.js';
  *    which triggers fetch-through for any missing head/tail ranges.
  *  - Bounded: lookback is limited to a configurable number of candles per
  *    timeframe (default 500, enough for scanner evaluation windows), and runs
- *    respect a minimum interval since the last completed scheduled cycle.
+ *    respect a minimum interval since the last scheduled warm-cycle attempt —
+ *    failed and partial attempts included, so a broken provider or an
+ *    exhausted budget cannot be retried on every scanner tick.
  *  - Retention-aware: ranges are clamped to the retention cutoff.
  *  - Never throws: individual pair failures are logged and the rest continue
  *    — except a provider rate limit or an exhausted request budget, which
@@ -40,7 +42,7 @@ export interface ScheduledIngestionOptions {
   lookbackCandles?: number;
   /** Maximum actual provider requests allowed in one warm cycle. */
   maxRequestsPerCycle?: number;
-  /** Minimum time between completed scheduled runs. */
+  /** Minimum time between scheduled warm-cycle attempts (any outcome). */
   minIntervalMs?: number;
   /** Override for "now" (tests). */
   nowMs?: number;
@@ -161,35 +163,43 @@ export class ScheduledIngestionService {
   }
 
   /**
-   * Most recent completed scheduled run's persisted finish time, in epoch ms.
-   * Failed, partial, and in-progress runs do not delay the next cycle.
+   * End time of the most recent scheduled warm-cycle attempt, in epoch ms —
+   * whatever its outcome (completed, partial, failed).
+   *
+   * The cooldown is measured from the last *attempt*, not the last success:
+   * a failed or partial cycle still spent provider requests, so re-running it
+   * on the next scanner tick would burn credits against the same broken
+   * state. A run row that never finished (still `running`, e.g. left behind by
+   * a killed process) counts at its start time, which is the conservative
+   * reading of "when the attempt happened".
+   *
+   * Returns null only when no scheduled run has ever been recorded.
    */
-  async lastScheduledRunFinishedAtMs(queryable: MarketDataQueryable = this.pool): Promise<number | null> {
-    const res = await queryable.query<{ finished_at: Date | string | null }>(
-      `SELECT finished_at
+  async lastScheduledRunAttemptAtMs(queryable: MarketDataQueryable = this.pool): Promise<number | null> {
+    const res = await queryable.query<{ attempted_at: Date | string | null }>(
+      `SELECT COALESCE(finished_at, started_at) AS attempted_at
          FROM ingestion_runs
         WHERE trigger = 'scheduled'
-          AND status = 'completed'
-          AND finished_at IS NOT NULL
-        ORDER BY finished_at DESC
+        ORDER BY COALESCE(finished_at, started_at) DESC
         LIMIT 1`,
     );
-    const finishedAt = res.rows[0]?.finished_at;
-    if (finishedAt == null) return null;
+    const attemptedAt = res.rows[0]?.attempted_at;
+    if (attemptedAt == null) return null;
 
-    const finishedAtMs = finishedAt instanceof Date ? finishedAt.getTime() : Date.parse(finishedAt);
-    if (!Number.isFinite(finishedAtMs)) {
-      throw new Error('Last completed scheduled ingestion run has an invalid finished_at timestamp.');
+    const attemptedAtMs = attemptedAt instanceof Date ? attemptedAt.getTime() : Date.parse(attemptedAt);
+    if (!Number.isFinite(attemptedAtMs)) {
+      throw new Error('Most recent scheduled ingestion attempt has an invalid timestamp.');
     }
-    return finishedAtMs;
+    return attemptedAtMs;
   }
 
   /**
    * Warm the candle cache for the active instrument universe.
    *
    * Safe to call even when no provider is registered — all pairs will fail
-   * gracefully and the result will report zero upserts. A recent completed run
-   * (or an unreadable prior-run state) skips this cycle without recording a run.
+   * gracefully and the result will report zero upserts. A recent scheduled
+   * attempt (or an unreadable prior-run state) skips this cycle without
+   * recording a run.
    *
    * Never throws: individual pair failures are caught and logged. A provider
    * rate limit or exhausted request budget stops the cycle immediately
@@ -291,9 +301,9 @@ export class ScheduledIngestionService {
     const nowMs = args?.nowMs ?? Date.now();
     const startedAt = new Date(nowMs).toISOString();
 
-    let lastRunFinishedAtMs: number | null;
+    let lastAttemptAtMs: number | null;
     try {
-      lastRunFinishedAtMs = await this.lastScheduledRunFinishedAtMs(lockClient);
+      lastAttemptAtMs = await this.lastScheduledRunAttemptAtMs(lockClient);
     } catch (err) {
       this.logger.error('scheduled ingestion: failed to read prior run state; skipping cycle', {
         error: err instanceof Error ? err.message : 'unknown',
@@ -303,11 +313,11 @@ export class ScheduledIngestionService {
 
     if (
       this.minIntervalMs > 0 &&
-      lastRunFinishedAtMs !== null &&
-      nowMs - lastRunFinishedAtMs < this.minIntervalMs
+      lastAttemptAtMs !== null &&
+      nowMs - lastAttemptAtMs < this.minIntervalMs
     ) {
       this.logger.info('scheduled ingestion: skipping cycle because minimum interval has not elapsed', {
-        lastScheduledRunFinishedAtMs: lastRunFinishedAtMs,
+        lastScheduledRunAttemptAtMs: lastAttemptAtMs,
         minIntervalMs: this.minIntervalMs,
       });
       return this.skippedResult(startedAt);

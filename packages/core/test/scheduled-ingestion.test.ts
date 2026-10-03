@@ -535,7 +535,7 @@ describe('ScheduledIngestionService', () => {
     assert.ok(result.candlesUpserted > 0);
   });
 
-  test('warmCache runs the first cycle when no completed scheduled run exists', async () => {
+  test('warmCache runs the first cycle when no scheduled attempt exists', async () => {
     await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
     const firstCycleScheduled = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
 
@@ -549,12 +549,12 @@ describe('ScheduledIngestionService', () => {
     await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
     const intervalScheduled = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
     const first = await intervalScheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
-    const lastFinishedAtMs = await intervalScheduled.lastScheduledRunFinishedAtMs();
-    assert.ok(lastFinishedAtMs !== null);
+    const lastAttemptAtMs = await intervalScheduled.lastScheduledRunAttemptAtMs();
+    assert.ok(lastAttemptAtMs !== null);
 
     const second = await intervalScheduled.warmCache({
       timeframes: ['1h'],
-      nowMs: lastFinishedAtMs + 900_000 - 1,
+      nowMs: lastAttemptAtMs + 900_000 - 1,
     });
 
     assert.equal(second.skippedDueToMinInterval, true);
@@ -566,13 +566,13 @@ describe('ScheduledIngestionService', () => {
     await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
     const intervalScheduled = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
     const first = await intervalScheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
-    const lastFinishedAtMs = await intervalScheduled.lastScheduledRunFinishedAtMs();
-    assert.ok(lastFinishedAtMs !== null);
+    const lastAttemptAtMs = await intervalScheduled.lastScheduledRunAttemptAtMs();
+    assert.ok(lastAttemptAtMs !== null);
     const runCountBefore = await countScheduledRuns();
 
     const skipped = await intervalScheduled.warmCache({
       timeframes: ['1h'],
-      nowMs: lastFinishedAtMs + 1,
+      nowMs: lastAttemptAtMs + 1,
     });
 
     assert.equal(skipped.skippedDueToMinInterval, true);
@@ -584,12 +584,12 @@ describe('ScheduledIngestionService', () => {
     await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
     const intervalScheduled = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
     const first = await intervalScheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
-    const lastFinishedAtMs = await intervalScheduled.lastScheduledRunFinishedAtMs();
-    assert.ok(lastFinishedAtMs !== null);
+    const lastAttemptAtMs = await intervalScheduled.lastScheduledRunAttemptAtMs();
+    assert.ok(lastAttemptAtMs !== null);
 
     const second = await intervalScheduled.warmCache({
       timeframes: ['1h'],
-      nowMs: lastFinishedAtMs + 900_000,
+      nowMs: lastAttemptAtMs + 900_000,
     });
 
     assert.equal(second.skippedDueToMinInterval, false);
@@ -604,7 +604,7 @@ describe('ScheduledIngestionService', () => {
     const expectedFinishedAtMs = Date.parse(first.finishedAt);
 
     const secondService = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
-    assert.equal(await secondService.lastScheduledRunFinishedAtMs(), expectedFinishedAtMs);
+    assert.equal(await secondService.lastScheduledRunAttemptAtMs(), expectedFinishedAtMs);
     const second = await secondService.warmCache({
       timeframes: ['1h'],
       nowMs: expectedFinishedAtMs + 1,
@@ -612,6 +612,149 @@ describe('ScheduledIngestionService', () => {
 
     assert.equal(second.skippedDueToMinInterval, true);
     assert.equal(await countScheduledRuns(), 1);
+  });
+
+  test('a fully failed warm cycle starts the minimum-interval cooldown', async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const cooldownScheduled = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      minIntervalMs: 900_000,
+    });
+
+    // Every pair fails: the run is terminal, but not 'completed'. Before the
+    // cooldown read widened to attempts, such a row was invisible and the next
+    // scanner tick walked straight back into the same broken provider state.
+    mockProvider.failKind = 'unavailable';
+    const failed = await cooldownScheduled
+      .warmCache({ timeframes: ['1h', '4h'], nowMs: Date.now() })
+      .finally(() => {
+        mockProvider.failKind = null;
+      });
+
+    assert.equal(failed.skippedDueToMinInterval, false);
+    assert.equal(failed.pairsCompleted, 0);
+    assert.equal(failed.pairsFailed, 4);
+    const runRes = await pool.query<{ status: string }>(
+      `SELECT status FROM ingestion_runs WHERE trigger = 'scheduled'`,
+    );
+    assert.equal(runRes.rows[0]?.status, 'failed');
+
+    const lastAttemptAtMs = await cooldownScheduled.lastScheduledRunAttemptAtMs();
+    assert.ok(lastAttemptAtMs !== null);
+
+    const fetchCountBefore = mockProvider.fetchCount;
+    const retry = await cooldownScheduled.warmCache({
+      timeframes: ['1h', '4h'],
+      nowMs: lastAttemptAtMs + 900_000 - 1,
+    });
+
+    assert.equal(retry.skippedDueToMinInterval, true);
+    assert.equal(retry.providerRequests, 0);
+    assert.equal(mockProvider.fetchCount, fetchCountBefore);
+    assert.equal(await countScheduledRuns(), 1);
+  });
+
+  test('a partial warm cycle starts the minimum-interval cooldown and holds its boundary', async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const cooldownScheduled = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      maxRequestsPerCycle: 2,
+      minIntervalMs: 900_000,
+    });
+
+    // Two pairs warm, then the third runs into the provider-request budget:
+    // the cycle is recorded 'partial', not 'completed'.
+    const partial = await cooldownScheduled.warmCache({ timeframes: ['1h', '4h'], nowMs: Date.now() });
+    assert.equal(partial.abortedDueToRateLimit, true);
+    assert.ok(partial.pairsCompleted > 0);
+    assert.ok(partial.pairsFailed > 0);
+    const runRes = await pool.query<{ status: string }>(
+      `SELECT status FROM ingestion_runs WHERE trigger = 'scheduled'`,
+    );
+    assert.equal(runRes.rows[0]?.status, 'partial');
+
+    const lastAttemptAtMs = await cooldownScheduled.lastScheduledRunAttemptAtMs();
+    assert.ok(lastAttemptAtMs !== null);
+
+    // One millisecond short of the interval: still inside the cooldown.
+    const tooEarly = await cooldownScheduled.warmCache({
+      timeframes: ['1h'],
+      nowMs: lastAttemptAtMs + 900_000 - 1,
+    });
+    assert.equal(tooEarly.skippedDueToMinInterval, true);
+    assert.equal(tooEarly.providerRequests, 0);
+
+    // Exactly at the interval: the cooldown has elapsed and the cycle runs.
+    const onTime = await cooldownScheduled.warmCache({
+      timeframes: ['1h'],
+      nowMs: lastAttemptAtMs + 900_000,
+    });
+    assert.equal(onTime.skippedDueToMinInterval, false);
+    assert.ok(onTime.instrumentsProcessed > 0);
+    assert.equal(await countScheduledRuns(), 2);
+  });
+
+  test('an unfinished scheduled attempt pins the cooldown from its start time', async () => {
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const attemptStartedAtMs = Date.now() - 60_000;
+    await pool.query(
+      `INSERT INTO ingestion_runs (trigger, status, provider_slug, request, started_at)
+       VALUES ('scheduled', 'running', 'scheduled', '{}', $1::timestamptz)`,
+      [new Date(attemptStartedAtMs).toISOString()],
+    );
+    const cooldownScheduled = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      minIntervalMs: 900_000,
+    });
+
+    // A 'running' row left behind by a killed process has no finished_at; the
+    // attempt still counts (from its start) so a crash cannot trigger an
+    // immediate retry either.
+    assert.equal(await cooldownScheduled.lastScheduledRunAttemptAtMs(), attemptStartedAtMs);
+    const tooEarly = await cooldownScheduled.warmCache({
+      timeframes: ['1h'],
+      nowMs: attemptStartedAtMs + 900_000 - 1,
+    });
+    assert.equal(tooEarly.skippedDueToMinInterval, true);
+    assert.equal(tooEarly.providerRequests, 0);
+  });
+
+  test('the cooldown follows the newest attempt even when an older completed run exists', async () => {
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const minIntervalMs = 900_000;
+    const completedAtMs = Date.now() - 4 * minIntervalMs;
+    const failedAtMs = completedAtMs + 2 * minIntervalMs;
+    await pool.query(
+      `INSERT INTO ingestion_runs (trigger, status, provider_slug, request, started_at, finished_at)
+       VALUES ('scheduled', 'completed', 'scheduled', '{}', $1::timestamptz, $1::timestamptz),
+              ('scheduled', 'failed', 'scheduled', '{}', $2::timestamptz, $2::timestamptz)`,
+      [new Date(completedAtMs).toISOString(), new Date(failedAtMs).toISOString()],
+    );
+    const cooldownScheduled = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      minIntervalMs,
+    });
+
+    assert.equal(await cooldownScheduled.lastScheduledRunAttemptAtMs(), failedAtMs);
+
+    // The completed run's own 15-minute window elapsed long ago — if the
+    // cooldown still keyed off completed runs only, this would start a cycle.
+    const tooEarly = await cooldownScheduled.warmCache({
+      timeframes: ['1h'],
+      nowMs: failedAtMs - 1,
+    });
+    assert.equal(tooEarly.skippedDueToMinInterval, true);
+    assert.equal(tooEarly.providerRequests, 0);
+
+    // Once the newest attempt's own window has elapsed, the cycle runs again.
+    const onTime = await cooldownScheduled.warmCache({
+      timeframes: ['1h'],
+      nowMs: failedAtMs + minIntervalMs,
+    });
+    assert.equal(onTime.skippedDueToMinInterval, false);
+    assert.ok(onTime.instrumentsProcessed > 0);
   });
 
   test('concurrent warmCache calls are serialized by a database advisory lock', async () => {
