@@ -84,6 +84,7 @@ export {
 } from './market-data/ingestion.js';
 export {
   ScheduledIngestionService,
+  isRateLimitedError,
   DEFAULT_SCHEDULED_TIMEFRAMES,
   DEFAULT_SCHEDULED_LOOKBACK_CANDLES,
   MAX_SCHEDULED_INSTRUMENTS,

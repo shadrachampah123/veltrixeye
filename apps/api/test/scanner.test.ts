@@ -638,6 +638,7 @@ describe('F3: Internal scanner worker endpoints & ticker', () => {
         pairsFailed: 0,
         candlesUpserted: 0,
         pairsAlreadyCached: 0,
+        abortedDueToRateLimit: false,
       };
     };
     workerCtx.scanner.runWorkerOnce = async (args) => {
@@ -675,6 +676,7 @@ describe('F3: Internal scanner worker endpoints & ticker', () => {
         pairsFailed: 0,
         candlesUpserted: 0,
         pairsAlreadyCached: 0,
+        abortedDueToRateLimit: false,
       };
     };
     workerCtx.scanner.runWorkerOnce = async (args) => {

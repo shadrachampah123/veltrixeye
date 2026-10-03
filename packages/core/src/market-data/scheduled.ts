@@ -1,5 +1,13 @@
 import type pg from 'pg';
-import { type AssetClass, type Timeframe, timeframeMinutes, retentionCutoffMs } from '@veltrixeye/contracts';
+import {
+  type AssetClass,
+  type Timeframe,
+  ERROR_CODES,
+  isProviderError,
+  timeframeMinutes,
+  retentionCutoffMs,
+} from '@veltrixeye/contracts';
+import { isDomainError } from '../errors.js';
 import type { IngestionService } from './ingestion.js';
 
 /**
@@ -19,7 +27,9 @@ import type { IngestionService } from './ingestion.js';
  *  - Bounded: lookback is limited to a configurable number of candles per
  *    timeframe (default 500, enough for scanner evaluation windows).
  *  - Retention-aware: ranges are clamped to the retention cutoff.
- *  - Never throws: individual pair failures are logged and the rest continue.
+ *  - Never throws: individual pair failures are logged and the rest continue
+ *    — except a provider rate limit, which aborts the rest of the cycle so a
+ *    saturated provider is not hammered with the remaining pairs.
  *  - Records each run in `ingestion_runs` with trigger = 'scheduled'.
  */
 
@@ -47,6 +57,27 @@ export interface ScheduledIngestionResult {
   candlesUpserted: number;
   /** Pairs that were already fully cached (no provider fetch needed). */
   pairsAlreadyCached: number;
+  /**
+   * True when the cycle stopped early because a pair hit a provider rate
+   * limit — remaining instruments/timeframes were deliberately not attempted.
+   */
+  abortedDueToRateLimit: boolean;
+}
+
+/**
+ * True when a pair failed *specifically* because the provider is rate limited.
+ *
+ * `IngestionService` maps provider failures to domain errors, so the usual
+ * shape is a `DomainError` with code `rate_limited`; the raw `ProviderError`
+ * and a bare HTTP 429 are also recognized so a rate limit is never mistaken
+ * for an ordinary pair failure. Everything else (unknown instrument, provider
+ * unavailable, network blip, …) is an ordinary failure and must keep the
+ * existing continue-on-error handling.
+ */
+export function isRateLimitedError(err: unknown): boolean {
+  if (isDomainError(err)) return err.code === ERROR_CODES.RATE_LIMITED;
+  if (isProviderError(err)) return err.kind === 'rate_limited';
+  return (err as { statusCode?: unknown } | null | undefined)?.statusCode === 429;
 }
 
 /**
@@ -110,7 +141,11 @@ export class ScheduledIngestionService {
    * Safe to call even when no provider is registered — all pairs will fail
    * gracefully and the result will report zero upserts.
    *
-   * Never throws: individual pair failures are caught and logged.
+   * Never throws: individual pair failures are caught and logged. A pair that
+   * fails *because the provider is rate limited* stops the cycle immediately
+   * (`abortedDueToRateLimit: true`) instead of walking the remaining pairs
+   * into the same wall; every other failure keeps the continue-on-error
+   * behaviour.
    */
   async warmCache(
     args?: {
@@ -136,6 +171,7 @@ export class ScheduledIngestionService {
         pairsFailed: 0,
         candlesUpserted: 0,
         pairsAlreadyCached: 0,
+        abortedDueToRateLimit: false,
       };
     }
 
@@ -149,6 +185,7 @@ export class ScheduledIngestionService {
     let pairsFailed = 0;
     let candlesUpserted = 0;
     let pairsAlreadyCached = 0;
+    let abortedDueToRateLimit = false;
 
     for (const inst of instruments) {
       for (const tf of timeframes) {
@@ -163,14 +200,28 @@ export class ScheduledIngestionService {
           }
         } catch (err) {
           pairsFailed++;
-          this.logger.warn('scheduled ingestion: pair failed', {
-            assetClass: inst.assetClass,
-            symbol: inst.symbol,
-            timeframe: tf,
-            error: err instanceof Error ? err.message : 'unknown',
-          });
+          const rateLimited = isRateLimitedError(err);
+          this.logger.warn(
+            rateLimited
+              ? 'scheduled ingestion: provider rate limited — stopping warm cycle'
+              : 'scheduled ingestion: pair failed',
+            {
+              assetClass: inst.assetClass,
+              symbol: inst.symbol,
+              timeframe: tf,
+              error: err instanceof Error ? err.message : 'unknown',
+            },
+          );
+          // A rate limit is provider-wide: every remaining pair would fail the
+          // same way (and burn credits), so stop the cycle here. Any other
+          // failure stays per-pair and the cycle continues.
+          if (rateLimited) {
+            abortedDueToRateLimit = true;
+            break;
+          }
         }
       }
+      if (abortedDueToRateLimit) break;
     }
 
     const finishedAt = new Date().toISOString();
@@ -181,6 +232,7 @@ export class ScheduledIngestionService {
       pairsFailed,
       pairsAlreadyCached,
       candlesUpserted,
+      abortedDueToRateLimit,
     });
 
     // Record the run in ingestion_runs for observability
@@ -191,6 +243,7 @@ export class ScheduledIngestionService {
       pairsFailed,
       pairsAlreadyCached,
       candlesUpserted,
+      abortedDueToRateLimit,
       startedAt,
       finishedAt,
     }).catch((err) => {
@@ -208,6 +261,7 @@ export class ScheduledIngestionService {
       pairsFailed,
       candlesUpserted,
       pairsAlreadyCached,
+      abortedDueToRateLimit,
     };
   }
 
@@ -281,6 +335,7 @@ export class ScheduledIngestionService {
     pairsFailed: number;
     pairsAlreadyCached: number;
     candlesUpserted: number;
+    abortedDueToRateLimit: boolean;
     startedAt: string;
     finishedAt: string;
   }): Promise<void> {
@@ -299,9 +354,14 @@ export class ScheduledIngestionService {
           pairsFailed: args.pairsFailed,
           pairsAlreadyCached: args.pairsAlreadyCached,
           totalPairs,
+          abortedDueToRateLimit: args.abortedDueToRateLimit,
         }),
         args.candlesUpserted,
-        args.pairsFailed > 0 ? `${args.pairsFailed} of ${totalPairs} pairs failed` : null,
+        args.pairsFailed > 0
+          ? `${args.pairsFailed} of ${totalPairs} pairs failed${
+              args.abortedDueToRateLimit ? ' (cycle stopped early: provider rate limited)' : ''
+            }`
+          : null,
         args.finishedAt,
       ],
     );

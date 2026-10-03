@@ -9,10 +9,12 @@ import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 import {
   type Candle,
   type MarketDataProvider,
+  type ProviderFailureKind,
   type Timeframe,
   type NormalizedInstrument,
   type RealtimeSubscription,
   type RealtimeCandleStream,
+  ProviderError,
   TIMEFRAMES,
 } from '@veltrixeye/contracts';
 import {
@@ -23,6 +25,8 @@ import {
   CandleStore,
   IngestionService,
   ScheduledIngestionService,
+  isRateLimitedError,
+  Errors,
 } from '../src/index.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -48,6 +52,8 @@ class MockProvider implements MarketDataProvider {
     maxLookbackDays: 2190,
   };
   public fetchCount = 0;
+  /** When set, every fetch fails with this provider failure kind (tests). */
+  public failKind: ProviderFailureKind | null = null;
 
   async getSymbols() {
     return [];
@@ -60,6 +66,7 @@ class MockProvider implements MarketDataProvider {
     to: number;
   }): Promise<Candle[]> {
     this.fetchCount++;
+    if (this.failKind) throw new ProviderError(this.failKind, 'mock provider failure');
     const periodMs = getTimeframeMs(req.timeframe);
     const candles: Candle[] = [];
     const start = Math.ceil(req.from / periodMs) * periodMs;
@@ -316,5 +323,109 @@ describe('ScheduledIngestionService', () => {
 
     assert.ok(result.instrumentsProcessed > 0);
     assert.ok(result.candlesUpserted > 0);
+  });
+
+  test('warmCache stops the cycle when a pair is rate limited', async () => {
+    // Start from a cold cache so the very first pair has to hit the provider.
+    await pool.query('DELETE FROM candles');
+    mockProvider.failKind = 'rate_limited';
+    const fetchCountBefore = mockProvider.fetchCount;
+
+    try {
+      const result = await scheduled.warmCache({
+        timeframes: ['1h', '4h'],
+        nowMs: Date.now(),
+      });
+
+      // 2 instruments x 2 timeframes were candidates, but the rate limit must
+      // abort after the first failed pair instead of walking into it 3 more
+      // times (burning provider credits for the same answer).
+      assert.equal(result.abortedDueToRateLimit, true);
+      assert.equal(result.pairsFailed, 1);
+      assert.equal(result.pairsCompleted, 0);
+      assert.equal(result.candlesUpserted, 0);
+      assert.equal(mockProvider.fetchCount, fetchCountBefore + 1);
+    } finally {
+      mockProvider.failKind = null;
+    }
+  });
+
+  test('warmCache records the rate-limit abort on the ingestion run', async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    mockProvider.failKind = 'rate_limited';
+
+    try {
+      await scheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+    } finally {
+      mockProvider.failKind = null;
+    }
+
+    // The abort must be visible to operators, not just to the caller: the run
+    // row carries the flag in its request payload and says so in `error`.
+    const runRes = await pool.query<{ request: Record<string, unknown>; error: string | null }>(
+      `SELECT request, error FROM ingestion_runs WHERE trigger = 'scheduled'`,
+    );
+    assert.equal(runRes.rowCount, 1);
+    assert.equal(runRes.rows[0]?.request?.abortedDueToRateLimit, true);
+    assert.match(runRes.rows[0]?.error ?? '', /rate limited/);
+  });
+
+  test('warmCache keeps going past non-rate-limit pair failures', async () => {
+    await pool.query('DELETE FROM candles');
+    // 'unavailable' is an ordinary per-pair failure — the whole universe must
+    // still be attempted, exactly as before the rate-limit guard existed.
+    mockProvider.failKind = 'unavailable';
+    const fetchCountBefore = mockProvider.fetchCount;
+
+    try {
+      const result = await scheduled.warmCache({
+        timeframes: ['1h', '4h'],
+        nowMs: Date.now(),
+      });
+
+      assert.equal(result.abortedDueToRateLimit, false);
+      assert.equal(result.pairsCompleted, 0);
+      assert.equal(result.pairsFailed, 4);
+      assert.equal(mockProvider.fetchCount, fetchCountBefore + 4);
+    } finally {
+      mockProvider.failKind = null;
+    }
+  });
+
+  test('warmCache recovers after a rate-limited cycle', async () => {
+    await pool.query('DELETE FROM candles');
+    mockProvider.failKind = 'rate_limited';
+    try {
+      const aborted = await scheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+      assert.equal(aborted.abortedDueToRateLimit, true);
+    } finally {
+      mockProvider.failKind = null;
+    }
+
+    // The guard is per-cycle: a later cycle with the provider healthy warms
+    // normally and reports no abort.
+    const result = await scheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+    assert.equal(result.abortedDueToRateLimit, false);
+    assert.equal(result.pairsFailed, 0);
+    assert.ok(result.candlesUpserted > 0);
+  });
+});
+
+describe('isRateLimitedError', () => {
+  test('recognises only rate-limit failures', () => {
+    // Ingestion maps provider failures to domain errors — the shape a warm
+    // cycle actually sees.
+    assert.equal(isRateLimitedError(Errors.rateLimited('slow down')), true);
+    assert.equal(isRateLimitedError(new ProviderError('rate_limited', 'slow down')), true);
+    assert.equal(isRateLimitedError(Object.assign(new Error('429'), { statusCode: 429 })), true);
+
+    assert.equal(isRateLimitedError(new ProviderError('unavailable', 'down')), false);
+    assert.equal(isRateLimitedError(new ProviderError('not_found', 'nope')), false);
+    assert.equal(isRateLimitedError(new ProviderError('invalid_request', 'bad range')), false);
+    assert.equal(isRateLimitedError(Errors.providerUnavailable('down')), false);
+    assert.equal(isRateLimitedError(Errors.notFound('unknown instrument')), false);
+    assert.equal(isRateLimitedError(new Error('socket hang up')), false);
+    assert.equal(isRateLimitedError(undefined), false);
   });
 });
