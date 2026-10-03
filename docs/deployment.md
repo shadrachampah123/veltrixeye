@@ -268,6 +268,7 @@ disagree. The failing `schema` block is included in the response.
 | `SCANNER_WORKER_TOKEN` | for scheduled scanning (F3) | Shared secret for `POST /api/internal/scanner/run` and `POST /api/internal/scanner/maintenance`. **Empty = those routes return 404.** Set it so an external scheduler (Render Cron Job) can wake a sleeping instance and run a scan cycle safely. |
 | `SCANNER_ENABLED` | no (default `false`; `true` in `render.yaml`) | `true` starts the overlap-safe in-process scanner ticker (`startScannerWorkerTicker`) every `SCANNER_INTERVAL_MS`. Safe alongside external scheduler invocations via advisory lock `875421009`. |
 | `SCANNER_INTERVAL_MS` / `SCANNER_LEASE_MS` | no (default `300000` / `1800000`) | Scan cadence (5 m) and stale-run recovery horizon (30 m). |
+| `INGESTION_LOOKBACK_CANDLES` | no (default `500`; `200` in `render.yaml`) | P1 scheduled ingestion. Max candles per instrument × timeframe per warm cycle (50–5000). The cycle itself **stays off in production**: `INGESTION_SCHEDULE_ENABLED` is deliberately not set in the blueprint (default `false`), so the scanner keeps using fetch-through reads and this value only bounds a future opt-in. |
 
 Missing or malformed values make the API **fail at boot** with an itemized
 error (`loadConfig` zod validation) instead of misbehaving at runtime.

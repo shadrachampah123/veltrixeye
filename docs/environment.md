@@ -79,6 +79,8 @@ git-ignored and never contain values you would commit.
 | `SCANNER_RETRY_BASE_MS` | int 100–60000 | `1000` | Base backoff for retries. |
 | `SCANNER_RETRY_MAX_MS` | int 1000–120000 | `10000` | Max backoff cap. |
 | `SCANNER_WORKER_TOKEN` | secret, ≤256 chars | *(empty)* | Shared secret for `POST /api/internal/scanner/run` and `POST /api/internal/scanner/maintenance` (external scheduler). **Empty ⇒ those routes return 404.** |
+| `INGESTION_SCHEDULE_ENABLED` | `true` \\| `false` | `false` | P1 scheduled / pre-emptive candle ingestion. `true` runs a cache-warm cycle before each scanner tick so fetch-through reads become cache hits. Off by default and **left unset in `render.yaml`** (production runs fetch-through only). |
+| `INGESTION_LOOKBACK_CANDLES` | int 50–5000 | `500` (`200` in `render.yaml`) | P1. Max candles per instrument × timeframe per warm cycle — bounds provider credits. Dormant while `INGESTION_SCHEDULE_ENABLED` is unset/false. |
 | `EXECUTION_GLOBAL_KILL_SWITCH` | `true` \| `false` (strict) | `false` | M8.6 deployment-level global kill switch. `true` pins the platform-wide emergency stop ON for EVERY account regardless of database state: new execution (automation gates and paper simulation) is refused, `GET /api/execution/automation` reports `global_kill_switch_forced_by_environment`, and no API can clear the pin — only changing this value and redeploying. It GRANTS nothing; live execution remains impossible either way. |
 
 Empty-string values (a platform dashboard often writes one for a skipped

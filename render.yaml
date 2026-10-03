@@ -110,6 +110,16 @@ services:
         value: '1000'
       - key: SCANNER_RETRY_MAX_MS
         value: '10000'
+      # --- P1 scheduled / pre-emptive candle ingestion ---
+      # Bounds the cache-warm cycle to 200 candles per instrument × timeframe
+      # (the code default is 500; range 50–5000). Smaller = fewer provider
+      # credits per warm cycle; 200 still covers the scanner's evaluation
+      # windows. NOTE: the warm cycle itself stays OFF in production —
+      # INGESTION_SCHEDULE_ENABLED is deliberately NOT set here, so the
+      # default `false` applies and this value is dormant until an operator
+      # opts in.
+      - key: INGESTION_LOOKBACK_CANDLES
+        value: '200'
       # --- M8.6 deployment-level global kill switch ---
       # 'true' pins the platform-wide emergency stop ON for every account
       # regardless of database state (new execution + paper simulation
