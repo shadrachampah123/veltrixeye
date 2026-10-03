@@ -35,6 +35,7 @@ const DB_USER = 'test';
 const DB_PASSWORD = randomBytes(16).toString('hex');
 const DB_NAME = 'veltrixeye_test_scheduled_ingestion';
 
+let databaseUrl: string;
 let stopDb: () => Promise<void>;
 let pool: ReturnType<typeof createPool>;
 let candleStore: CandleStore;
@@ -52,6 +53,8 @@ class MockProvider implements MarketDataProvider {
     maxLookbackDays: 2190,
   };
   public fetchCount = 0;
+  /** Optional barrier used to hold a provider request in concurrency tests. */
+  public beforeFetch: (() => Promise<void>) | null = null;
   /** When set, every fetch fails with this provider failure kind (tests). */
   public failKind: ProviderFailureKind | null = null;
 
@@ -66,6 +69,7 @@ class MockProvider implements MarketDataProvider {
     to: number;
   }): Promise<Candle[]> {
     this.fetchCount++;
+    await this.beforeFetch?.();
     if (this.failKind) throw new ProviderError(this.failKind, 'mock provider failure');
     const periodMs = getTimeframeMs(req.timeframe);
     const candles: Candle[] = [];
@@ -166,6 +170,13 @@ async function seedScopedStrategy(args: {
   }
 }
 
+async function countScheduledRuns(): Promise<number> {
+  const result = await pool.query<{ cnt: number }>(
+    `SELECT count(*)::int AS cnt FROM ingestion_runs WHERE trigger = 'scheduled'`,
+  );
+  return result.rows[0]?.cnt ?? 0;
+}
+
 before(async () => {
   const dataDir = path.join(REPO_ROOT, '.test', 'pg-scheduled-ingestion');
   rmSync(dataDir, { recursive: true, force: true });
@@ -177,7 +188,8 @@ before(async () => {
     database: DB_NAME,
   });
   stopDb = db.stop;
-  pool = createPool({ databaseUrl: db.dbUrl });
+  databaseUrl = db.dbUrl;
+  pool = createPool({ databaseUrl });
   await runMigrations(pool, MIGRATIONS_DIR);
 
   providerRegistry = createProviderRegistry();
@@ -213,6 +225,7 @@ before(async () => {
 
   scheduled = new ScheduledIngestionService(pool, ingestion, {
     lookbackCandles: 100,
+    minIntervalMs: 0,
   });
 }, { timeout: 180_000 });
 
@@ -298,6 +311,7 @@ describe('ScheduledIngestionService', () => {
     const emptyIngestion = new IngestionService(pool, emptyRegistry, candleStore);
     const emptyScheduled = new ScheduledIngestionService(pool, emptyIngestion, {
       lookbackCandles: 100,
+      minIntervalMs: 0,
     });
 
     // Should not throw — just reports failures
@@ -314,6 +328,7 @@ describe('ScheduledIngestionService', () => {
   test('warmCache respects lookbackCandles bound', async () => {
     const smallScheduled = new ScheduledIngestionService(pool, ingestion, {
       lookbackCandles: 10,
+      minIntervalMs: 0,
     });
 
     const result = await smallScheduled.warmCache({
@@ -323,6 +338,115 @@ describe('ScheduledIngestionService', () => {
 
     assert.ok(result.instrumentsProcessed > 0);
     assert.ok(result.candlesUpserted > 0);
+  });
+
+  test('warmCache stops at the configured provider-request budget', async () => {
+    await pool.query('DELETE FROM candles');
+    const budgeted = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      maxRequestsPerCycle: 2,
+      minIntervalMs: 0,
+    });
+    const fetchCountBefore = mockProvider.fetchCount;
+
+    const result = await budgeted.warmCache({
+      timeframes: ['1h', '4h'],
+      nowMs: Date.now(),
+    });
+
+    assert.equal(result.providerRequests, 2);
+    assert.equal(mockProvider.fetchCount, fetchCountBefore + 2);
+    assert.equal(result.abortedDueToRateLimit, true);
+  });
+
+  test('warmCache counts both provider ranges needed by one pair', async () => {
+    await pool.query('DELETE FROM candles');
+    const nowMs = Date.now();
+    const timeframe: Timeframe = '1h';
+    const periodMs = getTimeframeMs(timeframe);
+    const lookbackCandles = 10;
+    const from = nowMs - lookbackCandles * periodMs;
+    const middleBarTime = from + 5 * periodMs;
+
+    // A stored middle bar leaves both the head and tail missing for either
+    // target pair, so the first pair requires two provider requests.
+    for (const [assetClass, symbol] of [
+      ['commodity', 'XAUUSD'],
+      ['forex', 'EURUSD'],
+    ] as const) {
+      const instrument = await candleStore.resolveInstrument(assetClass, symbol);
+      assert.ok(instrument);
+      await candleStore.upsertCandles({
+        instrumentId: instrument.id,
+        timeframe,
+        providerSlug: 'test-seed',
+        candles: [{
+          time: middleBarTime,
+          open: 100,
+          high: 105,
+          low: 95,
+          close: 102,
+          volume: 1000,
+        }],
+      });
+    }
+
+    const budgeted = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles,
+      maxRequestsPerCycle: 2,
+      minIntervalMs: 0,
+    });
+    const fetchCountBefore = mockProvider.fetchCount;
+
+    const result = await budgeted.warmCache({ timeframes: [timeframe], nowMs });
+
+    assert.equal(result.providerRequests, 2);
+    assert.equal(mockProvider.fetchCount, fetchCountBefore + 2);
+    assert.equal(result.abortedDueToRateLimit, true);
+  });
+
+  test('cached pairs consume no provider-request budget', async () => {
+    await pool.query('DELETE FROM candles');
+    const nowMs = Date.now();
+    const warmScheduled = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      maxRequestsPerCycle: 8,
+      minIntervalMs: 0,
+    });
+    const warmed = await warmScheduled.warmCache({ timeframes: ['1h'], nowMs });
+    assert.equal(warmed.providerRequests, 2);
+
+    const fetchCountBefore = mockProvider.fetchCount;
+    const cacheOnlyScheduled = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      maxRequestsPerCycle: 0,
+      minIntervalMs: 0,
+    });
+    const cached = await cacheOnlyScheduled.warmCache({ timeframes: ['1h'], nowMs });
+
+    assert.equal(cached.pairsAlreadyCached, 2);
+    assert.equal(cached.providerRequests, 0);
+    assert.equal(mockProvider.fetchCount, fetchCountBefore);
+    assert.equal(cached.abortedDueToRateLimit, false);
+  });
+
+  test('warmCache returns and persists providerRequests', async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const budgeted = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      maxRequestsPerCycle: 1,
+      minIntervalMs: 0,
+    });
+
+    const result = await budgeted.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+
+    assert.equal(result.providerRequests, 1);
+    const runRes = await pool.query<{ request: Record<string, unknown> }>(
+      `SELECT request FROM ingestion_runs WHERE trigger = 'scheduled'`,
+    );
+    assert.equal(runRes.rowCount, 1);
+    assert.equal(runRes.rows[0]?.request?.providerRequests, 1);
   });
 
   test('warmCache stops the cycle when a pair is rate limited', async () => {
@@ -409,6 +533,195 @@ describe('ScheduledIngestionService', () => {
     assert.equal(result.abortedDueToRateLimit, false);
     assert.equal(result.pairsFailed, 0);
     assert.ok(result.candlesUpserted > 0);
+  });
+
+  test('warmCache runs the first cycle when no completed scheduled run exists', async () => {
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const firstCycleScheduled = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
+
+    const result = await firstCycleScheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+
+    assert.equal(result.skippedDueToMinInterval, false);
+    assert.equal(await countScheduledRuns(), 1);
+  });
+
+  test('warmCache skips a second cycle before the default 15-minute interval', async () => {
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const intervalScheduled = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
+    const first = await intervalScheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+    const lastFinishedAtMs = await intervalScheduled.lastScheduledRunFinishedAtMs();
+    assert.ok(lastFinishedAtMs !== null);
+
+    const second = await intervalScheduled.warmCache({
+      timeframes: ['1h'],
+      nowMs: lastFinishedAtMs + 900_000 - 1,
+    });
+
+    assert.equal(second.skippedDueToMinInterval, true);
+    assert.equal(second.providerRequests, 0);
+    assert.equal(first.skippedDueToMinInterval, false);
+  });
+
+  test('a minimum-interval skip does not create an ingestion run', async () => {
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const intervalScheduled = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
+    const first = await intervalScheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+    const lastFinishedAtMs = await intervalScheduled.lastScheduledRunFinishedAtMs();
+    assert.ok(lastFinishedAtMs !== null);
+    const runCountBefore = await countScheduledRuns();
+
+    const skipped = await intervalScheduled.warmCache({
+      timeframes: ['1h'],
+      nowMs: lastFinishedAtMs + 1,
+    });
+
+    assert.equal(skipped.skippedDueToMinInterval, true);
+    assert.equal(await countScheduledRuns(), runCountBefore);
+    assert.equal(first.skippedDueToMinInterval, false);
+  });
+
+  test('warmCache runs again once the default 15-minute interval has elapsed', async () => {
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const intervalScheduled = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
+    const first = await intervalScheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+    const lastFinishedAtMs = await intervalScheduled.lastScheduledRunFinishedAtMs();
+    assert.ok(lastFinishedAtMs !== null);
+
+    const second = await intervalScheduled.warmCache({
+      timeframes: ['1h'],
+      nowMs: lastFinishedAtMs + 900_000,
+    });
+
+    assert.equal(second.skippedDueToMinInterval, false);
+    assert.equal(await countScheduledRuns(), 2);
+    assert.equal(first.skippedDueToMinInterval, false);
+  });
+
+  test('minimum-interval state persists in ingestion_runs across service instances', async () => {
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const firstService = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
+    const first = await firstService.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+    const expectedFinishedAtMs = Date.parse(first.finishedAt);
+
+    const secondService = new ScheduledIngestionService(pool, ingestion, { lookbackCandles: 10 });
+    assert.equal(await secondService.lastScheduledRunFinishedAtMs(), expectedFinishedAtMs);
+    const second = await secondService.warmCache({
+      timeframes: ['1h'],
+      nowMs: expectedFinishedAtMs + 1,
+    });
+
+    assert.equal(second.skippedDueToMinInterval, true);
+    assert.equal(await countScheduledRuns(), 1);
+  });
+
+  test('concurrent warmCache calls are serialized by a database advisory lock', async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const firstService = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      maxRequestsPerCycle: 8,
+      minIntervalMs: 0,
+    });
+    const secondService = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      maxRequestsPerCycle: 8,
+      minIntervalMs: 0,
+    });
+
+    let signalFirstFetchStarted!: () => void;
+    const firstFetchStarted = new Promise<void>((resolve) => {
+      signalFirstFetchStarted = resolve;
+    });
+    let releaseFirstFetch!: () => void;
+    const holdFirstFetch = new Promise<void>((resolve) => {
+      releaseFirstFetch = resolve;
+    });
+    let firstFetchIsBlocked = false;
+    mockProvider.beforeFetch = async () => {
+      if (!firstFetchIsBlocked) {
+        firstFetchIsBlocked = true;
+        signalFirstFetchStarted();
+        await holdFirstFetch;
+      }
+    };
+
+    const fetchCountBefore = mockProvider.fetchCount;
+    let firstCycle: Promise<Awaited<ReturnType<typeof firstService.warmCache>>> | undefined;
+    try {
+      firstCycle = firstService.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+      await firstFetchStarted;
+
+      const overlapping = await secondService.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+      assert.equal(overlapping.providerRequests, 0);
+      assert.equal(overlapping.skippedDueToMinInterval, false);
+      assert.equal(mockProvider.fetchCount, fetchCountBefore + 1);
+      assert.equal(await countScheduledRuns(), 0);
+
+      releaseFirstFetch();
+      const first = await firstCycle;
+      assert.equal(first.providerRequests, 2);
+      assert.equal(mockProvider.fetchCount, fetchCountBefore + 2);
+      assert.equal(await countScheduledRuns(), 1);
+    } finally {
+      releaseFirstFetch();
+      mockProvider.beforeFetch = null;
+      await firstCycle?.catch(() => {});
+    }
+  });
+
+  test('warmCache completes with a pool size of one', { timeout: 30_000 }, async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const singleConnectionPool = createPool({ databaseUrl, max: 1 });
+    try {
+      const singleConnectionStore = new CandleStore(singleConnectionPool);
+      const singleConnectionIngestion = new IngestionService(
+        singleConnectionPool,
+        providerRegistry,
+        singleConnectionStore,
+      );
+      const singleConnectionScheduled = new ScheduledIngestionService(
+        singleConnectionPool,
+        singleConnectionIngestion,
+        { lookbackCandles: 10, minIntervalMs: 0 },
+      );
+
+      const result = await singleConnectionScheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+
+      assert.equal(result.instrumentsProcessed, 2);
+      assert.equal(result.pairsFailed, 0);
+      assert.equal(result.providerRequests, 2);
+      assert.equal(await countScheduledRuns(), 1);
+    } finally {
+      await singleConnectionPool.end();
+    }
+  });
+
+  test('warmCache fails closed when it cannot read previous-run state', async () => {
+    let queryCount = 0;
+    const failingPool = {
+      connect: async () => ({
+        query: async (sql: string) => {
+          if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
+          if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
+          queryCount++;
+          throw new Error('database unavailable');
+        },
+        release: () => {},
+      }),
+      query: async () => {
+        throw new Error('unexpected pool query');
+      },
+    } as unknown as typeof pool;
+    const failClosedScheduled = new ScheduledIngestionService(failingPool, ingestion, {
+      lookbackCandles: 10,
+    });
+
+    const result = await failClosedScheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+
+    assert.equal(result.skippedDueToMinInterval, true);
+    assert.equal(result.providerRequests, 0);
+    assert.equal(queryCount, 1);
   });
 });
 

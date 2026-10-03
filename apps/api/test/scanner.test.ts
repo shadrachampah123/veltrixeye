@@ -637,7 +637,9 @@ describe('F3: Internal scanner worker endpoints & ticker', () => {
         pairsCompleted: 0,
         pairsFailed: 0,
         candlesUpserted: 0,
+        providerRequests: 0,
         pairsAlreadyCached: 0,
+        skippedDueToMinInterval: false,
         abortedDueToRateLimit: false,
       };
     };
@@ -675,7 +677,9 @@ describe('F3: Internal scanner worker endpoints & ticker', () => {
         pairsCompleted: 0,
         pairsFailed: 0,
         candlesUpserted: 0,
+        providerRequests: 0,
         pairsAlreadyCached: 0,
+        skippedDueToMinInterval: false,
         abortedDueToRateLimit: false,
       };
     };

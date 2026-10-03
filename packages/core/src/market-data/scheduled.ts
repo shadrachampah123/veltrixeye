@@ -7,7 +7,8 @@ import {
   timeframeMinutes,
   retentionCutoffMs,
 } from '@veltrixeye/contracts';
-import { isDomainError } from '../errors.js';
+import { Errors, isDomainError } from '../errors.js';
+import type { MarketDataQueryable } from './candles.js';
 import type { IngestionService } from './ingestion.js';
 
 /**
@@ -25,17 +26,22 @@ import type { IngestionService } from './ingestion.js';
  *  - For each instrument × timeframe, calls `IngestionService.getCandles()`
  *    which triggers fetch-through for any missing head/tail ranges.
  *  - Bounded: lookback is limited to a configurable number of candles per
- *    timeframe (default 500, enough for scanner evaluation windows).
+ *    timeframe (default 500, enough for scanner evaluation windows), and runs
+ *    respect a minimum interval since the last completed scheduled cycle.
  *  - Retention-aware: ranges are clamped to the retention cutoff.
  *  - Never throws: individual pair failures are logged and the rest continue
- *    — except a provider rate limit, which aborts the rest of the cycle so a
- *    saturated provider is not hammered with the remaining pairs.
+ *    — except a provider rate limit or an exhausted request budget, which
+ *    aborts the rest of the cycle before another provider request starts.
  *  - Records each run in `ingestion_runs` with trigger = 'scheduled'.
  */
 
 export interface ScheduledIngestionOptions {
   /** Max candles to fetch per instrument × timeframe (bounds provider usage). */
   lookbackCandles?: number;
+  /** Maximum actual provider requests allowed in one warm cycle. */
+  maxRequestsPerCycle?: number;
+  /** Minimum time between completed scheduled runs. */
+  minIntervalMs?: number;
   /** Override for "now" (tests). */
   nowMs?: number;
 }
@@ -55,24 +61,26 @@ export interface ScheduledIngestionResult {
   pairsFailed: number;
   /** Total candles upserted across all pairs. */
   candlesUpserted: number;
+  /** Actual provider requests started during this cycle. */
+  providerRequests: number;
   /** Pairs that were already fully cached (no provider fetch needed). */
   pairsAlreadyCached: number;
+  /** True when the minimum-interval guard skipped the cycle, including fail-closed state-read errors. */
+  skippedDueToMinInterval: boolean;
   /**
-   * True when the cycle stopped early because a pair hit a provider rate
-   * limit — remaining instruments/timeframes were deliberately not attempted.
+   * True when the cycle stopped early because of a provider rate limit or the
+   * scheduled provider-request budget — remaining pairs were not attempted.
    */
   abortedDueToRateLimit: boolean;
 }
 
 /**
- * True when a pair failed *specifically* because the provider is rate limited.
- *
- * `IngestionService` maps provider failures to domain errors, so the usual
- * shape is a `DomainError` with code `rate_limited`; the raw `ProviderError`
- * and a bare HTTP 429 are also recognized so a rate limit is never mistaken
- * for an ordinary pair failure. Everything else (unknown instrument, provider
- * unavailable, network blip, …) is an ordinary failure and must keep the
- * existing continue-on-error handling.
+ * True when a pair should stop the scheduled cycle: for a provider rate limit
+ * or the scheduled provider-request budget. `IngestionService` maps provider
+ * failures to domain errors, so the usual provider-limit shape is a
+ * `DomainError` with code `rate_limited`; the raw `ProviderError` and a bare
+ * HTTP 429 are also recognized. Everything else (unknown instrument, provider
+ * unavailable, network blip, …) remains an ordinary per-pair failure.
  */
 export function isRateLimitedError(err: unknown): boolean {
   if (isDomainError(err)) return err.code === ERROR_CODES.RATE_LIMITED;
@@ -100,6 +108,11 @@ export const DEFAULT_SCHEDULED_TIMEFRAMES: readonly Timeframe[] = [
 ];
 
 export const DEFAULT_SCHEDULED_LOOKBACK_CANDLES = 500;
+export const DEFAULT_SCHEDULED_MAX_REQUESTS_PER_CYCLE = 8;
+export const DEFAULT_SCHEDULED_MIN_INTERVAL_MS = 900_000;
+
+/** Dedicated database advisory lock for one scheduled-ingestion warm cycle. */
+const SCHEDULED_INGESTION_ADVISORY_LOCK_KEY = 875_421_010;
 
 /** Max instruments the scheduled ingestion will process per cycle. */
 export const MAX_SCHEDULED_INSTRUMENTS = 50;
@@ -118,6 +131,8 @@ const NOOP_LOGGER: ScheduledIngestionLogger = {
 
 export class ScheduledIngestionService {
   private readonly lookbackCandles: number;
+  private readonly maxRequestsPerCycle: number;
+  private readonly minIntervalMs: number;
   private readonly logger: ScheduledIngestionLogger;
 
   constructor(
@@ -125,6 +140,8 @@ export class ScheduledIngestionService {
     private readonly ingestion: IngestionService,
     options?: {
       lookbackCandles?: number;
+      maxRequestsPerCycle?: number;
+      minIntervalMs?: number;
       logger?: ScheduledIngestionLogger;
     },
   ) {
@@ -132,20 +149,52 @@ export class ScheduledIngestionService {
       10,
       Math.min(options?.lookbackCandles ?? DEFAULT_SCHEDULED_LOOKBACK_CANDLES, 5000),
     );
+    const maxRequestsPerCycle = options?.maxRequestsPerCycle ?? DEFAULT_SCHEDULED_MAX_REQUESTS_PER_CYCLE;
+    this.maxRequestsPerCycle = Number.isFinite(maxRequestsPerCycle)
+      ? Math.max(0, Math.floor(maxRequestsPerCycle))
+      : DEFAULT_SCHEDULED_MAX_REQUESTS_PER_CYCLE;
+    const minIntervalMs = options?.minIntervalMs ?? DEFAULT_SCHEDULED_MIN_INTERVAL_MS;
+    this.minIntervalMs = Number.isFinite(minIntervalMs)
+      ? Math.max(0, Math.floor(minIntervalMs))
+      : DEFAULT_SCHEDULED_MIN_INTERVAL_MS;
     this.logger = options?.logger ?? NOOP_LOGGER;
+  }
+
+  /**
+   * Most recent completed scheduled run's persisted finish time, in epoch ms.
+   * Failed, partial, and in-progress runs do not delay the next cycle.
+   */
+  async lastScheduledRunFinishedAtMs(queryable: MarketDataQueryable = this.pool): Promise<number | null> {
+    const res = await queryable.query<{ finished_at: Date | string | null }>(
+      `SELECT finished_at
+         FROM ingestion_runs
+        WHERE trigger = 'scheduled'
+          AND status = 'completed'
+          AND finished_at IS NOT NULL
+        ORDER BY finished_at DESC
+        LIMIT 1`,
+    );
+    const finishedAt = res.rows[0]?.finished_at;
+    if (finishedAt == null) return null;
+
+    const finishedAtMs = finishedAt instanceof Date ? finishedAt.getTime() : Date.parse(finishedAt);
+    if (!Number.isFinite(finishedAtMs)) {
+      throw new Error('Last completed scheduled ingestion run has an invalid finished_at timestamp.');
+    }
+    return finishedAtMs;
   }
 
   /**
    * Warm the candle cache for the active instrument universe.
    *
    * Safe to call even when no provider is registered — all pairs will fail
-   * gracefully and the result will report zero upserts.
+   * gracefully and the result will report zero upserts. A recent completed run
+   * (or an unreadable prior-run state) skips this cycle without recording a run.
    *
-   * Never throws: individual pair failures are caught and logged. A pair that
-   * fails *because the provider is rate limited* stops the cycle immediately
-   * (`abortedDueToRateLimit: true`) instead of walking the remaining pairs
-   * into the same wall; every other failure keeps the continue-on-error
-   * behaviour.
+   * Never throws: individual pair failures are caught and logged. A provider
+   * rate limit or exhausted request budget stops the cycle immediately
+   * (`abortedDueToRateLimit: true`) instead of attempting another provider
+   * request; every other failure keeps the continue-on-error behaviour.
    */
   async warmCache(
     args?: {
@@ -153,12 +202,121 @@ export class ScheduledIngestionService {
       nowMs?: number;
     },
   ): Promise<ScheduledIngestionResult> {
+    const startedAt = new Date(args?.nowMs ?? Date.now()).toISOString();
+    let lockClient: pg.PoolClient;
+    try {
+      lockClient = await this.pool.connect();
+    } catch (err) {
+      this.logger.error('scheduled ingestion: failed to connect for warm-cycle lock; skipping cycle', {
+        error: err instanceof Error ? err.message : 'unknown',
+      });
+      return this.skippedResult(startedAt, false);
+    }
+
+    let lockAcquired = false;
+    let destroyLockClient = false;
+    try {
+      let lockRes;
+      try {
+        lockRes = await lockClient.query<{ acquired: boolean }>(
+          'SELECT pg_try_advisory_lock($1) AS acquired',
+          [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY],
+        );
+      } catch (err) {
+        // The server may have acquired the lock before the connection failed;
+        // evict this session so it cannot retain an orphaned advisory lock.
+        destroyLockClient = true;
+        this.logger.error('scheduled ingestion: failed to acquire warm-cycle lock; skipping cycle', {
+          lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+          error: err instanceof Error ? err.message : 'unknown',
+        });
+        return this.skippedResult(startedAt, false);
+      }
+
+      lockAcquired = lockRes.rows[0]?.acquired ?? false;
+      if (!lockAcquired) {
+        this.logger.info('scheduled ingestion: warm-cycle lock is already held; skipping cycle', {
+          lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+        });
+        return this.skippedResult(startedAt, false);
+      }
+
+      // Keep the session-scoped lock held through the interval check, warming,
+      // and the final ingestion_runs write.
+      return await this.warmCacheLocked(args, lockClient);
+    } finally {
+      try {
+        if (lockAcquired) {
+          try {
+            const unlockRes = await lockClient.query<{
+              unlocked?: boolean;
+              pg_advisory_unlock?: boolean;
+            }>('SELECT pg_advisory_unlock($1) AS unlocked', [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY]);
+            const row = unlockRes?.rows?.[0];
+            const unlocked =
+              typeof row?.unlocked === 'boolean'
+                ? row.unlocked
+                : typeof row?.pg_advisory_unlock === 'boolean'
+                  ? row.pg_advisory_unlock
+                  : false;
+            if (!unlocked) {
+              destroyLockClient = true;
+              this.logger.error('scheduled ingestion: warm-cycle advisory unlock failed', {
+                lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+                reason: 'unlock_returned_false',
+              });
+            }
+          } catch (err) {
+            destroyLockClient = true;
+            this.logger.error('scheduled ingestion: warm-cycle advisory unlock failed', {
+              lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+              reason: 'query_error',
+              error: err instanceof Error ? err.message : 'unknown',
+            });
+          }
+        }
+      } finally {
+        lockClient.release(destroyLockClient || undefined);
+      }
+    }
+  }
+
+  private async warmCacheLocked(
+    args: {
+      timeframes?: readonly Timeframe[];
+      nowMs?: number;
+    } | undefined,
+    lockClient: pg.PoolClient,
+  ): Promise<ScheduledIngestionResult> {
     const nowMs = args?.nowMs ?? Date.now();
     const startedAt = new Date(nowMs).toISOString();
+
+    let lastRunFinishedAtMs: number | null;
+    try {
+      lastRunFinishedAtMs = await this.lastScheduledRunFinishedAtMs(lockClient);
+    } catch (err) {
+      this.logger.error('scheduled ingestion: failed to read prior run state; skipping cycle', {
+        error: err instanceof Error ? err.message : 'unknown',
+      });
+      return this.skippedResult(startedAt);
+    }
+
+    if (
+      this.minIntervalMs > 0 &&
+      lastRunFinishedAtMs !== null &&
+      nowMs - lastRunFinishedAtMs < this.minIntervalMs
+    ) {
+      this.logger.info('scheduled ingestion: skipping cycle because minimum interval has not elapsed', {
+        lastScheduledRunFinishedAtMs: lastRunFinishedAtMs,
+        minIntervalMs: this.minIntervalMs,
+      });
+      return this.skippedResult(startedAt);
+    }
+
     const timeframes = args?.timeframes ?? DEFAULT_SCHEDULED_TIMEFRAMES;
 
     // Resolve the active instrument universe
-    const instruments = await this.resolveUniverse();
+    const instruments = await this.resolveUniverse(lockClient);
 
     if (instruments.length === 0) {
       this.logger.info('scheduled ingestion: no instruments in universe');
@@ -170,7 +328,9 @@ export class ScheduledIngestionService {
         pairsCompleted: 0,
         pairsFailed: 0,
         candlesUpserted: 0,
+        providerRequests: 0,
         pairsAlreadyCached: 0,
+        skippedDueToMinInterval: false,
         abortedDueToRateLimit: false,
       };
     }
@@ -179,18 +339,28 @@ export class ScheduledIngestionService {
       instruments: instruments.length,
       timeframes: timeframes.length,
       lookbackCandles: this.lookbackCandles,
+      maxRequestsPerCycle: this.maxRequestsPerCycle,
+      minIntervalMs: this.minIntervalMs,
     });
 
     let pairsCompleted = 0;
     let pairsFailed = 0;
     let candlesUpserted = 0;
+    let providerRequests = 0;
     let pairsAlreadyCached = 0;
     let abortedDueToRateLimit = false;
+
+    const beforeProviderRequest = (): void => {
+      if (providerRequests >= this.maxRequestsPerCycle) {
+        throw Errors.rateLimited('Scheduled ingestion provider request budget exhausted.');
+      }
+      providerRequests++;
+    };
 
     for (const inst of instruments) {
       for (const tf of timeframes) {
         try {
-          const result = await this.warmPair(inst, tf, nowMs);
+          const result = await this.warmPair(inst, tf, nowMs, beforeProviderRequest, lockClient);
           candlesUpserted += result.candlesUpserted;
           if (result.fetchedFromProvider) {
             pairsCompleted++;
@@ -203,7 +373,7 @@ export class ScheduledIngestionService {
           const rateLimited = isRateLimitedError(err);
           this.logger.warn(
             rateLimited
-              ? 'scheduled ingestion: provider rate limited — stopping warm cycle'
+              ? 'scheduled ingestion: provider rate limit or request budget reached — stopping warm cycle'
               : 'scheduled ingestion: pair failed',
             {
               assetClass: inst.assetClass,
@@ -212,9 +382,8 @@ export class ScheduledIngestionService {
               error: err instanceof Error ? err.message : 'unknown',
             },
           );
-          // A rate limit is provider-wide: every remaining pair would fail the
-          // same way (and burn credits), so stop the cycle here. Any other
-          // failure stays per-pair and the cycle continues.
+          // Provider rate limits and an exhausted request budget both stop the
+          // cycle here; any other failure stays per-pair and the cycle continues.
           if (rateLimited) {
             abortedDueToRateLimit = true;
             break;
@@ -232,6 +401,7 @@ export class ScheduledIngestionService {
       pairsFailed,
       pairsAlreadyCached,
       candlesUpserted,
+      providerRequests,
       abortedDueToRateLimit,
     });
 
@@ -243,10 +413,11 @@ export class ScheduledIngestionService {
       pairsFailed,
       pairsAlreadyCached,
       candlesUpserted,
+      providerRequests,
       abortedDueToRateLimit,
       startedAt,
       finishedAt,
-    }).catch((err) => {
+    }, lockClient).catch((err) => {
       this.logger.error('scheduled ingestion: failed to record run', {
         error: err instanceof Error ? err.message : 'unknown',
       });
@@ -260,7 +431,9 @@ export class ScheduledIngestionService {
       pairsCompleted,
       pairsFailed,
       candlesUpserted,
+      providerRequests,
       pairsAlreadyCached,
+      skippedDueToMinInterval: false,
       abortedDueToRateLimit,
     };
   }
@@ -269,6 +442,8 @@ export class ScheduledIngestionService {
     inst: { assetClass: AssetClass; symbol: string },
     tf: Timeframe,
     nowMs: number,
+    beforeProviderRequest: () => void,
+    queryable: pg.PoolClient,
   ): Promise<{ candlesUpserted: number; fetchedFromProvider: boolean }> {
     const periodMs = timeframeMinutes(tf) * 60_000;
     const lookbackMs = this.lookbackCandles * periodMs;
@@ -284,11 +459,32 @@ export class ScheduledIngestionService {
       to,
       limit: this.lookbackCandles,
       nowMs,
+      beforeProviderRequest,
+      dbClient: queryable,
     });
 
     return {
       candlesUpserted: result.candles.length,
       fetchedFromProvider: result.fetchedFromProvider,
+    };
+  }
+
+  private skippedResult(
+    startedAt: string,
+    skippedDueToMinInterval = true,
+  ): ScheduledIngestionResult {
+    return {
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      instrumentsProcessed: 0,
+      timeframesProcessed: 0,
+      pairsCompleted: 0,
+      pairsFailed: 0,
+      candlesUpserted: 0,
+      providerRequests: 0,
+      pairsAlreadyCached: 0,
+      skippedDueToMinInterval,
+      abortedDueToRateLimit: false,
     };
   }
 
@@ -302,8 +498,10 @@ export class ScheduledIngestionService {
    * replicated here: this set is a superset of what any scan will touch, so
    * it can only warm instruments that *might* be needed — never miss one.
    */
-  private async resolveUniverse(): Promise<{ assetClass: AssetClass; symbol: string }[]> {
-    const res = await this.pool.query<{ asset_class: string; symbol: string }>(
+  private async resolveUniverse(
+    queryable: MarketDataQueryable = this.pool,
+  ): Promise<{ assetClass: AssetClass; symbol: string }[]> {
+    const res = await queryable.query<{ asset_class: string; symbol: string }>(
       `SELECT i.asset_class, i.symbol
          FROM instruments i
         WHERE EXISTS (
@@ -328,20 +526,24 @@ export class ScheduledIngestionService {
     }));
   }
 
-  private async recordRun(args: {
-    instruments: { assetClass: AssetClass; symbol: string }[];
-    timeframes: Timeframe[];
-    pairsCompleted: number;
-    pairsFailed: number;
-    pairsAlreadyCached: number;
-    candlesUpserted: number;
-    abortedDueToRateLimit: boolean;
-    startedAt: string;
-    finishedAt: string;
-  }): Promise<void> {
+  private async recordRun(
+    args: {
+      instruments: { assetClass: AssetClass; symbol: string }[];
+      timeframes: Timeframe[];
+      pairsCompleted: number;
+      pairsFailed: number;
+      pairsAlreadyCached: number;
+      candlesUpserted: number;
+      providerRequests: number;
+      abortedDueToRateLimit: boolean;
+      startedAt: string;
+      finishedAt: string;
+    },
+    queryable: MarketDataQueryable = this.pool,
+  ): Promise<void> {
     const status = args.pairsFailed === 0 ? 'completed' : args.pairsCompleted === 0 ? 'failed' : 'partial';
     const totalPairs = args.pairsCompleted + args.pairsFailed;
-    await this.pool.query(
+    await queryable.query(
       `INSERT INTO ingestion_runs (trigger, status, provider_slug, request, candles_upserted, error, finished_at)
        VALUES ('scheduled', $1, 'scheduled', $2, $3, $4, $5)`,
       [
@@ -354,12 +556,15 @@ export class ScheduledIngestionService {
           pairsFailed: args.pairsFailed,
           pairsAlreadyCached: args.pairsAlreadyCached,
           totalPairs,
+          providerRequests: args.providerRequests,
           abortedDueToRateLimit: args.abortedDueToRateLimit,
         }),
         args.candlesUpserted,
         args.pairsFailed > 0
           ? `${args.pairsFailed} of ${totalPairs} pairs failed${
-              args.abortedDueToRateLimit ? ' (cycle stopped early: provider rate limited)' : ''
+              args.abortedDueToRateLimit
+                ? ' (cycle stopped early: provider rate limited or request budget exhausted)'
+                : ''
             }`
           : null,
         args.finishedAt,

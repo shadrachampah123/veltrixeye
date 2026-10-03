@@ -2,6 +2,8 @@ import type pg from 'pg';
 import type { AssetClass, CandleDto, CoverageDto, Timeframe } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
 
+export type MarketDataQueryable = pg.Pool | pg.PoolClient;
+
 export interface ResolvedInstrument {
   id: string;
   assetClass: AssetClass;
@@ -23,8 +25,12 @@ export class CandleStore {
   constructor(private readonly pool: pg.Pool) {}
 
   /** Resolve a normalized (assetClass, symbol) to its instruments row. */
-  async resolveInstrument(assetClass: string, symbol: string): Promise<ResolvedInstrument | null> {
-    const res = await this.pool.query<{
+  async resolveInstrument(
+    assetClass: string,
+    symbol: string,
+    queryable: MarketDataQueryable = this.pool,
+  ): Promise<ResolvedInstrument | null> {
+    const res = await queryable.query<{
       id: string;
       asset_class: string;
       symbol: string;
@@ -42,12 +48,15 @@ export class CandleStore {
    * Idempotent bulk upsert. Returns the number of input candles stored
    * (inserted + corrected). Rejects invalid candles before touching the DB.
    */
-  async upsertCandles(args: {
-    instrumentId: string;
-    timeframe: Timeframe;
-    providerSlug: string;
-    candles: readonly CandleDto[];
-  }): Promise<number> {
+  async upsertCandles(
+    args: {
+      instrumentId: string;
+      timeframe: Timeframe;
+      providerSlug: string;
+      candles: readonly CandleDto[];
+    },
+    queryable: MarketDataQueryable = this.pool,
+  ): Promise<number> {
     if (args.candles.length === 0) return 0;
     for (const c of args.candles) assertValidCandle(c);
     // Dedupe by time (last wins) so one call can never conflict with itself.
@@ -60,7 +69,7 @@ export class CandleStore {
     const lows = rows.map((c) => c.low);
     const closes = rows.map((c) => c.close);
     const volumes = rows.map((c) => c.volume);
-    await this.pool.query(
+    await queryable.query(
       `INSERT INTO candles (instrument_id, timeframe, ts, open, high, low, close, volume, provider_slug, fetched_at)
        SELECT $1, $2, ts, open, high, low, close, volume, $3, now()
        FROM UNNEST($4::bigint[], $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::numeric[])
@@ -75,14 +84,17 @@ export class CandleStore {
   }
 
   /** Range read, ascending by time. `limit` caps the rows returned. */
-  async queryCandles(args: {
-    instrumentId: string;
-    timeframe: Timeframe;
-    from: number;
-    to: number;
-    limit: number;
-  }): Promise<CandleDto[]> {
-    const res = await this.pool.query<{
+  async queryCandles(
+    args: {
+      instrumentId: string;
+      timeframe: Timeframe;
+      from: number;
+      to: number;
+      limit: number;
+    },
+    queryable: MarketDataQueryable = this.pool,
+  ): Promise<CandleDto[]> {
+    const res = await queryable.query<{
       ts: string;
       open: string;
       high: string;
@@ -106,13 +118,16 @@ export class CandleStore {
   }
 
   /** Count + earliest/latest inside one range (drives fetch-through gap math). */
-  async rangeStats(args: {
-    instrumentId: string;
-    timeframe: Timeframe;
-    from: number;
-    to: number;
-  }): Promise<{ count: number; earliest: number | null; latest: number | null }> {
-    const res = await this.pool.query<{ count: string; earliest: string | null; latest: string | null }>(
+  async rangeStats(
+    args: {
+      instrumentId: string;
+      timeframe: Timeframe;
+      from: number;
+      to: number;
+    },
+    queryable: MarketDataQueryable = this.pool,
+  ): Promise<{ count: number; earliest: number | null; latest: number | null }> {
+    const res = await queryable.query<{ count: string; earliest: string | null; latest: string | null }>(
       `SELECT count(*)::text AS count, min(ts)::text AS earliest, max(ts)::text AS latest
        FROM candles WHERE instrument_id = $1 AND timeframe = $2 AND ts >= $3 AND ts < $4`,
       [args.instrumentId, args.timeframe, args.from, args.to],
@@ -168,8 +183,11 @@ export class CandleStore {
   }
 
   /** Delete rows older than the retention cutoff. Returns rows removed. */
-  async pruneBeyondRetention(args: { instrumentId: string; timeframe: Timeframe; cutoffMs: number }): Promise<number> {
-    const res = await this.pool.query(
+  async pruneBeyondRetention(
+    args: { instrumentId: string; timeframe: Timeframe; cutoffMs: number },
+    queryable: MarketDataQueryable = this.pool,
+  ): Promise<number> {
+    const res = await queryable.query(
       'DELETE FROM candles WHERE instrument_id = $1 AND timeframe = $2 AND ts < $3',
       [args.instrumentId, args.timeframe, args.cutoffMs],
     );

@@ -17,7 +17,12 @@ import {
   MIN_SCANNER_LEASE_MS,
 } from '@veltrixeye/contracts';
 import type { SmtpEmailConfig as SmtpEmailConfigShape } from '@veltrixeye/core';
-import { BILLING_FX_POLICY, validateExecutionTransportConfig } from '@veltrixeye/core';
+import {
+  BILLING_FX_POLICY,
+  DEFAULT_SCHEDULED_MAX_REQUESTS_PER_CYCLE,
+  DEFAULT_SCHEDULED_MIN_INTERVAL_MS,
+  validateExecutionTransportConfig,
+} from '@veltrixeye/core';
 import { DEFAULT_TRUSTED_PROXIES, parseTrustedProxies } from './trust-proxy.js';
 import {
   parsePaystackWebhookAllowList,
@@ -254,6 +259,10 @@ const baseEnvSchema = z.object({
   INGESTION_SCHEDULE_ENABLED: boolEnv(false),
   /** Max candles per instrument × timeframe per warm cycle (bounds credits). */
   INGESTION_LOOKBACK_CANDLES: intEnv(50, 5000, 500),
+  /** Actual provider historical-range requests allowed per warm cycle. */
+  INGESTION_MAX_REQUESTS_PER_CYCLE: intEnv(1, 1000, DEFAULT_SCHEDULED_MAX_REQUESTS_PER_CYCLE),
+  /** Minimum delay after a completed scheduled warm cycle (zero disables the delay). */
+  INGESTION_MIN_INTERVAL_MS: intEnv(0, 86_400_000, DEFAULT_SCHEDULED_MIN_INTERVAL_MS),
 
   /* ---------------------------------------------------------------------- */
   /* M8.6 — kill-switch & safety controls                                      */
@@ -475,6 +484,10 @@ export interface ScheduledIngestionConfig {
   enabled: boolean;
   /** Max candles to fetch per instrument × timeframe per warm cycle. */
   lookbackCandles: number;
+  /** Maximum actual provider requests allowed per warm cycle. */
+  maxRequestsPerCycle: number;
+  /** Minimum milliseconds between completed scheduled warm cycles. */
+  minIntervalMs: number;
 }
 
 /**
@@ -585,6 +598,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     scheduledIngestion: {
       enabled: values.INGESTION_SCHEDULE_ENABLED,
       lookbackCandles: values.INGESTION_LOOKBACK_CANDLES,
+      maxRequestsPerCycle: values.INGESTION_MAX_REQUESTS_PER_CYCLE,
+      minIntervalMs: values.INGESTION_MIN_INTERVAL_MS,
     },
     billing: {
       provider: 'paystack',
