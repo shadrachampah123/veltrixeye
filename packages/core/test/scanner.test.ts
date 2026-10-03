@@ -102,12 +102,14 @@ class MockProvider implements MarketDataProvider {
   public shouldTimeout = false;
   public failKind: 'unavailable' | 'rate_limited' | 'invalid_request' | 'not_found' | 'unauthorized' = 'unavailable';
   public candles: Candle[] = [];
+  public historicalCalls = 0;
 
   async getSymbols() {
     return [];
   }
 
   async getHistoricalCandles(): Promise<Candle[]> {
+    this.historicalCalls += 1;
     if (this.shouldTimeout) {
       await new Promise((r) => setTimeout(r, 200));
       throw new Error('Provider timeout after 15000ms');
@@ -1148,7 +1150,7 @@ describe('F14: MTF anchor alignment (no lookahead)', () => {
   const MIN15_MS = 15 * 60_000;
   const HOUR4_MS = 4 * 60 * 60_000;
 
-  async function createPublishedScannerStrategy() {
+  async function createPublishedScannerStrategy(assetClass: 'forex' | 'commodity' = 'forex', symbol = 'EURUSD') {
     const email = uniqueEmail();
     const passwordHash = await hashPassword(PASSWORD);
     const user = await users.create({ email, passwordHash, name: 'F14 Anchor User' });
@@ -1161,7 +1163,7 @@ describe('F14: MTF anchor alignment (no lookahead)', () => {
         timeframes: { htf_bias: '4h', setup: '1h', entry: '15m' },
         marketScope: {
           mode: 'instruments',
-          instruments: [{ assetClass: 'forex', symbol: 'EURUSD' }],
+          instruments: [{ assetClass, symbol }],
         },
         sessionFilters: [],
         risk: {
@@ -1199,6 +1201,118 @@ describe('F14: MTF anchor alignment (no lookahead)', () => {
     await strategies.updateStrategy(user.id, created.id, { status: 'active' });
     return { user, strategyId: created.id, versionId };
   }
+
+  test('uses fresh closed XAUUSD CandleStore batches when the provider is rate-limited', async () => {
+    const { user, strategyId, versionId } = await createPublishedScannerStrategy('commodity', 'XAUUSD');
+    const instrument = await candleStore.resolveInstrument('commodity', 'XAUUSD');
+    assert.ok(instrument);
+
+    const nowMs = Math.floor(Date.now() / HOUR_MS) * HOUR_MS + 25 * 60_000;
+    const latestClosedHtfOpen = Math.floor(nowMs / HOUR4_MS) * HOUR4_MS - HOUR4_MS;
+    const latestClosedSetupOpen = Math.floor(nowMs / HOUR_MS) * HOUR_MS - HOUR_MS;
+    const latestClosedEntryOpen = Math.floor(nowMs / MIN15_MS) * MIN15_MS - MIN15_MS;
+    const cachedByTimeframe = [
+      {
+        timeframe: '4h' as const,
+        periodMs: HOUR4_MS,
+        candles: makeCandles(60, latestClosedHtfOpen - 59 * HOUR4_MS, HOUR4_MS),
+      },
+      {
+        timeframe: '1h' as const,
+        periodMs: HOUR_MS,
+        candles: makeCandles(120, latestClosedSetupOpen - 119 * HOUR_MS, HOUR_MS),
+      },
+      {
+        timeframe: '15m' as const,
+        periodMs: MIN15_MS,
+        candles: makeCandles(120, latestClosedEntryOpen - 119 * MIN15_MS, MIN15_MS),
+      },
+    ];
+
+    for (const batch of cachedByTimeframe) {
+      assert.equal(
+        checkFreshness({ candles: batch.candles, timeframe: batch.timeframe, nowMs }).fresh,
+        true,
+        `${batch.timeframe} CandleStore batch must meet the existing freshness threshold`,
+      );
+      assert.ok(batch.candles.every((c) => c.time + batch.periodMs <= nowMs), `${batch.timeframe} cache must contain closed candles only`);
+      await candleStore.upsertCandles({
+        instrumentId: instrument.id,
+        timeframe: batch.timeframe,
+        providerSlug: 'twelve-data',
+        candles: batch.candles,
+      });
+      const formingOpen = batch.candles.at(-1)!.time + batch.periodMs;
+      assert.ok(formingOpen < nowMs, `${batch.timeframe} forming tail should be present by scan time`);
+      await candleStore.upsertCandles({
+        instrumentId: instrument.id,
+        timeframe: batch.timeframe,
+        providerSlug: 'twelve-data',
+        candles: [makeCandle(formingOpen)],
+      });
+    }
+
+    const rateLimitedProvider = new MockProvider();
+    rateLimitedProvider.shouldFail = true;
+    rateLimitedProvider.failKind = 'rate_limited';
+    const unavailableRegistry = createProviderRegistry();
+    unavailableRegistry.register(rateLimitedProvider);
+    const providerIngestion = new IngestionService(pool, unavailableRegistry, candleStore);
+    let ingestionCalls = 0;
+    const monitoredIngestion = {
+      getCandles: async (request: Parameters<IngestionService['getCandles']>[0]) => {
+        ingestionCalls += 1;
+        return providerIngestion.getCandles(request);
+      },
+    } as unknown as IngestionService;
+
+    const detectedAsOfs: number[] = [];
+    const cachedSetups = {
+      detect: async (args: { asOf: number; direction: 'long' | 'short' }) => {
+        detectedAsOfs.push(args.asOf);
+        return { detections: [{ direction: args.direction, qualified: false, setup: null, created: false }] };
+      },
+    } as unknown as SetupService;
+    const cachedScanner = new ScannerService(
+      pool,
+      unavailableRegistry,
+      candleStore,
+      monitoredIngestion,
+      evaluation,
+      cachedSetups,
+      scoring,
+      alerts,
+      { logger: { info: () => {}, warn: () => {}, error: () => {} }, maxRetries: 0, providerTimeoutMs: 500 },
+    );
+
+    const result = await cachedScanner.triggerScan({
+      strategyId,
+      force: false,
+      initiatedBy: user.id,
+      nowMs,
+    });
+
+    const expectedAnchor = latestClosedSetupOpen + HOUR_MS;
+    const formingSetupClose = latestClosedSetupOpen + 2 * HOUR_MS;
+    assert.ok(formingSetupClose > nowMs, 'the setup candle after the latest closed candle is still forming');
+    assert.equal(result.run.status, 'completed', 'scanner should complete from the fresh CandleStore batches');
+    assert.deepEqual(detectedAsOfs, [expectedAnchor, expectedAnchor], 'both setup directions use the latest closed candle close');
+    assert.ok(detectedAsOfs.every((asOf) => asOf <= nowMs), 'no setup evaluation may look ahead past nowMs');
+    assert.ok(detectedAsOfs.every((asOf) => asOf < formingSetupClose), 'forming setup candle close must not become the evaluation anchor');
+    assert.equal(ingestionCalls, 0, 'valid CandleStore batches must bypass IngestionService.getCandles');
+    assert.equal(rateLimitedProvider.historicalCalls, 0, 'the unavailable provider must not be called for cached data');
+
+    const cursor = await pool.query<{ last_candle_time: string }>(
+      `SELECT last_candle_time FROM scanner_cursors
+       WHERE strategy_version_id = $1 AND instrument_id = $2 AND timeframe = '1h'`,
+      [versionId, instrument.id],
+    );
+    assert.equal(
+      Number(cursor.rows[0]?.last_candle_time),
+      latestClosedSetupOpen,
+      'cursor advances to the OPEN time of the latest closed setup candle',
+    );
+  });
 
   test('forming tail setup candle is excluded: anchor is last closed setup candle close (<= nowMs) and cursor re-arms on roll', async () => {
     const { user, strategyId, versionId } = await createPublishedScannerStrategy();
