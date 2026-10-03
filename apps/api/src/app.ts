@@ -265,6 +265,8 @@ export function createAppContext(
   // P1 — scheduled/pre-emptive candle ingestion (cache warming).
   const scheduledIngestion = new ScheduledIngestionService(pool, ingestion, {
     lookbackCandles: config.scheduledIngestion.lookbackCandles,
+    maxRequestsPerCycle: config.scheduledIngestion.maxRequestsPerCycle,
+    minIntervalMs: config.scheduledIngestion.minIntervalMs,
     logger: {
       info: (msg, meta) => {
         if (config.NODE_ENV === 'production') {

@@ -16,7 +16,7 @@ import {
   type Timeframe,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
-import type { CandleStore } from './candles.js';
+import type { CandleStore, MarketDataQueryable } from './candles.js';
 import type { ProviderRegistry } from './registry.js';
 
 /** Preferred provider id; falls back to any registered historical provider. */
@@ -33,6 +33,10 @@ export interface CandleReadRequest {
   nowMs?: number;
   /** Acting user, recorded on fetch-through runs. */
   initiatedBy?: string;
+  /** Checked-out connection for cycles that must keep all database work on one session. */
+  dbClient?: pg.PoolClient;
+  /** Called immediately before each provider request; may throw to stop fetch-through. */
+  beforeProviderRequest?: () => void;
 }
 
 export interface BackfillRequest {
@@ -71,7 +75,8 @@ export class IngestionService {
   /** Read candles, fetching + persisting missing head/tail first. */
   async getCandles(req: CandleReadRequest): Promise<CandlesResponseDto> {
     const nowMs = req.nowMs ?? Date.now();
-    const instrument = await this.store.resolveInstrument(req.assetClass, req.symbol);
+    const queryable: MarketDataQueryable = req.dbClient ?? this.pool;
+    const instrument = await this.store.resolveInstrument(req.assetClass, req.symbol, queryable);
     if (!instrument) {
       throw Errors.notFound(`Unknown instrument "${req.assetClass}/${req.symbol}"`);
     }
@@ -82,7 +87,7 @@ export class IngestionService {
       timeframe: req.timeframe,
       from: req.from,
       to: req.to,
-    });
+    }, queryable);
     const ranges = missingRanges(req.from, req.to, stats.earliest, stats.latest, timeframeMinutes(req.timeframe) * 60_000);
     let fetchedFromProvider = false;
     if (ranges.length > 0) {
@@ -90,6 +95,7 @@ export class IngestionService {
       let upserted = 0;
       try {
         for (const [from, to] of ranges) {
+          req.beforeProviderRequest?.();
           const candles = await provider.getHistoricalCandles({
             instrument: { assetClass: instrument.assetClass, symbol: instrument.symbol },
             timeframe: req.timeframe,
@@ -101,7 +107,7 @@ export class IngestionService {
             timeframe: req.timeframe,
             providerSlug: provider.id,
             candles: toDtos(candles),
-          });
+          }, queryable);
         }
       } catch (err) {
         await this.recordRun({
@@ -112,14 +118,14 @@ export class IngestionService {
           candlesUpserted: upserted,
           error: runErrorMessage(err),
           initiatedBy: req.initiatedBy ?? null,
-        });
+        }, queryable);
         throw mapProviderError(err);
       }
       await this.store.pruneBeyondRetention({
         instrumentId: instrument.id,
         timeframe: req.timeframe,
         cutoffMs: retentionCutoffMs(req.timeframe, nowMs),
-      });
+      }, queryable);
       await this.recordRun({
         trigger: 'fetch_through',
         status: 'completed',
@@ -128,7 +134,7 @@ export class IngestionService {
         candlesUpserted: upserted,
         error: null,
         initiatedBy: req.initiatedBy ?? null,
-      });
+      }, queryable);
       fetchedFromProvider = true;
     }
 
@@ -140,7 +146,7 @@ export class IngestionService {
       from: req.from,
       to: req.to,
       limit: req.limit + 1,
-    });
+    }, queryable);
     if (rows.length > req.limit) {
       throw Errors.invalidInput(
         `Range holds more than the ${req.limit}-candle limit — narrow the range or raise the limit (max 5000).`,
@@ -252,16 +258,19 @@ export class IngestionService {
     throw Errors.providerUnavailable('No market-data provider is registered — ingestion is unavailable.');
   }
 
-  private async recordRun(args: {
-    trigger: IngestionTrigger;
-    status: IngestionStatus;
-    providerSlug: string;
-    request: Record<string, unknown>;
-    candlesUpserted: number;
-    error: string | null;
-    initiatedBy: string | null;
-  }): Promise<void> {
-    await this.pool.query(
+  private async recordRun(
+    args: {
+      trigger: IngestionTrigger;
+      status: IngestionStatus;
+      providerSlug: string;
+      request: Record<string, unknown>;
+      candlesUpserted: number;
+      error: string | null;
+      initiatedBy: string | null;
+    },
+    queryable: MarketDataQueryable = this.pool,
+  ): Promise<void> {
+    await queryable.query(
       `INSERT INTO ingestion_runs (trigger, status, provider_slug, request, candles_upserted, error, initiated_by, finished_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, now())`,
       [args.trigger, args.status, args.providerSlug, JSON.stringify(args.request), args.candlesUpserted, args.error, args.initiatedBy],

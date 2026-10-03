@@ -269,6 +269,8 @@ disagree. The failing `schema` block is included in the response.
 | `SCANNER_ENABLED` | no (default `false`; `true` in `render.yaml`) | `true` starts the overlap-safe in-process scanner ticker (`startScannerWorkerTicker`) every `SCANNER_INTERVAL_MS`. Safe alongside external scheduler invocations via advisory lock `875421009`. |
 | `SCANNER_INTERVAL_MS` / `SCANNER_LEASE_MS` | no (default `300000` / `1800000`) | Scan cadence (5 m) and stale-run recovery horizon (30 m). |
 | `INGESTION_LOOKBACK_CANDLES` | no (default `500`; `200` in `render.yaml`) | P1 scheduled ingestion. Max candles per instrument × timeframe per warm cycle (50–5000). The cycle itself **stays off in production**: `INGESTION_SCHEDULE_ENABLED` is deliberately not set in the blueprint (default `false`), so the scanner keeps using fetch-through reads and this value only bounds a future opt-in. |
+| `INGESTION_MAX_REQUESTS_PER_CYCLE` | no (default `8`; range 1–1000) | P1 guard on actual provider requests per scheduled warm cycle; cache hits do not consume the budget. Dormant while scheduled ingestion remains off. |
+| `INGESTION_MIN_INTERVAL_MS` | no (default `900000` / 15 minutes; range 0–86400000) | P1 cooldown after the last completed scheduled warm cycle. `0` disables the cooldown, not the advisory lock. Dormant while scheduled ingestion remains off. |
 
 Missing or malformed values make the API **fail at boot** with an itemized
 error (`loadConfig` zod validation) instead of misbehaving at runtime.
