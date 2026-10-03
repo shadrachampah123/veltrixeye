@@ -261,7 +261,7 @@ const baseEnvSchema = z.object({
   INGESTION_LOOKBACK_CANDLES: intEnv(50, 5000, 500),
   /** Actual provider historical-range requests allowed per warm cycle. */
   INGESTION_MAX_REQUESTS_PER_CYCLE: intEnv(1, 1000, DEFAULT_SCHEDULED_MAX_REQUESTS_PER_CYCLE),
-  /** Minimum delay after a completed scheduled warm cycle (zero disables the delay). */
+  /** Minimum delay after the most recent scheduled warm-cycle attempt (zero disables it). */
   INGESTION_MIN_INTERVAL_MS: intEnv(0, 86_400_000, DEFAULT_SCHEDULED_MIN_INTERVAL_MS),
 
   /* ---------------------------------------------------------------------- */
@@ -486,7 +486,7 @@ export interface ScheduledIngestionConfig {
   lookbackCandles: number;
   /** Maximum actual provider requests allowed per warm cycle. */
   maxRequestsPerCycle: number;
-  /** Minimum milliseconds between completed scheduled warm cycles. */
+  /** Minimum milliseconds between scheduled warm-cycle attempts (any outcome). */
   minIntervalMs: number;
 }
 
