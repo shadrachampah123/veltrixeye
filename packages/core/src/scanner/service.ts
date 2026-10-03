@@ -828,6 +828,7 @@ export class ScannerService {
       timeframe: htfTf,
       nowMs,
       instrumentId: instrument.instrumentId,
+      minimumCandles: 50,
       metrics,
       cycleCache,
     });
@@ -838,6 +839,7 @@ export class ScannerService {
       timeframe: setupTf,
       nowMs,
       instrumentId: instrument.instrumentId,
+      minimumCandles: 100,
       metrics,
       cycleCache,
     });
@@ -848,6 +850,7 @@ export class ScannerService {
       timeframe: entryTf,
       nowMs,
       instrumentId: instrument.instrumentId,
+      minimumCandles: 100,
       metrics,
       cycleCache,
     });
@@ -1032,6 +1035,8 @@ export class ScannerService {
     timeframe: Timeframe;
     nowMs: number;
     instrumentId: string;
+    /** Minimum candles required by this timeframe's scanner role (HTF/setup/entry). */
+    minimumCandles: number;
     metrics: ScanMetrics;
     /** P2: per-cycle cache to deduplicate identical fetches across strategies. */
     cycleCache?: ScanCycleCache;
@@ -1048,8 +1053,48 @@ export class ScannerService {
     if (args.cycleCache) {
       const cacheKey = makeCacheKey(args.assetClass, args.symbol, args.timeframe);
       const cached = args.cycleCache.get(cacheKey);
-      if (cached) {
+      if (cached && cached.candles.length >= args.minimumCandles) {
         return cached.candles;
+      }
+    }
+
+    // Prefer a complete, valid, fresh batch already in the shared CandleStore.
+    // Only closed candles are eligible so a cache hit cannot introduce a
+    // forming-bar lookahead; otherwise keep the existing ingestion fetch-through
+    // path below as the source of truth.
+    const storedCandles = await this.candleStore.queryCandles({
+      instrumentId: args.instrumentId,
+      timeframe: args.timeframe,
+      from,
+      to,
+      limit: windowCandles + 1,
+    });
+
+    if (storedCandles.length <= windowCandles) {
+      const closedCandles = storedCandles.filter((c) => c.time + periodMs <= args.nowMs);
+      const normalizedBatch = normalizeCandleBatch(closedCandles);
+      if (normalizedBatch) {
+        const normalized = normalizedBatch.normalized;
+        const validation = validateCandleBatch({
+          candles: normalized,
+          timeframe: args.timeframe,
+          expectedFrom: from,
+          expectedTo: to,
+          allowGaps: args.timeframe === '1d' || args.timeframe === '1w' || args.timeframe === '1M',
+        });
+        const freshness = checkFreshness({
+          candles: normalized,
+          timeframe: args.timeframe,
+          nowMs: args.nowMs,
+        });
+
+        if (normalized.length >= args.minimumCandles && validation.valid && freshness.fresh) {
+          if (args.cycleCache) {
+            const cacheKey = makeCacheKey(args.assetClass, args.symbol, args.timeframe);
+            args.cycleCache.set(cacheKey, { candles: normalized });
+          }
+          return normalized;
+        }
       }
     }
 
