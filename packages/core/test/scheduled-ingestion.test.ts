@@ -112,6 +112,53 @@ function getTimeframeMs(tf: Timeframe): number {
 
 let mockProvider: MockProvider;
 
+/**
+ * Seed a throwaway user + strategy + version + instrument scope.
+ *
+ * Scope rows must be written while the version is still `draft`: migration
+ * 0007's guard rejects configuration writes once a version is published.
+ */
+async function seedScopedStrategy(args: {
+  name: string;
+  strategyStatus: 'active' | 'paused';
+  versionStatus: 'draft' | 'published';
+  symbols: [string, string][];
+}): Promise<void> {
+  const email = `${args.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}@fixture.test`;
+  const user = await pool.query<{ id: string }>(
+    `INSERT INTO users (email, password_hash, name)
+     VALUES ($1, $2, 'Scheduled Ingestion Fixture') RETURNING id`,
+    [email, 'x'.repeat(32)],
+  );
+  const userId = user.rows[0]!.id;
+  const strategy = await pool.query<{ id: string }>(
+    `INSERT INTO strategies (user_id, name, status) VALUES ($1, $2, $3) RETURNING id`,
+    [userId, args.name, args.strategyStatus],
+  );
+  const version = await pool.query<{ id: string }>(
+    `INSERT INTO strategy_versions (strategy_id, version_number, status, created_by)
+     VALUES ($1, 1, 'draft', $2) RETURNING id`,
+    [strategy.rows[0]!.id, userId],
+  );
+  const versionId = version.rows[0]!.id;
+  await pool.query(`INSERT INTO strategy_market_scopes (version_id, mode) VALUES ($1, 'instruments')`, [
+    versionId,
+  ]);
+  for (const [assetClass, symbol] of args.symbols) {
+    await pool.query(
+      `INSERT INTO strategy_market_scope_instruments (version_id, instrument_id)
+       SELECT $1, id FROM instruments WHERE asset_class = $2 AND symbol = $3`,
+      [versionId, assetClass, symbol],
+    );
+  }
+  if (args.versionStatus === 'published') {
+    await pool.query(
+      `UPDATE strategy_versions SET status = 'published', published_at = now() WHERE id = $1`,
+      [versionId],
+    );
+  }
+}
+
 before(async () => {
   const dataDir = path.join(REPO_ROOT, '.test', 'pg-scheduled-ingestion');
   rmSync(dataDir, { recursive: true, force: true });
@@ -131,6 +178,32 @@ before(async () => {
   providerRegistry.register(mockProvider);
   candleStore = new CandleStore(pool);
   ingestion = new IngestionService(pool, providerRegistry, candleStore);
+
+  // The warm universe is derived from what the scanner can actually reach, so
+  // seed the strategy scope: one in-scope active + published strategy, and two
+  // decoys that must not widen it (a draft version, and a paused strategy).
+  await seedScopedStrategy({
+    name: 'Warm scope published',
+    strategyStatus: 'active',
+    versionStatus: 'published',
+    symbols: [
+      ['forex', 'EURUSD'],
+      ['commodity', 'XAUUSD'],
+    ],
+  });
+  await seedScopedStrategy({
+    name: 'Warm scope draft version decoy',
+    strategyStatus: 'active',
+    versionStatus: 'draft',
+    symbols: [['stock', 'AAPL']],
+  });
+  await seedScopedStrategy({
+    name: 'Warm scope paused strategy decoy',
+    strategyStatus: 'paused',
+    versionStatus: 'published',
+    symbols: [['etf', 'SPY']],
+  });
+
   scheduled = new ScheduledIngestionService(pool, ingestion, {
     lookbackCandles: 100,
   });
@@ -142,15 +215,17 @@ after(async () => {
 });
 
 describe('ScheduledIngestionService', () => {
-  test('warmCache processes the seeded instrument universe', async () => {
+  test('warmCache warms only instruments reachable by an active published strategy', async () => {
     const result = await scheduled.warmCache({
       timeframes: ['1h', '4h'],
       nowMs: Date.now(),
     });
 
-    // Migration 0002 seeds 9 instruments
-    assert.ok(result.instrumentsProcessed > 0);
-    assert.equal(result.timeframesProcessed, result.instrumentsProcessed * 2);
+    // Migration 0002 seeds 9 platform instruments, but only the two scoped to
+    // the fixture's active + published strategy are warm targets: the draft
+    // version (AAPL) and the paused strategy (SPY) must not contribute.
+    assert.equal(result.instrumentsProcessed, 2);
+    assert.equal(result.timeframesProcessed, 4);
     assert.equal(result.pairsFailed, 0);
     assert.ok(result.candlesUpserted > 0);
     assert.ok(typeof result.startedAt === 'string');

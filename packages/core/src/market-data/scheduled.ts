@@ -11,7 +11,9 @@ import type { IngestionService } from './ingestion.js';
  * from scan timing and reduces provider credit usage.
  *
  * Design:
- *  - Reads the active instrument universe from the `instruments` table.
+ *  - Reads the instrument universe reachable by an active strategy's
+ *    published version (scope 'instruments' rows, or the whole platform
+ *    universe when any live version uses scope 'all').
  *  - For each instrument × timeframe, calls `IngestionService.getCandles()`
  *    which triggers fetch-through for any missing head/tail ranges.
  *  - Bounded: lookback is limited to a configurable number of candles per
@@ -236,9 +238,34 @@ export class ScheduledIngestionService {
     };
   }
 
+  /**
+   * Instruments a scan can actually reach: those referenced by the published
+   * version of an active strategy, plus the whole platform universe whenever
+   * any such version uses scope mode 'all'.
+   *
+   * Mirrors the scanner's eligibility read (active strategy + published
+   * version). The scanner's JS-side entitlement gate is deliberately NOT
+   * replicated here: this set is a superset of what any scan will touch, so
+   * it can only warm instruments that *might* be needed — never miss one.
+   */
   private async resolveUniverse(): Promise<{ assetClass: AssetClass; symbol: string }[]> {
     const res = await this.pool.query<{ asset_class: string; symbol: string }>(
-      `SELECT asset_class, symbol FROM instruments ORDER BY asset_class, symbol LIMIT $1`,
+      `SELECT i.asset_class, i.symbol
+         FROM instruments i
+        WHERE EXISTS (
+                SELECT 1
+                  FROM strategy_market_scope_instruments smsi
+                  JOIN strategy_versions v ON v.id = smsi.version_id AND v.status = 'published'
+                  JOIN strategies s ON s.id = v.strategy_id AND s.status = 'active'
+                 WHERE smsi.instrument_id = i.id)
+           OR EXISTS (
+                SELECT 1
+                  FROM strategy_market_scopes ms
+                  JOIN strategy_versions v ON v.id = ms.version_id AND v.status = 'published'
+                  JOIN strategies s ON s.id = v.strategy_id AND s.status = 'active'
+                 WHERE ms.mode = 'all')
+        ORDER BY i.asset_class, i.symbol
+        LIMIT $1`,
       [MAX_SCHEDULED_INSTRUMENTS],
     );
     return res.rows.map((r) => ({
