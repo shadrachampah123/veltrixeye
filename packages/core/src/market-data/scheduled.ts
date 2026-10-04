@@ -22,7 +22,10 @@ import type { IngestionService } from './ingestion.js';
  * Design:
  *  - Reads the instrument universe reachable by an active strategy's
  *    published version (scope 'instruments' rows, or the whole platform
- *    universe when any live version uses scope 'all').
+ *    universe when any live version uses scope 'all'), narrowed to the
+ *    instruments that actually have a provider-symbol mapping on an active
+ *    provider — an unsupported/unlicensed instrument (e.g. `index/SPX500`)
+ *    is never warmed.
  *  - For each instrument × timeframe, calls `IngestionService.getCandles()`
  *    which triggers fetch-through for any missing head/tail ranges.
  *  - Bounded: lookback is limited to a configurable number of candles per
@@ -507,6 +510,16 @@ export class ScheduledIngestionService {
    * version). The scanner's JS-side entitlement gate is deliberately NOT
    * replicated here: this set is a superset of what any scan will touch, so
    * it can only warm instruments that *might* be needed — never miss one.
+   *
+   * One narrowing DOES apply, and only to warming: an instrument is skipped
+   * unless it has a provider-symbol mapping on an `active` provider. An
+   * unmapped instrument is, by definition, one the platform does not source
+   * data for — `index/SPX500` is the canonical case (S&P index licensing keeps
+   * it out of the ingestion universe; see docs/provider-licensing.md). Warming
+   * it would spend a provider request on an unsupported symbol, so it is
+   * excluded here rather than attempted and failed. The scanner is untouched:
+   * it keeps its own universe and still surfaces such instruments as having no
+   * coverage.
    */
   private async resolveUniverse(
     queryable: MarketDataQueryable = this.pool,
@@ -516,16 +529,22 @@ export class ScheduledIngestionService {
          FROM instruments i
         WHERE EXISTS (
                 SELECT 1
-                  FROM strategy_market_scope_instruments smsi
-                  JOIN strategy_versions v ON v.id = smsi.version_id AND v.status = 'published'
-                  JOIN strategies s ON s.id = v.strategy_id AND s.status = 'active'
-                 WHERE smsi.instrument_id = i.id)
-           OR EXISTS (
-                SELECT 1
-                  FROM strategy_market_scopes ms
-                  JOIN strategy_versions v ON v.id = ms.version_id AND v.status = 'published'
-                  JOIN strategies s ON s.id = v.strategy_id AND s.status = 'active'
-                 WHERE ms.mode = 'all')
+                  FROM instrument_provider_symbols ips
+                  JOIN data_providers dp ON dp.id = ips.provider_id AND dp.status = 'active'
+                 WHERE ips.instrument_id = i.id)
+          AND (
+                EXISTS (
+                  SELECT 1
+                    FROM strategy_market_scope_instruments smsi
+                    JOIN strategy_versions v ON v.id = smsi.version_id AND v.status = 'published'
+                    JOIN strategies s ON s.id = v.strategy_id AND s.status = 'active'
+                   WHERE smsi.instrument_id = i.id)
+             OR EXISTS (
+                  SELECT 1
+                    FROM strategy_market_scopes ms
+                    JOIN strategy_versions v ON v.id = ms.version_id AND v.status = 'published'
+                    JOIN strategies s ON s.id = v.strategy_id AND s.status = 'active'
+                   WHERE ms.mode = 'all'))
         ORDER BY i.asset_class, i.symbol
         LIMIT $1`,
       [MAX_SCHEDULED_INSTRUMENTS],

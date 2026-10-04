@@ -53,6 +53,8 @@ class MockProvider implements MarketDataProvider {
     maxLookbackDays: 2190,
   };
   public fetchCount = 0;
+  /** Every instrument this provider was asked for, in request order (tests). */
+  public requestedInstruments: { assetClass: string; symbol: string }[] = [];
   /** Optional barrier used to hold a provider request in concurrency tests. */
   public beforeFetch: (() => Promise<void>) | null = null;
   /** When set, every fetch fails with this provider failure kind (tests). */
@@ -69,6 +71,10 @@ class MockProvider implements MarketDataProvider {
     to: number;
   }): Promise<Candle[]> {
     this.fetchCount++;
+    this.requestedInstruments.push({
+      assetClass: req.instrument.assetClass,
+      symbol: req.instrument.symbol,
+    });
     await this.beforeFetch?.();
     if (this.failKind) throw new ProviderError(this.failKind, 'mock provider failure');
     const periodMs = getTimeframeMs(req.timeframe);
@@ -128,13 +134,17 @@ let mockProvider: MockProvider;
  *
  * Scope rows must be written while the version is still `draft`: migration
  * 0007's guard rejects configuration writes once a version is published.
+ *
+ * Returns the strategy id. A strategy with a published version cannot be
+ * hard-deleted (migration 0007) — set its status to something other than
+ * 'active' to take it back out of the warm universe.
  */
 async function seedScopedStrategy(args: {
   name: string;
   strategyStatus: 'active' | 'paused';
   versionStatus: 'draft' | 'published';
   symbols: [string, string][];
-}): Promise<void> {
+}): Promise<string> {
   const email = `${args.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}@fixture.test`;
   const user = await pool.query<{ id: string }>(
     `INSERT INTO users (email, password_hash, name)
@@ -168,6 +178,7 @@ async function seedScopedStrategy(args: {
       [versionId],
     );
   }
+  return strategy.rows[0]!.id;
 }
 
 async function countScheduledRuns(): Promise<number> {
@@ -250,6 +261,126 @@ describe('ScheduledIngestionService', () => {
     assert.ok(result.candlesUpserted > 0);
     assert.ok(typeof result.startedAt === 'string');
     assert.ok(typeof result.finishedAt === 'string');
+  });
+
+  test('warmCache never warms an instrument with no provider-symbol mapping', async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+
+    // `index/SPX500` keeps its M1 identifier row but has NO provider-symbol
+    // mapping: S&P index licensing keeps it out of the ingestion universe
+    // (docs/provider-licensing.md). Scoping an active + published strategy to
+    // it must not turn it into a warm target — warming would spend a provider
+    // request on a symbol the platform has no licensed feed for.
+    const mappings = await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n
+         FROM instrument_provider_symbols m
+         JOIN instruments i ON i.id = m.instrument_id
+        WHERE i.asset_class = 'index' AND i.symbol = 'SPX500'`,
+    );
+    assert.equal(Number(mappings.rows[0]?.n), 0, 'fixture premise: index/SPX500 is unmapped');
+
+    const unlicensedStrategyId = await seedScopedStrategy({
+      name: 'Unlicensed index scope',
+      strategyStatus: 'active',
+      versionStatus: 'published',
+      symbols: [['index', 'SPX500']],
+    });
+
+    try {
+      // Guard the premise from the other side: the strategy really is active +
+      // published and really does scope the unmapped instrument, so the
+      // assertions below cannot pass merely because no scope row was written.
+      const scopeRes = await pool.query<{ n: string }>(
+        `SELECT count(*)::text AS n
+           FROM strategy_market_scope_instruments smsi
+           JOIN strategy_versions v ON v.id = smsi.version_id AND v.status = 'published'
+           JOIN strategies s ON s.id = v.strategy_id AND s.status = 'active'
+           JOIN instruments i ON i.id = smsi.instrument_id
+          WHERE s.id = $1 AND i.asset_class = 'index' AND i.symbol = 'SPX500'`,
+        [unlicensedStrategyId],
+      );
+      assert.equal(Number(scopeRes.rows[0]?.n), 1);
+
+      mockProvider.requestedInstruments = [];
+      const result = await scheduled.warmCache({ timeframes: ['1h', '4h'], nowMs: Date.now() });
+
+      // Only the two mapped, in-scope instruments are warmed: the unmapped one
+      // is never attempted, so it produces neither a provider request nor a
+      // per-pair failure (it is simply not in the warm universe).
+      assert.equal(result.instrumentsProcessed, 2);
+      assert.equal(result.pairsCompleted, 4);
+      assert.equal(result.pairsFailed, 0);
+      assert.equal(result.abortedDueToRateLimit, false);
+      assert.equal(mockProvider.requestedInstruments.length, 4);
+      assert.deepEqual(
+        [...new Set(mockProvider.requestedInstruments.map((i) => `${i.assetClass}/${i.symbol}`))].sort(),
+        ['commodity/XAUUSD', 'forex/EURUSD'],
+      );
+
+      // The exclusion is visible in the recorded run too — operators see the
+      // universe that was actually warmed, not the raw strategy scope.
+      const runRes = await pool.query<{ request: Record<string, unknown> }>(
+        `SELECT request FROM ingestion_runs WHERE trigger = 'scheduled'`,
+      );
+      assert.deepEqual(runRes.rows[0]?.request?.instruments, ['commodity/XAUUSD', 'forex/EURUSD']);
+    } finally {
+      // A strategy with a published version cannot be hard-deleted (migration
+      // 0007); archiving it takes it out of the warm universe instead.
+      await pool.query(`UPDATE strategies SET status = 'archived' WHERE id = $1`, [unlicensedStrategyId]);
+    }
+  });
+
+  test('warmCache never warms an instrument mapped only to a non-active provider', async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+
+    // A mapping alone is not enough: the provider behind it must be declared
+    // active. A `planned`/`deprecated` provider row is not a supported feed,
+    // so mapping `index/SPX500` to one must still not make it a warm target.
+    const providerRes = await pool.query<{ id: string }>(
+      `INSERT INTO data_providers (slug, display_name, status)
+       VALUES ('fixture-planned-provider', 'Fixture Planned Provider', 'planned') RETURNING id`,
+    );
+    const providerId = providerRes.rows[0]!.id;
+    await pool.query(
+      `INSERT INTO instrument_provider_symbols (instrument_id, provider_id, provider_symbol)
+       SELECT i.id, $1, 'FIXTURESPX' FROM instruments i
+        WHERE i.asset_class = 'index' AND i.symbol = 'SPX500'`,
+      [providerId],
+    );
+    const mappingRes = await pool.query<{ n: string }>(
+      `SELECT count(*)::text AS n
+         FROM instrument_provider_symbols m
+         JOIN instruments i ON i.id = m.instrument_id
+        WHERE i.asset_class = 'index' AND i.symbol = 'SPX500'`,
+    );
+    assert.equal(Number(mappingRes.rows[0]?.n), 1, 'fixture premise: SPX500 now has one mapping');
+
+    const strategyId = await seedScopedStrategy({
+      name: 'Planned-provider scope',
+      strategyStatus: 'active',
+      versionStatus: 'published',
+      symbols: [['index', 'SPX500']],
+    });
+
+    try {
+      mockProvider.requestedInstruments = [];
+      const result = await scheduled.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+
+      assert.equal(result.instrumentsProcessed, 2);
+      assert.equal(result.pairsCompleted, 2);
+      assert.equal(result.pairsFailed, 0);
+      assert.equal(
+        mockProvider.requestedInstruments.some((i) => `${i.assetClass}/${i.symbol}` === 'index/SPX500'),
+        false,
+      );
+    } finally {
+      await pool.query(`UPDATE strategies SET status = 'archived' WHERE id = $1`, [strategyId]);
+      // Deleting the provider row cascade-deletes its mappings, restoring the
+      // seeded 8-mapping universe.
+      await pool.query('DELETE FROM data_providers WHERE id = $1', [providerId]);
+    }
   });
 
   test('warmCache fetches from provider for missing data', async () => {
