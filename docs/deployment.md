@@ -268,9 +268,10 @@ disagree. The failing `schema` block is included in the response.
 | `SCANNER_WORKER_TOKEN` | for scheduled scanning (F3) | Shared secret for `POST /api/internal/scanner/run` and `POST /api/internal/scanner/maintenance`. **Empty = those routes return 404.** Set it so an external scheduler (Render Cron Job) can wake a sleeping instance and run a scan cycle safely. |
 | `SCANNER_ENABLED` | no (default `false`; `true` in `render.yaml`) | `true` starts the overlap-safe in-process scanner ticker (`startScannerWorkerTicker`) every `SCANNER_INTERVAL_MS`. Safe alongside external scheduler invocations via advisory lock `875421009`. |
 | `SCANNER_INTERVAL_MS` / `SCANNER_LEASE_MS` | no (default `300000` / `1800000`) | Scan cadence (5 m) and stale-run recovery horizon (30 m). |
-| `INGESTION_LOOKBACK_CANDLES` | no (default `500`; `500` in `render.yaml`) | P1 scheduled ingestion. Max candles per instrument × timeframe per warm cycle (50–5000). The cycle itself **stays off in production**: `INGESTION_SCHEDULE_ENABLED` is deliberately not set in the blueprint (default `false`), so the scanner keeps using fetch-through reads and this value only bounds a future opt-in. |
-| `INGESTION_MAX_REQUESTS_PER_CYCLE` | no (default `8`; range 1–1000) | P1 guard on actual provider requests per scheduled warm cycle; cache hits do not consume the budget. Dormant while scheduled ingestion remains off. |
-| `INGESTION_MIN_INTERVAL_MS` | no (default `900000` / 15 minutes; range 0–86400000) | P1 cooldown after the most recent scheduled warm-cycle attempt (failed and partial attempts count). `0` disables the cooldown, not the advisory lock. Dormant while scheduled ingestion remains off. |
+| `INGESTION_SCHEDULE_ENABLED` | no (default `false`; **`true` in `render.yaml`**) | P1 scheduled / pre-emptive candle ingestion. `true` runs a cache-warm cycle before each scanner tick so the scan's fetch-through reads become cache hits. Production runs it **on** (operator-enabled after review, reverted by setting `false` and redeploying); local development leaves it unset. |
+| `INGESTION_LOOKBACK_CANDLES` | no (default `500`; `500` in `render.yaml`) | P1. Max candles per instrument × timeframe per warm cycle (50–5000) — bounds provider credits. |
+| `INGESTION_MAX_REQUESTS_PER_CYCLE` | no (default `8`; `8` in `render.yaml`; range 1–1000) | P1 guard on actual provider requests per scheduled warm cycle; cache hits do not consume the budget. A cycle that reaches the cap stops early. |
+| `INGESTION_MIN_INTERVAL_MS` | no (default `900000` / 15 minutes; `900000` in `render.yaml`; range 0–86400000) | P1 cooldown after the most recent scheduled warm-cycle attempt (failed and partial attempts count). `0` disables the cooldown, not the advisory lock. |
 
 Missing or malformed values make the API **fail at boot** with an itemized
 error (`loadConfig` zod validation) instead of misbehaving at runtime.
@@ -375,6 +376,50 @@ migrations are unaffected.
   header) recovers stale `running` scans past `SCANNER_LEASE_MS` and returns
   bounded operational status without tenant identifiers or secrets. See
   [scanner.md](./scanner.md).
+
+### Scheduled ingestion operations (P1)
+
+Production runs the P1 cache-warm cycle **on**: the blueprint pins
+`INGESTION_SCHEDULE_ENABLED=true`, `INGESTION_LOOKBACK_CANDLES=500`,
+`INGESTION_MAX_REQUESTS_PER_CYCLE=8` and `INGESTION_MIN_INTERVAL_MS=900000`
+(15 minutes). Before each scan cycle the service warms the candle store for the
+instruments an active strategy can actually reach (provider-mapped ones only),
+so the scan's fetch-through reads become cache hits. Both scanner paths warm —
+the in-process ticker and `POST /api/internal/scanner/run`.
+
+- **Confirming it is on** — the boot log reads
+  `[api] live scanner enabled (… ) , scheduled ingestion warm enabled`. With
+  `INGESTION_MIN_INTERVAL_MS=900000` the guard, not the 5-minute scanner
+  cadence, sets the rate: a warm cycle runs at most once every 15 minutes, and
+  two instances cannot overlap it (advisory lock `875421010`).
+- **Per-cycle log** — `scheduled ingestion: warm cycle complete` carries
+  `instruments`, `timeframes`, `pairsCompleted`, `pairsFailed`,
+  `pairsAlreadyCached`, `candlesUpserted`, `providerRequests` and
+  `abortedDueToRateLimit`. `providerRequests` never exceeds
+  `INGESTION_MAX_REQUESTS_PER_CYCLE`; a cycle that reaches the cap (or a
+  provider rate limit) stops early with `abortedDueToRateLimit: true` instead
+  of spending another credit.
+- **Durable record** — every attempted cycle (including failed and partial
+  ones) writes an `ingestion_runs` row with `trigger = 'scheduled'`, `status`
+  `completed` / `partial` / `failed`, and the counters above inside `request`:
+
+  ```sql
+  SELECT started_at, finished_at, status, candles_upserted,
+         request->>'providerRequests'      AS provider_requests,
+         request->>'pairsCompleted'        AS pairs_completed,
+         request->>'pairsFailed'           AS pairs_failed,
+         request->>'pairsAlreadyCached'    AS already_cached,
+         request->>'abortedDueToRateLimit' AS aborted
+    FROM ingestion_runs
+   WHERE trigger = 'scheduled'
+   ORDER BY started_at DESC
+   LIMIT 10;
+  ```
+
+- **Turning it off** — set `INGESTION_SCHEDULE_ENABLED` to `false` (blueprint
+  or dashboard) and redeploy; the scanner immediately falls back to
+  fetch-through reads. No schema or code change is involved, and the other
+  three values simply stop being read.
 
 ### Operations
 
