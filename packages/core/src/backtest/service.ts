@@ -2,8 +2,8 @@
 import type pg from 'pg';
 import {
   BACKTEST_ENGINE_VERSION,
+  MAX_BACKTEST_ROLE_CANDLES,
   MAX_BACKTEST_TRADES,
-  MAX_BACKTEST_STEPS,
   backtestDirectionSchema,
   backtestInstrumentSchema,
   backtestMetricsSchema,
@@ -12,12 +12,18 @@ import {
   type BacktestListQuery,
   type BacktestRunDto,
   type BacktestTrade,
+  type Timeframe,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
 import type { StrategyService } from '../strategies/strategies.js';
 import type { CandleStore } from '../market-data/candles.js';
-import { requiredWindows } from '../strategies/evaluation/service.js';
-import { runBacktest } from './engine.js';
+import {
+  anchorHorizonMs,
+  roleCoverageWindow,
+  runBacktest,
+  setupCoverageWindow,
+  type BacktestRoleWindow,
+} from './engine.js';
 import { resolveEntitlements } from '../billing/entitlement-resolution.js';
 import type { UserPlan } from '@veltrixeye/contracts';
 import { computeConfigHash, isValidConfigHash } from './canonical.js';
@@ -187,43 +193,57 @@ export class BacktestService {
     }
 
     // 6. Load required candles (store-only, never provider).
-    const windows = requiredWindows(config);
-    const setupPeriodMs = timeframeMinutes(config.timeframes.setup) * 60_000;
-    const htfPeriodMs = timeframeMinutes(config.timeframes.htf_bias) * 60_000;
-    const entryPeriodMs = timeframeMinutes(config.timeframes.entry) * 60_000;
+    //
+    // M6.2 coverage: each role's window is sized from that ROLE's own period
+    // (see engine.ts), not from MAX_BACKTEST_STEPS. One anchor costs one setup
+    // candle but setupPeriod/entryPeriod entry candles, so a per-role budget of
+    // "one candle per step" truncated the finer roles and left every later
+    // anchor replaying a stale prefix. The setup role is loaded first because
+    // it defines the anchors: the bias/entry windows are measured to the last
+    // anchor this run will actually evaluate, and capped by
+    // MAX_BACKTEST_ROLE_CANDLES (fail closed, never a truncated replay).
+    const setupWindow = setupCoverageWindow({
+      config,
+      fromMs: args.from,
+      toMs: args.to,
+      maxHoldCandles: parsed.exitPolicy.maxHoldCandles,
+    });
+    assertWithinRoleCap('setup', config.timeframes.setup, setupWindow);
 
-    // For each role, load from (from - window*period - period) to to.
-    // The extra period ensures we include a candle whose close is exactly at from.
-    const htfFrom = args.from - windows.htf_bias * htfPeriodMs - htfPeriodMs;
-    const setupFrom = args.from - windows.setup * setupPeriodMs - setupPeriodMs;
-    const entryFrom = args.from - windows.entry * entryPeriodMs - entryPeriodMs;
+    const setupCandles = await this.candles.queryCandles({
+      instrumentId: resolved.id,
+      timeframe: config.timeframes.setup,
+      from: setupWindow.from,
+      to: setupWindow.to,
+      limit: setupWindow.limit,
+    });
 
-    // Limit: window + MAX_BACKTEST_STEPS + margin, capped to 10k to avoid unbounded loads.
-    const htfLimit = Math.min(10000, windows.htf_bias + MAX_BACKTEST_STEPS + 500);
-    const setupLimit = Math.min(10000, windows.setup + MAX_BACKTEST_STEPS + 500);
-    const entryLimit = Math.min(10000, windows.entry + MAX_BACKTEST_STEPS + 500);
+    const horizonMs = anchorHorizonMs({
+      setup: setupCandles,
+      setupPeriodMs: timeframeMinutes(config.timeframes.setup) * 60_000,
+      fromMs: args.from,
+      toMs: args.to,
+    });
 
-    const [htfCandles, setupCandles, entryCandles] = await Promise.all([
+    const htfWindow = roleCoverageWindow({ role: 'htf_bias', config, fromMs: args.from, horizonMs });
+    const entryWindow = roleCoverageWindow({ role: 'entry', config, fromMs: args.from, horizonMs });
+    assertWithinRoleCap('htf_bias', config.timeframes.htf_bias, htfWindow);
+    assertWithinRoleCap('entry', config.timeframes.entry, entryWindow);
+
+    const [htfCandles, entryCandles] = await Promise.all([
       this.candles.queryCandles({
         instrumentId: resolved.id,
         timeframe: config.timeframes.htf_bias,
-        from: Math.max(0, htfFrom),
-        to: args.to,
-        limit: htfLimit,
-      }),
-      this.candles.queryCandles({
-        instrumentId: resolved.id,
-        timeframe: config.timeframes.setup,
-        from: Math.max(0, setupFrom),
-        to: args.to,
-        limit: setupLimit,
+        from: htfWindow.from,
+        to: htfWindow.to,
+        limit: htfWindow.limit,
       }),
       this.candles.queryCandles({
         instrumentId: resolved.id,
         timeframe: config.timeframes.entry,
-        from: Math.max(0, entryFrom),
-        to: args.to,
-        limit: entryLimit,
+        from: entryWindow.from,
+        to: entryWindow.to,
+        limit: entryWindow.limit,
       }),
     ]);
 
@@ -499,6 +519,21 @@ export class BacktestService {
     );
     return res.rows[0] ?? null;
   }
+}
+
+/**
+ * M6.2 fail-closed bound: a run may never load more than
+ * `MAX_BACKTEST_ROLE_CANDLES` candles for one role. Crossing the cap means the
+ * range cannot be covered at this strategy's timeframes, and a truncated
+ * (stale) replay is worse than no replay — refuse it and say how to proceed.
+ */
+function assertWithinRoleCap(role: string, timeframe: Timeframe, window: BacktestRoleWindow): void {
+  if (window.limit <= MAX_BACKTEST_ROLE_CANDLES) return;
+  throw Errors.invalidInput(
+    `Backtest range is too long to cover at this version's timeframes: the ${role} timeframe (${timeframe}) ` +
+      `would need more than ${MAX_BACKTEST_ROLE_CANDLES} candles. Split the range into shorter backtests ` +
+      `(or backtest a version with a coarser ${role} timeframe).`,
+  );
 }
 
 function toRunDto(

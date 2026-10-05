@@ -260,20 +260,34 @@ describe('m6 anchors, determinism and warm-up', () => {
     assertValidResult(a);
   });
 
-  test('ranges over MAX_BACKTEST_STEPS keep the first 2000 anchors and note the truncation', () => {
-    const shapes: Array<[number, number, number, number]> = Array.from({ length: 2100 }, () => NORMAL);
+  test('ranges over MAX_BACKTEST_STEPS keep the first MAX_BACKTEST_STEPS anchors and note the truncation', () => {
+    const shapeCount = MAX_BACKTEST_STEPS + 100;
+    const shapes: Array<[number, number, number, number]> = Array.from({ length: shapeCount }, () => NORMAL);
     shapes[5] = BULL_PIN;
     shapes[6] = BULL_PIN;
     const setup = hourly(shapes);
-    const full = run({ config: longPins(), setup, fromMs: closeOf(0), toMs: closeOf(2099) + 1, direction: 'long' });
+    const full = run({
+      config: longPins(),
+      setup,
+      fromMs: closeOf(0),
+      toMs: closeOf(shapeCount - 1) + 1,
+      direction: 'long',
+    });
     assert.equal(full.stepsEvaluated, MAX_BACKTEST_STEPS);
-    assert.ok(full.notes.some((n) => n.includes('2100') && n.includes('2000')));
+    assert.ok(full.notes.some((n) => n.includes(String(shapeCount)) && n.includes(String(MAX_BACKTEST_STEPS))));
 
-    // The truncated run replayed exactly the first-2000 prefix: same trades/metrics
-    // as a run whose whole range fits under the cap (exits resolve early).
-    const prefix = hourly(shapes.slice(0, 2000));
-    const bounded = run({ config: longPins(), setup: prefix, fromMs: closeOf(0), toMs: closeOf(1999) + 1, direction: 'long' });
-    assert.equal(bounded.stepsEvaluated, 2000);
+    // The truncated run replayed exactly the first-MAX_BACKTEST_STEPS prefix:
+    // same trades/metrics as a run whose whole range fits under the cap
+    // (exits resolve early).
+    const prefix = hourly(shapes.slice(0, MAX_BACKTEST_STEPS));
+    const bounded = run({
+      config: longPins(),
+      setup: prefix,
+      fromMs: closeOf(0),
+      toMs: closeOf(MAX_BACKTEST_STEPS - 1) + 1,
+      direction: 'long',
+    });
+    assert.equal(bounded.stepsEvaluated, MAX_BACKTEST_STEPS);
     assert.ok(!bounded.notes.some((n) => n.includes('MAX_BACKTEST_STEPS')));
     assert.deepEqual(full.trades, bounded.trades);
     assert.deepEqual(full.metrics, bounded.metrics);
@@ -851,11 +865,13 @@ describe('m6 overlaps, gaps and multi-role visibility', () => {
     // …and with <20 closed HTF bars the trend gate fails closed everywhere.
     assert.equal(withUnclosed.trades.length, 0);
 
-    // Sanity: HTF data IS consumed — 20 closed rising bars align longs.
+    // Sanity: HTF data IS consumed — 20+ closed rising bars align longs.
+    // The series must also COVER the range: a bias series that ends before
+    // the anchors it feeds is refused, not replayed stale (M6.2).
     const aligned = run({
       config,
       setup,
-      htf: Array.from({ length: 20 }, (_, i) => candle(T0 - 20 * DAY + i * DAY, 90 + i, 91 + i, 89 + i, 90 + i)),
+      htf: Array.from({ length: 22 }, (_, i) => candle(T0 - 20 * DAY + i * DAY, 90 + i, 91 + i, 89 + i, 90 + i)),
       fromMs,
       toMs,
       direction: 'both',

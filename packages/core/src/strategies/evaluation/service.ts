@@ -5,6 +5,7 @@ import {
   type EvaluationEngine,
   type EvaluationResultDto,
   type InstrumentEvaluation,
+  type ConditionTimeframeRole,
   type NormalizedInstrument,
   type StrategyVersionConfig,
   type Timeframe,
@@ -177,6 +178,29 @@ const TYPE_WINDOW_FLOOR: Record<string, number> = {
 };
 
 /**
+ * The candle role a condition actually reads.
+ *
+ * `timeframeRole: 'any'` means the SETUP role (its evaluation convention),
+ * except htf_alignment which means the HTF/bias role. Exported so callers
+ * that must size or validate role coverage (M6 backtest) use the SAME mapping
+ * as the warm-up windows below — there is exactly one role convention.
+ */
+export function conditionRole(condition: {
+  conditionType: string;
+  timeframeRole: ConditionTimeframeRole;
+}): 'htf_bias' | 'setup' | 'entry' {
+  return condition.timeframeRole === 'any'
+    ? condition.conditionType === 'htf_alignment'
+      ? 'htf_bias'
+      : 'setup'
+    : condition.timeframeRole === 'htf_bias'
+      ? 'htf_bias'
+      : condition.timeframeRole === 'entry'
+        ? 'entry'
+        : 'setup';
+}
+
+/**
  * Largest candle count any condition assigned to a role may consume.
  * `timeframeRole: 'any'` counts toward the SETUP role (its evaluation
  * convention), except htf_alignment which counts toward htf_bias.
@@ -189,16 +213,7 @@ export function requiredWindows(config: StrategyVersionConfig): Record<'htf_bias
   };
   for (const group of config.ruleGroups) {
     for (const condition of group.conditions) {
-      const roleForWindow: 'htf_bias' | 'setup' | 'entry' =
-        condition.timeframeRole === 'any'
-          ? condition.conditionType === 'htf_alignment'
-            ? 'htf_bias'
-            : 'setup'
-          : condition.timeframeRole === 'htf_bias'
-            ? 'htf_bias'
-            : condition.timeframeRole === 'entry'
-              ? 'entry'
-              : 'setup';
+      const roleForWindow = conditionRole(condition);
       let need = TYPE_WINDOW_FLOOR[condition.conditionType] ?? 0;
       const params = condition.params as Record<string, unknown>;
       for (const key of ['lookbackCandles', 'maxAgeCandles', 'maxRetestCandles', 'period', 'atrPeriod']) {
