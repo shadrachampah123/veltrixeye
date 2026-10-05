@@ -143,8 +143,8 @@ async function seedCandles(symbol: string, count: number, startMs: number, shape
   assert.equal(upserted, count);
 }
 
-async function seedMixedCandles(symbol: string, shapes: Shape[], startMs: number): Promise<void> {
-  const instrument = await store.resolveInstrument('forex', symbol);
+async function seedMixedCandles(symbol: string, shapes: Shape[], startMs: number, assetClass = 'forex'): Promise<void> {
+  const instrument = await store.resolveInstrument(assetClass, symbol);
   assert.ok(instrument);
   const candles = shapes.map(([o, h, l, c], idx) => candle(startMs + idx * HOUR, o, h, l, c));
   await store.upsertCandles({ instrumentId: instrument.id, timeframe: '1h', providerSlug: 'test-fixture', candles });
@@ -562,6 +562,64 @@ describe('m6 backtests api', () => {
     const m = typeof metrics === 'string' ? JSON.parse(metrics) : metrics;
     assert.ok(typeof m.totalR === 'number');
     assert.ok(Array.isArray(direct.rows[0]!.notes) || typeof direct.rows[0]!.notes === 'object');
+  });
+
+  test('costs are instrument-aware: XAUUSD pips convert via pip_size (regression: the −729.60R TP3 trade)', async () => {
+    // The reported bug: cost fields were subtracted as raw price units, so on
+    // gold (pip_size 0.01, migration 0017) a normal pip policy was 100× too
+    // expensive in price units and this exact trade closed at −729.60R.
+    const owner = await registerUser();
+    const { strategyId, versionId } = await createPublishedVersion(owner.cookie, {
+      timeframes: { htf_bias: '1h', setup: '1h', entry: '1h' },
+      marketScope: { mode: 'instruments', instruments: [{ assetClass: 'commodity', symbol: 'XAUUSD' }] },
+      sessionFilters: [],
+      // 33.802-pip fixed buffer ⇒ riskDistance 0.0033802 on gold; TP3 at 10R.
+      risk: { ...RISK, stopLossBuffer: 33.802, tp1Rr: 2, tp2Rr: 5, tp3Rr: 10 },
+      filters: [],
+      ruleGroups: [
+        {
+          name: 'Pins',
+          logic: 'AND',
+          position: 0,
+          conditions: [
+            { conditionType: 'rejection_candle', classification: 'required', timeframeRole: 'setup', params: { direction: 'bullish', minWickBodyRatio: 2 }, position: 0 },
+          ],
+        },
+      ],
+    });
+    const NORMAL: Shape = [100, 100.0005, 99.9998, 100.0002];
+    const PIN: Shape = [100, 100.0005, 99.998, 100];
+    const TP3: Shape = [100, 100.04, 99.999, 100.01];
+    await seedMixedCandles('XAUUSD', [NORMAL, PIN, TP3, NORMAL], T0, 'commodity');
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/backtests',
+      headers: { cookie: owner.cookie, 'x-forwarded-for': freshIp() },
+      payload: {
+        strategyId,
+        versionId,
+        instrument: { assetClass: 'commodity', symbol: 'XAUUSD' },
+        direction: 'long',
+        from: T0 + HOUR,
+        to: T0 + 4 * HOUR,
+        costPolicy: { feePerSide: 0.5, slippagePerSide: 0.25, spread: 1 }, // pips
+      },
+    });
+    assert.equal(res.statusCode, 201, res.body);
+    const body = res.json();
+    assert.equal(body.trades.length, 1);
+    const trade = body.trades[0];
+    assert.equal(trade.exitReason, 'take_profit_3');
+    // The version config round-trips through `strategy_risk_config`
+    // (`stop_loss_buffer numeric(10,2)`), so 33.802 pips persist as 33.80:
+    //   D = 33.80 × 0.0001 (the engine's pip buffer) = 0.00338
+    //   cost = 2.5 pips × 0.01 (XAUUSD pip_size) = 0.025 price units
+    //   pnlR = 10R − 0.025/0.00338 = +2.60355 → +2.6036R (numeric(12,4))
+    // Pre-fix (raw price-unit costs) this same trade was −729.64R.
+    assert.equal(trade.pnlR, 2.6036);
+    assert.ok(trade.pnlR > 0, 'TP3 must be positive once costs use the instrument pip size');
+    assert.equal(body.run.costPolicy.feePerSide, 0.5);
   });
 
   test('list/detail/trade endpoints', async () => {

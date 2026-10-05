@@ -186,11 +186,19 @@ export class BacktestService {
       throw Errors.invalidInput('Published version is missing its risk configuration.');
     }
 
-    // 5. Resolve instrument.
+    // 5. Resolve instrument + its pip size.
+    //
+    // Costs are pips, so the engine needs the instrument's pip size to convert
+    // them into price units (see `resolvePipSize` in engine.ts). The spec lives
+    // in `instrument_risk_specs` (M8.2, migration 0017) — the same table the
+    // risk/execution engines size positions from. A missing spec is only fatal
+    // when the cost policy is non-zero (the engine enforces that), so a
+    // costless replay of an instrument without a spec still runs.
     const resolved = await this.candles.resolveInstrument(instrumentParsed.assetClass, instrumentParsed.symbol);
     if (!resolved) {
       throw Errors.notFound(`Unknown instrument "${instrumentParsed.assetClass}/${instrumentParsed.symbol}"`);
     }
+    const pipSize = await this.loadPipSize(resolved.id);
 
     // 6. Load required candles (store-only, never provider).
     //
@@ -261,6 +269,7 @@ export class BacktestService {
       direction: directionParsed,
       exitPolicy: parsed.exitPolicy,
       costPolicy: parsed.costPolicy,
+      pipSize,
     });
 
     // 8. Enforce MAX_BACKTEST_TRADES at persistence boundary.
@@ -424,6 +433,23 @@ export class BacktestService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Instrument pip size (price units per pip) from `instrument_risk_specs`
+   * (M8.2, migration 0017) — undefined when the instrument has no spec.
+   * Costs are pips and are converted with this value; the pure engine refuses
+   * a non-zero cost policy without it, so no unit is ever assumed here.
+   */
+  private async loadPipSize(instrumentId: string): Promise<number | undefined> {
+    const res = await this.pool.query<{ pip_size: string }>(
+      'SELECT pip_size FROM instrument_risk_specs WHERE instrument_id = $1',
+      [instrumentId],
+    );
+    const row = res.rows[0];
+    if (!row) return undefined;
+    const pipSize = Number(row.pip_size);
+    return Number.isFinite(pipSize) && pipSize > 0 ? pipSize : undefined;
   }
 
   async countBacktestsThisMonth(userId: string): Promise<number> {

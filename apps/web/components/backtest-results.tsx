@@ -59,9 +59,9 @@ export function BacktestRunSummary({
           value={run.exitPolicy.takeProfit === 'none' ? 'None' : run.exitPolicy.takeProfit.toUpperCase()}
         />
         <SummaryItem label="Max hold" value={`${run.exitPolicy.maxHoldCandles} setup candles`} />
-        <SummaryItem label="Fee per side" value={formatPrice(run.costPolicy.feePerSide)} />
-        <SummaryItem label="Slippage per side" value={formatPrice(run.costPolicy.slippagePerSide)} />
-        <SummaryItem label="Spread (entry)" value={formatPrice(run.costPolicy.spread)} />
+        <SummaryItem label="Fee per side (pips)" value={formatPrice(run.costPolicy.feePerSide)} />
+        <SummaryItem label="Slippage per side (pips)" value={formatPrice(run.costPolicy.slippagePerSide)} />
+        <SummaryItem label="Spread (entry, pips)" value={formatPrice(run.costPolicy.spread)} />
         <SummaryItem
           label="Risk per trade"
           value={run.costPolicy.riskPerTrade === undefined ? 'not set (R only)' : formatPrice(run.costPolicy.riskPerTrade)}

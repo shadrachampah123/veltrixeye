@@ -288,7 +288,7 @@ export function BacktestForm(props: BacktestFormProps) {
         <Card>
           <CardHeader
             title="Costs and sizing"
-            subtitle="Price units, applied adversely: fee and slippage on both sides, spread at entry"
+            subtitle="Pips, applied adversely: fee and slippage on both sides, spread at entry — converted with the instrument's pip size"
           />
           <div className="grid gap-4 px-5 py-4 sm:grid-cols-2 lg:grid-cols-4">
             <Field label="Fee per side" error={errors.feePerSide}>

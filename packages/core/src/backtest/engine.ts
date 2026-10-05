@@ -51,7 +51,9 @@ import { scoreSetupQuality } from '../scoring/engine.js';
  *    candle-by-candle on the setup timeframe only;
  *  - a candle touching BOTH stop and target resolves to the stop
  *    (`stop_first` — conservative, not configurable);
- *  - costs are explicit inputs (fee/slippage per side, spread at entry);
+ *  - costs are explicit inputs in PIPS (fee/slippage per side, spread at
+ *    entry), converted to price units with the instrument's pip size, so the
+ *    same policy means the same thing on EURUSD and XAUUSD;
  *  - R-multiples are primary; currency P&L exists only with `riskPerTrade`.
  *
  * Metrics denominators (pinned):
@@ -68,6 +70,7 @@ import { scoreSetupQuality } from '../scoring/engine.js';
 export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
   const exitPolicy = parseExitPolicy(input.exitPolicy);
   const costPolicy = parseCostPolicy(input.costPolicy);
+  const pipSize = resolvePipSize(input.pipSize, costPolicy);
   const config = input.config;
   if (!config.timeframes) {
     throw Errors.invalidInput('Backtest requires config.timeframes (published versions always have them).');
@@ -169,6 +172,7 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
         minRr: config.risk.minRr,
         exitPolicy,
         costPolicy,
+        pipSize,
       });
       if (trade.exitReason === 'no_levels') noLevels += 1;
       trades.push(trade);
@@ -428,6 +432,35 @@ function parseCostPolicy(policy: unknown): BacktestCostPolicy {
   return parsed.data;
 }
 
+/** Total modeled cost of one trade, in pips (fee/slippage both sides, spread at entry). */
+function totalCostPips(costPolicy: BacktestCostPolicy): number {
+  return 2 * (costPolicy.feePerSide + costPolicy.slippagePerSide) + costPolicy.spread;
+}
+
+/**
+ * Instrument pip size (price units per pip) for pip-denominated costs.
+ *
+ * A costless replay is scale-independent (every cost is zero), so a missing
+ * instrument spec is only refused when there IS something to convert —
+ * otherwise an unknown/absent pip size would silently reintroduce the unit
+ * bug this guards against. The service resolves the value from
+ * `instrument_risk_specs.pip_size` (M8.2); here it is validated at the pure
+ * engine boundary.
+ */
+function resolvePipSize(pipSize: number | undefined, costPolicy: BacktestCostPolicy): number {
+  if (pipSize !== undefined && (!Number.isFinite(pipSize) || pipSize <= 0)) {
+    throw Errors.invalidInput('Backtest pipSize must be a positive finite number of price units per pip.');
+  }
+  if (totalCostPips(costPolicy) === 0) return pipSize ?? 1; // inert: all costs are zero
+  if (pipSize === undefined) {
+    throw Errors.invalidInput(
+      'Backtest costs are pips and require the instrument pip size (instrument_risk_specs.pip_size), ' +
+        'but none was supplied for this instrument.',
+    );
+  }
+  return pipSize;
+}
+
 interface TradeSimulationInput {
   seq: number;
   direction: 'long' | 'short';
@@ -443,6 +476,8 @@ interface TradeSimulationInput {
   minRr: number;
   exitPolicy: BacktestExitPolicy;
   costPolicy: BacktestCostPolicy;
+  /** Instrument pip size (price units per pip) — costs are pips. */
+  pipSize: number;
 }
 
 /**
@@ -536,8 +571,11 @@ function simulateTrade(t: TradeSimulationInput): BacktestTrade {
     exitAsOfMs = t.anchor;
   }
 
-  // Costs are adverse by construction: fee/slippage on both sides, spread at entry.
-  const totalCost = 2 * (t.costPolicy.feePerSide + t.costPolicy.slippagePerSide) + t.costPolicy.spread;
+  // Costs are adverse by construction: fee/slippage on both sides, spread at
+  // entry. The policy is in pips, so one instrument-aware conversion happens
+  // here — the same policy on XAUUSD (pip 0.01) costs 100× the price units of
+  // EURUSD (pip 0.0001), which is exactly what "1 pip" means for each.
+  const totalCost = totalCostPips(t.costPolicy) * t.pipSize;
   const signedMove = t.direction === 'long' ? exitPrice - entry : entry - exitPrice;
   const pnlR = round4((signedMove - totalCost) / riskDistance);
   const pnlCurrency = t.costPolicy.riskPerTrade !== undefined ? round2(pnlR * t.costPolicy.riskPerTrade) : null;

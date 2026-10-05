@@ -102,9 +102,16 @@ const shortPins = () =>
 
 const INSTRUMENT = { assetClass: 'forex', symbol: 'EURUSD' };
 
+/** EURUSD pip size from `instrument_risk_specs` (M8.2, migration 0017). */
+const EURUSD_PIP_SIZE = 0.0001;
+/** XAUUSD pip size from `instrument_risk_specs` (M8.2, migration 0017). */
+const XAUUSD_PIP_SIZE = 0.01;
+
 /**
  * Fixed 10-pip stops on EURUSD: entry E ⇒ stop E−0.001, tp1 E+0.001,
  * tp2 E+0.002, tp3 E+0.003, riskDistance 0.001 (short legs mirrored).
+ *
+ * `costPolicy` values are PIPS (converted by the engine with `pipSize`).
  */
 function run(opts: {
   config: StrategyVersionConfig;
@@ -116,10 +123,13 @@ function run(opts: {
   direction?: 'long' | 'short' | 'both';
   exitPolicy?: unknown;
   costPolicy?: unknown;
+  pipSize?: number;
+  instrument?: { assetClass: string; symbol: string };
 }): BacktestEngineResult {
   return runBacktest({
     config: opts.config,
-    instrument: INSTRUMENT,
+    instrument: opts.instrument ?? INSTRUMENT,
+    pipSize: opts.pipSize ?? EURUSD_PIP_SIZE,
     candles: { htf_bias: opts.htf ?? opts.setup, setup: opts.setup, entry: opts.entry ?? opts.setup },
     fromMs: opts.fromMs,
     toMs: opts.toMs,
@@ -195,6 +205,35 @@ describe('m6 backtest engine input validation', () => {
         run({ config: alwaysPass(), setup, fromMs: closeOf(0), toMs: closeOf(2), exitPolicy: { sameCandleRule: 'tp_first' } }),
       /Invalid backtest exit policy/,
     );
+  });
+
+  test('non-zero costs without an instrument pip size are refused (never guessed)', () => {
+    const flat: [number, number, number, number] = [100, 100, 100, 100];
+    const setup = hourly([NORMAL, BULL_PIN, flat]);
+    // Bypasses the helper, which supplies the EURUSD pip size.
+    assert.throws(
+      () =>
+        runBacktest({
+          config: alwaysPass(),
+          instrument: INSTRUMENT,
+          candles: { htf_bias: setup, setup, entry: setup },
+          fromMs: closeOf(0),
+          toMs: closeOf(2),
+          direction: 'long',
+          costPolicy: { spread: 1 },
+        }),
+      /require the instrument pip size/,
+    );
+    // Costless replays are scale-independent: no spec needed.
+    const frictionless = runBacktest({
+      config: alwaysPass(),
+      instrument: INSTRUMENT,
+      candles: { htf_bias: setup, setup, entry: setup },
+      fromMs: closeOf(0),
+      toMs: closeOf(2),
+      direction: 'long',
+    });
+    assert.equal(first(frictionless.trades).pnlR, 0);
   });
 
   test('empty range (no setup closes) evaluates nothing and stays schema-valid', () => {
@@ -674,7 +713,8 @@ describe('m6 missing levels, costs and metrics', () => {
 
   test('fees, slippage and spread shift R adversely and exactly', () => {
     const setup = hourly([NORMAL, BULL_PIN, [100, 100.0005, 99.998, 99.9992], NORMAL]);
-    const costPolicy = { feePerSide: 0.0002, slippagePerSide: 0.0001, spread: 0.0002 };
+    // PIPS: 2×(2+1)+2 = 8 pips ⇒ 8 × 0.0001 = 0.0008 price units on EURUSD.
+    const costPolicy = { feePerSide: 2, slippagePerSide: 1, spread: 2 };
     const result = run({
       config: longPins(),
       setup,
@@ -697,6 +737,68 @@ describe('m6 missing levels, costs and metrics', () => {
       costPolicy,
     });
     assert.equal(first(tp.trades).pnlR, 0.2);
+  });
+
+  test('costs are instrument-aware: the same pip policy converts with the instrument pip size', () => {
+    // Identical fixture and policy; only the pip size differs. XAUUSD's pip
+    // (0.01) is 100× EURUSD's (0.0001), so the price-unit cost drag is 100×.
+    const setup = hourly([NORMAL, BULL_PIN, [100, 100.04, 99.999, 100.01], NORMAL]);
+    const config = mkConfig(
+      [group('Pins', 'AND', [cond('rejection_candle', 'required', 'setup', { direction: 'bullish', minWickBodyRatio: 2 })])],
+      { stopLossBuffer: 33.802, tp1Rr: 2, tp2Rr: 5, tp3Rr: 10 },
+    );
+    const costPolicy = { feePerSide: 0.5, slippagePerSide: 0.25, spread: 1 };
+    const common = { config, setup, fromMs: closeOf(0), toMs: closeOf(3), direction: 'long' as const, costPolicy };
+
+    const eur = first(run({ ...common, pipSize: EURUSD_PIP_SIZE }).trades);
+    const xau = first(run({ ...common, pipSize: XAUUSD_PIP_SIZE, instrument: { assetClass: 'commodity', symbol: 'XAUUSD' } }).trades);
+
+    // TP3 = +10R before costs; cost = 2.5 pips.
+    //   EURUSD: 2.5 × 0.0001 = 0.00025 price units
+    //   XAUUSD: 2.5 × 0.01   = 0.025   price units
+    // Levels are instrument-independent (same config/candles): the risk
+    // distance is 33.802 pips × 0.0001 = 0.0033802 in both runs — only the
+    // cost conversion differs.
+    const riskDistance = Math.abs((xau.entryPrice ?? 0) - (xau.stopLossPrice ?? 0));
+    assert.ok(Math.abs(riskDistance - 0.0033802) < 1e-9);
+    assert.equal(eur.pnlR, 9.926);
+    assert.equal(xau.pnlR, 2.604);
+    // pnlR is rounded to 4 decimals, so compare the drags with that tolerance.
+    const eurDrag = 10 - (eur.pnlR ?? 0);
+    const xauDrag = 10 - (xau.pnlR ?? 0);
+    assert.ok(Math.abs(xauDrag - eurDrag * 100) < 0.01, 'gold cost must be 100× the EURUSD cost');
+  });
+
+  test('XAUUSD regression: the reported −729.60R TP3 trade is positive once costs use pip_size', () => {
+    // The reported bug: a gold trade exiting at TP3 showed −729.60R because
+    // cost fields were subtracted as RAW PRICE UNITS. On XAUUSD the pip is
+    // 0.01, so a normal pip policy was 100× too expensive in price units:
+    //   (10R pre-cost) − 2.5/0.0033802 = −729.6012R   ← pre-fix (price units)
+    //   (10R pre-cost) − 0.025/0.0033802 =   +2.604R  ← fixed (2.5 pips × 0.01)
+    // riskDistance 0.0033802 = 33.802 pips × the engine's fixed-buffer conversion.
+    const config = mkConfig(
+      [group('Pins', 'AND', [cond('rejection_candle', 'required', 'setup', { direction: 'bullish', minWickBodyRatio: 2 })])],
+      { stopLossBuffer: 33.802, tp1Rr: 2, tp2Rr: 5, tp3Rr: 10 },
+    );
+    const setup = hourly([NORMAL, BULL_PIN, [100, 100.04, 99.999, 100.01], NORMAL]);
+    const result = run({
+      config,
+      setup,
+      fromMs: closeOf(0),
+      toMs: closeOf(3),
+      direction: 'long',
+      costPolicy: { feePerSide: 0.5, slippagePerSide: 0.25, spread: 1 }, // pips
+      pipSize: XAUUSD_PIP_SIZE,
+      instrument: { assetClass: 'commodity', symbol: 'XAUUSD' },
+    });
+
+    const trade = first(result.trades);
+    assert.equal(trade.direction, 'long');
+    assert.equal(trade.exitReason, 'take_profit_3');
+    assert.equal(trade.pnlR, 2.604);
+    assert.ok((trade.pnlR ?? 0) > 0, 'TP3 must be positive — the -729.60R price-unit cost is gone');
+    assert.equal(result.metrics.totalR, 2.604);
+    assertValidResult(result);
   });
 
   test('riskPerTrade derives currency P&L without changing R', () => {
