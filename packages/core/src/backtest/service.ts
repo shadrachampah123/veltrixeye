@@ -12,6 +12,7 @@ import {
   type BacktestListQuery,
   type BacktestRunDto,
   type BacktestTrade,
+  type CandleDto,
   type Timeframe,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
@@ -19,6 +20,7 @@ import type { StrategyService } from '../strategies/strategies.js';
 import type { CandleStore } from '../market-data/candles.js';
 import {
   anchorHorizonMs,
+  requiredCoverageRoles,
   roleCoverageWindow,
   runBacktest,
   setupCoverageWindow,
@@ -210,6 +212,14 @@ export class BacktestService {
     // it defines the anchors: the bias/entry windows are measured to the last
     // anchor this run will actually evaluate, and capped by
     // MAX_BACKTEST_ROLE_CANDLES (fail closed, never a truncated replay).
+    //
+    // Only roles the version READS are loaded. A version with no bias/entry
+    // condition still pins those timeframes, so covering them blindly (and
+    // refusing a run whose unused role window crosses the cap) rejected
+    // otherwise-valid long ranges. Unused roles are passed through empty;
+    // required roles keep the exact fail-closed behaviour below.
+    const coverageRoles = requiredCoverageRoles(config);
+
     const setupWindow = setupCoverageWindow({
       config,
       fromMs: args.from,
@@ -233,26 +243,34 @@ export class BacktestService {
       toMs: args.to,
     });
 
-    const htfWindow = roleCoverageWindow({ role: 'htf_bias', config, fromMs: args.from, horizonMs });
-    const entryWindow = roleCoverageWindow({ role: 'entry', config, fromMs: args.from, horizonMs });
-    assertWithinRoleCap('htf_bias', config.timeframes.htf_bias, htfWindow);
-    assertWithinRoleCap('entry', config.timeframes.entry, entryWindow);
+    const htfWindow = coverageRoles.htf_bias
+      ? roleCoverageWindow({ role: 'htf_bias', config, fromMs: args.from, horizonMs })
+      : null;
+    const entryWindow = coverageRoles.entry
+      ? roleCoverageWindow({ role: 'entry', config, fromMs: args.from, horizonMs })
+      : null;
+    if (htfWindow) assertWithinRoleCap('htf_bias', config.timeframes.htf_bias, htfWindow);
+    if (entryWindow) assertWithinRoleCap('entry', config.timeframes.entry, entryWindow);
 
     const [htfCandles, entryCandles] = await Promise.all([
-      this.candles.queryCandles({
-        instrumentId: resolved.id,
-        timeframe: config.timeframes.htf_bias,
-        from: htfWindow.from,
-        to: htfWindow.to,
-        limit: htfWindow.limit,
-      }),
-      this.candles.queryCandles({
-        instrumentId: resolved.id,
-        timeframe: config.timeframes.entry,
-        from: entryWindow.from,
-        to: entryWindow.to,
-        limit: entryWindow.limit,
-      }),
+      htfWindow
+        ? this.candles.queryCandles({
+            instrumentId: resolved.id,
+            timeframe: config.timeframes.htf_bias,
+            from: htfWindow.from,
+            to: htfWindow.to,
+            limit: htfWindow.limit,
+          })
+        : Promise.resolve<CandleDto[]>([]),
+      entryWindow
+        ? this.candles.queryCandles({
+            instrumentId: resolved.id,
+            timeframe: config.timeframes.entry,
+            from: entryWindow.from,
+            to: entryWindow.to,
+            limit: entryWindow.limit,
+          })
+        : Promise.resolve<CandleDto[]>([]),
     ]);
 
     // 7. Run pure engine (no I/O, no side effects).

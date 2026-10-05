@@ -501,10 +501,14 @@ describe('m6.2 BacktestService coverage', () => {
       nowMs: win.toMs + DAY,
     });
 
-    // Setup first (it defines the anchors), then bias + entry to the horizon.
-    assert.equal(calls.length, 3);
+    // Setup first (it defines the anchors), then entry to the horizon. This
+    // version reads no bias condition, so the bias role is never loaded (M6.2
+    // follow-up: an unused role is neither capped nor queried).
+    assert.deepEqual(
+      calls.map((c) => c.timeframe),
+      ['4h', '15m'],
+    );
     const [setupCall] = calls;
-    const biasCall = calls.find((c) => c.timeframe === '1d')!;
     const entryCall = calls.find((c) => c.timeframe === '15m')!;
     assert.equal(setupCall!.timeframe, '4h');
 
@@ -525,8 +529,8 @@ describe('m6.2 BacktestService coverage', () => {
     for (const t of db.trades) {
       assert.ok(Number(t[4]) >= win.firstSignalAt, 'no trade was priced off a stale entry candle');
     }
-    // Roles the version never reads are still bounded (bias is empty here).
-    assert.equal(biasCall.timeframe, '1d');
+    // The unread bias role was never loaded, so it cannot bound the run.
+    assert.ok(!calls.some((c) => c.timeframe === '1d'));
   });
 
   test('a range no role window can cover fails closed — no truncated replay, no writes', async () => {
@@ -605,5 +609,57 @@ describe('m6.2 BacktestService coverage', () => {
     assert.match(err.message, /stale entry candles/);
     assert.equal(db.connects, 0, 'the failure happened before any write');
     assert.equal(db.trades.length, 0);
+  });
+
+  test('an unused role over the 60 000-candle cap is neither refused nor queried (no false refusal)', async () => {
+    // SETUP_ONLY reads only the setup series, but its version still pins a 1m
+    // bias AND a 1m entry timeframe. Over this ~100-day range each of those
+    // roles would need ~144 000 candles — far past MAX_BACKTEST_ROLE_CANDLES.
+    // A role the version never reads can never make the replay stale, so the
+    // cap must not refuse the run, and the store must never be asked for rows
+    // the engine cannot consume.
+    const config = mkConfig(
+      [group('Pass', 'AND', [cond('volatility_filter', 'required', 'setup', { metric: 'body_range', period: 2, min: 0 })])],
+      { htf_bias: '1m', setup: '4h', entry: '1m' },
+    );
+    const win = longWindow();
+    const calls: CapturedQuery[] = [];
+    const db = fakePool();
+    // The store really holds > 60 000 hypothetical 1m candles: the pre-fix
+    // loader sized a coverage window for the unused role from this timeframe,
+    // crossed the cap, and refused an otherwise valid backtest.
+    const hypothetical = Array.from({ length: MAX_BACKTEST_ROLE_CANDLES + 1 }, (_, i) => FLAT(T0 + i * MINUTE));
+    const service = new BacktestService(
+      db.pool,
+      fakeStrategies(config),
+      fakeStore({ '1m': hypothetical, '4h': win.setup, '15m': win.entry }, calls),
+    );
+
+    const result = await service.createBacktest({
+      userId: 'user-1',
+      strategyId: '11111111-1111-1111-1111-111111111111',
+      versionId: '22222222-2222-2222-2222-222222222222',
+      instrument: INSTRUMENT,
+      direction: 'long',
+      from: win.fromMs,
+      to: win.toMs,
+      nowMs: win.toMs + DAY,
+    });
+
+    assert.equal(result.created, true, 'the run must not be refused');
+    assert.equal(result.run.metrics.stepsEvaluated, win.anchors.length);
+    assert.deepEqual(
+      calls.map((c) => c.timeframe),
+      ['4h'],
+      'only the anchor-defining setup role is loaded',
+    );
+    assert.ok(!calls.some((c) => c.timeframe === '1m'), 'the unused bias/entry roles were never queried');
+
+    // Sanity: had those roles been treated as required, the run would indeed
+    // have been refused at the cap.
+    for (const role of ['htf_bias', 'entry'] as const) {
+      const window = roleCoverageWindow({ role, config, fromMs: win.fromMs, horizonMs: win.toMs });
+      assert.ok(window.limit > MAX_BACKTEST_ROLE_CANDLES, `${role} window would breach the cap if required`);
+    }
   });
 });
