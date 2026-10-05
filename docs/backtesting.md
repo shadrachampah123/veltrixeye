@@ -1,4 +1,4 @@
-# Deterministic Backtesting (M6, Phases 1, 2 & 4)
+# Deterministic Backtesting (M6, Phases 1, 2 & 4; M6.2 long-window coverage)
 
 M6 backtesting replays a published strategy version over historical candles
 and records what its own detection, level, and scoring layers would have
@@ -26,7 +26,7 @@ recorded transactionally.
   exitPolicy, costPolicy })` engine — no database, no providers, no clock.
 - Derives replay anchors as setup closes in `[fromMs, toMs)` (from
   inclusive, to exclusive), deterministically capped at the first
-  `MAX_BACKTEST_STEPS` (2000) anchors with a truncation note.
+  `MAX_BACKTEST_STEPS` (4500) anchors with a truncation note.
 - Evaluates each anchor through the **real M3 engine**
   (`evaluateStrategyVersion`) on look-ahead-proof prefixes: per role, only
   candles fully closed at the anchor, with `htf_alignment` on the HTF role —
@@ -64,7 +64,7 @@ writer of `backtest_runs` / `backtest_trades`:
   (M3/M4/M5 rules unchanged).
 - **Pure engine delegation**: after loading and validating candles,
   `BacktestService` calls the pure `runBacktest` from Phase 1. No new
-  evaluation logic, no change to `m6-backtest-1` semantics.
+  evaluation logic, no change to the Phase 1 engine semantics.
 - **Transactional persistence with Phase 1 idempotency**: a winner inserts
   `backtest_runs` row + up to `MAX_BACKTEST_TRADES` trades in one
   transaction. `config_hash` uniqueness (`backtest_runs_idempotency_uniq`
@@ -98,11 +98,15 @@ writer of `backtest_runs` / `backtest_trades`:
   6. Documented here and in code; changing algorithm requires new engine
      version.
 - **Bounds enforcement**:
-  - `MAX_BACKTEST_STEPS` (2000): enforced inside `runBacktest`; if anchor
-    count exceeds 2000 the engine evaluates first 2000 and sets
-    `notes: ['truncated_steps:2000']`. Service surfaces `truncated=true`
+  - `MAX_BACKTEST_STEPS` (4500): enforced inside `runBacktest`; if anchor
+    count exceeds 4500 the engine evaluates first 4500 and notes the
+    truncation. Service surfaces `truncated=true`
     when `metrics.stepsEvaluated >= MAX_BACKTEST_STEPS` or engine notes
     truncation.
+  - `MAX_BACKTEST_ROLE_CANDLES` (60000): enforced inside `BacktestService`
+    before any candle is read for the role (see "M6.2 long-window coverage"
+    below). A range whose coverage need exceeds the cap is refused with 400 —
+    never loaded truncated.
   - `MAX_BACKTEST_TRADES` (500): service stores first 500 trades in `seq`
     order when `run.trades.length > 500`; `truncated=true` in response.
     `GET /:id/trades` paginates up to 500.
@@ -122,13 +126,15 @@ on top of the Phase 2 API — no engine, service or schema change.
 
 ## Engine contract
 
-Pinned as **`m6-backtest-1`** (`BACKTEST_ENGINE_VERSION` in
+Pinned as **`m6-backtest-2`** (`BACKTEST_ENGINE_VERSION` in
 `@veltrixeye/contracts`), stored on every run row. Any change to anchors,
-evaluation, exits, costs, or metrics requires a new version string.
+evaluation, coverage, exits, costs, or metrics requires a new version string
+(`m6-backtest-1` → `m6-backtest-2` is the M6.2 long-window coverage fix).
 
 Bounds (pinned in contracts, none configurable):
 
-- `MAX_BACKTEST_STEPS` (2000): anchors evaluated per call.
+- `MAX_BACKTEST_STEPS` (4500): anchors evaluated per call.
+- `MAX_BACKTEST_ROLE_CANDLES` (60000): candles loadable per timeframe role.
 - `MAX_BACKTEST_INSTRUMENTS_PER_CALL` (1): one instrument per call.
 - `MAX_BACKTEST_TRADES` (500): stored trades per run.
 - `DEFAULT_MAX_HOLD_CANDLES` (100): max hold default.
@@ -147,7 +153,8 @@ decimals) only when set.
 
 - Anchors pure function of setup closes and `[fromMs,toMs)`.
 - Every anchor sees only per-role prefixes closed at anchor; candles beyond
-  `toMs` dropped; HTF candles still open excluded.
+  `toMs` dropped; HTF candles still open excluded; a required bias/entry role
+  that ran out of candles fails the run closed (M6.2).
 - Input order irrelevant (time sort); duplicate timestamps last-wins.
 - Warm-up reported, never skipped; gaps >2× median spacing noted; exits scan
   next available candle — no interpolation.
@@ -157,6 +164,41 @@ decimals) only when set.
   `created=true` and `created=false` paths return DB-rounded
   `numeric(24,10)` values, ensuring `deepEqual` replay determinism
   (`100.002` vs `100.00200000000001`).
+
+## M6.2 long-window coverage (engine `m6-backtest-2`)
+
+A replay consumes candles per **role**, not per anchor: one anchor costs one
+setup candle but `setupPeriod / entryPeriod` entry candles (16 for a 4h setup
+with a 15m entry), and one bias candle per `entryPeriod`-worth of range. The
+pre-M6.2 loader budgeted `warm-up + MAX_BACKTEST_STEPS + 500` rows for *every*
+role — i.e. one candle per step — so a long backtest on a strategy whose entry
+timeframe is finer than its setup timeframe read an ascending store prefix
+that stopped early. The prefix pointer then never advanced again and every
+later anchor silently re-evaluated the **same stale bias/entry candle**,
+reporting confident results computed on history that had already ended.
+
+Two independent guards now make that impossible:
+
+- **Coverage is planned per role** (`setupCoverageWindow` /
+  `anchorHorizonMs` / `roleCoverageWindow` in
+  `packages/core/src/backtest/engine.ts`). The setup role is loaded first —
+  warm-up + `MAX_BACKTEST_STEPS` anchors + the `maxHoldCandles` exit tail —
+  because it *defines* the anchors; the bias and entry windows are then
+  measured to the last anchor the run will actually evaluate (plus one further
+  candle, which can never enter a prefix: it opens at or after the horizon,
+  but proves the series was not truncated inside the replay).
+- **The replay fails closed** (`assertRoleCoverage`). At every anchor, each
+  role the version actually reads must still have candles: an empty series, or
+  a series already exhausted while the last loaded candle closed *before* the
+  anchor, is a `400 invalid_input` ("split the range into shorter backtests or
+  ingest more history") instead of a stale replay. Roles no condition reads
+  are never required, so a version that only uses the setup timeframe is
+  unaffected.
+
+`MAX_BACKTEST_ROLE_CANDLES` (60000) is the ceiling on one role's window: a
+range that would need more (e.g. 4500 four-hour anchors read through a 15m
+entry role) is refused up front — `BacktestService` never issues the
+under-covered read and never writes a run.
 
 ## HTTP API (Phase 2)
 

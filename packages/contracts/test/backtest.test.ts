@@ -7,6 +7,7 @@ import {
   DEFAULT_MAX_HOLD_CANDLES,
   MAX_BACKTESTS_LIMIT,
   MAX_BACKTEST_INSTRUMENTS_PER_CALL,
+  MAX_BACKTEST_ROLE_CANDLES,
   MAX_BACKTEST_STEPS,
   MAX_BACKTEST_TRADES,
   backtestCostPolicySchema,
@@ -87,11 +88,12 @@ function validRun(overrides: Record<string, unknown> = {}) {
 
 describe('m6 backtest contracts', () => {
   test('engine identity and bounds are pinned', () => {
-    assert.equal(BACKTEST_ENGINE_VERSION, 'm6-backtest-1');
-    assert.equal(MAX_BACKTEST_STEPS, 2000);
+    assert.equal(BACKTEST_ENGINE_VERSION, 'm6-backtest-2');
+    assert.equal(MAX_BACKTEST_STEPS, 4500);
     assert.equal(MAX_BACKTEST_INSTRUMENTS_PER_CALL, 1);
     assert.equal(DEFAULT_MAX_HOLD_CANDLES, 100);
     assert.equal(MAX_BACKTEST_TRADES, 500);
+    assert.equal(MAX_BACKTEST_ROLE_CANDLES, 60000);
     assert.equal(DEFAULT_BACKTESTS_LIMIT, 50);
     assert.equal(MAX_BACKTESTS_LIMIT, 100);
   });

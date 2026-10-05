@@ -14,15 +14,16 @@ import type {
   BacktestTrade,
   CandleDto,
   DirectionEvaluation,
+  StrategyVersionConfig,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
 import { createEvaluationEngine } from '../strategies/evaluation/engine.js';
-import { requiredWindows } from '../strategies/evaluation/service.js';
+import { conditionRole, requiredWindows } from '../strategies/evaluation/service.js';
 import { detectionLevels } from '../setups/levels.js';
 import { scoreSetupQuality } from '../scoring/engine.js';
 
 /**
- * The deterministic backtest replay engine (M6 Phase 1).
+ * The deterministic backtest replay engine (M6 Phase 1 + M6.2 coverage).
  *
  * PURE: same inputs ⇒ byte-identical outputs. No database, no provider, no
  * ingestion, no wall clock, no network, no filesystem, no randomness. The
@@ -40,6 +41,10 @@ import { scoreSetupQuality } from '../scoring/engine.js';
  *    at MAX_BACKTEST_STEPS (first N win, plus a truncation note);
  *  - at every anchor each role sees ONLY candles with
  *    `time + rolePeriod ≤ anchor` (exact M3 closed-candle semantics);
+ *  - a role the version reads must be COVERED at the anchor: a bias/entry
+ *    series that is empty or already exhausted fails the run closed
+ *    (see `assertRoleCoverage`) — a stale prefix is never replayed as
+ *    current data;
  *  - a passing M3 direction becomes an in-memory setup via `detectionLevels`
  *    and is scored via `scoreSetupQuality` at the anchor;
  *  - entry is the signal-candle close (`signal_close`); exits are tracked
@@ -116,6 +121,12 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
   const trades: BacktestTrade[] = [];
   let noLevels = 0;
 
+  // M6.2: only roles the version reads can make a replay stale. The setup
+  // role is the anchor source — it is covered at its own anchor by
+  // construction — but the bias and entry roles are loaded independently and
+  // can run out mid-range (see `roleCoverageWindow`).
+  const coverageRoles = requiredCoverageRoles(config);
+
   // Monotonic prefix pointers (anchors ascend, so prefixes only grow):
   // each anchor's evaluation receives ONLY the candles closed at that
   // anchor — look-ahead is structurally impossible, not just avoided.
@@ -126,6 +137,8 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
     htfEnd = advancePrefix(htf, htfPeriodMs, anchor, htfEnd);
     setupEnd = advancePrefix(setup, setupPeriodMs, anchor, setupEnd);
     entryEnd = advancePrefix(entry, entryPeriodMs, anchor, entryEnd);
+    assertRoleCoverage('htf_bias', htf, htfPeriodMs, anchor, htfEnd, coverageRoles.htf_bias);
+    assertRoleCoverage('entry', entry, entryPeriodMs, anchor, entryEnd, coverageRoles.entry);
     const htfPrefix = htf.slice(0, htfEnd);
     const setupPrefix = setup.slice(0, setupEnd);
     const entryPrefix = entry.slice(0, entryEnd);
@@ -186,6 +199,133 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
   return { trades, metrics, notes, stepsEvaluated: anchors.length };
 }
 
+// ---------------------------------------------------------------------------
+// Loader coverage (M6.2) — pure planning helpers for BacktestService
+// ---------------------------------------------------------------------------
+
+/**
+ * The exact [from, to) window and row cap that cover ONE timeframe role for
+ * one backtest run. The service passes these straight to
+ * `CandleStore.queryCandles`, which reads ascending — so the cap keeps the
+ * EARLIEST candles, which are the ones the replay consumes first.
+ */
+export interface BacktestRoleWindow {
+  /** Inclusive lower bound on candle open time. */
+  from: number;
+  /** Exclusive upper bound on candle open time. */
+  to: number;
+  /** Row cap — the largest number of candles the replay can consume. */
+  limit: number;
+}
+
+/**
+ * WHY THIS EXISTS. A replay consumes candles per ROLE, not per anchor: one
+ * anchor costs one setup candle but `setupPeriod / entryPeriod` entry candles
+ * (16 for a 4h setup with a 15m entry). The pre-M6.2 loader capped every role
+ * at `warm-up + MAX_BACKTEST_STEPS + 500`, i.e. it budgeted ONE candle per
+ * anchor for every role. Past that cap the ascending store read returned a
+ * truncated prefix, the prefix pointer stopped advancing, and every later
+ * anchor silently re-evaluated the SAME stale bias/entry candle — a long
+ * backtest reported confident results computed on history that had already
+ * ended. Coverage is now derived from each role's own period, and the
+ * engine fails closed (`assertRoleCoverage`) if a required role still runs
+ * out before an anchor.
+ */
+export function setupCoverageWindow(args: {
+  config: StrategyVersionConfig;
+  fromMs: number;
+  toMs: number;
+  maxHoldCandles: number;
+}): BacktestRoleWindow {
+  const periodMs = rolePeriodMs(args.config, 'setup');
+  const warmup = requiredWindows(args.config).setup;
+  return {
+    // Warm-up candles (closed before `fromMs`) are never anchors but M3 needs
+    // them: same `window + 1` alignment the live evaluation service uses.
+    from: Math.max(0, args.fromMs - (warmup + 1) * periodMs),
+    // Anchors are setup closes < toMs, and the exit scan stops at the range
+    // end, so nothing past `toMs` can ever be read.
+    to: args.toMs,
+    // warm-up + one candle per evaluated anchor + the max-hold exit tail of
+    // the last anchor (+2 alignment candles).
+    limit: warmup + 1 + MAX_BACKTEST_STEPS + Math.max(0, args.maxHoldCandles) + 2,
+  };
+}
+
+/**
+ * Latest setup close the engine will evaluate for this range — the coverage
+ * horizon for every non-anchor role. Zero anchors ⇒ `fromMs` (nothing to
+ * cover). Reuses `anchorsInRange`, so the horizon can never disagree with
+ * the anchors the engine actually replays.
+ */
+export function anchorHorizonMs(args: {
+  setup: readonly CandleDto[];
+  setupPeriodMs: number;
+  fromMs: number;
+  toMs: number;
+}): number {
+  const anchors = anchorsInRange(
+    prepareSeries(args.setup),
+    args.setupPeriodMs,
+    args.fromMs,
+    args.toMs,
+  );
+  const lastEvaluated = anchors[Math.min(anchors.length, MAX_BACKTEST_STEPS) - 1];
+  return lastEvaluated ?? args.fromMs;
+}
+
+/**
+ * Coverage for a role that does NOT define anchors (bias / entry): every
+ * candle of that timeframe closed at or before the last evaluated anchor,
+ * plus one more candle.
+ *
+ * The extra candle is the freshness witness: it opens at or after the
+ * horizon, so it can never enter a prefix (`time + period > anchor` for every
+ * anchor), yet its presence proves the series was not truncated inside the
+ * replay. Without it a coarse role (say a weekly bias) whose next candle only
+ * opens after the horizon would look "exhausted" and fail closed for a
+ * perfectly covered run.
+ */
+export function roleCoverageWindow(args: {
+  role: 'htf_bias' | 'entry';
+  config: StrategyVersionConfig;
+  fromMs: number;
+  horizonMs: number;
+}): BacktestRoleWindow {
+  const periodMs = rolePeriodMs(args.config, args.role);
+  const warmup = requiredWindows(args.config)[args.role];
+  const from = Math.max(0, args.fromMs - (warmup + 1) * periodMs);
+  const to = args.horizonMs + periodMs;
+  return {
+    from,
+    to,
+    limit: warmup + 1 + Math.ceil((to - from) / periodMs) + 1,
+  };
+}
+
+function rolePeriodMs(config: StrategyVersionConfig, role: 'htf_bias' | 'setup' | 'entry'): number {
+  const timeframes = config.timeframes;
+  if (!timeframes) {
+    throw Errors.invalidInput('Backtest requires config.timeframes (published versions always have them).');
+  }
+  return timeframeMinutes(timeframes[role]) * 60_000;
+}
+
+/**
+ * Roles the version actually READS. Only these can make a run stale — a
+ * version with no bias/entry condition never looks at those candles, so an
+ * empty or short series there is irrelevant (and must not fail the run).
+ */
+export function requiredCoverageRoles(config: StrategyVersionConfig): Record<'htf_bias' | 'setup' | 'entry', boolean> {
+  const roles = { htf_bias: false, setup: false, entry: false };
+  for (const group of config.ruleGroups) {
+    for (const condition of group.conditions) {
+      roles[conditionRole(condition)] = true;
+    }
+  }
+  return roles;
+}
+
 /** Sort ascending by time; on duplicate timestamps the LAST candle wins (store-upsert convention). */
 function prepareSeries(candles: readonly CandleDto[]): CandleDto[] {
   const byTime = new Map<number, CandleDto>();
@@ -206,6 +346,49 @@ function anchorsInRange(
     if (close >= fromMs && close < toMs) anchors.push(close);
   }
   return anchors;
+}
+
+/**
+ * FAIL-CLOSED coverage guard for one non-anchor role (M6.2).
+ *
+ * A replay is only meaningful while each required role still has candles
+ * closing at the anchor. Two states are rejected instead of silently
+ * replaying history that has already ended:
+ *
+ *  - MISSING: the role has no candles at all, so every anchor would evaluate
+ *    with an empty (and, per M3, insufficient-data) prefix;
+ *  - STALE: the pointer has consumed the whole series while the last loaded
+ *    candle closed BEFORE the anchor — the store read was truncated (or the
+ *    history simply stops), so the next anchor would re-read that same old
+ *    candle as if it were current.
+ *
+ * An empty PREFIX at an anchor is not an error: that is the ordinary warm-up
+ * / not-yet-closed state that M3 already reports as `insufficient_data`.
+ */
+function assertRoleCoverage(
+  role: 'htf_bias' | 'entry',
+  series: readonly CandleDto[],
+  periodMs: number,
+  anchor: number,
+  end: number,
+  required: boolean,
+): void {
+  if (!required) return;
+  const label = role === 'htf_bias' ? 'bias (htf_bias)' : 'entry';
+  const last = series[series.length - 1];
+  if (!last) {
+    throw Errors.invalidInput(
+      `Backtest cannot evaluate this version: no ${label}-timeframe candles were loaded for the requested range, ` +
+        `but the version reads them. Ingest ${label}-timeframe history for the range (or backtest a version whose rules do not use the ${label} timeframe).`,
+    );
+  }
+  if (end === series.length && last.time + periodMs < anchor) {
+    throw Errors.invalidInput(
+      `Backtest coverage for the ${label} timeframe ends at ${new Date(last.time + periodMs).toISOString()} — ` +
+        `before the anchor ${new Date(anchor).toISOString()}. Replaying further would re-use stale ${label} candles, ` +
+        `so the run was refused: split the range into shorter backtests or ingest more ${label}-timeframe history.`,
+    );
+  }
 }
 
 /** Advance a prefix pointer while candles are closed at the anchor. */

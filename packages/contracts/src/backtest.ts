@@ -29,7 +29,10 @@ import type { StrategyVersionConfig } from './strategies.js';
  *  - R-multiples are the primary result; currency P&L exists only when the
  *    caller explicitly supplies `riskPerTrade` (no invented account size);
  *  - costs (fee/slippage/spread) are explicit inputs, defaulting to zero —
- *    spread is NEVER sourced from market data (no spread feed exists).
+ *    spread is NEVER sourced from market data (no spread feed exists);
+ *  - every timeframe ROLE the version reads must be covered over the anchors
+ *    the run evaluates: a required bias/entry series that ends early is a
+ *    fail-closed error, never a stale replay (see `MAX_BACKTEST_ROLE_CANDLES`).
  *
  * Phase 1 ships these contracts, the 0011 migration, and the pure engine.
  * The Phase 2 service adds retention checks, compute bounds, persistence,
@@ -37,16 +40,30 @@ import type { StrategyVersionConfig } from './strategies.js';
  */
 
 /** Pinned identifier stored on every backtest run produced by this engine. */
-export const BACKTEST_ENGINE_VERSION = 'm6-backtest-1';
+export const BACKTEST_ENGINE_VERSION = 'm6-backtest-2';
 
 /** Max evaluated anchors (setup closes) per backtest run. */
-export const MAX_BACKTEST_STEPS = 2000;
+export const MAX_BACKTEST_STEPS = 4500;
 
 /** Instruments per backtest call in M6 (one instrument per run; multi-instrument replays are N runs). */
 export const MAX_BACKTEST_INSTRUMENTS_PER_CALL = 1;
 
 /** Default hold cap, in setup-timeframe closed candles after the signal. */
 export const DEFAULT_MAX_HOLD_CANDLES = 100;
+
+/**
+ * Max candles ONE timeframe role may load for a single backtest run.
+ *
+ * A replay consumes candles per ROLE, not per anchor: a 4h setup with a 15m
+ * entry needs 16 entry candles for every anchor it evaluates. The loader
+ * therefore sizes each role's window from that role's own period (see
+ * `packages/core/src/backtest/engine.ts`) instead of from
+ * `MAX_BACKTEST_STEPS`. This constant is the hard ceiling on that window: a
+ * request whose coverage need exceeds it FAILS CLOSED (400, "split the
+ * range") instead of loading a truncated prefix and silently replaying stale
+ * role candles for the rest of the run.
+ */
+export const MAX_BACKTEST_ROLE_CANDLES = 60000;
 
 /** Max trades persisted per run (deterministic: first N in seq order + truncation flag). */
 export const MAX_BACKTEST_TRADES = 500;
