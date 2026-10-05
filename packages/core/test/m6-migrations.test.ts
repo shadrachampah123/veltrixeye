@@ -113,7 +113,15 @@ const EXIT_POLICY = {
   sameCandleRule: 'stop_first',
   entryTiming: 'signal_close',
 } satisfies BacktestExitPolicy;
-const COST_POLICY = { feePerSide: 0, slippagePerSide: 0, spread: 0 } satisfies BacktestCostPolicy;
+// `costUnit` is part of the policy since m6-backtest-3; a stored policy snapshot
+// without it is still valid JSON (the service reads it back untyped), but the
+// fixture writes what the current engine writes.
+const COST_POLICY = {
+  costUnit: 'price',
+  feePerSide: 0,
+  slippagePerSide: 0,
+  spread: 0,
+} satisfies BacktestCostPolicy;
 
 async function insertRun(opts: {
   ownerId: string;

@@ -5,12 +5,15 @@ import type { BacktestRunDto, BacktestTrade } from '@veltrixeye/contracts';
 import { Badge, Card, CardHeader, Monospace } from '@/components/ui';
 import {
   backtestOutcomeLabel,
+  costUnitFieldLabel,
+  costUnitOptionLabel,
   directionLabel,
   exitReasonLabel,
   exitReasonTone,
   formatEpochMsUtc,
   formatR,
   metricTiles,
+  storedCostUnit,
   truncationIndicators,
   tradesHasMore,
   tradesTruncationMessage,
@@ -36,6 +39,10 @@ export function BacktestRunSummary({
 }) {
   const outcome = created === undefined ? null : backtestOutcomeLabel(created);
   const limits = truncationIndicators({ notes: run.notes });
+  // The unit the run's costs were denominated in (M6.3). Legacy rows predate
+  // the field and were charged as price units, so they read as `'price'`.
+  const costUnit = storedCostUnit(run.costPolicy);
+  const costUnitName = costUnitFieldLabel(costUnit);
 
   return (
     <Card>
@@ -59,11 +66,12 @@ export function BacktestRunSummary({
           value={run.exitPolicy.takeProfit === 'none' ? 'None' : run.exitPolicy.takeProfit.toUpperCase()}
         />
         <SummaryItem label="Max hold" value={`${run.exitPolicy.maxHoldCandles} setup candles`} />
-        <SummaryItem label="Fee per side" value={formatPrice(run.costPolicy.feePerSide)} />
-        <SummaryItem label="Slippage per side" value={formatPrice(run.costPolicy.slippagePerSide)} />
-        <SummaryItem label="Spread (entry)" value={formatPrice(run.costPolicy.spread)} />
+        <SummaryItem label="Cost unit" value={costUnitOptionLabel(costUnit)} />
+        <SummaryItem label={`Fee per side (${costUnitName})`} value={formatPrice(run.costPolicy.feePerSide)} />
+        <SummaryItem label={`Slippage per side (${costUnitName})`} value={formatPrice(run.costPolicy.slippagePerSide)} />
+        <SummaryItem label={`Spread, entry only (${costUnitName})`} value={formatPrice(run.costPolicy.spread)} />
         <SummaryItem
-          label="Risk per trade"
+          label="Risk per trade, optional (account currency)"
           value={run.costPolicy.riskPerTrade === undefined ? 'not set (R only)' : formatPrice(run.costPolicy.riskPerTrade)}
         />
         <SummaryItem label="Entry timing" value="Signal close (pinned)" />

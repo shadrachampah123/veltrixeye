@@ -1,4 +1,5 @@
 import {
+  BACKTEST_COST_UNITS,
   BACKTEST_EXIT_REASONS,
   DEFAULT_BACKTESTS_LIMIT,
   MAX_BACKTESTS_LIMIT,
@@ -6,6 +7,7 @@ import {
   MAX_BACKTEST_STEPS,
   MAX_BACKTEST_TRADES,
   backtestRequestSchema,
+  type BacktestCostUnit,
   type BacktestDirection,
   type BacktestExitReason,
   type BacktestExitPolicyInput,
@@ -45,6 +47,56 @@ export type TakeProfitOption = (typeof TAKE_PROFIT_OPTIONS)[number];
 
 export const DIRECTION_OPTIONS = ['long', 'short', 'both'] as const;
 
+/**
+ * Cost denomination options (M6.3, engine `m6-backtest-3`).
+ *
+ * A bare cost number is ambiguous across instruments: "30" typed for XAUUSD is
+ * 30 price units of gold (catastrophic against a tight stop) or a 30-pip
+ * spread, and only the author knows which. The form therefore always states
+ * the unit it is sending, and the engine converts pips with the instrument's
+ * pip size. `'price'` stays the default so existing FX workflows are unchanged.
+ */
+export const COST_UNIT_OPTIONS = BACKTEST_COST_UNITS;
+export type CostUnitOption = BacktestCostUnit;
+
+/** Short unit suffix used on the cost field labels (`Fee per side (pips)`). */
+export function costUnitFieldLabel(unit: BacktestCostUnit): string {
+  return unit === 'pips' ? 'pips' : 'price units';
+}
+
+/** Full option label for the cost-unit selector. */
+export function costUnitOptionLabel(unit: BacktestCostUnit): string {
+  return unit === 'pips'
+    ? 'Pips — converted with the instrument pip size'
+    : 'Price units — raw quote-price amounts';
+}
+
+/**
+ * The unit a STORED run's costs were denominated in.
+ *
+ * Rows written before `m6-backtest-3` carry no `costUnit` field at all: they
+ * were charged as raw price units, which is exactly what the default means, so
+ * a missing (or unparseable) field renders as `'price'` rather than as an
+ * unknown — and a legacy run is never re-labelled as pip-denominated. The
+ * input is `unknown` on purpose: it is a stored JSON snapshot, not a value this
+ * module constructed.
+ */
+export function storedCostUnit(costPolicy: unknown): BacktestCostUnit {
+  const unit = (costPolicy as { costUnit?: unknown } | null | undefined)?.costUnit;
+  return unit === 'pips' ? 'pips' : 'price';
+}
+
+/**
+ * Copy that explains what the selected unit means for the run. The engine
+ * records the exact pip size it used in the run's notes, so this never states
+ * a conversion factor the browser cannot know.
+ */
+export function costUnitHint(unit: BacktestCostUnit): string {
+  return unit === 'pips'
+    ? 'Fee, slippage and spread are entered in pips; the engine converts them with this instrument’s pip size (the same convention the version’s pip stop buffer uses) and records the conversion in the run notes.'
+    : 'Fee, slippage and spread are entered in raw quote-price units (for example 0.0002 on EURUSD or 0.30 on XAUUSD) and are charged exactly as typed.';
+}
+
 /** Field keys the form can report an error against. */
 export const BACKTEST_FORM_FIELDS = [
   'strategyVersion',
@@ -52,6 +104,7 @@ export const BACKTEST_FORM_FIELDS = [
   'from',
   'to',
   'maxHoldCandles',
+  'costUnit',
   'feePerSide',
   'slippagePerSide',
   'spread',
@@ -78,6 +131,8 @@ export interface BacktestFormState {
   stopLoss: StopLossOption;
   takeProfit: TakeProfitOption;
   maxHoldCandles: string;
+  /** Denomination of the three cost fields below (M6.3). */
+  costUnit: BacktestCostUnit;
   feePerSide: string;
   slippagePerSide: string;
   spread: string;
@@ -131,6 +186,7 @@ export function createBacktestFormState(nowMs: number, presetId: BacktestRangePr
     stopLoss: 'level',
     takeProfit: 'tp3',
     maxHoldCandles: String(DEFAULT_MAX_HOLD_CANDLES),
+    costUnit: 'price',
     feePerSide: '0',
     slippagePerSide: '0',
     spread: '0',
@@ -222,14 +278,15 @@ export function validateBacktestForm(state: BacktestFormState, nowMs: number): B
     if (n < 1 || n > 5000) errors.maxHoldCandles = 'Max hold must be between 1 and 5000 candles.';
   }
 
+  const unit = costUnitFieldLabel(state.costUnit);
   if (parseNonNegative(state.feePerSide) === null) {
-    errors.feePerSide = 'Fee per side must be a number ≥ 0 (price units).';
+    errors.feePerSide = `Fee per side must be a number ≥ 0 (${unit}).`;
   }
   if (parseNonNegative(state.slippagePerSide) === null) {
-    errors.slippagePerSide = 'Slippage per side must be a number ≥ 0 (price units).';
+    errors.slippagePerSide = `Slippage per side must be a number ≥ 0 (${unit}).`;
   }
   if (parseNonNegative(state.spread) === null) {
-    errors.spread = 'Spread must be a number ≥ 0 (price units, applied at entry).';
+    errors.spread = `Spread must be a number ≥ 0 (${unit}, applied at entry).`;
   }
   if (!parseRiskPerTrade(state.riskPerTrade).ok) {
     errors.riskPerTrade = 'Risk per trade must be a positive number (or left blank).';
@@ -261,6 +318,8 @@ export function buildBacktestRequest(state: BacktestFormState, nowMs: number): B
     maxHoldCandles: Number(state.maxHoldCandles.trim()),
   };
   const costPolicy: BacktestCostPolicyInput = {
+    // Explicit, always: the engine must never have to guess what "30" means.
+    costUnit: state.costUnit,
     feePerSide: parseNonNegative(state.feePerSide) ?? 0,
     slippagePerSide: parseNonNegative(state.slippagePerSide) ?? 0,
     spread: parseNonNegative(state.spread) ?? 0,
@@ -281,21 +340,23 @@ export function buildBacktestRequest(state: BacktestFormState, nowMs: number): B
       const path = issue.path.join('.');
       const key = path.startsWith('costPolicy.riskPerTrade')
         ? 'riskPerTrade'
-        : path.startsWith('costPolicy.feePerSide')
-          ? 'feePerSide'
-          : path.startsWith('costPolicy.slippagePerSide')
-            ? 'slippagePerSide'
-            : path.startsWith('costPolicy.spread')
-              ? 'spread'
-              : path.startsWith('exitPolicy.maxHoldCandles')
-                ? 'maxHoldCandles'
-                : path === 'from'
-                  ? 'from'
-                  : path === 'to'
-                    ? 'to'
-                    : path.startsWith('instrument')
-                      ? 'instrument'
-                      : 'strategyVersion';
+        : path.startsWith('costPolicy.costUnit')
+          ? 'costUnit'
+          : path.startsWith('costPolicy.feePerSide')
+            ? 'feePerSide'
+            : path.startsWith('costPolicy.slippagePerSide')
+              ? 'slippagePerSide'
+              : path.startsWith('costPolicy.spread')
+                ? 'spread'
+                : path.startsWith('exitPolicy.maxHoldCandles')
+                  ? 'maxHoldCandles'
+                  : path === 'from'
+                    ? 'from'
+                    : path === 'to'
+                      ? 'to'
+                      : path.startsWith('instrument')
+                        ? 'instrument'
+                        : 'strategyVersion';
       mapped[key] ??= issue.message;
     }
     return { ok: false, errors: mapped };

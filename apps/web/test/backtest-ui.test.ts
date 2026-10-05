@@ -13,6 +13,7 @@ import * as React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import {
   MAX_BACKTEST_TRADES,
+  backtestCostPolicySchema,
   backtestRunDtoSchema,
   backtestTradeDtoSchema,
   type BacktestRunDto,
@@ -154,13 +155,18 @@ test('BacktestForm renders every input the API accepts, with accessible labels',
     'Stop-loss',
     'Take-profit leg',
     'Max hold (setup candles)',
-    'Fee per side',
-    'Slippage per side',
-    'Spread (entry only)',
-    'Risk per trade (optional)',
+    // M6.3: every cost field states the unit it is denominated in, so a
+    // XAUUSD "30" can never be silently read as 30 price units of gold.
+    'Cost unit',
+    'Fee per side (price units)',
+    'Slippage per side (price units)',
+    'Spread, entry only (price units)',
+    'Risk per trade, optional (account currency)',
   ]) {
     assert.ok(html.includes(label), `missing field label: ${label}`);
   }
+  assert.ok(html.includes('Price units — raw quote-price amounts'), 'price-unit option offered');
+  assert.ok(html.includes('Pips — converted with the instrument pip size'), 'pip-unit option offered');
 
   // Selectable options come from the API, not from hard-coded values.
   assert.ok(html.includes('London Breakout'), 'strategy option rendered');
@@ -178,6 +184,37 @@ test('BacktestForm renders every input the API accepts, with accessible labels',
   assert.ok(html.includes('Run backtest'), 'submit control');
   assert.ok(html.includes('datetime-local'), 'range inputs are datetime controls');
   assert.ok(html.includes('aria-busy="false"'), 'form reports its busy state');
+});
+
+test('BacktestForm labels every cost field with the selected unit (M6.3)', () => {
+  const renderForm = (overrides: Partial<BacktestFormState>) =>
+    renderToStaticMarkup(
+      React.createElement(BacktestForm, {
+        state: formState(overrides),
+        onChange: noop,
+        errors: {},
+        submitting: false,
+        onSubmit: noop,
+        strategies: strategies(),
+        instruments: [{ assetClass: 'commodity', symbol: 'XAUUSD', displayName: 'Gold / USD' }],
+        versionConfig: null,
+        loadingOptions: false,
+        optionsError: null,
+        submitError: null,
+        onPreset: noop,
+      }),
+    );
+
+  const pips = renderForm({ costUnit: 'pips', assetClass: 'commodity', symbol: 'XAUUSD', spread: '30' });
+  for (const label of ['Fee per side (pips)', 'Slippage per side (pips)', 'Spread, entry only (pips)']) {
+    assert.ok(pips.includes(label), `missing pip-denominated label: ${label}`);
+  }
+  assert.ok(!pips.includes('Fee per side (price units)'), 'the price-unit label is gone once pips are selected');
+  assert.ok(pips.includes('this instrument’s pip size'), 'the conversion is explained, not implied');
+  assert.ok(pips.includes('value="pips" selected'), 'the selector reflects the state');
+
+  const price = renderForm({});
+  assert.ok(price.includes('charged exactly as typed'), 'price-unit runs state that nothing is converted');
 });
 
 // ---------------------------------------------------------------------------
@@ -266,6 +303,26 @@ test('BacktestRunSummary renders the run inputs, engine version and config hash'
   assert.ok(html.includes('Stop first (pinned)'), 'pinned same-candle rule');
   assert.ok(html.includes('0.0003'), 'spread input echoed back');
   assert.ok(html.includes('Backtest completed'), 'created badge');
+  // M6.3: a run states the unit its costs were denominated in. This fixture has
+  // no `costUnit` (a pre-`m6-backtest-3` row), so it reads as price units.
+  assert.ok(html.includes('Cost unit'), 'cost unit is a reported run input');
+  assert.ok(html.includes('Price units — raw quote-price amounts'), 'legacy runs are never re-labelled as pips');
+  assert.ok(html.includes('Fee per side (price units)'), 'cost fields carry the unit');
+});
+
+test('BacktestRunSummary labels a pip-denominated run as pips', () => {
+  const run = runFixture({
+    costPolicy: backtestCostPolicySchema.parse({
+      costUnit: 'pips',
+      feePerSide: 5,
+      slippagePerSide: 5,
+      spread: 10,
+    }),
+  });
+  const html = renderToStaticMarkup(React.createElement(BacktestRunSummary, { run }));
+  assert.ok(html.includes('Pips — converted with the instrument pip size'), 'the run reports pip-denominated costs');
+  assert.ok(html.includes('Spread, entry only (pips)'), 'cost fields carry the pip unit');
+  assert.ok(!html.includes('Price units — raw quote-price amounts'), 'not labelled as price units');
 });
 
 test('BacktestRunSummary flags a deterministic replay instead of claiming a new run', () => {

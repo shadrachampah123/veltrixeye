@@ -26,6 +26,7 @@ import {
 } from '@veltrixeye/contracts';
 import {
   BACKTEST_RANGE_PRESETS,
+  COST_UNIT_OPTIONS,
   DEFAULT_BACKTESTS_PAGE_SIZE,
   MAX_BACKTEST_RANGE_MS,
   TRADES_PAGE_SIZES,
@@ -33,6 +34,9 @@ import {
   applyTradesPage,
   backtestHistoryCopy,
   buildBacktestRequest,
+  costUnitFieldLabel,
+  costUnitHint,
+  costUnitOptionLabel,
   createBacktestFormState,
   directionLabel,
   exitReasonLabel,
@@ -46,6 +50,7 @@ import {
   nextTradesPageSize,
   toDateTimeLocalValue,
   tradesHasMore,
+  storedCostUnit,
   tradesTruncationMessage,
   truncationIndicators,
   type BacktestFormState,
@@ -77,6 +82,8 @@ test('createBacktestFormState() — pinned defaults, 90-day range ending at "now
   assert.equal(s.stopLoss, 'level');
   assert.equal(s.takeProfit, 'tp3');
   assert.equal(s.direction, 'both');
+  assert.equal(s.costUnit, 'price', 'costs default to raw price units — existing FX workflows are unchanged');
+  assert.deepEqual([...COST_UNIT_OPTIONS], ['price', 'pips']);
   assert.equal(s.feePerSide, '0');
   assert.equal(s.slippagePerSide, '0');
   assert.equal(s.spread, '0');
@@ -173,6 +180,67 @@ test('validateBacktestForm() — negative or non-numeric costs are rejected', ()
     assert.equal(built.ok, false, `${field}=${value} must fail`);
     if (!built.ok) assert.ok(built.errors[field], `error reported for ${field}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Cost units (M6.3) — the denomination is explicit, never inferred
+// ---------------------------------------------------------------------------
+
+test('buildBacktestRequest() — the cost unit travels with the payload', () => {
+  const legacy = buildBacktestRequest(validState(), NOW_MS);
+  assert.equal(legacy.ok, true);
+  if (legacy.ok) {
+    assert.equal(legacy.body.costPolicy?.costUnit, 'price', 'default stays price units');
+  }
+
+  // The reported XAUUSD case: 30 units of cost, stated as pips.
+  const pips = buildBacktestRequest(
+    { ...validState(), costUnit: 'pips', feePerSide: '5', slippagePerSide: '5', spread: '10' },
+    NOW_MS,
+  );
+  assert.equal(pips.ok, true, JSON.stringify(pips.ok ? {} : pips.errors));
+  if (pips.ok) {
+    assert.deepEqual(pips.body.costPolicy, {
+      costUnit: 'pips',
+      feePerSide: 5,
+      slippagePerSide: 5,
+      spread: 10,
+    });
+    // The body the browser sends is the shared contract's parsed output.
+    const { strategyId: _s, versionId: _v, ...rest } = pips.body;
+    assert.equal(backtestRequestSchema.safeParse(rest).success, true);
+  }
+});
+
+test('validateBacktestForm() — cost errors name the unit the author selected', () => {
+  const pips = buildBacktestRequest({ ...validState(), costUnit: 'pips', feePerSide: '-1' }, NOW_MS);
+  assert.equal(pips.ok, false);
+  if (!pips.ok) assert.match(pips.errors.feePerSide ?? '', /pips/);
+
+  const price = buildBacktestRequest({ ...validState(), spread: 'abc' }, NOW_MS);
+  assert.equal(price.ok, false);
+  if (!price.ok) assert.match(price.errors.spread ?? '', /price units/);
+});
+
+test('validateBacktestForm() — a unit the contract does not define is reported on the costUnit field', () => {
+  const built = buildBacktestRequest({ ...validState(), costUnit: 'bps' as 'price' }, NOW_MS);
+  assert.equal(built.ok, false);
+  if (!built.ok) assert.ok(built.errors.costUnit, 'the rejection is mapped to the selector, not to a random field');
+});
+
+test('storedCostUnit() — legacy runs without the field read as price units, never as pips', () => {
+  assert.equal(storedCostUnit({ feePerSide: 0, slippagePerSide: 0, spread: 0 }), 'price');
+  assert.equal(storedCostUnit({ costUnit: 'pips' }), 'pips');
+  assert.equal(storedCostUnit({ costUnit: 'price' }), 'price');
+  assert.equal(storedCostUnit(undefined), 'price');
+  assert.equal(storedCostUnit(null), 'price');
+  assert.equal(storedCostUnit({ costUnit: 'bps' }), 'price', 'a unit this build does not know is never shown as pips');
+  assert.equal(costUnitFieldLabel('pips'), 'pips');
+  assert.equal(costUnitFieldLabel('price'), 'price units');
+  assert.match(costUnitOptionLabel('pips'), /Pips/);
+  assert.match(costUnitOptionLabel('price'), /Price units/);
+  assert.match(costUnitHint('pips'), /pip size/);
+  assert.match(costUnitHint('price'), /quote-price units/);
 });
 
 test('validateBacktestForm() — riskPerTrade must be positive when supplied, optional when blank', () => {

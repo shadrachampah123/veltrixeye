@@ -2,6 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  BACKTEST_COST_UNITS,
   BACKTEST_ENGINE_VERSION,
   DEFAULT_BACKTESTS_LIMIT,
   DEFAULT_MAX_HOLD_CANDLES,
@@ -88,7 +89,7 @@ function validRun(overrides: Record<string, unknown> = {}) {
 
 describe('m6 backtest contracts', () => {
   test('engine identity and bounds are pinned', () => {
-    assert.equal(BACKTEST_ENGINE_VERSION, 'm6-backtest-2');
+    assert.equal(BACKTEST_ENGINE_VERSION, 'm6-backtest-3');
     assert.equal(MAX_BACKTEST_STEPS, 4500);
     assert.equal(MAX_BACKTEST_INSTRUMENTS_PER_CALL, 1);
     assert.equal(DEFAULT_MAX_HOLD_CANDLES, 100);
@@ -133,8 +134,9 @@ describe('m6 backtest contracts', () => {
     assert.equal(backtestExitPolicySchema.safeParse({ stopLoss: 'level', extra: 1 }).success, false);
   });
 
-  test('cost policy defaults to frictionless; riskPerTrade is optional', () => {
+  test('cost policy defaults to frictionless price units; riskPerTrade is optional', () => {
     assert.deepEqual(backtestCostPolicySchema.parse({}), {
+      costUnit: 'price',
       feePerSide: 0,
       slippagePerSide: 0,
       spread: 0,
@@ -142,6 +144,27 @@ describe('m6 backtest contracts', () => {
     const withRisk = backtestCostPolicySchema.parse({ feePerSide: 0.5, riskPerTrade: 100 });
     assert.equal(withRisk.feePerSide, 0.5);
     assert.equal(withRisk.riskPerTrade, 100);
+    assert.equal(withRisk.costUnit, 'price', 'an existing payload keeps its historical meaning');
+  });
+
+  test('cost policy carries an explicit unit (m6-backtest-3): price or pips, nothing else', () => {
+    // The unit is what makes "30" on XAUUSD unambiguous: 30 price units of
+    // gold and 30 pips of gold differ by the instrument's pip size.
+    assert.deepEqual([...BACKTEST_COST_UNITS], ['price', 'pips']);
+    for (const costUnit of BACKTEST_COST_UNITS) {
+      const parsed = backtestCostPolicySchema.parse({ costUnit, spread: 30 });
+      assert.equal(parsed.costUnit, costUnit);
+      assert.equal(parsed.spread, 30, 'the value is stored as authored; the engine converts it');
+    }
+    // A legacy policy without the field parses to the historical unit.
+    assert.equal(backtestCostPolicySchema.parse({ feePerSide: 0.0002 }).costUnit, 'price');
+    for (const costUnit of ['bps', 'percent', 'PIPS', 'points', '', null, 1]) {
+      assert.equal(
+        backtestCostPolicySchema.safeParse({ costUnit }).success,
+        false,
+        `costUnit ${JSON.stringify(costUnit)} must be rejected`,
+      );
+    }
   });
 
   test('cost policy rejects negative costs, non-positive risk and unknown keys', () => {
@@ -161,6 +184,7 @@ describe('m6 backtest contracts', () => {
     assert.equal(parsed.instrument.symbol, 'EURUSD');
     assert.equal(parsed.exitPolicy.stopLoss, 'level');
     assert.equal(parsed.costPolicy.feePerSide, 0);
+    assert.equal(parsed.costPolicy.costUnit, 'price', 'cost unit defaults to raw price units');
   });
 
   test('backtest request rejects invalid ranges, directions and unknown keys', () => {

@@ -13,9 +13,17 @@
  *     (`backtestExitPolicySchema`, `backtestCostPolicySchema`). This applies
  *     defaults (`stopLoss: 'level'`, `takeProfit: 'tp3'`, `maxHoldCandles: 100`,
  *     `sameCandleRule: 'stop_first'`, `entryTiming: 'signal_close'`,
- *     `feePerSide: 0`, `slippagePerSide: 0`, `spread: 0`) and rejects unknown
- *     keys, so `{}` and `{ stopLoss: 'level', takeProfit: 'tp3', ... }` become
- *     byte-identical after parsing.
+ *     `costUnit: 'price'`, `feePerSide: 0`, `slippagePerSide: 0`, `spread: 0`)
+ *     and rejects unknown keys, so `{}` and `{ stopLoss: 'level', takeProfit: 'tp3', ... }`
+ *     become byte-identical after parsing.
+ *
+ *     The parsed policies are what the engine consumes, so anything that
+ *     changes their meaning changes the hash: adding `costUnit` (m6-backtest-3)
+ *     makes a pip-denominated cost policy hash differently from the same
+ *     numbers read as price units. That is deliberate — and safe, because
+ *     `engine_version` is part of `backtest_runs_idempotency_uniq`, so a hash
+ *     computed by one engine version can never collapse onto a run recorded by
+ *     another.
  *
  *  2. Build the canonical object:
  *     `{ exitPolicy: <parsed>, costPolicy: <parsed> }`

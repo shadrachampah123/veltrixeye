@@ -1,4 +1,4 @@
-# Deterministic Backtesting (M6, Phases 1, 2 & 4; M6.2 long-window coverage)
+# Deterministic Backtesting (M6, Phases 1, 2 & 4; M6.2 long-window coverage; M6.3 cost units)
 
 M6 backtesting replays a published strategy version over historical candles
 and records what its own detection, level, and scoring layers would have
@@ -40,8 +40,8 @@ recorded transactionally.
   (`sameCandleRule: 'stop_first'`); equality with a level counts as a touch.
 - Records setups that pass M3 but have no deterministic levels as
   `no_levels` rows (never skipped, excluded from R statistics).
-- Attributes explicit costs (`feePerSide`, `slippagePerSide`, `spread`,
-  optional `riskPerTrade`) and reports R-primary metrics (win rate,
+- Attributes explicit costs (`costUnit`, `feePerSide`, `slippagePerSide`,
+  `spread`, optional `riskPerTrade`) and reports R-primary metrics (win rate,
   expectancy, profit factor, max drawdown, averages).
 - Persists runs and trades in `backtest_runs` / `backtest_trades`
   (migration `0011`): idempotent replays collapse via the full-input
@@ -78,8 +78,11 @@ writer of `backtest_runs` / `backtest_trades`:
   1. Zod-parse `exitPolicy` and `costPolicy` through their contract schemas
      with defaults (`stopLoss: 'level'`, `takeProfit: 'tp3'`,
      `maxHoldCandles: 100`, `sameCandleRule: 'stop_first'`,
-     `entryTiming: 'signal_close'`, fees 0). `{}` and
-     `{stopLoss:'level',...}` become byte-identical after parsing.
+     `entryTiming: 'signal_close'`, `costUnit: 'price'`, fees 0). `{}` and
+     `{stopLoss:'level',...}` become byte-identical after parsing. Because
+     `engine_version` is part of the idempotency key, the `costUnit` field
+     added by `m6-backtest-3` cannot collapse onto a run recorded by an older
+     engine.
   2. Build canonical object `{ exitPolicy: <parsed>, costPolicy: <parsed> }`
      — only policies are hashed. Remaining idempotency dimensions
      (`user_id`, `strategy_version_id`, `instrument_id`, `direction`,
@@ -126,10 +129,14 @@ on top of the Phase 2 API — no engine, service or schema change.
 
 ## Engine contract
 
-Pinned as **`m6-backtest-2`** (`BACKTEST_ENGINE_VERSION` in
+Pinned as **`m6-backtest-3`** (`BACKTEST_ENGINE_VERSION` in
 `@veltrixeye/contracts`), stored on every run row. Any change to anchors,
-evaluation, coverage, exits, costs, or metrics requires a new version string
-(`m6-backtest-1` → `m6-backtest-2` is the M6.2 long-window coverage fix).
+evaluation, coverage, exits, costs, or metrics requires a new version string:
+
+| Bump | Change |
+| --- | --- |
+| `m6-backtest-1` → `m6-backtest-2` | M6.2 long-window candle coverage (per-role loader windows + fail-closed coverage guard) |
+| `m6-backtest-2` → `m6-backtest-3` | M6.3 explicit, instrument-aware cost units (`costPolicy.costUnit`) |
 
 Bounds (pinned in contracts, none configurable):
 
@@ -144,10 +151,13 @@ Exit policy: `stopLoss` (`level`|`none`), `takeProfit` (`tp1`|`tp2`|`tp3`|
 `entryTiming` (`signal_close`, pinned). `none` disables that leg but never
 changes level derivation — R stays normalized by version stop.
 
-Cost policy: `feePerSide`, `slippagePerSide`, `spread` (≥0, default 0),
-`riskPerTrade` (>0 optional). `pnlR = (signedPriceMove − totalCost) /
-riskDistance` rounded 4 decimals; `pnlCurrency = pnlR × riskPerTrade` (2
-decimals) only when set.
+Cost policy: `costUnit` (`price`|`pips`, default `price`), `feePerSide`,
+`slippagePerSide`, `spread` (≥0, default 0), `riskPerTrade` (>0 optional).
+`totalCost = 2 × (feePerSide + slippagePerSide) + spread` **in price units**
+(pip-denominated values are converted first — see "M6.3 cost units" below);
+`pnlR = (signedPriceMove − totalCost) / riskDistance` rounded 4 decimals;
+`pnlCurrency = pnlR × riskPerTrade` (2 decimals) only when set.
+`riskPerTrade` is an account-currency amount and is never pip-converted.
 
 ## Determinism and look-ahead protection
 
@@ -200,6 +210,58 @@ range that would need more (e.g. 4500 four-hour anchors read through a 15m
 entry role) is refused up front — `BacktestService` never issues the
 under-covered read and never writes a run.
 
+## M6.3 cost units (engine `m6-backtest-3`)
+
+A cost policy used to carry three bare numbers, and the engine read all of
+them as **raw price units**. That is unambiguous for an FX author typing
+`0.0002`, and catastrophic for everyone else: a XAUUSD run whose author typed
+`30` meaning a 30-pip spread was charged **30 price units of gold**. That run
+entered long at 4380.01175 with a stop at 4379.9708 (a 0.04095 price-unit risk
+distance) and TP3 at 4380.1346 — a gross **+3R** trade — and reported
+**−729.60R**, because `(0.12285 − 30) / 0.04095 = −729.6007`.
+
+Costs are now explicit and instrument-aware:
+
+- **`costUnit: 'price'`** (the default) — the three cost fields are raw
+  quote-price units, exactly as before. Every existing payload, every stored
+  run and every FX replay produces byte-identical R; the pinned FX cost
+  arithmetic in `packages/core/test/backtest.test.ts` is unchanged.
+- **`costUnit: 'pips'`** — the same three fields are instrument pips. The
+  engine converts each with the instrument's pip size
+  (`resolveBacktestCosts` in `packages/core/src/backtest/engine.ts`) before
+  any cost can touch R.
+
+The pip size comes from `pipSizeFor(symbol)`
+(`packages/core/src/strategies/evaluation/indicators.ts`) — the platform's
+single pinned pip convention (0.01 for JPY-quoted symbols, 0.0001 otherwise).
+That is deliberate: it is the **same** function `deriveCandidate` uses to
+convert this version's `stopLossBuffer` pips into the entry/stop/target levels
+that define `riskDistance`. Costs and the R denominator therefore always share
+one unit, and a run can never divide a pip-scaled cost by a price-scaled stop.
+
+With the reported inputs restated as pips
+(`{costUnit:'pips', feePerSide:5, slippagePerSide:5, spread:10}` = 30 pips),
+the same XAUUSD trade costs `30 × 0.0001 = 0.003` price units and reports
+`(0.12285 − 0.003) / 0.04095` = **+2.9267R** — pinned by
+`packages/core/test/backtest-cost-units.test.ts`, which also asserts that the
+`−729.6007R` figure is still reachable, but only when the author explicitly
+asks for price units.
+
+A pip-denominated run records the conversion it used as a deterministic engine
+note (the pip size, the authored values and the resulting per-trade price-unit
+cost), so any stored R can be re-derived by hand.
+
+**Known, separate inconsistency (not changed here).** `pipSizeFor('XAUUSD')`
+returns `0.0001`, while `instrument_risk_specs.pip_size` for
+`commodity/XAUUSD` (migration `0017`) is `0.01`. This affects *level
+derivation* — a "10 pip" gold stop buffer becomes 0.001 price units instead of
+0.10, which is why the reported run's risk distance is only 4 cents — and it
+lives in the M3 strategy-evaluation path, not in the backtest cost model. M6.3
+deliberately reuses the existing convention rather than introducing a second
+one inside a single R figure; reconciling `pipSizeFor` with the risk specs is
+a separate strategy-engine change (it would move every gold setup's levels and
+needs its own engine version).
+
 ## HTTP API (Phase 2)
 
 All routes session-authenticated, owner-scoped with masked 404, Zod-validated,
@@ -245,17 +307,22 @@ migration or engine behaviour.
   unselectable), an instrument from `GET /api/markets/instruments`, direction,
   the range as local `datetime-local` inputs sent as UTC epoch-ms, the exit
   policy (`stopLoss`, `takeProfit`, `maxHoldCandles`) and the cost/sizing
-  policy (`feePerSide`, `slippagePerSide`, `spread`, optional `riskPerTrade`).
-  The three timeframes are **not** an input: they come from the selected
-  version's configuration and are displayed read-only, as are the pinned
-  `signal_close` / `stop_first` rules.
+  policy (`costUnit`, `feePerSide`, `slippagePerSide`, `spread`, optional
+  `riskPerTrade`). The cost unit is a visible selector (default "Price units"),
+  and the three cost fields are labelled with the unit in force — `Fee per side
+  (pips)` — so the number a user types is never interpreted as a unit they did
+  not choose. The three timeframes are **not** an input: they come from the
+  selected version's configuration and are displayed read-only, as are the
+  pinned `signal_close` / `stop_first` rules.
 - **Client-side validation mirrors the service** (required selections,
   `from < to`, no future bounds, ≤ 10-year span, `maxHoldCandles` 1–5000,
-  non-negative costs, optional positive risk) and the submitted body is the
+  a contract-known `costUnit`, non-negative costs, optional positive risk) and the submitted body is the
   parsed output of the shared `backtestRequestSchema`, so the payload that
   leaves the browser is the payload the route accepts. A 400 is still rendered,
   with per-field messages when the API supplies them.
-- **Results** — the run's policies, engine version and `config_hash`; every
+- **Results** — the run's policies (including the cost unit; runs stored
+  before `m6-backtest-3` have no `costUnit` and are labelled price units, the
+  only thing they can have meant), engine version and `config_hash`; every
   metric of `BacktestMetrics` (setups detected, trades closed, wins, losses,
   win rate, average R/expectancy, avg win/loss, net R, max drawdown, profit
   factor, steps evaluated, currency only when `riskPerTrade` was supplied);

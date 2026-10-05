@@ -28,8 +28,13 @@ import type { StrategyVersionConfig } from './strategies.js';
  *  - exits are evaluated on the setup timeframe only;
  *  - R-multiples are the primary result; currency P&L exists only when the
  *    caller explicitly supplies `riskPerTrade` (no invented account size);
- *  - costs (fee/slippage/spread) are explicit inputs, defaulting to zero —
- *    spread is NEVER sourced from market data (no spread feed exists);
+ *  - costs (fee/slippage/spread) are explicit inputs, defaulting to zero, and
+ *    their UNIT is explicit too (`costUnit`, added by `m6-backtest-3`):
+ *    `'price'` means raw quote-price units (the historical behaviour — every
+ *    stored run and every FX replay is unchanged), `'pips'` means instrument
+ *    pips converted with the instrument's pip size, so "30" typed for XAUUSD
+ *    can never silently be read as 30 price units of gold. Spread is NEVER
+ *    sourced from market data (no spread feed exists);
  *  - every timeframe ROLE the version reads must be covered over the anchors
  *    the run evaluates: a required bias/entry series that ends early is a
  *    fail-closed error, never a stale replay (see `MAX_BACKTEST_ROLE_CANDLES`).
@@ -39,8 +44,20 @@ import type { StrategyVersionConfig } from './strategies.js';
  * API routes and audit events — reusing these exact schemas.
  */
 
-/** Pinned identifier stored on every backtest run produced by this engine. */
-export const BACKTEST_ENGINE_VERSION = 'm6-backtest-2';
+/**
+ * Pinned identifier stored on every backtest run produced by this engine.
+ *
+ * Any change to anchors, evaluation, coverage, exits, COSTS or metrics
+ * requires a new string:
+ *  - `m6-backtest-1` → `m6-backtest-2`: the M6.2 long-window candle-coverage
+ *    fix (per-role coverage windows + fail-closed `assertRoleCoverage`);
+ *  - `m6-backtest-2` → `m6-backtest-3`: the M6.3 cost-unit fix — cost policies
+ *    carry an explicit `costUnit` (`'price'` | `'pips'`) and pip-denominated
+ *    costs are converted with the instrument's pip size before they touch R.
+ *    The unit is part of the canonical `config_hash`, so a run recorded under
+ *    an older engine version can never be replayed as an identical run.
+ */
+export const BACKTEST_ENGINE_VERSION = 'm6-backtest-3';
 
 /** Max evaluated anchors (setup closes) per backtest run. */
 export const MAX_BACKTEST_STEPS = 4500;
@@ -111,16 +128,43 @@ export type BacktestExitPolicy = z.infer<typeof backtestExitPolicySchema>;
 export type BacktestExitPolicyInput = z.input<typeof backtestExitPolicySchema>;
 
 /**
- * Cost + sizing policy — explicit price-unit inputs (instruments span FX,
- * crypto and equities, so no single bps convention applies).
+ * The unit a cost policy's `feePerSide` / `slippagePerSide` / `spread` values
+ * are denominated in (`m6-backtest-3`).
  *
+ * WHY THIS EXISTS. Instruments span FX, metals, crypto and equities, so a bare
+ * cost number is ambiguous — and the ambiguity is not cosmetic. A XAUUSD run
+ * whose author typed "30" meaning a 30-pip spread was charged 30 *price units*
+ * of gold: against the 0.04095 price-unit risk distance of that run, a +3R
+ * take-profit-3 exit was reported as −729.60R. The unit now travels with the
+ * policy, so the same numbers cannot be read two ways:
+ *
+ *  - `'price'` (the default, and the pre-`m6-backtest-3` behaviour) — raw
+ *    quote-price units. Every existing payload, stored run and FX replay is
+ *    bit-for-bit unchanged.
+ *  - `'pips'` — instrument pips. The engine converts each field to price units
+ *    with the instrument's pip size (`value × pipSize`) using the SAME pinned
+ *    pip convention that derives the candidate levels (`pipSizeFor` in
+ *    `packages/core/src/strategies/evaluation/indicators.ts`), so costs and the
+ *    R denominator can never be expressed in two different units.
+ */
+export const BACKTEST_COST_UNITS = ['price', 'pips'] as const;
+export type BacktestCostUnit = (typeof BACKTEST_COST_UNITS)[number];
+export const backtestCostUnitSchema = z.enum(BACKTEST_COST_UNITS);
+
+/**
+ * Cost + sizing policy — explicit inputs with an EXPLICIT unit (`costUnit`).
+ *
+ *  - `costUnit` selects the denomination of the three cost fields below
+ *    (`'price'` = quote-price units, `'pips'` = instrument pips);
  *  - `feePerSide` / `slippagePerSide` apply adversely on BOTH sides;
  *  - `spread` applies adversely at entry only;
  *  - `riskPerTrade` (optional) only scales R into currency P&L — it never
- *    changes entries, exits or R.
+ *    changes entries, exits or R. It is ALWAYS an account-currency amount, so
+ *    `costUnit` does not apply to it.
  */
 export const backtestCostPolicySchema = z
   .object({
+    costUnit: backtestCostUnitSchema.default('price'),
     feePerSide: z.number().min(0).finite().default(0),
     slippagePerSide: z.number().min(0).finite().default(0),
     spread: z.number().min(0).finite().default(0),

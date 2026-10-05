@@ -6,6 +6,7 @@ import {
 } from '@veltrixeye/contracts';
 import type {
   BacktestCostPolicy,
+  BacktestCostUnit,
   BacktestEngineInput,
   BacktestEngineResult,
   BacktestExitPolicy,
@@ -19,11 +20,13 @@ import type {
 import { Errors } from '../errors.js';
 import { createEvaluationEngine } from '../strategies/evaluation/engine.js';
 import { conditionRole, requiredWindows } from '../strategies/evaluation/service.js';
+import { pipSizeFor } from '../strategies/evaluation/indicators.js';
 import { detectionLevels } from '../setups/levels.js';
 import { scoreSetupQuality } from '../scoring/engine.js';
 
 /**
- * The deterministic backtest replay engine (M6 Phase 1 + M6.2 coverage).
+ * The deterministic backtest replay engine (M6 Phase 1 + M6.2 coverage +
+ * M6.3 cost units).
  *
  * PURE: same inputs ⇒ byte-identical outputs. No database, no provider, no
  * ingestion, no wall clock, no network, no filesystem, no randomness. The
@@ -51,7 +54,11 @@ import { scoreSetupQuality } from '../scoring/engine.js';
  *    candle-by-candle on the setup timeframe only;
  *  - a candle touching BOTH stop and target resolves to the stop
  *    (`stop_first` — conservative, not configurable);
- *  - costs are explicit inputs (fee/slippage per side, spread at entry);
+ *  - costs are explicit inputs (fee/slippage per side, spread at entry) in an
+ *    explicit UNIT (`costPolicy.costUnit`, M6.3): `'price'` — the default and
+ *    the historical behaviour — is raw quote-price units; `'pips'` is
+ *    instrument pips, converted with the instrument's pip size before it can
+ *    touch R (see `resolveBacktestCosts`);
  *  - R-multiples are primary; currency P&L exists only with `riskPerTrade`.
  *
  * Metrics denominators (pinned):
@@ -68,6 +75,13 @@ import { scoreSetupQuality } from '../scoring/engine.js';
 export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
   const exitPolicy = parseExitPolicy(input.exitPolicy);
   const costPolicy = parseCostPolicy(input.costPolicy);
+  // M6.3: costs are instrument-aware. `costUnit: 'pips'` values are converted
+  // with the instrument's pip size — the same pinned convention
+  // (`pipSizeFor`) that derived the candidate levels this run normalizes R by,
+  // so a cost can never be denominated in a different unit than the risk
+  // distance it is divided by. `costUnit: 'price'` (the default) converts
+  // nothing, which keeps every FX replay bit-for-bit identical to before.
+  const costs = resolveBacktestCosts(costPolicy, pipSizeFor(input.instrument.symbol));
   const config = input.config;
   if (!config.timeframes) {
     throw Errors.invalidInput('Backtest requires config.timeframes (published versions always have them).');
@@ -99,6 +113,17 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
   const anchors = truncated ? allAnchors.slice(0, MAX_BACKTEST_STEPS) : allAnchors;
 
   const notes: string[] = [];
+  if (costs.unit === 'pips') {
+    // Deterministic audit trail for the conversion: a pip-denominated run
+    // records the pip size it used and the resulting price-unit cost, so the
+    // R of a stored run can always be re-derived by hand.
+    notes.push(
+      `Cost policy is pip-denominated (costUnit "pips"): converted with ${input.instrument.symbol}'s pip size ` +
+        `(1 pip = ${formatCostNumber(costs.pipSize)} price units — the pinned pip convention this version's pip buffers also use), ` +
+        `so fee ${formatCostNumber(costPolicy.feePerSide)} + slippage ${formatCostNumber(costPolicy.slippagePerSide)} per side ` +
+        `and spread ${formatCostNumber(costPolicy.spread)} at entry apply as ${formatCostNumber(costs.total)} price units of adverse cost per trade.`,
+    );
+  }
   if (anchors.length === 0) {
     notes.push(
       `No setup-timeframe closes in [${new Date(fromMs).toISOString()}, ${new Date(toMs).toISOString()}) — nothing evaluated.`,
@@ -168,7 +193,8 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
         dirEval,
         minRr: config.risk.minRr,
         exitPolicy,
-        costPolicy,
+        costs,
+        riskPerTrade: costPolicy.riskPerTrade,
       });
       if (trade.exitReason === 'no_levels') noLevels += 1;
       trades.push(trade);
@@ -428,6 +454,76 @@ function parseCostPolicy(policy: unknown): BacktestCostPolicy {
   return parsed.data;
 }
 
+/**
+ * The cost policy's three cost fields in PRICE units, plus the single adverse
+ * total the replay charges every trade (`2 × (fee + slippage) + spread`).
+ */
+export interface ResolvedBacktestCosts {
+  /** The unit the caller supplied (`costPolicy.costUnit`). */
+  unit: BacktestCostUnit;
+  /** The instrument's pip size — the conversion factor when `unit === 'pips'`. */
+  pipSize: number;
+  feePerSide: number;
+  slippagePerSide: number;
+  spread: number;
+  /** Total adverse cost per trade, in price units. */
+  total: number;
+}
+
+/**
+ * M6.3 cost-unit resolution — the ONLY place a cost number becomes a price.
+ *
+ * A bare cost value is meaningless without its unit: for XAUUSD, "30" is 30
+ * cents of gold in price units but a 30-pip spread in pips, and the two differ
+ * by the instrument's pip size. Before `m6-backtest-3` the engine had one
+ * interpretation (price units), so a pip-minded XAUUSD cost of 30 was charged
+ * as 30 price units — against that run's 0.04095 price-unit risk distance a
+ * +3R take-profit exit was reported as −729.60R.
+ *
+ * Now the unit is explicit and instrument-aware:
+ *  - `costUnit: 'price'` (the default) ⇒ scale 1 ⇒ every existing payload,
+ *    stored run and FX replay produces byte-identical R;
+ *  - `costUnit: 'pips'` ⇒ scale = the instrument's pip size.
+ *
+ * The pip size comes from `pipSizeFor(symbol)` — the platform's single pinned
+ * pip convention, and the SAME one `deriveCandidate` uses to convert this
+ * version's `stopLossBuffer` pips into the levels that define `riskDistance`.
+ * Costs and the R denominator therefore always share one unit; a run can never
+ * divide a pip-scaled cost by a price-scaled stop (or the reverse).
+ *
+ * PURE: no database, no provider, no clock. `riskPerTrade` is deliberately not
+ * scaled — it is an account-currency amount, not a price distance.
+ */
+export function resolveBacktestCosts(policy: BacktestCostPolicy, pipSize: number): ResolvedBacktestCosts {
+  const pips = policy.costUnit === 'pips';
+  if (pips && (!(pipSize > 0) || !Number.isFinite(pipSize))) {
+    // Fail closed rather than charge a nonsense cost. Unreachable through
+    // `pipSizeFor` (a pinned positive constant per symbol), but a caller that
+    // ever injects a pip size must not be able to divide R by it silently.
+    throw Errors.invalidInput(
+      `Cannot convert pip-denominated backtest costs: the instrument's pip size must be a positive finite number (got ${String(pipSize)}).`,
+    );
+  }
+  const scale = pips ? pipSize : 1;
+  const feePerSide = policy.feePerSide * scale;
+  const slippagePerSide = policy.slippagePerSide * scale;
+  const spread = policy.spread * scale;
+  return {
+    unit: policy.costUnit,
+    pipSize,
+    feePerSide,
+    slippagePerSide,
+    spread,
+    // Adverse by construction: fee + slippage on BOTH sides, spread at entry.
+    total: 2 * (feePerSide + slippagePerSide) + spread,
+  };
+}
+
+/** Shortest stable decimal rendering of a cost figure, for engine notes. */
+function formatCostNumber(value: number): string {
+  return String(Number(value.toPrecision(12)));
+}
+
 interface TradeSimulationInput {
   seq: number;
   direction: 'long' | 'short';
@@ -442,7 +538,10 @@ interface TradeSimulationInput {
   dirEval: DirectionEvaluation;
   minRr: number;
   exitPolicy: BacktestExitPolicy;
-  costPolicy: BacktestCostPolicy;
+  /** Costs already resolved to price units (M6.3 `costUnit` conversion). */
+  costs: ResolvedBacktestCosts;
+  /** Account-currency risk per trade (never pip-scaled); undefined ⇒ R only. */
+  riskPerTrade: number | undefined;
 }
 
 /**
@@ -536,11 +635,13 @@ function simulateTrade(t: TradeSimulationInput): BacktestTrade {
     exitAsOfMs = t.anchor;
   }
 
-  // Costs are adverse by construction: fee/slippage on both sides, spread at entry.
-  const totalCost = 2 * (t.costPolicy.feePerSide + t.costPolicy.slippagePerSide) + t.costPolicy.spread;
+  // Costs are adverse by construction: fee/slippage on both sides, spread at
+  // entry — already converted to price units by `resolveBacktestCosts`, so
+  // `signedMove` and `totalCost` are guaranteed to share one unit here.
+  const totalCost = t.costs.total;
   const signedMove = t.direction === 'long' ? exitPrice - entry : entry - exitPrice;
   const pnlR = round4((signedMove - totalCost) / riskDistance);
-  const pnlCurrency = t.costPolicy.riskPerTrade !== undefined ? round2(pnlR * t.costPolicy.riskPerTrade) : null;
+  const pnlCurrency = t.riskPerTrade !== undefined ? round2(pnlR * t.riskPerTrade) : null;
   return { ...base, exitReason, exitPrice, exitAsOfMs, pnlR, pnlCurrency };
 }
 

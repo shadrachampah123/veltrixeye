@@ -17,11 +17,15 @@ import {
 } from '@/components/ui';
 import {
   BACKTEST_RANGE_PRESETS,
+  COST_UNIT_OPTIONS,
   DIRECTION_OPTIONS,
   STOP_LOSS_OPTIONS,
   TAKE_PROFIT_OPTIONS,
   applyRangePreset,
   buildBacktestRequest,
+  costUnitFieldLabel,
+  costUnitHint,
+  costUnitOptionLabel,
   createBacktestFormState,
   type BacktestFormErrors,
   type BacktestFormState,
@@ -77,6 +81,9 @@ export function BacktestForm(props: BacktestFormProps) {
   const selected = strategies.find((s) => s.id === state.strategyId) ?? null;
   const versions = selected?.publishedVersions ?? [];
   const instrumentKey = state.assetClass && state.symbol ? `${state.assetClass}/${state.symbol}` : '';
+  // The three cost fields are labelled with the unit they are denominated in,
+  // so "30" on XAUUSD can never be read as 30 price units by accident (M6.3).
+  const costUnit = costUnitFieldLabel(state.costUnit);
 
   return (
     <form
@@ -288,10 +295,24 @@ export function BacktestForm(props: BacktestFormProps) {
         <Card>
           <CardHeader
             title="Costs and sizing"
-            subtitle="Price units, applied adversely: fee and slippage on both sides, spread at entry"
+            subtitle="Applied adversely — fee and slippage on both sides, spread at entry — in the unit you state below"
           />
-          <div className="grid gap-4 px-5 py-4 sm:grid-cols-2 lg:grid-cols-4">
-            <Field label="Fee per side" error={errors.feePerSide}>
+          <div className="grid gap-4 px-5 py-4 sm:grid-cols-2 lg:grid-cols-3">
+            <Field label="Cost unit" error={errors.costUnit} hint="Sent with the request; the engine never guesses it">
+              <Select
+                value={state.costUnit}
+                disabled={submitting}
+                aria-invalid={errors.costUnit ? true : undefined}
+                onChange={(e) => onChange({ costUnit: e.target.value as BacktestFormState['costUnit'] })}
+              >
+                {COST_UNIT_OPTIONS.map((o) => (
+                  <option key={o} value={o}>
+                    {costUnitOptionLabel(o)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label={`Fee per side (${costUnit})`} error={errors.feePerSide}>
               <Input
                 type="number"
                 min={0}
@@ -303,7 +324,7 @@ export function BacktestForm(props: BacktestFormProps) {
                 onChange={(e) => onChange({ feePerSide: e.target.value })}
               />
             </Field>
-            <Field label="Slippage per side" error={errors.slippagePerSide}>
+            <Field label={`Slippage per side (${costUnit})`} error={errors.slippagePerSide}>
               <Input
                 type="number"
                 min={0}
@@ -315,7 +336,7 @@ export function BacktestForm(props: BacktestFormProps) {
                 onChange={(e) => onChange({ slippagePerSide: e.target.value })}
               />
             </Field>
-            <Field label="Spread (entry only)" error={errors.spread}>
+            <Field label={`Spread, entry only (${costUnit})`} error={errors.spread}>
               <Input
                 type="number"
                 min={0}
@@ -328,9 +349,9 @@ export function BacktestForm(props: BacktestFormProps) {
               />
             </Field>
             <Field
-              label="Risk per trade (optional)"
+              label="Risk per trade, optional (account currency)"
               error={errors.riskPerTrade}
-              hint="Only converts R into currency; never changes entries, exits or R"
+              hint="Only converts R into currency; never changes entries, exits or R — and never pip-converted"
             >
               <Input
                 type="number"
@@ -345,6 +366,7 @@ export function BacktestForm(props: BacktestFormProps) {
               />
             </Field>
           </div>
+          <p className="border-t border-ink-700 px-5 py-3 text-xs text-ink-400">{costUnitHint(state.costUnit)}</p>
         </Card>
 
         {props.submitError && (

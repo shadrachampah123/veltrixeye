@@ -352,6 +352,52 @@ describe('m6 backtests api', () => {
     assert.equal(body.truncated, false);
   });
 
+  test('cost policy carries an explicit unit (m6-backtest-3) end to end', async () => {
+    const owner = await registerUser();
+    const { strategyId, versionId } = await createPublishedVersion(owner.cookie, alwaysPassConfig('EURUSD'));
+    await seedCandles('EURUSD', 40, T0 - 20 * HOUR);
+    const post = (costPolicy: any) =>
+      app.inject({
+        method: 'POST',
+        url: '/api/backtests',
+        headers: { cookie: owner.cookie, 'x-forwarded-for': freshIp() },
+        payload: {
+          strategyId,
+          versionId,
+          instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+          direction: 'long',
+          from: T0,
+          to: T0 + 10 * HOUR,
+          costPolicy,
+        },
+      });
+
+    const pips = await post({ costUnit: 'pips', feePerSide: 2, slippagePerSide: 1, spread: 2 });
+    assert.equal(pips.statusCode, 201, pips.body);
+    assert.equal(pips.json().run.costPolicy.costUnit, 'pips', 'the unit is stored on the run');
+    assert.equal(pips.json().run.engineVersion, BACKTEST_ENGINE_VERSION);
+    assert.equal(backtestRunDtoSchema.safeParse(pips.json().run).success, true);
+    assert.ok(
+      pips.json().run.notes.some((n: string) => n.includes('pip-denominated')),
+      'a pip-denominated run records the conversion it used',
+    );
+
+    // A unit the contract does not define is a 400 — never a silent reading.
+    const bad = await post({ costUnit: 'bps', spread: 30 });
+    assert.equal(bad.statusCode, 400);
+
+    // A legacy payload (no costUnit) keeps its historical meaning, and the same
+    // numbers read as pips are a DIFFERENT logical run (different config_hash).
+    const legacy = await post({ feePerSide: 2, slippagePerSide: 1, spread: 2 });
+    assert.equal(legacy.statusCode, 201, legacy.body);
+    assert.equal(legacy.json().run.costPolicy.costUnit, 'price', 'the default is applied and persisted');
+    assert.notEqual(legacy.json().run.configHash, pips.json().run.configHash);
+    assert.ok(
+      !legacy.json().run.notes.some((n: string) => n.includes('pip-denominated')),
+      'price-unit runs add no conversion note',
+    );
+  });
+
   test('deterministic config_hash: same canonical config replays with created=false', async () => {
     const owner = await registerUser();
     const { strategyId, versionId } = await createPublishedVersion(owner.cookie, alwaysPassConfig('EURUSD'));
