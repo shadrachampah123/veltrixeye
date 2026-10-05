@@ -155,6 +155,41 @@ function MarketsContent() {
                 </div>
               </Card>
 
+              {/* TEMPORARY DIAGNOSTIC — read-only view of the already-loaded coverage response (no new request). */}
+              <Card>
+                <CardHeader title="Coverage Details — BTCUSD" subtitle="Temporary diagnostic · from the already-loaded /api/market-data/coverage response · times in UTC" />
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-ink-700 text-left text-[11px] uppercase tracking-wider text-ink-400">
+                        <th className="px-5 py-2.5 font-medium">Timeframe</th>
+                        <th className="px-3 py-2.5 text-right font-medium">Candle count</th>
+                        <th className="px-3 py-2.5 font-medium">Earliest (UTC)</th>
+                        <th className="px-5 py-2.5 font-medium">Latest (UTC)</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-ink-750">
+                      {(coverage ?? []).filter((c) => c.symbol === 'BTCUSD').length === 0 ? (
+                        <tr>
+                          <td colSpan={4} className="px-5 py-3 text-xs text-ink-400">No stored coverage rows for BTCUSD.</td>
+                        </tr>
+                      ) : (
+                        (coverage ?? [])
+                          .filter((c) => c.symbol === 'BTCUSD')
+                          .map((c) => (
+                            <tr key={`${c.assetClass}/${c.symbol}/${c.timeframe}`}>
+                              <td className="px-5 py-3 font-mono text-xs text-ink-100">{c.timeframe}</td>
+                              <td className="px-3 py-3 text-right font-mono text-xs text-ink-300">{c.candleCount.toLocaleString()}</td>
+                              <td className="px-3 py-3 font-mono text-xs text-ink-300">{c.earliestTime ? new Date(c.earliestTime).toISOString().replace('T', ' ').replace('.000Z', ' UTC') : '—'}</td>
+                              <td className="px-5 py-3 font-mono text-xs text-ink-300">{c.latestTime ? new Date(c.latestTime).toISOString().replace('T', ' ').replace('.000Z', ' UTC') : '—'}</td>
+                            </tr>
+                          ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+
               <MarketSelector instruments={instruments} />
 
               <BackfillCard instruments={instruments} onDone={load} />
