@@ -28,8 +28,11 @@ import type { StrategyVersionConfig } from './strategies.js';
  *  - exits are evaluated on the setup timeframe only;
  *  - R-multiples are the primary result; currency P&L exists only when the
  *    caller explicitly supplies `riskPerTrade` (no invented account size);
- *  - costs (fee/slippage/spread) are explicit inputs, defaulting to zero —
- *    spread is NEVER sourced from market data (no spread feed exists);
+ *  - costs (fee/slippage/spread) are explicit PIPS inputs, defaulting to
+ *    zero, converted to price units with the instrument's pip size
+ *    (`instrument_risk_specs.pip_size`, M8.2) — the same unit every other
+ *    cost input in the platform uses. Spread is NEVER sourced from market
+ *    data (no spread feed exists);
  *  - every timeframe ROLE the version reads must be covered over the anchors
  *    the run evaluates: a required bias/entry series that ends early is a
  *    fail-closed error, never a stale replay (see `MAX_BACKTEST_ROLE_CANDLES`).
@@ -40,7 +43,7 @@ import type { StrategyVersionConfig } from './strategies.js';
  */
 
 /** Pinned identifier stored on every backtest run produced by this engine. */
-export const BACKTEST_ENGINE_VERSION = 'm6-backtest-2';
+export const BACKTEST_ENGINE_VERSION = 'm6-backtest-3';
 
 /** Max evaluated anchors (setup closes) per backtest run. */
 export const MAX_BACKTEST_STEPS = 4500;
@@ -111,11 +114,14 @@ export type BacktestExitPolicy = z.infer<typeof backtestExitPolicySchema>;
 export type BacktestExitPolicyInput = z.input<typeof backtestExitPolicySchema>;
 
 /**
- * Cost + sizing policy — explicit price-unit inputs (instruments span FX,
- * crypto and equities, so no single bps convention applies).
+ * Cost + sizing policy — explicit PIP inputs (the platform cost convention:
+ * risk `maxSpreadPips`/`maxSlippagePips`, execution fee pips).
  *
  *  - `feePerSide` / `slippagePerSide` apply adversely on BOTH sides;
  *  - `spread` applies adversely at entry only;
+ *  - pips become price units via the instrument's `pip_size`
+ *    (`instrument_risk_specs`, M8.2 — e.g. 0.0001 EURUSD, 0.01 XAUUSD), which
+ *    is why costs are instrument-aware: 1 on gold is 1 cent, not 1 dollar;
  *  - `riskPerTrade` (optional) only scales R into currency P&L — it never
  *    changes entries, exits or R.
  */
@@ -305,6 +311,14 @@ export interface BacktestEngineInput {
   /** Published (immutable) version configuration. Treated as read-only. */
   config: StrategyVersionConfig;
   instrument: { assetClass: string; symbol: string };
+  /**
+   * Instrument pip size in price units (`instrument_risk_specs.pip_size`,
+   * M8.2). Cost-policy fields are pips and are multiplied by this to get the
+   * price-unit cost subtracted from every trade. Required whenever the cost
+   * policy is non-zero (the loader resolves it from the instrument spec);
+   * costless replays ignore it.
+   */
+  pipSize?: number;
   candles: BacktestCandleSet;
   /** Replay bounds, epoch-ms (UTC): anchors are setup closes in [fromMs, toMs). */
   fromMs: number;

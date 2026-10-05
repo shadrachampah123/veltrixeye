@@ -223,13 +223,13 @@ export function validateBacktestForm(state: BacktestFormState, nowMs: number): B
   }
 
   if (parseNonNegative(state.feePerSide) === null) {
-    errors.feePerSide = 'Fee per side must be a number ≥ 0 (price units).';
+    errors.feePerSide = 'Fee per side must be a number ≥ 0 (pips).';
   }
   if (parseNonNegative(state.slippagePerSide) === null) {
-    errors.slippagePerSide = 'Slippage per side must be a number ≥ 0 (price units).';
+    errors.slippagePerSide = 'Slippage per side must be a number ≥ 0 (pips).';
   }
   if (parseNonNegative(state.spread) === null) {
-    errors.spread = 'Spread must be a number ≥ 0 (price units, applied at entry).';
+    errors.spread = 'Spread must be a number ≥ 0 (pips, applied at entry).';
   }
   if (!parseRiskPerTrade(state.riskPerTrade).ok) {
     errors.riskPerTrade = 'Risk per trade must be a positive number (or left blank).';

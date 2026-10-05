@@ -40,9 +40,10 @@ recorded transactionally.
   (`sameCandleRule: 'stop_first'`); equality with a level counts as a touch.
 - Records setups that pass M3 but have no deterministic levels as
   `no_levels` rows (never skipped, excluded from R statistics).
-- Attributes explicit costs (`feePerSide`, `slippagePerSide`, `spread`,
-  optional `riskPerTrade`) and reports R-primary metrics (win rate,
-  expectancy, profit factor, max drawdown, averages).
+- Attributes explicit pip costs (`feePerSide`, `slippagePerSide`, `spread`,
+  optional `riskPerTrade`), converts them with the instrument's pip size, and
+  reports R-primary metrics (win rate, expectancy, profit factor, max
+  drawdown, averages).
 - Persists runs and trades in `backtest_runs` / `backtest_trades`
   (migration `0011`): idempotent replays collapse via the full-input
   uniqueness key, trades are append-only.
@@ -126,10 +127,11 @@ on top of the Phase 2 API — no engine, service or schema change.
 
 ## Engine contract
 
-Pinned as **`m6-backtest-2`** (`BACKTEST_ENGINE_VERSION` in
+Pinned as **`m6-backtest-3`** (`BACKTEST_ENGINE_VERSION` in
 `@veltrixeye/contracts`), stored on every run row. Any change to anchors,
 evaluation, coverage, exits, costs, or metrics requires a new version string
-(`m6-backtest-1` → `m6-backtest-2` is the M6.2 long-window coverage fix).
+(`m6-backtest-1` → `m6-backtest-2` is the M6.2 long-window coverage fix;
+`m6-backtest-2` → `m6-backtest-3` is the instrument-aware cost-unit fix).
 
 Bounds (pinned in contracts, none configurable):
 
@@ -144,10 +146,14 @@ Exit policy: `stopLoss` (`level`|`none`), `takeProfit` (`tp1`|`tp2`|`tp3`|
 `entryTiming` (`signal_close`, pinned). `none` disables that leg but never
 changes level derivation — R stays normalized by version stop.
 
-Cost policy: `feePerSide`, `slippagePerSide`, `spread` (≥0, default 0),
-`riskPerTrade` (>0 optional). `pnlR = (signedPriceMove − totalCost) /
+Cost policy: `feePerSide`, `slippagePerSide`, `spread` in **pips** (≥0,
+default 0), `riskPerTrade` (>0 optional). Pips are converted to price units
+with the instrument's pip size (`instrument_risk_specs.pip_size`, M8.2:
+0.0001 EURUSD, 0.01 XAUUSD, …); `totalCost = (2 × (feePerSide +
+slippagePerSide) + spread) × pipSize`. `pnlR = (signedPriceMove − totalCost) /
 riskDistance` rounded 4 decimals; `pnlCurrency = pnlR × riskPerTrade` (2
-decimals) only when set.
+decimals) only when set. A non-zero cost policy without an instrument spec is
+refused (`400`) — a pip is never guessed; a costless replay needs no spec.
 
 ## Determinism and look-ahead protection
 
@@ -200,6 +206,34 @@ range that would need more (e.g. 4500 four-hour anchors read through a 15m
 entry role) is refused up front — `BacktestService` never issues the
 under-covered read and never writes a run.
 
+## Instrument-aware costs (engine `m6-backtest-3`)
+
+Pre-`m6-backtest-3`, the cost policy fields were subtracted from the price
+move **as raw price units**, with no reference to the instrument, so the same
+policy meant wildly different things across the universe: a `spread` of 1
+is 10 000 pips of price on EURUSD but only 100 pips on gold. On XAUUSD
+(pip 0.01) a normal pip-denominated policy came out 100× too expensive —
+enough to turn a winning TP3 exit into a four-figure negative R (the reported
+gold trade closed at `−729.60R`).
+
+Costs are now pips, exactly like every other cost input in the platform
+(risk `maxSpreadPips` / `maxSlippagePips`, execution fee pips), and are
+converted once, inside the pure engine:
+
+```
+totalCost(price) = (2 × (feePerSide + slippagePerSide) + spread) × pipSize
+```
+
+- `pipSize` is loaded by `BacktestService` from `instrument_risk_specs`
+  (`0017`, the M8.2 contract-spec table) and passed to `runBacktest` as an
+  explicit input — the engine stays pure and reads no database.
+- A non-zero cost policy with no resolvable pip size fails closed
+  (`400 invalid_input`): a pip is never guessed from the symbol. A costless
+  replay is scale-independent and needs no spec.
+- This is a cost-semantics change, so the engine version is bumped
+  (`m6-backtest-2` → `m6-backtest-3`); stored runs keep their pinned version
+  and policies, and replay idempotency is unchanged.
+
 ## HTTP API (Phase 2)
 
 All routes session-authenticated, owner-scoped with masked 404, Zod-validated,
@@ -245,7 +279,8 @@ migration or engine behaviour.
   unselectable), an instrument from `GET /api/markets/instruments`, direction,
   the range as local `datetime-local` inputs sent as UTC epoch-ms, the exit
   policy (`stopLoss`, `takeProfit`, `maxHoldCandles`) and the cost/sizing
-  policy (`feePerSide`, `slippagePerSide`, `spread`, optional `riskPerTrade`).
+  policy (`feePerSide`, `slippagePerSide`, `spread` in pips, optional
+  `riskPerTrade`).
   The three timeframes are **not** an input: they come from the selected
   version's configuration and are displayed read-only, as are the pinned
   `signal_close` / `stop_first` rules.
