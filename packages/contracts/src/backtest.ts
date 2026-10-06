@@ -106,7 +106,9 @@ export type BacktestInstrument = z.infer<typeof backtestInstrumentSchema>;
  *  - `stopLoss: 'level'` honors the derived stop; `'none'` holds through it
  *    (for R:R analysis — the stop is still used to normalize R).
  *  - `takeProfit` selects which derived target leg exits the trade (`'none'`
- *    disables target exits). A null leg can never be touched.
+ *    disables target exits). A null leg can never be touched; when the strategy
+ *    uses its single structural target (stored as TP1), the default TP3 policy
+ *    resolves to that available TP1 instead of disabling target exits.
  *  - `maxHoldCandles` exits at the close of the Nth setup candle after the
  *    signal when no level was touched first (intra-candle touches precede
  *    the max-hold close by construction).

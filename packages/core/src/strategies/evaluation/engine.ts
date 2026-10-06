@@ -281,9 +281,10 @@ function evaluateDirection(
  *  - atr SL       = entry − ATR(14) − buffer (LONG-convention, same reason);
  *  - rr method    = TP1/2/3 at risk multiples above entry (LONG-convention),
  *                   achievableRr = tp3Rr (direction-neutral);
- *  - structure TP = achievableRr measured to the nearest opposing swing for
- *                   `direction` (no TP legs — rr_requirement reports
- *                   "insufficient_data" when no target exists);
+ *  - structure TP = the nearest opposing swing for `direction` stored as
+ *                   TP1, with achievableRr measured to that target (TP2/TP3
+ *                   remain null; rr_requirement reports "insufficient_data"
+ *                   when no target exists);
  *  - manual       = no targets (achievableRr null) — rr_requirement reports
  *                   "unsupported" for that method.
  *
@@ -355,6 +356,7 @@ export function deriveCandidate(
     achievableRr = risk.tp3Rr;
   } else if (risk.takeProfitMethod === 'structure') {
     const target = structuralTarget(window, direction, entry);
+    tp1 = target;
     achievableRr = target === null ? null : Math.abs(target - entry) / riskDistance;
   }
 
