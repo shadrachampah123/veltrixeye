@@ -17,7 +17,7 @@
  *    of k=2 (ties are NOT pivots — keeps detection deterministic on flat data).
  *  - Level tolerance is percentage-of-level (LEVEL_TOLERANCE_PCT = 0.1%).
  *  - Sessions are fixed UTC hour windows; no exchange calendars exist in M3.
- *  - A "pip" is 0.0001, or 0.01 for JPY-quoted symbols (symbol ends "JPY").
+ *  - Pip size comes from the instrument's authoritative `instrument_risk_specs.pip_size`.
  */
 
 import type { CandleDto } from '@veltrixeye/contracts';
