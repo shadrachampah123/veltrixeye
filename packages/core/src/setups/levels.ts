@@ -3,12 +3,13 @@ import type { CandidateLevels, SetupDirection } from '@veltrixeye/contracts';
 /**
  * M4 persisted trade levels (pure — no I/O, no clock).
  *
- * M3 structure stops are per-direction (a short candidate's stop already
- * sits above entry); fixed/atr stops and rr targets stay LONG-convention
- * (stop below, targets above — "per-direction levels deferred to M4"). For
- * a long setup the candidate is stored as-is; for a short setup each leg is
- * oriented idempotently — a leg already on the short side (stop above,
- * target below) is kept, a LONG-convention leg is mirrored around the entry
+ * M3 structure stops and structural TP1 targets are per-direction (a short
+ * candidate's stop sits above entry and its target below); fixed/atr stops and
+ * rr targets stay LONG-convention (stop below, targets above — "per-direction
+ * levels deferred to M4"). For a long setup the candidate is stored as-is;
+ * for a short setup each leg is oriented idempotently — a leg already on the
+ * short side (stop above, target below) is kept, a LONG-convention leg is
+ * mirrored around the entry
  * (`2 × entry − price`), preserving the exact risk distance either way.
  * Mirroring is the only deterministic reading of "the same risk profile,
  * opposite side" for LONG-convention legs and keeps `riskDistance`

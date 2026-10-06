@@ -145,8 +145,10 @@ Bounds (pinned in contracts, none configurable):
 
 Exit policy: `stopLoss` (`level`|`none`), `takeProfit` (`tp1`|`tp2`|`tp3`|
 `none`), `maxHoldCandles` (1–5000), `sameCandleRule` (`stop_first`, pinned),
-`entryTiming` (`signal_close`, pinned). `none` disables that leg but never
-changes level derivation — R stays normalized by version stop.
+`entryTiming` (`signal_close`, pinned). For a `structure` TP method, the
+single structural target is stored as TP1, and the default TP3 policy resolves
+to that target. `none` disables that leg but never changes level derivation —
+R stays normalized by version stop.
 
 Cost policy: `feePerSide`, `slippagePerSide`, `spread` in **pips** (≥0,
 default 0), `riskPerTrade` (>0 optional). Pips are converted to price units

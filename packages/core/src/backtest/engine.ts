@@ -192,6 +192,7 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
         toMs,
         dirEval,
         minRr: config.risk.minRr,
+        takeProfitMethod: config.risk.takeProfitMethod,
         exitPolicy,
         costPolicy,
         pipSize: costPipSize,
@@ -500,6 +501,7 @@ interface TradeSimulationInput {
   toMs: number;
   dirEval: DirectionEvaluation;
   minRr: number;
+  takeProfitMethod: NonNullable<StrategyVersionConfig['risk']>['takeProfitMethod'];
   exitPolicy: BacktestExitPolicy;
   costPolicy: BacktestCostPolicy;
   /**
@@ -546,13 +548,7 @@ function simulateTrade(t: TradeSimulationInput): BacktestTrade {
     };
   }
 
-  const tpTarget = selectTarget(t.exitPolicy, levels);
-  const tpReason: BacktestExitReason =
-    t.exitPolicy.takeProfit === 'tp1'
-      ? 'take_profit_1'
-      : t.exitPolicy.takeProfit === 'tp2'
-        ? 'take_profit_2'
-        : 'take_profit_3';
+  const tpTarget = selectTarget(t.exitPolicy, levels, t.takeProfitMethod);
 
   // Exit scan: subsequent setup candles (open after the signal) closed within
   // the range, in time order. Intra-candle touches precede the max-hold close
@@ -566,7 +562,7 @@ function simulateTrade(t: TradeSimulationInput): BacktestTrade {
     if (!c || c.time + t.setupPeriodMs > t.toMs) break;
     held += 1;
     const slTouched = t.exitPolicy.stopLoss === 'level' && isStopTouched(t.direction, c, stop);
-    const tpTouched = tpTarget !== null && isTargetTouched(t.direction, c, tpTarget);
+    const tpTouched = tpTarget !== null && isTargetTouched(t.direction, c, tpTarget.price);
     if (slTouched && tpTouched) {
       exitReason = 'stop_loss';
       exitPrice = stop;
@@ -580,8 +576,8 @@ function simulateTrade(t: TradeSimulationInput): BacktestTrade {
       break;
     }
     if (tpTouched && tpTarget !== null) {
-      exitReason = tpReason;
-      exitPrice = tpTarget;
+      exitReason = tpTarget.exitReason;
+      exitPrice = tpTarget.price;
       exitAsOfMs = c.time + t.setupPeriodMs;
       break;
     }
@@ -615,10 +611,23 @@ function simulateTrade(t: TradeSimulationInput): BacktestTrade {
 function selectTarget(
   exitPolicy: BacktestExitPolicy,
   levels: NonNullable<ReturnType<typeof detectionLevels>>,
-): number | null {
-  if (exitPolicy.takeProfit === 'tp1') return levels.tp1Price;
-  if (exitPolicy.takeProfit === 'tp2') return levels.tp2Price;
-  if (exitPolicy.takeProfit === 'tp3') return levels.tp3Price;
+  takeProfitMethod: NonNullable<StrategyVersionConfig['risk']>['takeProfitMethod'],
+): { price: number; exitReason: BacktestExitReason } | null {
+  if (exitPolicy.takeProfit === 'tp1') {
+    return levels.tp1Price === null ? null : { price: levels.tp1Price, exitReason: 'take_profit_1' };
+  }
+  if (exitPolicy.takeProfit === 'tp2') {
+    return levels.tp2Price === null ? null : { price: levels.tp2Price, exitReason: 'take_profit_2' };
+  }
+  if (exitPolicy.takeProfit === 'tp3') {
+    if (levels.tp3Price !== null) return { price: levels.tp3Price, exitReason: 'take_profit_3' };
+    // Structural TP is a single level stored in tp1. The backtest policy's
+    // default is tp3, so let that default resolve to the available structural
+    // target rather than silently running without a take-profit level.
+    if (takeProfitMethod === 'structure' && levels.tp1Price !== null) {
+      return { price: levels.tp1Price, exitReason: 'take_profit_1' };
+    }
+  }
   return null;
 }
 

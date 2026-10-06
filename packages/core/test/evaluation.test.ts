@@ -1258,9 +1258,13 @@ describe('m3 engine', () => {
     assert.ok(Math.abs(long.achievableRr - (Math.abs(102 - 100) / long.riskDistance)) < 1e-12);
     assert.ok(Math.abs(short.achievableRr - (Math.abs(97 - 100) / short.riskDistance)) < 1e-12);
     assert.notEqual(long.achievableRr, short.achievableRr);
-    // Structural TP still derives no TP legs (unchanged behavior).
-    assert.equal(long.tp1Price, null);
-    assert.equal(short.tp1Price, null);
+    // The nearest opposing structure is persisted as the sole target leg.
+    assert.equal(long.tp1Price, 102);
+    assert.equal(long.tp2Price, null);
+    assert.equal(long.tp3Price, null);
+    assert.equal(short.tp1Price, 97);
+    assert.equal(short.tp2Price, null);
+    assert.equal(short.tp3Price, null);
   });
 
   test('engine: structure candidates are per-direction (long stop below, short stop above)', () => {

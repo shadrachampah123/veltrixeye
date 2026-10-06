@@ -600,7 +600,70 @@ describe('m6 long exits (signal_close entry, setup-TF scan)', () => {
     assert.equal(trade.exitAsOfMs, closeOf(3));
   });
 
-  test('a null target leg can never be touched (fixed stop + structural targets)', () => {
+  test('structural target is stored as tp1 and the default tp3 policy exits at it for long and short', () => {
+    const structureHistory: Array<[number, number, number, number]> = [
+      [100, 100.5, 99.5, 100],
+      [100, 100.5, 99.5, 100],
+      [100, 100.5, 97, 100], // pivot low 97: opposing target for shorts
+      [100, 100.5, 99.5, 100],
+      [100, 102, 99.5, 101], // pivot high 102: opposing target for longs
+      [100, 101, 99.5, 100],
+      [100, 101, 99.5, 100], // confirms both pivots
+    ];
+    const cases = [
+      {
+        direction: 'long' as const,
+        pin: BULL_PIN,
+        exit: [100, 102.001, 99.9995, 102] as [number, number, number, number],
+        target: 102,
+        conditionDirection: 'bullish' as const,
+      },
+      {
+        direction: 'short' as const,
+        pin: BEAR_PIN,
+        exit: [100, 100.0005, 96.999, 97] as [number, number, number, number],
+        target: 97,
+        conditionDirection: 'bearish' as const,
+      },
+    ];
+
+    for (const scenario of cases) {
+      const config = mkConfig(
+        [
+          group(
+            'Pins',
+            'AND',
+            [
+              cond('rejection_candle', 'required', 'setup', {
+                direction: scenario.conditionDirection,
+                minWickBodyRatio: 2,
+              }),
+            ],
+          ),
+        ],
+        { takeProfitMethod: 'structure' },
+      );
+      const setup = hourly([...structureHistory, scenario.pin, scenario.exit]);
+      const result = run({
+        config,
+        setup,
+        fromMs: closeOf(7),
+        toMs: closeOf(8),
+        direction: scenario.direction,
+      });
+      assert.equal(result.trades.length, 1);
+      const trade = first(result.trades);
+      assert.equal(trade.tp1Price, scenario.target);
+      assert.equal(trade.tp2Price, null);
+      assert.equal(trade.tp3Price, null);
+      assert.equal(trade.exitReason, 'take_profit_1');
+      assert.equal(trade.exitPrice, scenario.target);
+      assert.equal(trade.exitAsOfMs, closeOf(8));
+      assertValidResult(result);
+    }
+  });
+
+  test('a structural target remains unavailable when no opposing pivot exists', () => {
     const config = mkConfig(
       [group('Pins', 'AND', [cond('rejection_candle', 'required', 'setup', { direction: 'bullish', minWickBodyRatio: 2 })])],
       { takeProfitMethod: 'structure' },
@@ -612,10 +675,33 @@ describe('m6 long exits (signal_close entry, setup-TF scan)', () => {
       fromMs: closeOf(0),
       toMs: closeOf(3) + 1,
       direction: 'long',
-      exitPolicy: { takeProfit: 'tp1', maxHoldCandles: 1 },
+      exitPolicy: { maxHoldCandles: 1 },
     });
     const trade = first(result.trades);
     assert.equal(trade.tp1Price, null);
+    assert.equal(trade.tp2Price, null);
+    assert.equal(trade.tp3Price, null);
+    assert.equal(trade.exitReason, 'max_hold');
+  });
+
+  test('manual take-profit remains unavailable under the default tp3 policy', () => {
+    const config = mkConfig(
+      [group('Pins', 'AND', [cond('rejection_candle', 'required', 'setup', { direction: 'bullish', minWickBodyRatio: 2 })])],
+      { takeProfitMethod: 'manual' },
+    );
+    const setup = hourly([NORMAL, BULL_PIN, [100, 100.005, 99.9995, 100.001], NORMAL]);
+    const result = run({
+      config,
+      setup,
+      fromMs: closeOf(0),
+      toMs: closeOf(3) + 1,
+      direction: 'long',
+      exitPolicy: { maxHoldCandles: 1 },
+    });
+    const trade = first(result.trades);
+    assert.equal(trade.tp1Price, null);
+    assert.equal(trade.tp2Price, null);
+    assert.equal(trade.tp3Price, null);
     assert.equal(trade.exitReason, 'max_hold');
   });
 });

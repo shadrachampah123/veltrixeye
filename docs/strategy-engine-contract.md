@@ -87,13 +87,15 @@ For each instrument in scope, for each direction (`long`, `short`):
 ### Candidate entry/SL/TP (rr_requirement only)
 
 When the version's risk config demands it, the engine derives a
-**candidate** deterministically, LONG-convention (per-direction levels are
-an M4 concern): entry is the last closed setup candle's close; the stop is
-`fixed` (entry − buffer), `structure` (last confirmed pivot low below entry,
-minus buffer; fallback: window low − buffer), or `atr` (entry − ATR(14) −
-buffer); RR take-profits are `entry + riskDistance × {tp1Rr, tp2Rr,
-tp3Rr}` with `achievableRr = tp3Rr`; a `structure` TP method targets the
-nearest pivot beyond entry. A degenerate candidate (non-positive risk
+**candidate** deterministically: entry is the last closed setup candle's
+close; the stop is `fixed` (entry − buffer), `structure` (last confirmed
+pivot low below entry for longs or pivot high above entry for shorts, with a
+window-extreme fallback), or `atr` (entry − ATR(14) − buffer). RR
+take-profits remain LONG-convention at `entry + riskDistance × {tp1Rr,
+tp2Rr, tp3Rr}` with `achievableRr = tp3Rr`. A `structure` TP method stores
+the nearest opposing swing as its sole TP1 (lowest pivot high above entry
+for longs, highest pivot low below entry for shorts) and measures
+`achievableRr` to that target. A degenerate candidate (non-positive risk
 distance) is `null` and noted — never fabricated.
 
 The buffer → price conversion is **pip-authoritative** (`m3-deterministic-eval-2`):
