@@ -72,7 +72,7 @@ function scoreFixture(overrides: Record<string, unknown> = {}): SetupScoreDto {
   return setupScoreDtoSchema.parse({
     id: 17,
     setupId: SETUP_ID,
-    engineVersion: 'm5-quality-score-1',
+    engineVersion: 'm5-quality-score-2',
     asOfMs: ANCHOR,
     total: 82,
     grade: 'A',
@@ -246,7 +246,7 @@ test('SetupScorePanel offers scoring with the setup’s own anchor and shows the
   assert.match(html, /Score setup/);
   assert.match(html, /1716206400000 epoch ms/, 'the default anchor is the setup’s own detection anchor');
   assert.match(html, /Use the setup’s own detection anchor/);
-  assert.match(html, /m5-quality-score-1/);
+  assert.match(html, /m5-quality-score-2/);
   assert.match(html, /Structure quality/);
   assert.match(html, /36 \/ 40 pts/);
   assert.match(html, /M5 engine is authoritative/);

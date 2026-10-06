@@ -247,7 +247,7 @@ test('api.scoreSetup() — the created/replay flag and score row are passed thro
     score: {
       id: 17,
       setupId: SETUP_ID,
-      engineVersion: 'm5-quality-score-1',
+      engineVersion: 'm5-quality-score-2',
       asOfMs: ANCHOR,
       total: 82,
       grade: 'A',
@@ -261,7 +261,7 @@ test('api.scoreSetup() — the created/replay flag and score row are passed thro
   const res = await api.scoreSetup(SETUP_ID, { asOf: ANCHOR });
   assert.equal(res.created, false, 'a replay stays a replay');
   assert.equal(res.score.total, 82);
-  assert.equal(res.score.engineVersion, 'm5-quality-score-1');
+  assert.equal(res.score.engineVersion, 'm5-quality-score-2');
 });
 
 // ---------------------------------------------------------------------------

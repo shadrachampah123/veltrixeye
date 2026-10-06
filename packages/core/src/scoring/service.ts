@@ -79,6 +79,7 @@ export class ScoringService {
     // published-only. minRr comes from the published risk configuration.
     const version = await this.strategies.getVersion(args.userId, row.strategy_id, row.strategy_version_id);
     const minRr = version.config.risk?.minRr ?? DEFAULT_MIN_RR;
+    const takeProfitMethod = version.config.risk?.takeProfitMethod ?? 'rr';
 
     const result = await this.evaluation.evaluateVersion({
       userId: args.userId,
@@ -97,7 +98,7 @@ export class ScoringService {
     const directionEvaluation = item.directions[row.direction];
 
     // Pure, deterministic engine — no I/O from here on.
-    const score = scoreSetupQuality({ evaluation: directionEvaluation, minRr, asOfMs });
+    const score = scoreSetupQuality({ evaluation: directionEvaluation, minRr, takeProfitMethod, asOfMs });
 
     // Persist under the 0010 idempotency key. `ON CONFLICT DO NOTHING` makes
     // the race abort-free: the winner inserts and refreshes the setup's

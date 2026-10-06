@@ -86,7 +86,7 @@ function scorePayload(overrides: Record<string, unknown> = {}) {
   return setupScoreDtoSchema.parse({
     id: 17,
     setupId: SETUP_ID,
-    engineVersion: 'm5-quality-score-1',
+    engineVersion: 'm5-quality-score-2',
     asOfMs: ANCHOR,
     total: 82,
     grade: 'A',
@@ -416,7 +416,7 @@ test('the whole browser workflow runs from a published version to an acknowledge
   // 5. Score it, then read the score history.
   const scored = await api.scoreSetup(setupId, { asOf: ANCHOR });
   assert.equal(scored.created, true);
-  assert.equal(scored.score.engineVersion, 'm5-quality-score-1');
+  assert.equal(scored.score.engineVersion, 'm5-quality-score-2');
   const history = await api.listSetupScores(setupId);
   assert.equal(history.scores[0]?.total, 82);
 

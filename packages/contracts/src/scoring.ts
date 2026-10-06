@@ -21,6 +21,7 @@
 import { z } from 'zod';
 import { setupDtoSchema } from './detection.js';
 import type { DirectionEvaluation } from './evaluation.js';
+import type { TakeProfitMethod } from './risk.js';
 
 export const QUALITY_GRADE_BANDS = [
   { grade: 'A+' as const, min: 90 },
@@ -46,7 +47,7 @@ export function qualityGrade(score: number): QualityGrade {
  * The formula behind this version is documented in docs/setup-scoring.md and
  * frozen: any future formula change MUST introduce a new version string.
  */
-export const M5_SCORE_ENGINE_VERSION = 'm5-quality-score-1';
+export const M5_SCORE_ENGINE_VERSION = 'm5-quality-score-2';
 
 /** Default/max page size for the score-history endpoint. */
 export const DEFAULT_SCORE_HISTORY_LIMIT = 50;
@@ -131,13 +132,22 @@ export interface ScoringInput {
 /**
  * The typed M5 scoring context carried inside `ScoringInput.context`:
  * the M3 direction evaluation being scored plus the version's minimum
- * risk:reward (used by the setup-completeness component).
+ * risk:reward and take-profit method (both used by the setup-completeness
+ * component — the TP sub-check is method-aware because the `structure`
+ * method derives TP1 only, by design).
  */
 export interface M5ScoringContext {
   /** The M3 evaluation of the setup's direction at the scoring anchor. */
   evaluation: DirectionEvaluation;
   /** The version's configured minimum risk:reward (e.g. 2 means 1:2). */
   minRr: number;
+  /**
+   * The version's configured take-profit method. Drives the completeness
+   * TP sub-check: `rr` requires TP1+TP2+TP3, `structure` requires TP1 only
+   * (TP2/TP3 are intentionally null for structural targets), `manual`
+   * keeps the all-three requirement.
+   */
+  takeProfitMethod: TakeProfitMethod;
   /** The deterministic scoring anchor (epoch-ms, UTC) the evaluation used. */
   asOfMs: number;
 }
