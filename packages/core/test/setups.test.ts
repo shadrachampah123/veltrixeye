@@ -87,6 +87,29 @@ describe('m4 detection levels (pure)', () => {
     assert.equal(Math.abs(levels.entryPrice - (levels.stopLossPrice ?? 0)), LONG_CANDIDATE.riskDistance);
   });
 
+  test('short setups keep per-direction M3 legs (no double-mirror of short structure stops)', () => {
+    // M3 structure shorts already sit above entry with targets below: M4 keeps
+    // them instead of mirroring back to the wrong side.
+    const shortAware: CandidateLevels = {
+      entryPrice: 100,
+      stopLossPrice: 102.5, // pivot high + buffer (already above)
+      riskDistance: 2.5,
+      tp1Price: 98, // already below (kept)
+      tp2Price: null,
+      tp3Price: 104, // LONG-convention leg above (still mirrors to 96)
+      achievableRr: 1.5,
+      basis: 'structure stop at 102 (recent swing) plus buffer',
+    };
+    const levels = detectionLevels(shortAware, 'short');
+    assert.ok(levels);
+    assert.equal(levels.entryPrice, 100);
+    assert.equal(levels.stopLossPrice, 102.5);
+    assert.equal(levels.tp1Price, 98);
+    assert.equal(levels.tp2Price, null);
+    assert.equal(levels.tp3Price, 96); // 2*100 - 104
+    assert.equal(Math.abs(levels.entryPrice - (levels.stopLossPrice ?? 0)), shortAware.riskDistance);
+  });
+
   test('mirroring is deterministic and involutive', () => {
     assert.equal(mirrorPrice(100, mirrorPrice(100, 98)), 98);
     assert.deepEqual(detectionLevels(LONG_CANDIDATE, 'short'), detectionLevels(LONG_CANDIDATE, 'short'));

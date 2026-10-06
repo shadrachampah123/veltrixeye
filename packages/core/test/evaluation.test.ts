@@ -1170,6 +1170,167 @@ describe('m3 engine', () => {
     assert.ok(candidate.achievableRr === null || candidate.achievableRr > 0);
   });
 
+  test('candidate levels: structure stops use the stop-side pivot per direction (long below, short above)', () => {
+    // Entry 100 sits between a confirmed pivot low (97) and pivot high (102).
+    const candles = zz([
+      [100, 99],
+      [100, 99],
+      [100, 97], // pivot low 97
+      [100, 98],
+      [102, 99], // pivot high 102
+      [101, 99.5],
+      [101, 99.5],
+      [100.5, 99.5], // entry = close 100
+    ]);
+    const risk = riskConfigurationSchema.parse({
+      stopLossMethod: 'structure',
+      stopLossBuffer: 10,
+      stopLossBufferUnit: 'pips',
+      takeProfitMethod: 'rr',
+    });
+    const buffer = 10 * EURUSD_PIP_SIZE; // 0.001
+
+    const long = deriveCandidate(risk, candles, EURUSD_PIP_SIZE, 'long');
+    assert.ok(long);
+    assert.equal(long.entryPrice, 100);
+    assert.ok(long.stopLossPrice < 100, `long structure stop must sit below entry, got ${long.stopLossPrice}`);
+    assert.ok(Math.abs(long.stopLossPrice - (97 - buffer)) < 1e-9);
+    assert.ok(Math.abs(long.riskDistance - (100 - (97 - buffer))) < 1e-12);
+
+    const short = deriveCandidate(risk, candles, EURUSD_PIP_SIZE, 'short');
+    assert.ok(short);
+    assert.equal(short.entryPrice, 100);
+    assert.ok(short.stopLossPrice > 100, `short structure stop must sit above entry, got ${short.stopLossPrice}`);
+    assert.ok(Math.abs(short.stopLossPrice - (102 + buffer)) < 1e-9);
+    assert.ok(Math.abs(short.riskDistance - ((102 + buffer) - 100)) < 1e-12);
+
+    // Backward compatibility: omitting direction keeps the long convention.
+    assert.deepEqual(deriveCandidate(risk, candles, EURUSD_PIP_SIZE), long);
+  });
+
+  test('candidate levels: structure fallback uses the window extreme on the stop side', () => {
+    // Flat series: no confirmed pivots, so both sides fall back to window extremes.
+    const candles = zz(Array.from({ length: 8 }, () => [100.5, 99.5] as [number, number]));
+    const risk = riskConfigurationSchema.parse({
+      stopLossMethod: 'structure',
+      stopLossBuffer: 0,
+      stopLossBufferUnit: 'pips',
+      takeProfitMethod: 'rr',
+    });
+    const long = deriveCandidate(risk, candles, EURUSD_PIP_SIZE, 'long');
+    assert.ok(long);
+    assert.equal(long.entryPrice, 100);
+    assert.equal(long.stopLossPrice, 99.5); // window low, no buffer
+    assert.ok(long.stopLossPrice < 100);
+
+    const short = deriveCandidate(risk, candles, EURUSD_PIP_SIZE, 'short');
+    assert.ok(short);
+    assert.equal(short.entryPrice, 100);
+    assert.equal(short.stopLossPrice, 100.5); // window high, no buffer
+    assert.ok(short.stopLossPrice > 100);
+  });
+
+  test('candidate levels: structural achievableRr is measured per direction', () => {
+    const candles = zz([
+      [100, 99],
+      [100, 99],
+      [100, 97], // pivot low 97
+      [100, 98],
+      [102, 99], // pivot high 102
+      [101, 99.5],
+      [101, 99.5],
+      [100.5, 99.5], // entry = close 100
+    ]);
+    const risk = riskConfigurationSchema.parse({
+      stopLossMethod: 'structure',
+      stopLossBuffer: 10,
+      stopLossBufferUnit: 'pips',
+      takeProfitMethod: 'structure',
+    });
+    const long = deriveCandidate(risk, candles, EURUSD_PIP_SIZE, 'long');
+    const short = deriveCandidate(risk, candles, EURUSD_PIP_SIZE, 'short');
+    assert.ok(long && short);
+    // Long measures to the nearest pivot high above entry (102); short to the
+    // nearest pivot low below (97) — via structuralTarget(window, direction, entry).
+    assert.equal(structuralTarget(candles, 'long', 100), 102);
+    assert.equal(structuralTarget(candles, 'short', 100), 97);
+    assert.ok(long.achievableRr !== null && short.achievableRr !== null);
+    assert.ok(Math.abs(long.achievableRr - (Math.abs(102 - 100) / long.riskDistance)) < 1e-12);
+    assert.ok(Math.abs(short.achievableRr - (Math.abs(97 - 100) / short.riskDistance)) < 1e-12);
+    assert.notEqual(long.achievableRr, short.achievableRr);
+    // Structural TP still derives no TP legs (unchanged behavior).
+    assert.equal(long.tp1Price, null);
+    assert.equal(short.tp1Price, null);
+  });
+
+  test('engine: structure candidates are per-direction (long stop below, short stop above)', () => {
+    const candles = zz([
+      [100, 99],
+      [100, 99],
+      [100, 97], // pivot low 97
+      [100, 98],
+      [102, 99], // pivot high 102
+      [101, 99.5],
+      [101, 99.5],
+      [100.5, 99.5], // entry = close 100
+    ]);
+    const risk = {
+      ...riskConfigurationSchema.parse({}),
+      stopLossMethod: 'structure' as const,
+      stopLossBuffer: 10,
+      stopLossBufferUnit: 'pips' as const,
+      takeProfitMethod: 'rr' as const,
+    };
+    const result = engine.evaluate({
+      config: mkConfig({ risk, ruleGroups: [group('empty', 'AND', [])] }),
+      instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+      pipSize: EURUSD_PIP_SIZE,
+      candles: { htf_bias: candles, setup: candles, entry: candles },
+      asOfMs: AS_OF,
+    });
+    assert.ok(result.long.candidate && result.short.candidate);
+    assert.equal(result.long.candidate.entryPrice, 100);
+    assert.equal(result.short.candidate.entryPrice, 100);
+    assert.ok(result.long.candidate.stopLossPrice < 100);
+    assert.ok(result.short.candidate.stopLossPrice > 100);
+    assert.ok(Math.abs(result.long.candidate.stopLossPrice - (97 - 10 * EURUSD_PIP_SIZE)) < 1e-9);
+    assert.ok(Math.abs(result.short.candidate.stopLossPrice - (102 + 10 * EURUSD_PIP_SIZE)) < 1e-9);
+  });
+
+  test('engine: a degenerate structure stop on one side nulls only that direction', () => {
+    const candles = zz([
+      [100, 99],
+      [100, 99],
+      [100, 97], // pivot low 97
+      [100, 98],
+      [102, 99], // pivot high 102
+      [101, 99.5],
+      [101, 99.5],
+      [100.5, 99.5], // entry = close 100
+    ]);
+    // 200% buffer: long stop (97 − 200) is non-positive → null; short survives.
+    const risk = {
+      ...riskConfigurationSchema.parse({}),
+      stopLossMethod: 'structure' as const,
+      stopLossBuffer: 200,
+      stopLossBufferUnit: 'pct' as const,
+      takeProfitMethod: 'rr' as const,
+    };
+    assert.equal(deriveCandidate(risk, candles, undefined, 'long'), null);
+    const short = deriveCandidate(risk, candles, undefined, 'short');
+    assert.ok(short);
+    assert.ok(short.stopLossPrice > 100);
+    const result = engine.evaluate({
+      config: mkConfig({ risk, ruleGroups: [group('empty', 'AND', [])] }),
+      instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+      candles: { htf_bias: candles, setup: candles, entry: candles },
+      asOfMs: AS_OF,
+    });
+    assert.equal(result.long.candidate, null);
+    assert.ok(result.short.candidate);
+    assert.ok(result.notes.some((n) => n.includes('long')));
+  });
+
   test('candidate levels: insufficient ATR history for atr stops yields null + engine note', () => {
     const risk = riskConfigurationSchema.parse({ stopLossMethod: 'atr' });
     const candles = series(longTrueShapes); // 18 candles < ATR(14) requirement of 15? 18 ≥ 15 — use fewer
