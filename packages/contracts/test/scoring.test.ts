@@ -38,7 +38,7 @@ const SCORE_DTO = {
 
 describe('m5 scoring contracts', () => {
   test('the pinned engine version is the documented M5 identifier', () => {
-    assert.equal(M5_SCORE_ENGINE_VERSION, 'm5-quality-score-1');
+    assert.equal(M5_SCORE_ENGINE_VERSION, 'm5-quality-score-2');
     assert.ok(M5_SCORE_ENGINE_VERSION.length <= 120); // setup_scores.engine_version CHECK
   });
 

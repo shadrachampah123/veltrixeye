@@ -518,7 +518,12 @@ interface TradeSimulationInput {
  * each signal gets its own scan (no position netting in M6 core).
  */
 function simulateTrade(t: TradeSimulationInput): BacktestTrade {
-  const score = scoreSetupQuality({ evaluation: t.dirEval, minRr: t.minRr, asOfMs: t.anchor });
+  const score = scoreSetupQuality({
+    evaluation: t.dirEval,
+    minRr: t.minRr,
+    takeProfitMethod: t.takeProfitMethod,
+    asOfMs: t.anchor,
+  });
   const levels = detectionLevels(t.dirEval.candidate, t.direction);
   const base = {
     seq: t.seq,

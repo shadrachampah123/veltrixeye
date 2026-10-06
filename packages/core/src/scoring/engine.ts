@@ -2,6 +2,8 @@ import {
   directionEvaluationSchema,
   M5_SCORE_ENGINE_VERSION,
   qualityGrade,
+  TAKE_PROFIT_METHODS,
+  type TakeProfitMethod,
   type ConditionOutcome,
   type M5ScoringContext,
   type QualityScoringEngine,
@@ -15,7 +17,8 @@ import { Errors } from '../errors.js';
 /**
  * The deterministic setup-quality scoring engine (M5).
  *
- * Pure function of `(M3 direction evaluation, version minRr, asOfMs)` →
+ * Pure function of `(M3 direction evaluation, version minRr,
+ * version takeProfitMethod, asOfMs)` →
  * a bounded, explainable 0–100 quality score. It:
  *  - consumes ONLY data produced by M3/M4 (never candles directly, never a
  *    provider, never the database),
@@ -27,7 +30,7 @@ import { Errors } from '../errors.js';
  *  - fails safely: unevaluable conditions (insufficient_data/unsupported)
  *    never earn points and always reduce data sufficiency.
  *
- * Formula (pinned as `m5-quality-score-1`, docs/setup-scoring.md):
+ * Formula (pinned as `m5-quality-score-2`, docs/setup-scoring.md):
  *  - seven fixed components whose weights sum to 100; component scores are
  *    0–100 and the total is the weight-weighted average rounded to the
  *    nearest integer (then clamped to 0–100);
@@ -257,20 +260,33 @@ function alignmentComponent(weight: number, declared: ConditionOutcome[]): Score
 /**
  * Setup completeness — four equally weighted sub-checks:
  *  1. a deterministic candidate (entry + stop) was derived at the anchor;
- *  2. all three take-profit targets were derived;
+ *  2. the take-profit targets the version's method is expected to derive
+ *     were derived — method-aware: `rr` derives all three targets so all
+ *     three are required; `structure` derives a single structural target
+ *     (TP1) by design, so only TP1 is required and the intentionally-null
+ *     TP2/TP3 never count against completeness; `manual` keeps the
+ *     all-three requirement;
  *  3. the achievable risk:reward meets the version's configured minimum;
  *  4. every version session filter is satisfied at the anchor
  *     (no filters declared ⇒ vacuously satisfied).
  */
 function completenessComponent(weight: number, context: M5ScoringContext): ScoreComponent {
-  const { evaluation, minRr } = context;
+  const { evaluation, minRr, takeProfitMethod } = context;
   const candidate = evaluation.candidate;
+  const tpCheck: { name: string; ok: boolean } =
+    takeProfitMethod === 'structure'
+      ? {
+          name: 'structural take-profit target (TP1) derived',
+          ok: candidate !== null && candidate.tp1Price !== null,
+        }
+      : {
+          name: 'all take-profit targets derived',
+          ok:
+            candidate !== null && candidate.tp1Price !== null && candidate.tp2Price !== null && candidate.tp3Price !== null,
+        };
   const checks: Array<{ name: string; ok: boolean }> = [
     { name: 'candidate entry/stop derived', ok: candidate !== null },
-    {
-      name: 'all take-profit targets derived',
-      ok: candidate !== null && candidate.tp1Price !== null && candidate.tp2Price !== null && candidate.tp3Price !== null,
-    },
+    tpCheck,
     {
       name: `achievable R:R meets the configured minimum (${minRr})`,
       ok: candidate !== null && candidate.achievableRr !== null && candidate.achievableRr >= minRr,
@@ -360,9 +376,23 @@ export function parseScoringContext(input: ScoringInput): M5ScoringContext {
   if (typeof minRr !== 'number' || !Number.isFinite(minRr) || minRr <= 0) {
     throw Errors.invalidInput('Scoring context is malformed: "minRr" must be a positive finite number.');
   }
+  const takeProfitMethod = context.takeProfitMethod;
+  if (
+    typeof takeProfitMethod !== 'string' ||
+    !(TAKE_PROFIT_METHODS as readonly string[]).includes(takeProfitMethod)
+  ) {
+    throw Errors.invalidInput(
+      `Scoring context is malformed: "takeProfitMethod" must be one of ${TAKE_PROFIT_METHODS.join(', ')}.`,
+    );
+  }
   const asOfMs = context.asOfMs;
   if (typeof asOfMs !== 'number' || !Number.isInteger(asOfMs) || asOfMs <= 0) {
     throw Errors.invalidInput('Scoring context is malformed: "asOfMs" must be a positive integer.');
   }
-  return { evaluation: evaluation.data, minRr, asOfMs };
+  return {
+    evaluation: evaluation.data,
+    minRr,
+    takeProfitMethod: takeProfitMethod as TakeProfitMethod,
+    asOfMs,
+  };
 }

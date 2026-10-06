@@ -71,7 +71,7 @@ function dirEval(args: {
 }
 
 function ctx(evaluation: DirectionEvaluation, overrides: Partial<Omit<M5ScoringContext, 'evaluation'>> = {}): M5ScoringContext {
-  return { evaluation, minRr: 2, asOfMs: AS_OF, ...overrides };
+  return { evaluation, minRr: 2, takeProfitMethod: 'rr', asOfMs: AS_OF, ...overrides };
 }
 
 function byName(score: ReturnType<typeof scoreSetupQuality>, name: string) {
@@ -112,7 +112,7 @@ describe('m5 scoring engine — determinism and shape', () => {
 
   test('score version is the pinned m5 identifier', () => {
     const score = scoreSetupQuality(ctx(richEvaluation()));
-    assert.equal(score.engineVersion, 'm5-quality-score-1');
+    assert.equal(score.engineVersion, 'm5-quality-score-2');
     assert.equal(score.engineVersion, M5_SCORE_ENGINE_VERSION);
     const engine = createQualityScoringEngine();
     assert.equal(engine.version, M5_SCORE_ENGINE_VERSION);
@@ -326,6 +326,50 @@ describe('m5 scoring engine — component contributions', () => {
     assert.ok(byName(sessionFail, 'setup_completeness').explanation.includes('session filters'));
   });
 
+  test('setup completeness TP sub-check is method-aware: structure requires TP1 only', () => {
+    // The structure TP method intentionally derives a single structural
+    // target (TP1) — TP2/TP3 are null by design and must NOT cost points.
+    const structureCandidate = { ...CANDIDATE, tp2Price: null, tp3Price: null };
+    const structure = scoreSetupQuality(
+      ctx(dirEval({ groups: [group('g', [cond('a', 'required', 'satisfied')])], candidate: structureCandidate }), {
+        takeProfitMethod: 'structure',
+      }),
+    );
+    assert.equal(byName(structure, 'setup_completeness').score, 100);
+    assert.equal(byName(structure, 'setup_completeness').points, 10);
+    assert.ok(byName(structure, 'setup_completeness').explanation.includes('structural take-profit target (TP1) derived'));
+
+    // structure with NO structural target at all (TP1 null) still fails the TP sub-check.
+    const noTarget = scoreSetupQuality(
+      ctx(
+        dirEval({
+          groups: [group('g', [cond('a', 'required', 'satisfied')])],
+          candidate: { ...CANDIDATE, tp1Price: null, tp2Price: null, tp3Price: null, achievableRr: null },
+        }),
+        { takeProfitMethod: 'structure' },
+      ),
+    );
+    assert.equal(byName(noTarget, 'setup_completeness').score, 50); // TP and R:R sub-checks fail
+
+    // rr still requires all three targets…
+    const rr = scoreSetupQuality(
+      ctx(dirEval({ groups: [group('g', [cond('a', 'required', 'satisfied')])], candidate: structureCandidate }), {
+        takeProfitMethod: 'rr',
+      }),
+    );
+    assert.equal(byName(rr, 'setup_completeness').score, 75);
+    assert.ok(byName(rr, 'setup_completeness').explanation.includes('all take-profit targets derived'));
+
+    // …and manual preserves the previous all-three behaviour.
+    const manual = scoreSetupQuality(
+      ctx(dirEval({ groups: [group('g', [cond('a', 'required', 'satisfied')])], candidate: structureCandidate }), {
+        takeProfitMethod: 'manual',
+      }),
+    );
+    assert.equal(byName(manual, 'setup_completeness').score, 75);
+    assert.ok(byName(manual, 'setup_completeness').explanation.includes('all take-profit targets derived'));
+  });
+
   test('insufficient data can never manufacture quality', () => {
     const evaluation = dirEval({
       passed: false,
@@ -411,7 +455,7 @@ describe('m5 scoring engine — QualityScoringEngine adapter boundary', () => {
       strategyVersionId: '11111111-1111-1111-1111-111111111111',
       instrument: { assetClass: 'forex', symbol: 'EURUSD' },
       direction: 'long',
-      context: { evaluation, minRr: 2, asOfMs: AS_OF },
+      context: { evaluation, minRr: 2, takeProfitMethod: 'rr', asOfMs: AS_OF },
     });
     assert.deepEqual(viaAdapter, scoreSetupQuality(ctx(evaluation)));
   });
@@ -425,19 +469,34 @@ describe('m5 scoring engine — QualityScoringEngine adapter boundary', () => {
     };
     await assert.rejects(engine.score({ ...base, context: {} }), /evaluation/);
     await assert.rejects(
-      engine.score({ ...base, context: { evaluation: { broken: true }, minRr: 2, asOfMs: AS_OF } }),
+      engine.score({ ...base, context: { evaluation: { broken: true }, minRr: 2, takeProfitMethod: 'rr', asOfMs: AS_OF } }),
       /evaluation/,
     );
     await assert.rejects(
-      engine.score({ ...base, context: { evaluation: richEvaluation(), minRr: -1, asOfMs: AS_OF } }),
+      engine.score({ ...base, context: { evaluation: richEvaluation(), minRr: -1, takeProfitMethod: 'rr', asOfMs: AS_OF } }),
       /minRr/,
     );
     await assert.rejects(
-      engine.score({ ...base, context: { evaluation: richEvaluation(), minRr: 2, asOfMs: 0 } }),
+      engine.score({ ...base, context: { evaluation: richEvaluation(), minRr: 2, asOfMs: AS_OF } }),
+      /takeProfitMethod/,
+    );
+    await assert.rejects(
+      engine.score({
+        ...base,
+        context: { evaluation: richEvaluation(), minRr: 2, takeProfitMethod: 'fibonacci', asOfMs: AS_OF },
+      }),
+      /takeProfitMethod/,
+    );
+    await assert.rejects(
+      engine.score({ ...base, context: { evaluation: richEvaluation(), minRr: 2, takeProfitMethod: 'rr', asOfMs: 0 } }),
       /asOfMs/,
     );
     await assert.rejects(
-      engine.score({ ...base, direction: 'short', context: { evaluation: richEvaluation(), minRr: 2, asOfMs: AS_OF } }),
+      engine.score({
+        ...base,
+        direction: 'short',
+        context: { evaluation: richEvaluation(), minRr: 2, takeProfitMethod: 'rr', asOfMs: AS_OF },
+      }),
       /direction/,
     );
   });

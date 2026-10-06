@@ -36,20 +36,24 @@ triggers, completes, invalidates, or expires a setup — M4 owns lifecycle.
 
 ## Scoring engine contract
 
-The engine is pinned as **`m5-quality-score-1`**
+The engine is pinned as **`m5-quality-score-2`**
 (`M5_SCORE_ENGINE_VERSION` in `@veltrixeye/contracts`), stored in
 `setup_scores.engine_version`. The formula below is frozen for this
 version: **any formula change MUST ship under a new version string** — the
-same version must always mean the same score.
+same version must always mean the same score. (`m5-quality-score-1` was
+identical except that the setup-completeness TP sub-check always required
+all three take-profit targets, which wrongly removed 2.5 points from
+`structure`-method versions whose TP2/TP3 are intentionally null.)
 
 Guarantees: identical `(strategy version, setup, evaluation result,
 instrument, timeframe, asOfMs)` inputs always produce the identical score.
 The engine reads only the M3 `DirectionEvaluation` of the setup's
-direction, the version's configured `minRr`, and the anchor — nothing else.
+direction, the version's configured `minRr` and `takeProfitMethod`, and
+the anchor — nothing else.
 `generatedAt` is the ISO-8601 rendering of the anchor, never a wall-clock
 read.
 
-## Formula (`m5-quality-score-1`)
+## Formula (`m5-quality-score-2`)
 
 Seven fixed components; weights sum to exactly 100. Each component reports
 a 0–100 `score`, a raw contribution (`points`), a maximum contribution
@@ -64,7 +68,7 @@ a 0–100 `score`, a raw contribution (`points`), a maximum contribution
 | 3 | `disqualifier_clearance` | 20 | 100 × (ruled out / declared) for `disqualifying` conditions. A disqualifier is cleared only when evaluated `unsatisfied`; `satisfied` vetoes and `insufficient_data`/`unsupported` are NOT cleared (fail closed). None declared ⇒ 100. |
 | 4 | `optional_support` | 15 | 100 × (satisfied / declared) for `optional` conditions. None declared ⇒ **0** — absence of evidence earns no points. |
 | 5 | `directional_alignment` | 10 | 100 × (satisfied / declared) for non-disqualifying conditions on the `htf_bias` timeframe role. None declared ⇒ **0**. |
-| 6 | `setup_completeness` | 10 | Four equal sub-checks (2.5 each): candidate entry/stop derived; all three TP targets derived; achievable R:R ≥ the version's `minRr`; every session filter satisfied at the anchor (no filters ⇒ vacuously satisfied). |
+| 6 | `setup_completeness` | 10 | Four equal sub-checks (2.5 each): candidate entry/stop derived; the TP targets the version's `takeProfitMethod` is expected to derive were derived (`rr`/`manual` ⇒ all three TP targets; `structure` ⇒ TP1 only, because the structure method derives a single structural target and TP2/TP3 are intentionally null); achievable R:R ≥ the version's `minRr`; every session filter satisfied at the anchor (no filters ⇒ vacuously satisfied). |
 | 7 | `data_sufficiency` | 5 | 100 × (evaluable / total) across conditions + session filters, where evaluable means `satisfied` or `unsatisfied`. Nothing declared ⇒ **0**. |
 
 Design rule: **gate components** (1–3) treat "none declared" as vacuously
