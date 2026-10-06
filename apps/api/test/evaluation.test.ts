@@ -7,7 +7,12 @@ import { fileURLToPath } from 'node:url';
 import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 
 import type pg from 'pg';
-import { evaluationResultSchema, type StrategyVersionConfig } from '@veltrixeye/contracts';
+import {
+  DETERMINISTIC_ENGINE_VERSION,
+  evaluationResultSchema,
+  type CandleDto,
+  type StrategyVersionConfig,
+} from '@veltrixeye/contracts';
 import { buildApp, createAppContext } from '../src/app.js';
 import { loadConfig, type AppConfig } from '../src/config.js';
 import { createPool, runMigrations, MIGRATIONS_DIR, CandleStore } from '@veltrixeye/core';
@@ -60,6 +65,8 @@ function cookieFrom(res: { headers: Record<string, string | number | string[] | 
 // candles, then a bearish candle, then a bullish engulfing close at the anchor.
 const HOUR = 3_600_000;
 const AS_OF = 1_800_000_000_000;
+/** XAUUSD pip size seeded by migration 0017 (`instrument_risk_specs.pip_size`). */
+const XAUUSD_PIP_SIZE = 0.01;
 const CANDLE_SHAPES: Array<[number, number, number, number]> = [
   ...Array.from({ length: 16 }, () => [100, 100.5, 99.5, 100] as [number, number, number, number]),
   [101, 101.2, 100, 100.2],
@@ -304,6 +311,157 @@ describe('m3 evaluation api', () => {
     const engulf = body.instruments[0].directions.long.groups[0].conditions[0];
     assert.equal(engulf.status, 'insufficient_data');
     assert.ok(body.instruments[0].directions.long.failureReasons.length > 0);
+  });
+
+  test('XAUUSD: pip levels use instrument_risk_specs.pip_size — the DB value is authoritative', async () => {
+    const owner = await registerUser();
+    // 100-pip fixed stop. The pre-fix symbol heuristic ("JPY ⇒ 0.01, else
+    // 0.0001") converted this to 0.01 price units on gold; the authoritative
+    // XAUUSD pip_size (0.01, migration 0017) makes it 1.00.
+    const config: StrategyVersionConfig = {
+      ...BULLISH_ENGULF_CONFIG,
+      marketScope: { mode: 'instruments', instruments: [{ assetClass: 'commodity', symbol: 'XAUUSD' }] },
+      risk: {
+        ...BULLISH_ENGULF_CONFIG.risk!,
+        stopLossMethod: 'fixed',
+        stopLossBuffer: 100,
+        stopLossBufferUnit: 'pips',
+      },
+    };
+    const { strategyId, versionId } = await createPublishedVersion(owner.cookie, config);
+
+    const gold = await store.resolveInstrument('commodity', 'XAUUSD');
+    assert.ok(gold);
+    const candles: CandleDto[] = CANDLE_SHAPES.map(([o, h, l, c], idx) => ({
+      time: AS_OF - (CANDLE_SHAPES.length - idx) * HOUR,
+      open: o,
+      high: h,
+      low: l,
+      close: c,
+      volume: null,
+    }));
+    await store.upsertCandles({ instrumentId: gold.id, timeframe: '1h', providerSlug: 'test-fixture', candles });
+
+    const storedSpec = await pool.query<{ pip_size: string }>(
+      'SELECT pip_size FROM instrument_risk_specs WHERE instrument_id = $1',
+      [gold.id],
+    );
+    assert.equal(Number(storedSpec.rows[0]?.pip_size), XAUUSD_PIP_SIZE, 'fixture premise: XAUUSD spec is seeded');
+
+    const evaluate = async () => {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/strategies/${strategyId}/versions/${versionId}/evaluate`,
+        headers: { cookie: owner.cookie, 'x-forwarded-for': freshIp() },
+        payload: { asOf: AS_OF },
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      const body = res.json();
+      assert.equal(evaluationResultSchema.safeParse(body).success, true, res.body);
+      return body;
+    };
+
+    const first = await evaluate();
+    assert.equal(first.engineVersion, DETERMINISTIC_ENGINE_VERSION);
+    assert.equal(first.instruments[0].symbol, 'XAUUSD');
+    const long = first.instruments[0].directions.long;
+    assert.equal(long.passed, true);
+    assert.ok(long.candidate, 'a valid XAUUSD pip size must derive candidate levels');
+    // 100 pips × 0.01 = 1.00 price unit; entry is the anchor close 101.3.
+    assert.ok(Math.abs(long.candidate.riskDistance - 1) < 1e-9);
+    assert.ok(Math.abs(long.candidate.stopLossPrice - (101.3 - 1)) < 1e-9);
+
+    // The STORED value is authoritative: change the DB row and the same
+    // published version converts with the new value on the next evaluation —
+    // so nothing is derived from the symbol or hard-coded in the engine.
+    await pool.query('UPDATE instrument_risk_specs SET pip_size = 0.5 WHERE instrument_id = $1', [gold.id]);
+    try {
+      const changed = await evaluate();
+      const changedLong = changed.instruments[0].directions.long;
+      assert.equal(changedLong.passed, true);
+      assert.ok(Math.abs(changedLong.candidate.riskDistance - 50) < 1e-9); // 100 × 0.5
+      assert.ok(Math.abs(changedLong.candidate.stopLossPrice - (101.3 - 50)) < 1e-9);
+    } finally {
+      await pool.query('UPDATE instrument_risk_specs SET pip_size = $2 WHERE instrument_id = $1', [
+        gold.id,
+        XAUUSD_PIP_SIZE,
+      ]);
+    }
+  });
+
+  test('XAUUSD: a pips buffer with no instrument spec fails the direction closed (no invented pip size)', async () => {
+    const owner = await registerUser();
+    const config: StrategyVersionConfig = {
+      ...BULLISH_ENGULF_CONFIG,
+      marketScope: { mode: 'instruments', instruments: [{ assetClass: 'commodity', symbol: 'XAUUSD' }] },
+      risk: {
+        ...BULLISH_ENGULF_CONFIG.risk!,
+        stopLossMethod: 'fixed',
+        stopLossBuffer: 100,
+        stopLossBufferUnit: 'pips',
+      },
+    };
+    const { strategyId, versionId } = await createPublishedVersion(owner.cookie, config);
+
+    const gold = await store.resolveInstrument('commodity', 'XAUUSD');
+    assert.ok(gold);
+    const candles: CandleDto[] = CANDLE_SHAPES.map(([o, h, l, c], idx) => ({
+      time: AS_OF - (CANDLE_SHAPES.length - idx) * HOUR,
+      open: o,
+      high: h,
+      low: l,
+      close: c,
+      volume: null,
+    }));
+    await store.upsertCandles({ instrumentId: gold.id, timeframe: '1h', providerSlug: 'test-fixture', candles });
+
+    // Missing spec row: the engine must refuse to convert rather than assume a
+    // pip size for gold.
+    const spec = await pool.query<Record<string, string>>(
+      'SELECT contract_size, pip_size, pnl_mode, quote_currency, min_quantity, quantity_step, max_quantity FROM instrument_risk_specs WHERE instrument_id = $1',
+      [gold.id],
+    );
+    assert.ok(spec.rows[0], 'fixture premise: XAUUSD has a spec to remove');
+    await pool.query('DELETE FROM instrument_risk_specs WHERE instrument_id = $1', [gold.id]);
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/strategies/${strategyId}/versions/${versionId}/evaluate`,
+        headers: { cookie: owner.cookie, 'x-forwarded-for': freshIp() },
+        payload: { asOf: AS_OF },
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      const body = res.json();
+      assert.equal(evaluationResultSchema.safeParse(body).success, true, res.body);
+      const long = body.instruments[0].directions.long;
+      // Fail closed: no candidate levels and the direction cannot pass, even
+      // though the engulfing condition itself is satisfied.
+      assert.equal(long.groups[0].conditions[0].status, 'satisfied');
+      assert.equal(long.candidate, null);
+      assert.equal(long.passed, false);
+      assert.ok(
+        long.failureReasons.some((r: string) => r.includes('instrument_risk_specs.pip_size')),
+        JSON.stringify(long.failureReasons),
+      );
+      assert.ok(body.notes.some((n: string) => n.includes('instrument_risk_specs.pip_size')));
+    } finally {
+      const row = spec.rows[0]!;
+      await pool.query(
+        `INSERT INTO instrument_risk_specs
+           (instrument_id, contract_size, pip_size, pnl_mode, quote_currency, min_quantity, quantity_step, max_quantity)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          gold.id,
+          row.contract_size,
+          row.pip_size,
+          row.pnl_mode,
+          row.quote_currency,
+          row.min_quantity,
+          row.quantity_step,
+          row.max_quantity,
+        ],
+      );
+    }
   });
 
   test('scope all evaluates the instrument universe read-only (no provider, no writes)', async () => {

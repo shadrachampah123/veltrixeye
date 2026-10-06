@@ -127,6 +127,8 @@ const BIAS_GATED = (timeframes?: { htf_bias: Timeframe; setup: Timeframe; entry:
   );
 
 const INSTRUMENT = { assetClass: 'forex', symbol: 'EURUSD' };
+/** EURUSD pip size from `instrument_risk_specs` (M8.2, migration 0017) — M3 pip levels need it. */
+const EURUSD_PIP_SIZE = 0.0001;
 
 function run(opts: {
   config: StrategyVersionConfig;
@@ -140,6 +142,10 @@ function run(opts: {
   return runBacktest({
     config: opts.config,
     instrument: INSTRUMENT,
+    // M6.4: the replay hands M3 the same authoritative pip size it uses for
+    // costs, so a pips risk buffer derives real levels (M3 fails closed
+    // without it).
+    pipSize: EURUSD_PIP_SIZE,
     candles: { htf_bias: opts.htf ?? [], setup: opts.setup, entry: opts.entry ?? [] },
     fromMs: opts.fromMs,
     toMs: opts.toMs,
@@ -467,7 +473,11 @@ function fakePool(): {
       state.connects += 1;
       return client;
     },
-    query: async () => ({ rows: [] }),
+    // The real service resolves the instrument pip size from
+    // `instrument_risk_specs` (migration 0017 seeds EURUSD at 0.0001) and
+    // threads it into M3; a pip-buffer version fails closed without it.
+    query: async (sql: string) =>
+      /instrument_risk_specs/.test(sql) ? { rows: [{ pip_size: String(EURUSD_PIP_SIZE) }] } : { rows: [] },
   };
   return { pool: pool as unknown as pg.Pool, ...state };
 }

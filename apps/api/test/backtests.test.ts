@@ -564,16 +564,19 @@ describe('m6 backtests api', () => {
     assert.ok(Array.isArray(direct.rows[0]!.notes) || typeof direct.rows[0]!.notes === 'object');
   });
 
-  test('costs are instrument-aware: XAUUSD pips convert via pip_size (regression: the −729.60R TP3 trade)', async () => {
-    // The reported bug: cost fields were subtracted as raw price units, so on
-    // gold (pip_size 0.01, migration 0017) a normal pip policy was 100× too
-    // expensive in price units and this exact trade closed at −729.60R.
+  test('XAUUSD regression: M3 levels and costs both convert via instrument_risk_specs.pip_size (the −729.60R trade)', async () => {
+    // The reported bug had two halves, both fixed against the SAME
+    // authoritative pip size (`instrument_risk_specs.pip_size`, migration
+    // 0017 — 0.01 for commodity/XAUUSD):
+    //   1. cost fields were subtracted as raw price units (m6-backtest-3);
+    //   2. the pips risk buffer was converted with a symbol heuristic
+    //      (0.0001), so a gold stop sat 100× too close (m6-backtest-4).
     const owner = await registerUser();
     const { strategyId, versionId } = await createPublishedVersion(owner.cookie, {
       timeframes: { htf_bias: '1h', setup: '1h', entry: '1h' },
       marketScope: { mode: 'instruments', instruments: [{ assetClass: 'commodity', symbol: 'XAUUSD' }] },
       sessionFilters: [],
-      // 33.802-pip fixed buffer ⇒ riskDistance 0.0033802 on gold; TP3 at 10R.
+      // 33.802-pip fixed buffer ⇒ riskDistance 0.33802 on gold; TP3 at 10R.
       risk: { ...RISK, stopLossBuffer: 33.802, tp1Rr: 2, tp2Rr: 5, tp3Rr: 10 },
       filters: [],
       ruleGroups: [
@@ -589,7 +592,8 @@ describe('m6 backtests api', () => {
     });
     const NORMAL: Shape = [100, 100.0005, 99.9998, 100.0002];
     const PIN: Shape = [100, 100.0005, 99.998, 100];
-    const TP3: Shape = [100, 100.04, 99.999, 100.01];
+    // Gold-scale continuation: TP3 = entry + 10 × (33.80 pips × 0.01) = 103.38.
+    const TP3: Shape = [100, 103.5, 99.999, 103.4];
     await seedMixedCandles('XAUUSD', [NORMAL, PIN, TP3, NORMAL], T0, 'commodity');
 
     const res = await app.inject({
@@ -608,17 +612,24 @@ describe('m6 backtests api', () => {
     });
     assert.equal(res.statusCode, 201, res.body);
     const body = res.json();
+    assert.equal(body.run.engineVersion, BACKTEST_ENGINE_VERSION);
     assert.equal(body.trades.length, 1);
     const trade = body.trades[0];
     assert.equal(trade.exitReason, 'take_profit_3');
     // The version config round-trips through `strategy_risk_config`
-    // (`stop_loss_buffer numeric(10,2)`), so 33.802 pips persist as 33.80:
-    //   D = 33.80 × 0.0001 (the engine's pip buffer) = 0.00338
-    //   cost = 2.5 pips × 0.01 (XAUUSD pip_size) = 0.025 price units
-    //   pnlR = 10R − 0.025/0.00338 = +2.60355 → +2.6036R (numeric(12,4))
-    // Pre-fix (raw price-unit costs) this same trade was −729.64R.
-    assert.equal(trade.pnlR, 2.6036);
-    assert.ok(trade.pnlR > 0, 'TP3 must be positive once costs use the instrument pip size');
+    // (`stop_loss_buffer numeric(10,2)`), so 33.802 pips persist as 33.80.
+    // Levels AND costs use the same `instrument_risk_specs.pip_size` (0.01):
+    //   entry = 100, D = 33.80 × 0.01         = 0.338 price units
+    //   stop  = 100 − 0.338 = 99.662; tp3 = 100 + 10 × 0.338 = 103.38
+    //   cost  = 2.5 pips × 0.01 = 0.025 price units
+    //   pnlR  = 10R − 0.025/0.338 = +9.9260R (numeric(12,4))
+    // Pre-fix (raw price-unit costs on a 100× too-small risk distance) this
+    // same trade closed at −729.64R.
+    assert.equal(trade.entryPrice, 100);
+    assert.equal(trade.stopLossPrice, 99.662);
+    assert.equal(trade.tp3Price, 103.38);
+    assert.equal(trade.pnlR, 9.926);
+    assert.ok(trade.pnlR > 0, 'TP3 must be positive once levels and costs use the instrument pip size');
     assert.equal(body.run.costPolicy.feePerSide, 0.5);
   });
 

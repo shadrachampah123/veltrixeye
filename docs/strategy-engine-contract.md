@@ -96,11 +96,23 @@ tp3Rr}` with `achievableRr = tp3Rr`; a `structure` TP method targets the
 nearest pivot beyond entry. A degenerate candidate (non-positive risk
 distance) is `null` and noted — never fabricated.
 
+The buffer → price conversion is **pip-authoritative** (`m3-deterministic-eval-2`):
+a `pips` buffer is multiplied by the instrument's pip size from
+`instrument_risk_specs.pip_size` (M8.2, migration 0017), passed in as the
+engine input's `pipSize`. There is no symbol/quote heuristic anywhere in M3.
+A `pips` buffer with a missing, non-finite or non-positive pip size cannot be
+converted, so it **fails closed**: no candidate levels are derived and
+neither direction may pass for that anchor (the failure reason and a note name
+`instrument_risk_specs.pip_size`). A `pct` buffer scales off the entry price
+and never needs a spec. `EvaluationService` resolves the pip size for each
+evaluated instrument; the M6 backtest service passes the same column into its
+replays, so live evaluation and replay agree.
+
 ## Producing output
 
 `evaluate(config, candlesByRoleAndInstrument, asOfMs)` returns a pure
 `EvaluationResultDto` (`@veltrixeye/contracts`, validated by
-`evaluationResultSchema`): `engineVersion` (`m3-deterministic-eval-1`),
+`evaluationResultSchema`): `engineVersion` (`m3-deterministic-eval-2`),
 `asOfMs`, `truncated`, and per instrument `per-direction` outcomes with
 groups, condition outcomes, session-filter outcomes, the optional candidate,
 `failureReasons`, and `notes`. **Nothing is written.** M3 does not insert

@@ -18,6 +18,7 @@ import type {
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
 import { createEvaluationEngine } from '../strategies/evaluation/engine.js';
+import { validPipSize } from '../strategies/evaluation/indicators.js';
 import { conditionRole, requiredWindows } from '../strategies/evaluation/service.js';
 import { detectionLevels } from '../setups/levels.js';
 import { scoreSetupQuality } from '../scoring/engine.js';
@@ -54,6 +55,11 @@ import { scoreSetupQuality } from '../scoring/engine.js';
  *  - costs are explicit inputs in PIPS (fee/slippage per side, spread at
  *    entry), converted to price units with the instrument's pip size, so the
  *    same policy means the same thing on EURUSD and XAUUSD;
+ *  - that SAME authoritative pip size (`instrument_risk_specs.pip_size`) is
+ *    passed to M3 for every anchor, so a version whose risk buffer is in pips
+ *    derives exactly the levels live evaluation would (M3 fails the direction
+ *    closed when the pip size is missing/invalid — the replay never invents
+ *    one, and `pct` buffers never need it);
  *  - R-multiples are primary; currency P&L exists only with `riskPerTrade`.
  *
  * Metrics denominators (pinned):
@@ -70,7 +76,20 @@ import { scoreSetupQuality } from '../scoring/engine.js';
 export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
   const exitPolicy = parseExitPolicy(input.exitPolicy);
   const costPolicy = parseCostPolicy(input.costPolicy);
+  /**
+   * The instrument's authoritative pip size (`instrument_risk_specs.pip_size`)
+   * or undefined when it has no spec. It is threaded into BOTH conversions the
+   * replay performs — M3 level derivation and cost pricing — so one run can
+   * never mix pip sizes.
+   */
   const pipSize = resolvePipSize(input.pipSize, costPolicy);
+  /**
+   * Cost conversion factor. `pipSize` is guaranteed defined whenever the cost
+   * policy is non-zero (`resolvePipSize` refuses otherwise), so the `?? 1`
+   * fallback is only reachable when every cost is zero — where the multiplier
+   * is inert (0 × anything = 0).
+   */
+  const costPipSize = pipSize ?? 1;
   const config = input.config;
   if (!config.timeframes) {
     throw Errors.invalidInput('Backtest requires config.timeframes (published versions always have them).');
@@ -150,6 +169,9 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
     const result = engine.evaluate({
       config,
       instrument: input.instrument,
+      // Same authoritative pip size as the cost conversion below: M3 derives
+      // the trade levels the replay then charges costs against.
+      pipSize,
       candles: { htf_bias: htfPrefix, setup: setupPrefix, entry: entryPrefix },
       asOfMs: anchor,
     });
@@ -172,7 +194,7 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
         minRr: config.risk.minRr,
         exitPolicy,
         costPolicy,
-        pipSize,
+        pipSize: costPipSize,
       });
       if (trade.exitReason === 'no_levels') noLevels += 1;
       trades.push(trade);
@@ -438,20 +460,24 @@ function totalCostPips(costPolicy: BacktestCostPolicy): number {
 }
 
 /**
- * Instrument pip size (price units per pip) for pip-denominated costs.
+ * The instrument's authoritative pip size (price units per pip) for every pip
+ * conversion in the replay: pip-denominated COSTS and pip-denominated M3 risk
+ * buffers.
  *
- * A costless replay is scale-independent (every cost is zero), so a missing
- * instrument spec is only refused when there IS something to convert —
- * otherwise an unknown/absent pip size would silently reintroduce the unit
- * bug this guards against. The service resolves the value from
+ * Returns the value unchanged (or undefined when the instrument has no spec).
+ * A non-zero cost policy without a pip size is refused — otherwise an absent
+ * value would silently reintroduce the unit bug this guards against. A
+ * costless replay is scale-independent for costs, so it may omit the value,
+ * but the engine still passes it on to M3, where a `pips` risk buffer fails
+ * closed without it. The service resolves the value from
  * `instrument_risk_specs.pip_size` (M8.2); here it is validated at the pure
  * engine boundary.
  */
-function resolvePipSize(pipSize: number | undefined, costPolicy: BacktestCostPolicy): number {
-  if (pipSize !== undefined && (!Number.isFinite(pipSize) || pipSize <= 0)) {
+function resolvePipSize(pipSize: number | undefined, costPolicy: BacktestCostPolicy): number | undefined {
+  if (pipSize !== undefined && validPipSize(pipSize) === null) {
     throw Errors.invalidInput('Backtest pipSize must be a positive finite number of price units per pip.');
   }
-  if (totalCostPips(costPolicy) === 0) return pipSize ?? 1; // inert: all costs are zero
+  if (totalCostPips(costPolicy) === 0) return pipSize; // costless: nothing to convert
   if (pipSize === undefined) {
     throw Errors.invalidInput(
       'Backtest costs are pips and require the instrument pip size (instrument_risk_specs.pip_size), ' +
@@ -476,7 +502,10 @@ interface TradeSimulationInput {
   minRr: number;
   exitPolicy: BacktestExitPolicy;
   costPolicy: BacktestCostPolicy;
-  /** Instrument pip size (price units per pip) — costs are pips. */
+  /**
+   * Cost conversion factor (price units per pip): the instrument's
+   * authoritative pip size, or `1` when the cost policy is all-zero (inert).
+   */
   pipSize: number;
 }
 

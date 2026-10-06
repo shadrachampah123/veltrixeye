@@ -31,8 +31,10 @@ import type { StrategyVersionConfig } from './strategies.js';
  *  - costs (fee/slippage/spread) are explicit PIPS inputs, defaulting to
  *    zero, converted to price units with the instrument's pip size
  *    (`instrument_risk_specs.pip_size`, M8.2) — the same unit every other
- *    cost input in the platform uses. Spread is NEVER sourced from market
- *    data (no spread feed exists);
+ *    cost input in the platform uses. The SAME authoritative pip size is
+ *    threaded into the M3 engine so the replay's levels and its costs are
+ *    converted consistently (one instrument, one pip size). Spread is NEVER
+ *    sourced from market data (no spread feed exists);
  *  - every timeframe ROLE the version reads must be covered over the anchors
  *    the run evaluates: a required bias/entry series that ends early is a
  *    fail-closed error, never a stale replay (see `MAX_BACKTEST_ROLE_CANDLES`).
@@ -42,8 +44,18 @@ import type { StrategyVersionConfig } from './strategies.js';
  * API routes and audit events — reusing these exact schemas.
  */
 
-/** Pinned identifier stored on every backtest run produced by this engine. */
-export const BACKTEST_ENGINE_VERSION = 'm6-backtest-3';
+/**
+ * Pinned identifier stored on every backtest run produced by this engine.
+ *
+ * Version history:
+ *  - `m6-backtest-1` — initial deterministic replay;
+ *  - `m6-backtest-2` — long-window per-role candle coverage;
+ *  - `m6-backtest-3` — instrument-aware (pip-size) cost conversion;
+ *  - `m6-backtest-4` — the replay's M3 level derivation receives the SAME
+ *    authoritative `instrument_risk_specs.pip_size` used for costs, so a
+ *    pip-denominated risk buffer converts identically everywhere in the run.
+ */
+export const BACKTEST_ENGINE_VERSION = 'm6-backtest-4';
 
 /** Max evaluated anchors (setup closes) per backtest run. */
 export const MAX_BACKTEST_STEPS = 4500;
@@ -313,10 +325,13 @@ export interface BacktestEngineInput {
   instrument: { assetClass: string; symbol: string };
   /**
    * Instrument pip size in price units (`instrument_risk_specs.pip_size`,
-   * M8.2). Cost-policy fields are pips and are multiplied by this to get the
-   * price-unit cost subtracted from every trade. Required whenever the cost
-   * policy is non-zero (the loader resolves it from the instrument spec);
-   * costless replays ignore it.
+   * M8.2) — the single authoritative value for EVERY pip conversion in the
+   * replay: non-zero cost-policy fields (fee/slippage/spread) are pips and are
+   * multiplied by it, and it is threaded into the M3 engine so a `pips` risk
+   * buffer derives the same levels the live evaluation would. Required
+   * whenever the cost policy is non-zero (the loader resolves it from the
+   * instrument spec); costless replays ignore it for costs, but a version
+   * whose risk buffer is in pips still needs it (M3 fails closed without it).
    */
   pipSize?: number;
   candles: BacktestCandleSet;

@@ -14,6 +14,7 @@ import { Errors } from '../../errors.js';
 import type { StrategyService } from '../strategies.js';
 import type { CandleStore } from '../../market-data/candles.js';
 import { createEvaluationEngine } from './engine.js';
+import { validPipSize } from './indicators.js';
 
 /**
  * Evaluation service (M3) — the ONLY boundary between the HTTP layer and the
@@ -31,6 +32,10 @@ import { createEvaluationEngine } from './engine.js';
  *  - bounded: instrument count is capped (`MAX_EVALUATION_INSTRUMENTS`, scope
  *    "all" is deterministically truncated), and each role's candle window is
  *    capped by the same 5000-candle ceiling the store enforces;
+ *  - pip-authoritative: each instrument's pip size is read from
+ *    `instrument_risk_specs.pip_size` (M8.2) and handed to the engine, which
+ *    converts `pips` risk buffers with that value alone — a missing/invalid
+ *    spec fails the direction closed instead of assuming a pip size;
  *  - deterministic anchor: `asOfMs` is taken from the caller; the service
  *    never advances the clock mid-evaluation. The ONLY wall-clock read is
  *    the default `asOfMs = Date.now()` at the API edge when the caller omits
@@ -90,6 +95,10 @@ export class EvaluationService {
       const result = this.engine.evaluate({
         config,
         instrument: { assetClass: resolved.assetClass, symbol: resolved.symbol },
+        // The instrument's authoritative pip size — the ONLY source for
+        // pip-based level conversion. Absent/invalid ⇒ the engine fails closed
+        // for versions whose risk buffer is expressed in pips.
+        pipSize: await this.loadPipSize(resolved.id),
         candles: candleSet,
         asOfMs,
       });
@@ -119,6 +128,28 @@ export class EvaluationService {
       truncated,
       notes: [...notes],
     };
+  }
+
+  /**
+   * Instrument pip size (price units per pip) from `instrument_risk_specs`
+   * (M8.2, migration 0017) — the ONLY authoritative source for pip-based M3
+   * level conversion (engine `m3-deterministic-eval-2`). The same column is
+   * read by the M6 backtest service, so a version's pips buffer converts
+   * identically in live evaluation and in replay.
+   *
+   * Returns undefined when the instrument has no spec row or the stored value
+   * is not a positive finite number; the engine then fails closed for any
+   * version whose risk buffer is in pips (never guessing one). Percentage
+   * buffers do not need it.
+   */
+  private async loadPipSize(instrumentId: string): Promise<number | undefined> {
+    const res = await this.pool.query<{ pip_size: string }>(
+      'SELECT pip_size FROM instrument_risk_specs WHERE instrument_id = $1',
+      [instrumentId],
+    );
+    const row = res.rows[0];
+    if (!row) return undefined;
+    return validPipSize(Number(row.pip_size)) ?? undefined;
   }
 
   /** STORE read only — deliberately not IngestionService, so no fetch-through. */
