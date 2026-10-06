@@ -89,16 +89,22 @@ function evaluate(input: EvaluationEngineInput): EvaluationEngineResult {
   // cannot be converted, so it fails CLOSED: no candidate levels are invented,
   // and neither direction can pass. `pct` buffers never need a pip size.
   const pipBufferUnresolved = config.risk.stopLossBufferUnit === 'pips' && validPipSize(pipSize) === null;
-  const candidate = deriveCandidate(config.risk, closed.setup, pipSize);
+  const candidateLong = deriveCandidate(config.risk, closed.setup, pipSize, 'long');
+  const candidateShort = deriveCandidate(config.risk, closed.setup, pipSize, 'short');
   if (pipBufferUnresolved) {
     notes.push(
       `No candidate levels could be derived: the ${config.risk.stopLossBuffer} ${config.risk.stopLossBufferUnit} ` +
         `stop-loss buffer requires the instrument pip size (instrument_risk_specs.pip_size), which is missing or ` +
         `invalid for ${instrument.symbol} — pip-based conversion fails closed.`,
     );
-  } else if (candidate === null) {
+  } else if (candidateLong === null && candidateShort === null) {
     notes.push(
       'No deterministic candidate entry/stop could be derived at the anchor (insufficient setup history or no structural stop); rr_requirement evaluates as insufficient_data.',
+    );
+  } else if (candidateLong === null || candidateShort === null) {
+    const missing = candidateLong === null ? 'long' : 'short';
+    notes.push(
+      `No deterministic candidate entry/stop could be derived for ${missing} at the anchor (insufficient setup history or no structural stop on that side); rr_requirement evaluates as insufficient_data for ${missing}.`,
     );
   }
   if (config.filters.length > 0) {
@@ -107,8 +113,8 @@ function evaluate(input: EvaluationEngineInput): EvaluationEngineResult {
     );
   }
 
-  const long = evaluateDirection('long', config, closed, candidate, pipBufferUnresolved);
-  const short = evaluateDirection('short', config, closed, candidate, pipBufferUnresolved);
+  const long = evaluateDirection('long', config, closed, candidateLong, pipBufferUnresolved);
+  const short = evaluateDirection('short', config, closed, candidateShort, pipBufferUnresolved);
   return { long, short, notes };
 }
 
@@ -266,12 +272,18 @@ function evaluateDirection(
  *                   invalid / zero pip size makes this function return null
  *                   (fail closed);
  *  - entry        = close of the last closed setup candle;
- *  - structure SL = most recent confirmed pivot beyond entry (fallback: the
- *                   extreme of the candidate window if strictly beyond entry);
- *  - fixed SL     = entry ∓ stopLossBuffer (converted via pips/pct);
- *  - atr SL       = entry ∓ ATR(14) ∓ buffer;
- *  - rr method    = TP1/2/3 at risk multiples (tp1Rr..tp3Rr), achievableRr = tp3Rr;
- *  - structure    = achievableRr measured to the nearest opposing swing;
+ *  - structure SL = most recent confirmed pivot on the stop side — pivot low
+ *                   below entry for longs (minus buffer), pivot high above
+ *                   entry for shorts (plus buffer); fallback: the window low
+ *                   (long) / window high (short) if strictly beyond entry;
+ *  - fixed SL     = entry − stopLossBuffer (LONG-convention; M4 mirrors for
+ *                   shorts — direction-neutral for M3's riskDistance);
+ *  - atr SL       = entry − ATR(14) − buffer (LONG-convention, same reason);
+ *  - rr method    = TP1/2/3 at risk multiples above entry (LONG-convention),
+ *                   achievableRr = tp3Rr (direction-neutral);
+ *  - structure TP = achievableRr measured to the nearest opposing swing for
+ *                   `direction` (no TP legs — rr_requirement reports
+ *                   "insufficient_data" when no target exists);
  *  - manual       = no targets (achievableRr null) — rr_requirement reports
  *                   "unsupported" for that method.
  *
@@ -282,6 +294,7 @@ export function deriveCandidate(
   risk: NonNullable<EvaluationEngineInput['config']['risk']>,
   setupClosed: Candle[],
   pipSize?: number,
+  direction: 'long' | 'short' = 'long',
 ): CandidateLevels | null {
   if (setupClosed.length < 2) return null;
   const window = setupClosed.slice(-CANDIDATE_WINDOW);
@@ -292,25 +305,31 @@ export function deriveCandidate(
   // null without one, so the candidate fails closed (never an assumed pip).
   const buffer = bufferToPrice(risk.stopLossBuffer, risk.stopLossBufferUnit, entry, pipSize);
   if (buffer === null) return null;
-  // PINNED: candidate levels use the LONG convention (stops below entry,
-  // rr targets above). rr_requirement only consumes riskDistance and
-  // achievableRr, which are direction-neutral; M4 derives per-direction
-  // levels when it persists setups.
-  const long = true;
+  // Structure stops are per-direction (stop-side pivots); fixed/atr stops and
+  // rr targets stay LONG-convention (stops below, targets above) because M3's
+  // consumers only read their direction-neutral riskDistance/achievableRr and
+  // M4 mirrors those legs for shorts at persistence time.
+  const isLong = direction === 'long';
 
   let stop: number | null = null;
   let basis: string;
   if (risk.stopLossMethod === 'structure') {
-    const pivot = long ? lastPivotLowBelow(window, entry) : lastPivotHighAbove(window, entry);
+    const pivot = isLong ? lastPivotLowBelow(window, entry) : lastPivotHighAbove(window, entry);
     if (pivot) {
-      stop = long ? pivot.price - buffer : pivot.price + buffer;
-      basis = `structure stop at ${pivot.price} (recent swing) minus buffer`;
+      stop = isLong ? pivot.price - buffer : pivot.price + buffer;
+      basis = isLong
+        ? `structure stop at ${pivot.price} (recent swing) minus buffer`
+        : `structure stop at ${pivot.price} (recent swing) plus buffer`;
     } else {
-      // Fallback: window extreme strictly beyond entry.
-      const extreme = Math.min(...window.map((c) => c.low));
-      if (extreme >= entry) return null;
-      stop = extreme - buffer;
-      basis = `structure stop at window extreme ${extreme} minus buffer`;
+      // Fallback: window extreme strictly beyond entry on the stop side.
+      const extreme = isLong
+        ? Math.min(...window.map((c) => c.low))
+        : Math.max(...window.map((c) => c.high));
+      if (isLong ? extreme >= entry : extreme <= entry) return null;
+      stop = isLong ? extreme - buffer : extreme + buffer;
+      basis = isLong
+        ? `structure stop at window extreme ${extreme} minus buffer`
+        : `structure stop at window extreme ${extreme} plus buffer`;
     }
   } else if (risk.stopLossMethod === 'fixed') {
     stop = entry - buffer;
@@ -335,7 +354,7 @@ export function deriveCandidate(
     tp3 = entry + riskDistance * risk.tp3Rr;
     achievableRr = risk.tp3Rr;
   } else if (risk.takeProfitMethod === 'structure') {
-    const target = structuralTarget(window, 'long', entry);
+    const target = structuralTarget(window, direction, entry);
     achievableRr = target === null ? null : Math.abs(target - entry) / riskDistance;
   }
 

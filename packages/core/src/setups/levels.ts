@@ -3,18 +3,21 @@ import type { CandidateLevels, SetupDirection } from '@veltrixeye/contracts';
 /**
  * M4 persisted trade levels (pure — no I/O, no clock).
  *
- * M3's `candidate` is LONG-convention (stop below entry, targets above —
- * "per-direction levels deferred to M4"). For a long setup the candidate is
- * stored as-is; for a short setup each leg is mirrored around the entry so
- * the stop sits above and the targets below, preserving the exact risk
- * distance. Mirroring is the only deterministic reading of "the same risk
- * profile, opposite side" and keeps `riskDistance` identical for both
- * directions.
+ * M3 structure stops are per-direction (a short candidate's stop already
+ * sits above entry); fixed/atr stops and rr targets stay LONG-convention
+ * (stop below, targets above — "per-direction levels deferred to M4"). For
+ * a long setup the candidate is stored as-is; for a short setup each leg is
+ * oriented idempotently — a leg already on the short side (stop above,
+ * target below) is kept, a LONG-convention leg is mirrored around the entry
+ * (`2 × entry − price`), preserving the exact risk distance either way.
+ * Mirroring is the only deterministic reading of "the same risk profile,
+ * opposite side" for LONG-convention legs and keeps `riskDistance`
+ * identical for both directions.
  *
  * A null candidate (M3 found no valid candidate) persists as all-null
- * levels. A mirrored leg that would land on the wrong side or at a
- * non-positive price is dropped to null rather than stored inverted — the
- * setup stays traceable (entry is always kept) without fabricating levels.
+ * levels. A leg that would land on the wrong side or at a non-positive
+ * price is dropped to null rather than stored inverted — the setup stays
+ * traceable (entry is always kept) without fabricating levels.
  */
 export interface DetectionLevels {
   entryPrice: number;
@@ -46,11 +49,15 @@ export function detectionLevels(
     };
   }
 
-  const stop = mirrorPrice(entry, candidate.stopLossPrice);
+  // Idempotent orientation: per-direction M3 legs (short structure stops)
+  // are already on the short side and must NOT be mirrored again, while
+  // LONG-convention legs (fixed/atr stops, rr targets) still mirror.
+  const rawStop = candidate.stopLossPrice;
+  const stop = rawStop > entry ? rawStop : mirrorPrice(entry, rawStop);
   const mirrorTarget = (tp: number | null): number | null => {
     if (tp === null) return null;
-    const m = mirrorPrice(entry, tp);
-    return m > 0 && m < entry ? m : null;
+    const oriented = tp < entry ? tp : mirrorPrice(entry, tp);
+    return oriented > 0 && oriented < entry ? oriented : null;
   };
   return {
     entryPrice: entry,
