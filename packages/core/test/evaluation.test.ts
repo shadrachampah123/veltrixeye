@@ -24,7 +24,7 @@ import {
   isDisplacement,
   lastPivotHighAbove,
   lastPivotLowBelow,
-  pipSizeFor,
+  validPipSize,
   requiredWindows,
   sma,
   structuralTarget,
@@ -42,6 +42,10 @@ import {
 const HOUR = 3_600_000;
 /** Fixed anchor. Every candle below is built around it — no wall clock anywhere. */
 const AS_OF = 1_800_000_000_000;
+/** EURUSD pip size from `instrument_risk_specs` (M8.2, migration 0017). */
+const EURUSD_PIP_SIZE = 0.0001;
+/** XAUUSD pip size from `instrument_risk_specs` (M8.2, migration 0017) — 100× EURUSD. */
+const XAUUSD_PIP_SIZE = 0.01;
 
 function candle(time: number, open: number, high: number, low: number, close: number): CandleDto {
   assert.ok(low <= Math.min(open, close) && high >= Math.max(open, close), 'test candle violates OHLC invariant');
@@ -331,12 +335,25 @@ describe('m3 indicators', () => {
     assert.equal(timeInSession(at13, 'asia'), false);
   });
 
-  test('pip and buffer math: JPY quotes use 0.01 pips; pct scales off entry', () => {
-    assert.equal(pipSizeFor('EURUSD'), 0.0001);
-    assert.equal(pipSizeFor('USDJPY'), 0.01);
-    assert.equal(bufferToPrice(2, 'pips', 100, 'EURUSD'), 0.0002);
-    assert.equal(bufferToPrice(2, 'pips', 100, 'USDJPY'), 0.02);
-    assert.equal(bufferToPrice(1, 'pct', 200, 'EURUSD'), 2);
+  test('pip and buffer math: pips use the supplied authoritative pip size; pct scales off entry', () => {
+    // EURUSD (0.0001) and USDJPY/XAUUSD (0.01) pip sizes come from
+    // `instrument_risk_specs.pip_size` (migration 0017) — never from a symbol
+    // heuristic, so the SAME symbol with a different pip size converts
+    // differently, and XAUUSD is no longer treated like a 4-decimal FX pair.
+    assert.equal(validPipSize(0.0001), 0.0001);
+    assert.equal(validPipSize(0.01), 0.01);
+    assert.equal(validPipSize(undefined), null);
+    assert.equal(validPipSize(0), null);
+    assert.equal(validPipSize(-0.01), null);
+    assert.equal(validPipSize(Number.NaN), null);
+    assert.equal(validPipSize(Number.POSITIVE_INFINITY), null);
+    assert.equal(bufferToPrice(2, 'pips', 100, 0.0001), 0.0002); // EURUSD
+    assert.equal(bufferToPrice(2, 'pips', 100, 0.01), 0.02); // USDJPY / XAUUSD
+    assert.equal(bufferToPrice(1, 'pct', 200, undefined), 2); // pct never needs a pip size
+    // A pips buffer without a usable pip size cannot be converted: fail closed.
+    assert.equal(bufferToPrice(2, 'pips', 100, undefined), null);
+    assert.equal(bufferToPrice(2, 'pips', 100, 0), null);
+    assert.equal(bufferToPrice(2, 'pips', 100, Number.NaN), null);
   });
 
   test('time gaps between candles do not affect index-based primitives', () => {
@@ -855,7 +872,7 @@ describe('m3 engine', () => {
   const engine = createEvaluationEngine();
 
   function evaluate(config: StrategyVersionConfig, candles: CandleDto[] = series(longTrueShapes)) {
-    return engine.evaluate({ config, instrument: { assetClass: 'forex', symbol: 'EURUSD' }, candles: { htf_bias: candles, setup: candles, entry: candles }, asOfMs: AS_OF });
+    return engine.evaluate({ config, instrument: { assetClass: 'forex', symbol: 'EURUSD' }, pipSize: EURUSD_PIP_SIZE, candles: { htf_bias: candles, setup: candles, entry: candles }, asOfMs: AS_OF });
   }
 
   test('AND group: every member must be satisfied; per-direction outcomes differ', () => {
@@ -946,6 +963,7 @@ describe('m3 engine', () => {
         ruleGroups: [group('g', 'AND', [longTrue])],
       }),
       instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+      pipSize: EURUSD_PIP_SIZE,
       candles: { htf_bias: candlesFull, setup: candlesFull, entry: candlesFull },
       asOfMs: asOf,
     });
@@ -960,6 +978,7 @@ describe('m3 engine', () => {
         ruleGroups: [group('g', 'AND', [longTrue])],
       }),
       instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+      pipSize: EURUSD_PIP_SIZE,
       candles: { htf_bias: candlesFull, setup: candlesFull, entry: candlesFull },
       asOfMs: asOf,
     });
@@ -976,6 +995,7 @@ describe('m3 engine', () => {
     const result = engine.evaluate({
       config: mkConfig({ ruleGroups: [group('g', 'AND', [cond('session_requirement', 'required', 'any', { sessions: ['london'], mode: 'include', timezone: 'utc' })])] }),
       instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+      pipSize: EURUSD_PIP_SIZE,
       candles: { htf_bias: [], setup: setupCandles, entry: [] },
       asOfMs: asOf,
     });
@@ -997,6 +1017,7 @@ describe('m3 engine', () => {
     const early = engine.evaluate({
       config,
       instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+      pipSize: EURUSD_PIP_SIZE,
       candles: { htf_bias: series(longTrueShapes), setup: series(longTrueShapes), entry: series(longTrueShapes) },
       asOfMs: AS_OF - HOUR, // the engulfing candle now closes AFTER the anchor → excluded
     });
@@ -1006,7 +1027,7 @@ describe('m3 engine', () => {
   test('candidate levels: fixed stop derives pips-precise risk and rr targets', () => {
     const candles = series(longTrueShapes);
     const risk = riskConfigurationSchema.parse({ stopLossMethod: 'fixed', stopLossBuffer: 1, stopLossBufferUnit: 'pips', takeProfitMethod: 'rr' });
-    const candidate = deriveCandidate(risk, candles, 'EURUSD');
+    const candidate = deriveCandidate(risk, candles, EURUSD_PIP_SIZE);
     assert.ok(candidate);
     assert.ok(candidate.stopLossPrice !== null);
     assert.ok(candidate.riskDistance !== null);
@@ -1016,6 +1037,120 @@ describe('m3 engine', () => {
     assert.ok(Math.abs(candidate.riskDistance - 0.0001) < 1e-12);
     assert.ok(Math.abs(candidate.tp3Price - (101.3 + 3 * 0.0001)) < 1e-9);
     assert.equal(candidate.achievableRr, 3);
+  });
+
+  test('XAUUSD: pips levels convert with the authoritative pip_size (0.01), not a symbol heuristic', () => {
+    const candles = series(longTrueShapes);
+    const risk = riskConfigurationSchema.parse({
+      stopLossMethod: 'fixed',
+      stopLossBuffer: 100,
+      stopLossBufferUnit: 'pips',
+      takeProfitMethod: 'rr',
+    });
+    // `instrument_risk_specs.pip_size` for commodity/XAUUSD is 0.01, so a
+    // 100-pip buffer is 1.00 price unit. The old symbol heuristic assumed
+    // 0.0001 for everything that is not JPY-quoted and was 100× too small here.
+    const gold = deriveCandidate(risk, candles, XAUUSD_PIP_SIZE);
+    assert.ok(gold);
+    assert.equal(gold.entryPrice, 101.3);
+    assert.ok(Math.abs(gold.stopLossPrice - (101.3 - 1)) < 1e-9);
+    assert.ok(Math.abs(gold.riskDistance - 1) < 1e-12);
+    assert.ok(Math.abs((gold.tp3Price ?? 0) - (101.3 + 3)) < 1e-9);
+
+    // The VALUE is authoritative, not the symbol: the same conversion applied
+    // to any symbol gives the same levels, and a different pip size (e.g.
+    // EURUSD's 0.0001) yields 100× smaller levels for the SAME symbol.
+    const samePip = deriveCandidate(risk, candles, 0.01);
+    assert.deepEqual(
+      { riskDistance: samePip?.riskDistance, stopLossPrice: samePip?.stopLossPrice },
+      { riskDistance: gold.riskDistance, stopLossPrice: gold.stopLossPrice },
+    );
+    const eurPip = deriveCandidate(risk, candles, EURUSD_PIP_SIZE);
+    assert.ok(eurPip);
+    assert.ok(Math.abs(eurPip.riskDistance - 0.01) < 1e-12);
+    assert.notEqual(eurPip.riskDistance, gold.riskDistance);
+  });
+
+  test('engine: a pips buffer with a missing/invalid/zero pip size fails closed for both directions', () => {
+    const candles = series(longTrueShapes);
+    const config = mkConfig({
+      risk: {
+        ...riskConfigurationSchema.parse({}),
+        stopLossMethod: 'fixed',
+        stopLossBuffer: 100,
+        stopLossBufferUnit: 'pips',
+        takeProfitMethod: 'rr',
+      },
+      ruleGroups: [group('g', 'AND', [longTrue])],
+    });
+    for (const pipSize of [undefined, 0, -0.01, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const result = engine.evaluate({
+        config,
+        instrument: { assetClass: 'commodity', symbol: 'XAUUSD' },
+        ...(pipSize === undefined ? {} : { pipSize }),
+        candles: { htf_bias: candles, setup: candles, entry: candles },
+        asOfMs: AS_OF,
+      });
+      const label = String(pipSize);
+      assert.equal(result.long.passed, false, `long must fail closed for pipSize ${label}`);
+      assert.equal(result.short.passed, false, `short must fail closed for pipSize ${label}`);
+      assert.equal(result.long.candidate, null, 'no levels may be invented without the pip size');
+      assert.equal(result.short.candidate, null);
+      assert.ok(
+        result.long.failureReasons.some((r) => r.includes('instrument_risk_specs.pip_size')),
+        `long failureReasons must name the missing pip size (${label})`,
+      );
+      assert.ok(
+        result.short.failureReasons.some((r) => r.includes('instrument_risk_specs.pip_size')),
+        `short failureReasons must name the missing pip size (${label})`,
+      );
+      assert.ok(result.notes.some((n) => n.includes('instrument_risk_specs.pip_size')));
+    }
+
+    // With the authoritative pip size the SAME config passes and derives levels.
+    const withSpec = engine.evaluate({
+      config,
+      instrument: { assetClass: 'commodity', symbol: 'XAUUSD' },
+      pipSize: XAUUSD_PIP_SIZE,
+      candles: { htf_bias: candles, setup: candles, entry: candles },
+      asOfMs: AS_OF,
+    });
+    assert.equal(withSpec.long.passed, true);
+    assert.equal(withSpec.long.failureReasons.length, 0);
+    assert.ok(Math.abs((withSpec.long.candidate?.riskDistance ?? 0) - 1) < 1e-12);
+  });
+
+  test('engine: percentage buffers keep working without any pip size (and ignore one when given)', () => {
+    const candles = series(longTrueShapes);
+    const config = mkConfig({
+      risk: {
+        ...riskConfigurationSchema.parse({}),
+        stopLossMethod: 'fixed',
+        stopLossBuffer: 1,
+        stopLossBufferUnit: 'pct',
+        takeProfitMethod: 'rr',
+      },
+      ruleGroups: [group('g', 'AND', [longTrue, cond('rr_requirement', 'required', 'setup', { minRr: 2 })])],
+    });
+    const withoutSpec = engine.evaluate({
+      config,
+      instrument: { assetClass: 'commodity', symbol: 'XAUUSD' },
+      candles: { htf_bias: candles, setup: candles, entry: candles },
+      asOfMs: AS_OF,
+    });
+    assert.equal(withoutSpec.long.passed, true);
+    // 1% of the entry close 101.3 — no instrument spec involved.
+    assert.ok(Math.abs((withoutSpec.long.candidate?.riskDistance ?? 0) - 1.013) < 1e-9);
+
+    const withSpec = engine.evaluate({
+      config,
+      instrument: { assetClass: 'commodity', symbol: 'XAUUSD' },
+      pipSize: XAUUSD_PIP_SIZE,
+      candles: { htf_bias: candles, setup: candles, entry: candles },
+      asOfMs: AS_OF,
+    });
+    assert.equal(withSpec.long.passed, true);
+    assert.equal(withSpec.long.candidate?.riskDistance, withoutSpec.long.candidate?.riskDistance);
   });
 
   test('candidate levels: structure stop uses the most recent swing; structural target measures rr', () => {
@@ -1028,7 +1163,7 @@ describe('m3 engine', () => {
       [101.5, 100,],
     ]);
     const risk = riskConfigurationSchema.parse({ stopLossMethod: 'structure', takeProfitMethod: 'structure' });
-    const candidate = deriveCandidate(risk, candles, 'EURUSD');
+    const candidate = deriveCandidate(risk, candles, EURUSD_PIP_SIZE);
     assert.ok(candidate);
     assert.equal(candidate.entryPrice, 100.75);
     assert.ok(candidate.stopLossPrice < 100.75); // beyond the swing
@@ -1039,11 +1174,12 @@ describe('m3 engine', () => {
     const risk = riskConfigurationSchema.parse({ stopLossMethod: 'atr' });
     const candles = series(longTrueShapes); // 18 candles < ATR(14) requirement of 15? 18 ≥ 15 — use fewer
     const shortCandles = candles.slice(0, 10);
-    const candidate = deriveCandidate(risk, shortCandles, 'EURUSD');
+    const candidate = deriveCandidate(risk, shortCandles, EURUSD_PIP_SIZE);
     assert.equal(candidate, null);
     const result = engine.evaluate({
       config: mkConfig({ risk: { ...riskConfigurationSchema.parse({}), stopLossMethod: 'atr' }, ruleGroups: [group('g', 'AND', [longTrue])] }),
       instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+      pipSize: EURUSD_PIP_SIZE,
       candles: { htf_bias: shortCandles, setup: shortCandles, entry: shortCandles },
       asOfMs: AS_OF,
     });

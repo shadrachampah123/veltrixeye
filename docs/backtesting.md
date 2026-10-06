@@ -127,11 +127,13 @@ on top of the Phase 2 API — no engine, service or schema change.
 
 ## Engine contract
 
-Pinned as **`m6-backtest-3`** (`BACKTEST_ENGINE_VERSION` in
+Pinned as **`m6-backtest-4`** (`BACKTEST_ENGINE_VERSION` in
 `@veltrixeye/contracts`), stored on every run row. Any change to anchors,
 evaluation, coverage, exits, costs, or metrics requires a new version string
 (`m6-backtest-1` → `m6-backtest-2` is the M6.2 long-window coverage fix;
-`m6-backtest-2` → `m6-backtest-3` is the instrument-aware cost-unit fix).
+`m6-backtest-2` → `m6-backtest-3` is the instrument-aware cost-unit fix;
+`m6-backtest-3` → `m6-backtest-4` threads the authoritative pip size into M3
+level derivation — see "Pip-authoritative levels" below).
 
 Bounds (pinned in contracts, none configurable):
 
@@ -153,7 +155,10 @@ with the instrument's pip size (`instrument_risk_specs.pip_size`, M8.2:
 slippagePerSide) + spread) × pipSize`. `pnlR = (signedPriceMove − totalCost) /
 riskDistance` rounded 4 decimals; `pnlCurrency = pnlR × riskPerTrade` (2
 decimals) only when set. A non-zero cost policy without an instrument spec is
-refused (`400`) — a pip is never guessed; a costless replay needs no spec.
+refused (`400`) — a pip is never guessed; a costless replay needs no spec
+*for costs* (but a version whose risk buffer is in pips still needs the spec
+for its levels — see below). The same `pipSize` is handed to M3 for every
+anchor, so a run never mixes two pip sizes.
 
 ## Determinism and look-ahead protection
 
@@ -233,6 +238,37 @@ totalCost(price) = (2 × (feePerSide + slippagePerSide) + spread) × pipSize
 - This is a cost-semantics change, so the engine version is bumped
   (`m6-backtest-2` → `m6-backtest-3`); stored runs keep their pinned version
   and policies, and replay idempotency is unchanged.
+
+## Pip-authoritative levels (engine `m6-backtest-4`)
+
+Costs are not the only pip-denominated input in a replay: a version's risk
+`stopLossBuffer` can be expressed in **pips**, and M3 converts it into the
+trade's stop. Pre-`m6-backtest-4` that conversion used a symbol heuristic
+(`JPY` quote ⇒ 0.01, everything else ⇒ 0.0001) inside the M3 engine, so on
+XAUUSD — a 0.01-pip instrument — the stop sat 100× too close while the costs
+were already being converted with the authoritative 0.01. The two conversions
+disagreed, and the reported gold trade closed at `−729.60R`.
+
+Now there is exactly one pip size per instrument per run:
+
+- `BacktestService` resolves `instrument_risk_specs.pip_size` (M8.2,
+  migration 0017) and passes it to the pure engine;
+- the engine validates it once and threads it into **both** conversions —
+  every `engine.evaluate(...)` call for M3 levels and every trade's cost
+  calculation. The old `pipSizeFor(symbol)` heuristic is gone;
+- M3 level derivation fails **closed** when a `pips` buffer meets a missing,
+  non-finite or non-positive pip size: no candidate levels are invented and
+  neither direction passes for that anchor. Percentage (`pct`) buffers scale
+  off the entry price and never need a spec;
+- costless replays still need no spec *unless* the version's buffer is in
+  pips (that is an M3-level conversion, so it is required there too).
+
+Because a pips buffer and a pips cost policy both scale with the same pip
+size, R-multiples are now scale-consistent across instruments: the same
+fixture and policy produce the same `pnlR` on EURUSD and XAUUSD (one pip is
+one pip), while their price-unit levels differ by exactly the pip-size ratio.
+The `m3-deterministic-eval-2` engine applies the same rule to live evaluation
+(`EvaluationService` resolves the identical column), so replay and live agree.
 
 ## HTTP API (Phase 2)
 

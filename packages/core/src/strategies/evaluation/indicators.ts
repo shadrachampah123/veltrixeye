@@ -436,21 +436,35 @@ export function timeInSession(timeMs: number, session: string): boolean {
 // Pip / buffer math
 // ---------------------------------------------------------------------------
 
-/** Pinned pip size: 0.01 for JPY-quoted symbols, 0.0001 otherwise. */
-export function pipSizeFor(symbol: string): number {
-  return symbol.toUpperCase().endsWith('JPY') ? 0.01 : 0.0001;
+/**
+ * Validate an authoritative instrument pip size (price units per pip).
+ *
+ * Returns the value when it is a positive finite number and `null` otherwise:
+ * missing, non-numeric, zero and negative pip sizes are ALL unusable, and
+ * callers must fail closed rather than substitute a heuristic for them.
+ */
+export function validPipSize(pipSize: number | null | undefined): number | null {
+  return typeof pipSize === 'number' && Number.isFinite(pipSize) && pipSize > 0 ? pipSize : null;
 }
 
 /**
- * Convert a risk-config buffer to price units.
- * pips → buffer × pipSize(symbol); pct → buffer/100 × entryPrice.
+ * Convert a risk-config buffer into price units for M3 level derivation.
+ *
+ *  - `pct` → `buffer/100 × entryPrice` — never needs an instrument spec;
+ *  - `pips` → `buffer × pipSize`, where `pipSize` is the instrument's
+ *    AUTHORITATIVE pip size (`instrument_risk_specs.pip_size`, M8.2 — the same
+ *    value the risk, execution and backtest cost engines use). There is NO
+ *    symbol/quote heuristic: a missing, invalid or zero pip size returns
+ *    `null`, and the caller fails closed instead of deriving a level from an
+ *    assumed pip size.
  */
 export function bufferToPrice(
   buffer: number,
   unit: 'pips' | 'pct',
   entryPrice: number,
-  symbol: string,
-): number {
+  pipSize?: number | null,
+): number | null {
   if (unit === 'pct') return (buffer / 100) * entryPrice;
-  return buffer * pipSizeFor(symbol);
+  const pip = validPipSize(pipSize);
+  return pip === null ? null : buffer * pip;
 }

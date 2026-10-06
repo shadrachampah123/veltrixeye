@@ -208,8 +208,8 @@ describe('m6 backtest engine input validation', () => {
   });
 
   test('non-zero costs without an instrument pip size are refused (never guessed)', () => {
-    const flat: [number, number, number, number] = [100, 100, 100, 100];
-    const setup = hourly([NORMAL, BULL_PIN, flat]);
+    const flat100: [number, number, number, number] = [100, 100, 100, 100];
+    const setup = hourly([NORMAL, BULL_PIN, flat100]);
     // Bypasses the helper, which supplies the EURUSD pip size.
     assert.throws(
       () =>
@@ -224,13 +224,36 @@ describe('m6 backtest engine input validation', () => {
         }),
       /require the instrument pip size/,
     );
-    // Costless replays are scale-independent: no spec needed.
-    const frictionless = runBacktest({
+  });
+
+  test('a pips risk buffer without a pip size fails M3 closed; a pct buffer needs no pip size', () => {
+    const flat100: [number, number, number, number] = [100, 100, 100, 100];
+    const setup = hourly([NORMAL, BULL_PIN, flat100]);
+    const candles = { htf_bias: setup, setup, entry: setup };
+
+    // `alwaysPass()` uses a 10-pip buffer: with no instrument pip size M3
+    // cannot convert it, so every direction fails closed and the replay has no
+    // qualifying setup to simulate (anchors are still evaluated).
+    const pipsNoSpec = runBacktest({
       config: alwaysPass(),
       instrument: INSTRUMENT,
-      candles: { htf_bias: setup, setup, entry: setup },
+      candles,
       fromMs: closeOf(0),
-      toMs: closeOf(2),
+      toMs: closeOf(3),
+      direction: 'long',
+    });
+    assert.equal(pipsNoSpec.stepsEvaluated, 3);
+    assert.equal(pipsNoSpec.trades.length, 0);
+
+    // A percentage buffer is scale-independent and never consults a spec, so
+    // the same costless replay still produces its trade (1% of 100 = 1.0).
+    const pctConfig = mkConfig(alwaysPass().ruleGroups, { stopLossBuffer: 1, stopLossBufferUnit: 'pct' });
+    const frictionless = runBacktest({
+      config: pctConfig,
+      instrument: INSTRUMENT,
+      candles,
+      fromMs: closeOf(0),
+      toMs: closeOf(3),
       direction: 'long',
     });
     assert.equal(first(frictionless.trades).pnlR, 0);
@@ -740,12 +763,14 @@ describe('m6 missing levels, costs and metrics', () => {
   });
 
   test('costs are instrument-aware: the same pip policy converts with the instrument pip size', () => {
-    // Identical fixture and policy; only the pip size differs. XAUUSD's pip
-    // (0.01) is 100× EURUSD's (0.0001), so the price-unit cost drag is 100×.
-    const setup = hourly([NORMAL, BULL_PIN, [100, 100.04, 99.999, 100.01], NORMAL]);
+    // A PERCENTAGE risk buffer keeps the derived levels identical on both
+    // instruments (0.5% of the entry), so the only difference left is the COST
+    // conversion: XAUUSD's pip (0.01) is 100× EURUSD's (0.0001), so the same
+    // 2.5-pip policy drags 100× the price units.
+    const setup = hourly([NORMAL, BULL_PIN, [100, 105.2, 99.9, 105], NORMAL]);
     const config = mkConfig(
       [group('Pins', 'AND', [cond('rejection_candle', 'required', 'setup', { direction: 'bullish', minWickBodyRatio: 2 })])],
-      { stopLossBuffer: 33.802, tp1Rr: 2, tp2Rr: 5, tp3Rr: 10 },
+      { stopLossBuffer: 0.5, stopLossBufferUnit: 'pct', tp1Rr: 2, tp2Rr: 5, tp3Rr: 10 },
     );
     const costPolicy = { feePerSide: 0.5, slippagePerSide: 0.25, spread: 1 };
     const common = { config, setup, fromMs: closeOf(0), toMs: closeOf(3), direction: 'long' as const, costPolicy };
@@ -753,34 +778,41 @@ describe('m6 missing levels, costs and metrics', () => {
     const eur = first(run({ ...common, pipSize: EURUSD_PIP_SIZE }).trades);
     const xau = first(run({ ...common, pipSize: XAUUSD_PIP_SIZE, instrument: { assetClass: 'commodity', symbol: 'XAUUSD' } }).trades);
 
+    // Levels are instrument-independent: entry 100, risk distance 0.5
+    // (0.5% of 100), TP3 +5.0 — the pip size only prices costs here.
+    assert.equal(eur.exitReason, 'take_profit_3');
+    assert.equal(xau.exitReason, 'take_profit_3');
+    assert.ok(Math.abs((eur.stopLossPrice ?? 0) - 99.5) < 1e-12);
+    assert.deepEqual(
+      [xau.entryPrice, xau.stopLossPrice, xau.tp3Price],
+      [eur.entryPrice, eur.stopLossPrice, eur.tp3Price],
+    );
+
     // TP3 = +10R before costs; cost = 2.5 pips.
-    //   EURUSD: 2.5 × 0.0001 = 0.00025 price units
-    //   XAUUSD: 2.5 × 0.01   = 0.025   price units
-    // Levels are instrument-independent (same config/candles): the risk
-    // distance is 33.802 pips × 0.0001 = 0.0033802 in both runs — only the
-    // cost conversion differs.
-    const riskDistance = Math.abs((xau.entryPrice ?? 0) - (xau.stopLossPrice ?? 0));
-    assert.ok(Math.abs(riskDistance - 0.0033802) < 1e-9);
-    assert.equal(eur.pnlR, 9.926);
-    assert.equal(xau.pnlR, 2.604);
-    // pnlR is rounded to 4 decimals, so compare the drags with that tolerance.
+    //   EURUSD: 2.5 × 0.0001 = 0.00025 price units → drag 0.0005R → 9.9995R
+    //   XAUUSD: 2.5 × 0.01   = 0.025   price units → drag 0.05R   → 9.95R
+    assert.equal(eur.pnlR, 9.9995);
+    assert.equal(xau.pnlR, 9.95);
     const eurDrag = 10 - (eur.pnlR ?? 0);
     const xauDrag = 10 - (xau.pnlR ?? 0);
-    assert.ok(Math.abs(xauDrag - eurDrag * 100) < 0.01, 'gold cost must be 100× the EURUSD cost');
+    assert.ok(Math.abs(xauDrag - eurDrag * 100) < 1e-9, 'gold cost must be 100× the EURUSD cost');
   });
 
-  test('XAUUSD regression: the reported −729.60R TP3 trade is positive once costs use pip_size', () => {
-    // The reported bug: a gold trade exiting at TP3 showed −729.60R because
-    // cost fields were subtracted as RAW PRICE UNITS. On XAUUSD the pip is
-    // 0.01, so a normal pip policy was 100× too expensive in price units:
-    //   (10R pre-cost) − 2.5/0.0033802 = −729.6012R   ← pre-fix (price units)
-    //   (10R pre-cost) − 0.025/0.0033802 =   +2.604R  ← fixed (2.5 pips × 0.01)
-    // riskDistance 0.0033802 = 33.802 pips × the engine's fixed-buffer conversion.
+  test('XAUUSD regression: M3 levels and costs both use the authoritative pip_size (the −729.60R trade)', () => {
+    // The reported bug had two halves: cost fields were subtracted as RAW
+    // PRICE UNITS, and the 33.802-pip risk buffer was converted with a symbol
+    // heuristic (0.0001) instead of gold's `instrument_risk_specs.pip_size`
+    // (0.01). Both now use the SAME authoritative value:
+    //   levels: 33.802 pips × 0.01 = 0.33802 price units (heuristic: 0.0033802)
+    //   costs:   2.5 pips × 0.01  = 0.025   price units (pre-M6.3: 2.5 raw)
+    //   pnlR = 10R − 0.025/0.33802 = +9.9260R
+    // The old numbers were −729.60R (raw costs on a heuristic-sized risk) and
+    // +2.604R (converted costs, still a 100× too-small risk distance).
     const config = mkConfig(
       [group('Pins', 'AND', [cond('rejection_candle', 'required', 'setup', { direction: 'bullish', minWickBodyRatio: 2 })])],
       { stopLossBuffer: 33.802, tp1Rr: 2, tp2Rr: 5, tp3Rr: 10 },
     );
-    const setup = hourly([NORMAL, BULL_PIN, [100, 100.04, 99.999, 100.01], NORMAL]);
+    const setup = hourly([NORMAL, BULL_PIN, [100, 103.5, 99.999, 103.4], NORMAL]);
     const result = run({
       config,
       setup,
@@ -792,13 +824,35 @@ describe('m6 missing levels, costs and metrics', () => {
       instrument: { assetClass: 'commodity', symbol: 'XAUUSD' },
     });
 
+    assert.equal(result.trades.length, 1);
     const trade = first(result.trades);
     assert.equal(trade.direction, 'long');
+    // Gold levels: 33.802 pips × 0.01 (the DB pip_size), not × 0.0001.
+    assert.equal(trade.entryPrice, 100);
+    assert.ok(Math.abs((trade.stopLossPrice ?? 0) - (100 - 0.33802)) < 1e-9);
+    assert.ok(Math.abs((trade.tp3Price ?? 0) - (100 + 3.3802)) < 1e-9);
     assert.equal(trade.exitReason, 'take_profit_3');
-    assert.equal(trade.pnlR, 2.604);
-    assert.ok((trade.pnlR ?? 0) > 0, 'TP3 must be positive — the -729.60R price-unit cost is gone');
-    assert.equal(result.metrics.totalR, 2.604);
+    assert.equal(trade.pnlR, 9.926);
+    assert.ok((trade.pnlR ?? 0) > 0, 'TP3 must be positive — the -729.60R unit bug is gone');
+    assert.equal(result.metrics.totalR, 9.926);
     assertValidResult(result);
+
+    // The replay hands M3 the same pip size it converts costs with, so the
+    // identical fixture/policy under EURUSD's pip size keeps the same R
+    // outcome (one pip is one pip) while its levels are 100× tighter.
+    const eur = first(
+      run({
+        config,
+        setup,
+        fromMs: closeOf(0),
+        toMs: closeOf(3),
+        direction: 'long',
+        costPolicy: { feePerSide: 0.5, slippagePerSide: 0.25, spread: 1 },
+        pipSize: EURUSD_PIP_SIZE,
+      }).trades,
+    );
+    assert.ok(Math.abs((eur.stopLossPrice ?? 0) - (100 - 0.0033802)) < 1e-9);
+    assert.equal(eur.pnlR, trade.pnlR);
   });
 
   test('riskPerTrade derives currency P&L without changing R', () => {

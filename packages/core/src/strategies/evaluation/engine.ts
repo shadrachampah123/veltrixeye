@@ -20,6 +20,7 @@ import {
   lastPivotLowBelow,
   structuralTarget,
   timeInSession,
+  validPipSize,
   type Candle,
 } from './indicators.js';
 
@@ -35,6 +36,11 @@ import {
  *  - applies rule-group AND/OR logic with top-level AND across groups,
  *  - derives pass/fail per direction from condition classifications,
  *  - fails CLOSED on `insufficient_data`/`unsupported` (see handlers.ts),
+ *  - converts `pips` risk buffers with the instrument's AUTHORITATIVE pip size
+ *    (`instrument_risk_specs.pip_size`, passed in as `pipSize` on the input)
+ *    and only that value — no symbol heuristic exists, and a pips buffer with
+ *    a missing/invalid/zero pip size fails CLOSED for both directions
+ *    (`pct` buffers do not need it),
  *  - derives candidate entry/SL/TP deterministically for `rr_requirement`,
  *  - persists nothing and never touches the clock, database or providers.
  *
@@ -66,7 +72,7 @@ export function createEvaluationEngine(): EvaluationEngine {
 }
 
 function evaluate(input: EvaluationEngineInput): EvaluationEngineResult {
-  const { config, instrument, candles, asOfMs } = input;
+  const { config, instrument, candles, asOfMs, pipSize } = input;
   if (!config.timeframes) throw new Error('engine requires config.timeframes (published versions always have them)');
   if (!config.risk) throw new Error('engine requires config.risk (published versions always have it)');
 
@@ -77,8 +83,20 @@ function evaluate(input: EvaluationEngineInput): EvaluationEngineResult {
     entry: closedCandles(candles.entry, timeframeMinutes(config.timeframes.entry) * 60_000, asOfMs),
   };
 
-  const candidate = deriveCandidate(config.risk, closed.setup, instrument.symbol);
-  if (candidate === null) {
+  // Pip-based level conversion uses the instrument's authoritative pip size
+  // ONLY (`instrument_risk_specs.pip_size`, resolved by EvaluationService /
+  // BacktestService). A `pips` buffer with a missing, invalid or zero pip size
+  // cannot be converted, so it fails CLOSED: no candidate levels are invented,
+  // and neither direction can pass. `pct` buffers never need a pip size.
+  const pipBufferUnresolved = config.risk.stopLossBufferUnit === 'pips' && validPipSize(pipSize) === null;
+  const candidate = deriveCandidate(config.risk, closed.setup, pipSize);
+  if (pipBufferUnresolved) {
+    notes.push(
+      `No candidate levels could be derived: the ${config.risk.stopLossBuffer} ${config.risk.stopLossBufferUnit} ` +
+        `stop-loss buffer requires the instrument pip size (instrument_risk_specs.pip_size), which is missing or ` +
+        `invalid for ${instrument.symbol} — pip-based conversion fails closed.`,
+    );
+  } else if (candidate === null) {
     notes.push(
       'No deterministic candidate entry/stop could be derived at the anchor (insufficient setup history or no structural stop); rr_requirement evaluates as insufficient_data.',
     );
@@ -89,8 +107,8 @@ function evaluate(input: EvaluationEngineInput): EvaluationEngineResult {
     );
   }
 
-  const long = evaluateDirection('long', config, closed, candidate, asOfMs);
-  const short = evaluateDirection('short', config, closed, candidate, asOfMs);
+  const long = evaluateDirection('long', config, closed, candidate, pipBufferUnresolved);
+  const short = evaluateDirection('short', config, closed, candidate, pipBufferUnresolved);
   return { long, short, notes };
 }
 
@@ -107,9 +125,20 @@ function evaluateDirection(
   config: EvaluationEngineInput['config'],
   closed: EvaluationEngineInput['candles'],
   candidate: CandidateLevels | null,
-  _asOfMs: number,
+  /** True when a pips buffer could not be converted for lack of a valid pip size. */
+  pipBufferUnresolved: boolean,
 ): DirectionEvaluation {
   const failureReasons: string[] = [];
+
+  // Fail closed: without the authoritative instrument pip size a `pips` risk
+  // buffer cannot become a price distance, so no direction may pass on levels
+  // that were never derivable.
+  if (pipBufferUnresolved) {
+    failureReasons.push(
+      `risk configuration uses a ${config.risk!.stopLossBuffer} ${config.risk!.stopLossBufferUnit} stop-loss buffer, ` +
+        'but the instrument pip size (instrument_risk_specs.pip_size) is missing or invalid — pip-based levels fail closed',
+    );
+  }
 
   const groups: GroupOutcome[] = config.ruleGroups.map((group) => {
     const conditions: ConditionOutcome[] = group.conditions.map((condition) => {
@@ -230,6 +259,12 @@ function evaluateDirection(
 /**
  * Deterministic candidate levels from the version's risk config (pinned):
  *
+ *  - `pipSize`    = the instrument's authoritative pip size
+ *                   (`instrument_risk_specs.pip_size`). A `pips`
+ *                   `stopLossBuffer` is converted with THAT value and only
+ *                   that value — there is no symbol heuristic, and a missing /
+ *                   invalid / zero pip size makes this function return null
+ *                   (fail closed);
  *  - entry        = close of the last closed setup candle;
  *  - structure SL = most recent confirmed pivot beyond entry (fallback: the
  *                   extreme of the candidate window if strictly beyond entry);
@@ -246,13 +281,17 @@ function evaluateDirection(
 export function deriveCandidate(
   risk: NonNullable<EvaluationEngineInput['config']['risk']>,
   setupClosed: Candle[],
-  symbol: string,
+  pipSize?: number,
 ): CandidateLevels | null {
   if (setupClosed.length < 2) return null;
   const window = setupClosed.slice(-CANDIDATE_WINDOW);
   const entry = setupClosed[setupClosed.length - 1]?.close;
   if (entry === undefined) return null;
-  const buffer = bufferToPrice(risk.stopLossBuffer, risk.stopLossBufferUnit, entry, symbol);
+  // Buffer → price units. `pct` scales off the entry price and does not need a
+  // pip size; `pips` needs the instrument's authoritative pip size and returns
+  // null without one, so the candidate fails closed (never an assumed pip).
+  const buffer = bufferToPrice(risk.stopLossBuffer, risk.stopLossBufferUnit, entry, pipSize);
+  if (buffer === null) return null;
   // PINNED: candidate levels use the LONG convention (stops below entry,
   // rr targets above). rr_requirement only consumes riskDistance and
   // achievableRr, which are direction-neutral; M4 derives per-direction

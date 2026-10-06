@@ -28,8 +28,18 @@ import type { CandleDto } from './ingestion.js';
  * scanners and alerts are later milestones.
  */
 
-/** Pinned identifier stored alongside any future evaluation artifacts. */
-export const DETERMINISTIC_ENGINE_VERSION = 'm3-deterministic-eval-1';
+/**
+ * Pinned identifier stored alongside any future evaluation artifacts.
+ *
+ * Version history:
+ *  - `m3-deterministic-eval-1` — initial deterministic engine;
+ *  - `m3-deterministic-eval-2` — pip-based level conversion is authoritative:
+ *    a `pips` risk buffer converts with the instrument's
+ *    `instrument_risk_specs.pip_size` and ONLY that value (no symbol
+ *    heuristic), and a pips buffer with a missing/invalid/zero pip size fails
+ *    closed. `pct` buffers are unaffected and never need a pip size.
+ */
+export const DETERMINISTIC_ENGINE_VERSION = 'm3-deterministic-eval-2';
 
 /** Hard cap on instruments evaluated in one request (scope "all" is capped). */
 export const MAX_EVALUATION_INSTRUMENTS = 50;
@@ -173,6 +183,16 @@ export interface EvaluationEngineInput {
   /** Published (immutable) version configuration. Treated as read-only. */
   config: StrategyVersionConfig;
   instrument: { assetClass: string; symbol: string };
+  /**
+   * Instrument pip size in price units (`instrument_risk_specs.pip_size`,
+   * M8.2, migration 0017) — the ONLY authoritative source for pip-based M3
+   * level conversion. There is no symbol/quote heuristic anywhere: a `pips`
+   * risk buffer is multiplied by THIS value, and when it is missing,
+   * non-finite or non-positive the direction fails CLOSED (no candidate
+   * levels are invented). `pct` buffers scale off the entry price and never
+   * need it.
+   */
+  pipSize?: number;
   candles: EvaluationCandleSet;
   asOfMs: number;
 }
