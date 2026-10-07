@@ -29,7 +29,9 @@ definition that produced a result is preserved forever.
 Each condition carries `conditionType` (a registry key), `classification`
 (`required`/`optional`/`confirmation`/`disqualifying`), `timeframeRole`,
 and a `params` object (a **complete** snapshot — defaults baked in at
-write).
+write). `params` may also carry `anchorOffsetCandles` (default `0`, see
+"Sequential anchors" below), the one param the ENGINE consumes rather than a
+handler.
 
 ### Candles come from the store — never from a provider
 
@@ -44,7 +46,10 @@ the only clock read in the whole path is the API edge defaulting `asOf` to
 
 `requiredWindows(config)` computes how much history each role needs (base
 120 per role, floors for FVG/supply/demand/HTF, plus every `lookback*`-style
-param, capped at 5000). The service uses it to bound its store queries.
+param and every condition's `anchorOffsetCandles`, capped at 5000). The service
+uses it to bound its store queries; M6 sizes its warm-up and per-role coverage
+windows from the same function, so live evaluation and replay fetch the same
+history.
 
 ## Evaluation semantics
 
@@ -57,6 +62,42 @@ For each instrument in scope, for each direction (`long`, `short`):
    blocks, FVG, supply/demand, sweeps, structure, engulfing direction, …)
    are evaluated **per direction**; `direction: 'either'` may satisfy via
    either side.
+### Sequential anchors — `anchorOffsetCandles`
+
+Every condition type accepts one extra optional param, `anchorOffsetCandles`
+(integer ≥ 0, default **0**), applied by the ENGINE and never by a handler:
+
+- **0** (and absent, which is what every config stored before the param existed
+  contains) evaluates the condition against the latest CLOSED candle of its
+  `timeframeRole` — the pre-`m3-deterministic-eval-3` behaviour, unchanged.
+- **N > 0** evaluates the condition against that role's candle series
+  truncated by N candles: the role's anchor moves back N bars, counted in the
+  role's OWN timeframe. Every other role is untouched, and the handler receives
+  exactly the shape it always did.
+
+This is the minimum needed to express a SEQUENCE on one anchor:
+
+```
+4h liquidity sweep   (timeframeRole htf_bias, anchorOffsetCandles: 1)  ← completed on the previous 4h candle
+1h break & retest    (timeframeRole setup,    anchorOffsetCandles: 0)  ← at the anchor
+15m rejection candle (timeframeRole entry,    anchorOffsetCandles: 0)  ← at the anchor
+```
+
+Without the offset all three legs must hold on the SAME anchor candle, which is
+a different (and stricter) claim than "the sweep came first, then the trigger".
+An offset deeper than the fetched history leaves the handler with too few
+candles, so it reports `insufficient_data` and the direction fails closed —
+never a silent re-anchoring on the latest candle. Candidate levels
+(`rr_requirement`) remain derived at the EVALUATION anchor: they are a property
+of the version's risk config, not of a condition's role series.
+
+`requiredWindows` adds each condition's offset to that condition's role window,
+so `EvaluationService`'s store reads and M6's warm-up/coverage windows
+(`setupCoverageWindow`, `roleCoverageWindow`) fetch the history the offset can
+read. The offset is echoed in the condition outcome's detail
+(`[anchor offset N × 4h]`) so a result can always be traced back to the exact
+candles behind it.
+
 2. A condition outcome is one of:
    - `satisfied` — the condition currently holds.
    - `unsatisfied` — it does not hold (with a deterministic detail string).
@@ -114,7 +155,7 @@ replays, so live evaluation and replay agree.
 
 `evaluate(config, candlesByRoleAndInstrument, asOfMs)` returns a pure
 `EvaluationResultDto` (`@veltrixeye/contracts`, validated by
-`evaluationResultSchema`): `engineVersion` (`m3-deterministic-eval-2`),
+`evaluationResultSchema`): `engineVersion` (`m3-deterministic-eval-3`),
 `asOfMs`, `truncated`, and per instrument `per-direction` outcomes with
 groups, condition outcomes, session-filter outcomes, the optional candidate,
 `failureReasons`, and `notes`. **Nothing is written.** M3 does not insert

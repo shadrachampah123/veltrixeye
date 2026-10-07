@@ -194,7 +194,10 @@ Two independent guards now make that impossible:
 
 - **Coverage is planned per role** (`setupCoverageWindow` /
   `anchorHorizonMs` / `roleCoverageWindow` in
-  `packages/core/src/backtest/engine.ts`). The setup role is loaded first —
+  `packages/core/src/backtest/engine.ts`), from the same `requiredWindows`
+  the live path uses — including every condition's `anchorOffsetCandles`
+  (sequential anchors, `m3-deterministic-eval-3`), so a replay loads the
+  history an offset condition can read. The setup role is loaded first —
   warm-up + `MAX_BACKTEST_STEPS` anchors + the `maxHoldCandles` exit tail —
   because it *defines* the anchors; the bias and entry windows are then
   measured to the last anchor the run will actually evaluate (plus one further
@@ -269,7 +272,7 @@ Because a pips buffer and a pips cost policy both scale with the same pip
 size, R-multiples are now scale-consistent across instruments: the same
 fixture and policy produce the same `pnlR` on EURUSD and XAUUSD (one pip is
 one pip), while their price-unit levels differ by exactly the pip-size ratio.
-The `m3-deterministic-eval-2` engine applies the same rule to live evaluation
+The `m3-deterministic-eval-3` engine applies the same rule to live evaluation
 (`EvaluationService` resolves the identical column), so replay and live agree.
 
 ## HTTP API (Phase 2)

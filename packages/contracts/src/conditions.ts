@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { MAX_CANDLES_PER_REQUEST } from './ingestion.js';
 import type { TimeframeRole } from './timeframes.js';
 
 /**
@@ -59,6 +60,43 @@ const positiveInt = (max = 100000) => z.number().int().positive().max(max);
 
 const lookback = positiveInt(5000);
 
+/** Condition-params key carrying the evaluation-anchor offset. */
+export const ANCHOR_OFFSET_PARAM = 'anchorOffsetCandles';
+
+/**
+ * Optional evaluation-anchor offset, in CANDLES OF THE CONDITION'S OWN ROLE
+ * TIMEFRAME. Default `0` — the latest closed candle, i.e. exactly the
+ * behaviour every config stored before this param existed keeps.
+ *
+ * The ENGINE applies it, never a handler: the condition is evaluated against
+ * its role's candle series with its anchor moved `anchorOffsetCandles` bars
+ * back. It is what lets a coarser prerequisite precede a finer one on the
+ * SAME anchor — e.g. "the 4h liquidity sweep completed on the PREVIOUS closed
+ * 4h candle (offset 1), then the 1h break/retest (offset 0), then the 15m
+ * rejection (offset 0)". An offset deeper than the stored history leaves a
+ * handler with too few candles, so it reports `insufficient_data` and the
+ * direction fails closed — never a silent fallback to the latest candle.
+ *
+ * Bounded by `MAX_CANDLES_PER_REQUEST`: the store can never serve a deeper
+ * series, so a larger offset would be un-evaluable by construction.
+ */
+export const anchorOffsetCandlesSchema = z
+  .number()
+  .int()
+  .min(0)
+  .max(MAX_CANDLES_PER_REQUEST)
+  .default(0);
+
+/**
+ * Defensive read of a stored condition's anchor offset: absent, non-integer,
+ * negative (impossible after registry validation) or non-numeric ⇒ 0.
+ * Shared by the engine and the window math so both read it identically.
+ */
+export function anchorOffsetOf(params: Record<string, unknown> | null | undefined): number {
+  const value = params?.[ANCHOR_OFFSET_PARAM];
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : 0;
+}
+
 /**
  * The condition-type registry.
  *
@@ -79,6 +117,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         side: z.enum(['above', 'below']).default('above'),
         lookbackCandles: z.number().int().min(1).max(1000).default(100),
         minWickRatio: z.number().min(0).max(1).default(0.3),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -94,6 +133,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         direction: direction.default('either'),
         lookbackCandles: lookback.default(200),
         requireDisplacement: z.boolean().default(false),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -108,6 +148,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
       .object({
         direction: direction.default('either'),
         lookbackCandles: lookback.default(200),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -124,6 +165,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         direction: direction.default('either'),
         maxRetestCandles: positiveInt(100).default(24),
         retestTolerancePct: z.number().positive().max(10).default(0.1),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -140,6 +182,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         kind: z.enum(['bullish', 'bearish']).default('bullish'),
         validation: z.enum(['mitigation', 'break']).default('mitigation'),
         maxAgeCandles: positiveInt(500).default(100),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -155,6 +198,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         kind: z.enum(['bullish', 'bearish']).default('bullish'),
         minGapSizePct: z.number().positive().max(10).optional(),
         requireMitigation: z.boolean().default(true),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -169,6 +213,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
       .object({
         minTouches: z.number().int().min(2).max(50).default(2),
         lookbackCandles: lookback.default(500),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -183,6 +228,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
       .object({
         minTouches: z.number().int().min(2).max(50).default(2),
         lookbackCandles: lookback.default(500),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -197,6 +243,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
       .object({
         source: z.enum(['swing_high', 'order_block', 'consolidation']).default('swing_high'),
         minTouches: z.number().int().min(1).max(50).default(1),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -211,6 +258,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
       .object({
         source: z.enum(['swing_low', 'order_block', 'consolidation']).default('swing_low'),
         minTouches: z.number().int().min(1).max(50).default(1),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -225,6 +273,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
       .object({
         direction: z.enum(['bullish', 'bearish']).default('bullish'),
         minWickBodyRatio: z.number().positive().max(20).default(2),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -239,6 +288,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
       .object({
         direction: direction.default('either'),
         minBodyRatio: z.number().min(0).max(10).optional(),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -254,6 +304,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         direction: direction.default('either'),
         atrPeriod: z.number().int().min(2).max(100).default(14),
         minAtrMultiple: z.number().positive().max(100).default(1.5),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -267,6 +318,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
     paramSchema: z
       .object({
         minRr: z.number().positive().max(100).default(2),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -282,6 +334,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         sessions: z.array(z.enum(['asia', 'london', 'new_york', 'sydney'])).min(1).default(['asia', 'london', 'new_york', 'sydney']),
         mode: z.enum(['include', 'exclude']).default('include'),
         timezone: z.enum(['utc', 'exchange']).default('exchange'),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -297,6 +350,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         maxImportance: z.enum(['low', 'medium', 'high']).default('high'),
         beforeMinutes: z.number().int().min(0).max(720).default(30),
         afterMinutes: z.number().int().min(0).max(720).default(30),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),
@@ -313,6 +367,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         period: z.number().int().min(2).max(200).default(14),
         min: z.number().min(0).max(1e6).default(0),
         max: z.number().positive().optional(),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({})
@@ -332,6 +387,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
       .object({
         max: z.number().positive(),
         unit: z.enum(['pips', 'pct']).default('pips'),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict(),
   },
@@ -345,6 +401,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
       .object({
         direction: direction.default('either'),
         source: z.enum(['trend', 'structure', 'bias']).default('structure'),
+        anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
       .default({}),

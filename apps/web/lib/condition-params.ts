@@ -102,8 +102,26 @@ export const CONDITION_PARAM_DESCRIPTORS: Record<string, ParamDescriptor[]> = {
   ],
 };
 
+/**
+ * Sequential anchors are supported by the engine on EVERY condition type
+ * (`anchorOffsetCandles`, contract default 0 = the latest closed candle), so
+ * the control is appended to every type's descriptors instead of being
+ * repeated in all 19 entries: 0 keeps a condition on the anchor candle, 1
+ * evaluates it one candle of ITS OWN role timeframe earlier — enough to make
+ * a 4h liquidity sweep a prerequisite of a 1h break/retest at the same anchor.
+ */
+const ANCHOR_OFFSET_DESCRIPTOR: ParamDescriptor = {
+  key: 'anchorOffsetCandles',
+  label: 'Anchor offset (candles)',
+  kind: 'number',
+  default: 0,
+  step: 1,
+  min: 0,
+  max: 5000,
+};
+
 export function descriptorsFor(type: string): ParamDescriptor[] {
-  return CONDITION_PARAM_DESCRIPTORS[type] ?? [];
+  return [...(CONDITION_PARAM_DESCRIPTORS[type] ?? []), ANCHOR_OFFSET_DESCRIPTOR];
 }
 
 /** Build a params object from defaults for a condition type. */

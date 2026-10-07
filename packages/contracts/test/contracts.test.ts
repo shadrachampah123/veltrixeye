@@ -23,6 +23,8 @@ import {
   CONDITION_CLASSIFICATIONS,
   listConditionTypes,
   getConditionType,
+  anchorOffsetOf,
+  ANCHOR_OFFSET_PARAM,
   strategyConditionSchema,
   riskConfigurationSchema,
   marketScopeSchema,
@@ -168,6 +170,27 @@ test('conditions: param schemas validate type-specific values', () => {
   const vol = getConditionType('volatility_filter')!;
   assert.equal(vol.paramSchema.safeParse({ min: 1, max: 0.5 }).success, false); // max <= min
   assert.equal(vol.paramSchema.safeParse({ min: 0.5, max: 2 }).success, true);
+});
+
+test('conditions: anchorOffsetCandles is optional, integer, >= 0 and defaults to 0 on every type', () => {
+  for (const def of listConditionTypes()) {
+    // `spread_filter` has no default for `max`; every other type accepts {}.
+    const base = def.type === 'spread_filter' ? { max: 2 } : {};
+    const parsed = def.paramSchema.parse(base) as Record<string, unknown>;
+    assert.equal(parsed[ANCHOR_OFFSET_PARAM], 0, `${def.type} must default the anchor offset to 0`);
+    assert.equal(def.paramSchema.safeParse({ ...base, [ANCHOR_OFFSET_PARAM]: 3 }).success, true, def.type);
+    assert.equal(def.paramSchema.safeParse({ ...base, [ANCHOR_OFFSET_PARAM]: -1 }).success, false, def.type);
+    assert.equal(def.paramSchema.safeParse({ ...base, [ANCHOR_OFFSET_PARAM]: 1.5 }).success, false, def.type);
+    assert.equal(def.paramSchema.safeParse({ ...base, [ANCHOR_OFFSET_PARAM]: '1' }).success, false, def.type);
+  }
+  // Bounded by what the candle store can serve.
+  const sweep = getConditionType('liquidity_sweep')!;
+  assert.equal(sweep.paramSchema.safeParse({ [ANCHOR_OFFSET_PARAM]: 5000 }).success, true);
+  assert.equal(sweep.paramSchema.safeParse({ [ANCHOR_OFFSET_PARAM]: 5001 }).success, false);
+  // Defensive reader shared by the engine and the window math.
+  assert.equal(anchorOffsetOf({ [ANCHOR_OFFSET_PARAM]: 2 }), 2);
+  assert.equal(anchorOffsetOf({}), 0);
+  assert.equal(anchorOffsetOf(undefined), 0);
 });
 
 test('conditions: strategyConditionSchema enforces the registry + classification', () => {

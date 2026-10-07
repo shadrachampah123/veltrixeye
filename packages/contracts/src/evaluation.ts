@@ -37,9 +37,18 @@ import type { CandleDto } from './ingestion.js';
  *    a `pips` risk buffer converts with the instrument's
  *    `instrument_risk_specs.pip_size` and ONLY that value (no symbol
  *    heuristic), and a pips buffer with a missing/invalid/zero pip size fails
- *    closed. `pct` buffers are unaffected and never need a pip size.
+ *    closed. `pct` buffers are unaffected and never need a pip size;
+ *  - `m3-deterministic-eval-3` — sequential anchors: a condition's optional
+ *    `anchorOffsetCandles` (integer ≥ 0, default 0) makes the ENGINE evaluate
+ *    it against its own role's candle series shifted that many candles back,
+ *    so a coarser prerequisite (e.g. a 4h liquidity sweep) can precede finer
+ *    legs (1h break/retest, 15m rejection) at the same anchor. `0` is the
+ *    latest closed candle — the exact pre-offset behaviour, so every config
+ *    stored without the param evaluates identically. Handlers are unchanged
+ *    (they never see the offset) and an offset deeper than the fetched history
+ *    fails closed as `insufficient_data`.
  */
-export const DETERMINISTIC_ENGINE_VERSION = 'm3-deterministic-eval-2';
+export const DETERMINISTIC_ENGINE_VERSION = 'm3-deterministic-eval-3';
 
 /** Hard cap on instruments evaluated in one request (scope "all" is capped). */
 export const MAX_EVALUATION_INSTRUMENTS = 50;
