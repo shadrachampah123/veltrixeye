@@ -73,6 +73,13 @@ Note: the registry stores **definitions only** — no detection logic. The
 M1 param schemas encode the *shape* of what a future engine will need
 (e.g. `liquidity_sweep.side: above|below`, `news_filter.maxImportance`).
 
+Every type's param schema also accepts the shared, optional
+`anchorOffsetCandles` (integer ≥ 0, default **0**): the M3 engine evaluates
+that condition against its role's candle series shifted that many candles
+back, which is how a sequential multi-timeframe setup is expressed
+(4h sweep at offset `1` → 1h break/retest and 15m rejection at offset `0`).
+See `docs/strategy-engine-contract.md` → "Sequential anchors".
+
 ## Classifications
 
 Every persisted condition carries one of:

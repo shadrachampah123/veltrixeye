@@ -1,7 +1,9 @@
 import {
   DETERMINISTIC_ENGINE_VERSION,
+  anchorOffsetOf,
   getConditionType,
   timeframeMinutes,
+  type ConditionTimeframeRole,
   type CandleDto,
   type DirectionEvaluation,
   type EvaluationEngine,
@@ -33,6 +35,13 @@ import {
  *    frozen by DB triggers — the engine only ever reads it),
  *  - evaluates only candles that are CLOSED at the anchor
  *    (`time + period ≤ asOfMs`),
+ *  - honours each condition's optional `anchorOffsetCandles`
+ *    (`m3-deterministic-eval-3`): the condition is evaluated against ITS
+ *    role's candle series with the anchor moved that many candles of that
+ *    role's timeframe back, so a coarser prerequisite (e.g. a 4h sweep on the
+ *    previous closed 4h candle) can precede finer ones on the same anchor.
+ *    `0` — every config stored before the param existed — is the latest closed
+ *    candle, byte-identical to the pre-offset behaviour,
  *  - applies rule-group AND/OR logic with top-level AND across groups,
  *  - derives pass/fail per direction from condition classifications,
  *  - fails CLOSED on `insufficient_data`/`unsupported` (see handlers.ts),
@@ -63,6 +72,55 @@ import {
 const CANDIDATE_WINDOW = 50;
 /** ATR period pinned for ATR-based candidate stops. */
 const CANDIDATE_ATR_PERIOD = 14;
+
+/**
+ * The candle role a condition actually reads.
+ *
+ * `timeframeRole: 'any'` means the SETUP role (its evaluation convention),
+ * except htf_alignment which means the HTF/bias role. Exported so callers
+ * that must size or validate role coverage (M6 backtest) use the SAME mapping
+ * as the engine and the warm-up windows — there is exactly one role
+ * convention.
+ */
+export function conditionRole(condition: {
+  conditionType: string;
+  timeframeRole: ConditionTimeframeRole;
+}): 'htf_bias' | 'setup' | 'entry' {
+  return condition.timeframeRole === 'any'
+    ? condition.conditionType === 'htf_alignment'
+      ? 'htf_bias'
+      : 'setup'
+    : condition.timeframeRole === 'htf_bias'
+      ? 'htf_bias'
+      : condition.timeframeRole === 'entry'
+        ? 'entry'
+        : 'setup';
+}
+
+/**
+ * The candle set ONE condition is evaluated against.
+ *
+ * With `anchorOffsetCandles: 0` (the default for every config stored before
+ * the param existed) this is the anchor set, unchanged. With a positive offset
+ * the series of the role the condition READS is truncated by that many candles
+ * — the role's anchor moves back `offset` bars — and every other role is
+ * untouched, so a handler keeps receiving exactly the shape it always did.
+ *
+ * An offset deeper than the available history yields a shorter (possibly
+ * empty) series, which a handler reports as `insufficient_data`: fail closed,
+ * never a silent re-anchoring on the latest candle. Candidate levels
+ * (`rr_requirement`) stay derived at the EVALUATION anchor — they are a
+ * property of the version's risk config, not of a condition's role series.
+ */
+function conditionCandles(
+  closed: EvaluationEngineInput['candles'],
+  role: 'htf_bias' | 'setup' | 'entry',
+  offset: number,
+): EvaluationEngineInput['candles'] {
+  if (offset <= 0) return closed;
+  const series = closed[role];
+  return { ...closed, [role]: series.slice(0, Math.max(0, series.length - offset)) };
+}
 
 export function createEvaluationEngine(): EvaluationEngine {
   return {
@@ -165,8 +223,14 @@ function evaluateDirection(
       if (!handler) {
         return { ...base, status: 'unsupported', detail: `no handler registered for "${condition.conditionType}"` };
       }
+      // Sequential anchors: the condition is evaluated against its role's
+      // series shifted `anchorOffsetCandles` bars back (0 = the latest closed
+      // candle). Handlers are untouched — they still receive one candle set
+      // and read a single role from it.
+      const offset = anchorOffsetOf(condition.params);
+      const role = conditionRole(condition);
       const result = handler({
-        candles: closed,
+        candles: conditionCandles(closed, role, offset),
         timeframeRole: condition.timeframeRole,
         params,
         direction,
@@ -174,7 +238,17 @@ function evaluateDirection(
         asOfMs: 0, // handlers are anchor-independent; the anchor filtered the candles
         candidate,
       });
-      return { ...base, status: result.status, detail: result.detail };
+      return {
+        ...base,
+        status: result.status,
+        // The offset is part of the outcome so a result can always be read
+        // back to the exact candles it was computed from (offset 0 — every
+        // pre-existing config — keeps the historical detail string verbatim).
+        detail:
+          offset > 0
+            ? `${result.detail} [anchor offset ${offset} × ${config.timeframes![role]}]`
+            : result.detail,
+      };
     });
 
     const satisfied =

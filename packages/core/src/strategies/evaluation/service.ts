@@ -1,11 +1,11 @@
 import type pg from 'pg';
 import {
   MAX_EVALUATION_INSTRUMENTS,
+  anchorOffsetOf,
   timeframeMinutes,
   type EvaluationEngine,
   type EvaluationResultDto,
   type InstrumentEvaluation,
-  type ConditionTimeframeRole,
   type NormalizedInstrument,
   type StrategyVersionConfig,
   type Timeframe,
@@ -13,8 +13,10 @@ import {
 import { Errors } from '../../errors.js';
 import type { StrategyService } from '../strategies.js';
 import type { CandleStore } from '../../market-data/candles.js';
-import { createEvaluationEngine } from './engine.js';
+import { conditionRole, createEvaluationEngine } from './engine.js';
 import { validPipSize } from './indicators.js';
+
+export { conditionRole };
 
 /**
  * Evaluation service (M3) — the ONLY boundary between the HTTP layer and the
@@ -77,7 +79,8 @@ export class EvaluationService {
     const { instruments, truncated } = await this.resolveInstruments(config);
 
     // Per-role candle windows: the largest lookback any condition assigned to
-    // that role can ask for, plus margin, clamped to the store's 5000 cap.
+    // that role can ask for, plus its `anchorOffsetCandles` (sequential
+    // anchors), plus margin, clamped to the store's 5000 cap.
     const windows = requiredWindows(config);
 
     const instrumentsOut: InstrumentEvaluation[] = [];
@@ -209,32 +212,17 @@ const TYPE_WINDOW_FLOOR: Record<string, number> = {
 };
 
 /**
- * The candle role a condition actually reads.
- *
- * `timeframeRole: 'any'` means the SETUP role (its evaluation convention),
- * except htf_alignment which means the HTF/bias role. Exported so callers
- * that must size or validate role coverage (M6 backtest) use the SAME mapping
- * as the warm-up windows below — there is exactly one role convention.
- */
-export function conditionRole(condition: {
-  conditionType: string;
-  timeframeRole: ConditionTimeframeRole;
-}): 'htf_bias' | 'setup' | 'entry' {
-  return condition.timeframeRole === 'any'
-    ? condition.conditionType === 'htf_alignment'
-      ? 'htf_bias'
-      : 'setup'
-    : condition.timeframeRole === 'htf_bias'
-      ? 'htf_bias'
-      : condition.timeframeRole === 'entry'
-        ? 'entry'
-        : 'setup';
-}
-
-/**
  * Largest candle count any condition assigned to a role may consume.
  * `timeframeRole: 'any'` counts toward the SETUP role (its evaluation
  * convention), except htf_alignment which counts toward htf_bias.
+ *
+ * A condition's `anchorOffsetCandles` (the engine evaluates it against its
+ * role's series shifted that many candles back) is added on top of its own
+ * lookback, so the fetched window still covers the deepest candle the
+ * condition can read. Every caller that sizes history from this function —
+ * `EvaluationService`'s store reads and M6's warm-up/coverage windows — gets
+ * the offset for free; the engine's `conditionRole` is the single role
+ * convention they all share.
  */
 export function requiredWindows(config: StrategyVersionConfig): Record<'htf_bias' | 'setup' | 'entry', number> {
   const windows: Record<'htf_bias' | 'setup' | 'entry', number> = {
@@ -252,7 +240,9 @@ export function requiredWindows(config: StrategyVersionConfig): Record<'htf_bias
         if (typeof v === 'number' && Number.isFinite(v) && v > need) need = v;
       }
       // displacement checks add ATR(14) context; break_retest scans its window.
-      const total = Math.min(MAX_WINDOW_CANDLES, Math.ceil(need) + WINDOW_MARGIN);
+      // Sequential anchors read `offset` candles BEFORE the deepest lookback,
+      // so the offset is part of the history this role must have fetched.
+      const total = Math.min(MAX_WINDOW_CANDLES, Math.ceil(need) + anchorOffsetOf(params) + WINDOW_MARGIN);
       if (total > windows[roleForWindow]) windows[roleForWindow] = total;
     }
   }
