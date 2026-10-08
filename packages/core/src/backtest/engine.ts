@@ -14,6 +14,7 @@ import type {
   BacktestTrade,
   CandleDto,
   DirectionEvaluation,
+  SetupQualityScore,
   StrategyVersionConfig,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
@@ -46,8 +47,13 @@ import { scoreSetupQuality } from '../scoring/engine.js';
  *    series that is empty or already exhausted fails the run closed
  *    (see `assertRoleCoverage`) — a stale prefix is never replayed as
  *    current data;
- *  - a passing M3 direction becomes an in-memory setup via `detectionLevels`
- *    and is scored via `scoreSetupQuality` at the anchor;
+ *  - a passing M3 direction is scored via `scoreSetupQuality` at the anchor
+ *    and gated by the published version's `risk.minQualityScore` — the SAME
+ *    gate `AlertService.generateAlert` enforces live — BEFORE it becomes an
+ *    in-memory setup: a below-minimum setup is not counted in
+ *    `setupsDetected` and produces no trade (not even a `no_levels` row);
+ *  - a setup that clears the gate becomes an in-memory trade via
+ *    `detectionLevels`;
  *  - entry is the signal-candle close (`signal_close`); exits are tracked
  *    candle-by-candle on the setup timeframe only;
  *  - a candle touching BOTH stop and target resolves to the stop
@@ -63,7 +69,8 @@ import { scoreSetupQuality } from '../scoring/engine.js';
  *  - R-multiples are primary; currency P&L exists only with `riskPerTrade`.
  *
  * Metrics denominators (pinned):
- *  - `setupsDetected` counts EVERY qualifying signal, including `no_levels`;
+ *  - `setupsDetected` counts every qualifying signal that ALSO clears the
+ *    version's `minQualityScore` gate, including `no_levels`;
  *  - `tradesClosed` counts trades with any exit except `no_levels`;
  *  - `wins` = closed trades with `pnlR > 0`, `losses` = `pnlR < 0`
  *    (breakeven `pnlR === 0` counts in neither, but in all denominators);
@@ -142,6 +149,17 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
   const engine = createEvaluationEngine();
   const trades: BacktestTrade[] = [];
   let noLevels = 0;
+  /**
+   * The published version's alert gate, read from the SAME config the live
+   * path reads (`AlertService.generateAlert` compares the M5 total against
+   * `version.config.risk.minQualityScore`). A qualifying setup that scores
+   * below it never becomes a simulated trade — backtest qualification must
+   * match the live alert gate, so a setup live would never alert on is never
+   * counted here. The schema defaults the field, so `?? 0` only guards a
+   * hand-built config (0 = no gate, the historical behaviour).
+   */
+  const minQualityScore = config.risk.minQualityScore ?? 0;
+  let gatedByQuality = 0;
 
   // M6.2: only roles the version reads can make a replay stale. The setup
   // role is the anchor source — it is covered at its own anchor by
@@ -181,6 +199,21 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
       if (!dirEval.passed) continue;
       const signal = setupPrefix[setupPrefix.length - 1];
       if (!signal) continue; // unreachable for publishable configs (a pass needs candles)
+      // M6-backtest-5 score gate: the M5 quality score is computed at the
+      // anchor and compared against the version's `minQualityScore` BEFORE
+      // any level derivation or trade simulation — a below-minimum setup is
+      // skipped entirely (no trade, no `no_levels` row, no `setupsDetected`
+      // count), exactly as the live alert gate would silence it.
+      const score = scoreSetupQuality({
+        evaluation: dirEval,
+        minRr: config.risk.minRr,
+        takeProfitMethod: config.risk.takeProfitMethod,
+        asOfMs: anchor,
+      });
+      if (score.total < minQualityScore) {
+        gatedByQuality += 1;
+        continue;
+      }
       const trade = simulateTrade({
         seq: trades.length,
         direction,
@@ -191,7 +224,7 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
         setupPeriodMs,
         toMs,
         dirEval,
-        minRr: config.risk.minRr,
+        score,
         takeProfitMethod: config.risk.takeProfitMethod,
         exitPolicy,
         costPolicy,
@@ -200,6 +233,13 @@ export function runBacktest(input: BacktestEngineInput): BacktestEngineResult {
       if (trade.exitReason === 'no_levels') noLevels += 1;
       trades.push(trade);
     }
+  }
+
+  if (gatedByQuality > 0) {
+    notes.push(
+      `${gatedByQuality} qualifying setup(s) scored below the version's minQualityScore (${minQualityScore}) ` +
+        `and were not simulated — the same gate live alerts enforce.`,
+    );
   }
 
   if (warmingUp > 0) {
@@ -500,7 +540,12 @@ interface TradeSimulationInput {
   setupPeriodMs: number;
   toMs: number;
   dirEval: DirectionEvaluation;
-  minRr: number;
+  /**
+   * The M5 quality score computed at the anchor by the caller — already
+   * gated by the version's `minQualityScore` (m6-backtest-5). Simulating a
+   * trade never re-scores: one anchor, one score, one gate.
+   */
+  score: SetupQualityScore;
   takeProfitMethod: NonNullable<StrategyVersionConfig['risk']>['takeProfitMethod'];
   exitPolicy: BacktestExitPolicy;
   costPolicy: BacktestCostPolicy;
@@ -512,18 +557,15 @@ interface TradeSimulationInput {
 }
 
 /**
- * Simulate one qualifying setup: pure M4 levels + pure M5 score, then a
- * candle-by-candle exit scan over the setup candles strictly AFTER the
- * signal and closed within the range. Overlapping trades are independent —
- * each signal gets its own scan (no position netting in M6 core).
+ * Simulate one QUALIFIED setup (M3 passed AND the version's `minQualityScore`
+ * gate cleared — the caller scored and gated it): pure M4 levels over the M3
+ * candidate, then a candle-by-candle exit scan over the setup candles
+ * strictly AFTER the signal and closed within the range. Overlapping trades
+ * are independent — each signal gets its own scan (no position netting in
+ * M6 core).
  */
 function simulateTrade(t: TradeSimulationInput): BacktestTrade {
-  const score = scoreSetupQuality({
-    evaluation: t.dirEval,
-    minRr: t.minRr,
-    takeProfitMethod: t.takeProfitMethod,
-    asOfMs: t.anchor,
-  });
+  const score = t.score;
   const levels = detectionLevels(t.dirEval.candidate, t.direction);
   const base = {
     seq: t.seq,

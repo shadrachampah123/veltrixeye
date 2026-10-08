@@ -88,7 +88,7 @@ function validRun(overrides: Record<string, unknown> = {}) {
 
 describe('m6 backtest contracts', () => {
   test('engine identity and bounds are pinned', () => {
-    assert.equal(BACKTEST_ENGINE_VERSION, 'm6-backtest-4');
+    assert.equal(BACKTEST_ENGINE_VERSION, 'm6-backtest-5');
     assert.equal(MAX_BACKTEST_STEPS, 4500);
     assert.equal(MAX_BACKTEST_INSTRUMENTS_PER_CALL, 1);
     assert.equal(DEFAULT_MAX_HOLD_CANDLES, 100);

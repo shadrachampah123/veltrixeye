@@ -1189,3 +1189,155 @@ describe('m6 look-ahead protection', () => {
     assert.deepEqual(run({ ...baseOpts(), setup: withDupes }), run({ ...baseOpts(), setup: modified }));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Quality-score gate (m6-backtest-5): qualification matches the live alert gate
+// ---------------------------------------------------------------------------
+
+describe('m6-backtest-5 minQualityScore gate', () => {
+  /**
+   * Scores exactly 60 (grade "ignore"): the required volatility filter is
+   * satisfied and the single confirmation (a bearish pin) is not, so the
+   * confirmation component earns 0 of 15 — 25 + 0 + 20 + 0 + 0 + 10 + 5 = 60.
+   * `mkConfig`'s default `minQualityScore` is 65.
+   */
+  const score60 = () =>
+    mkConfig([
+      group('Mixed', 'OR', [
+        cond('volatility_filter', 'required', 'setup', { metric: 'body_range', period: 2, min: 0 }),
+        cond('rejection_candle', 'confirmation', 'setup', { direction: 'bearish', minWickBodyRatio: 2 }),
+      ]),
+    ]);
+
+  /**
+   * Scores exactly 65 (grade "C"): one of two confirmations is satisfied
+   * (7.5 of 15) and `minRr: 4` exceeds the achievable 3R (completeness 7.5
+   * of 10) — 25 + 7.5 + 20 + 0 + 0 + 7.5 + 5 = 65.
+   */
+  const score65 = () =>
+    mkConfig(
+      [
+        group('Mixed', 'OR', [
+          cond('volatility_filter', 'required', 'setup', { metric: 'body_range', period: 2, min: 0 }),
+          cond('rejection_candle', 'confirmation', 'setup', { direction: 'bullish', minWickBodyRatio: 2 }),
+          cond('rejection_candle', 'confirmation', 'setup', { direction: 'bearish', minWickBodyRatio: 2 }),
+        ]),
+      ],
+      { minRr: 4 },
+    );
+
+  /** One qualifying long at closeOf(1) (the bull pin); anchor closeOf(0) is warm-up. */
+  const signalCandles = () => hourly([NORMAL, BULL_PIN, NORMAL]);
+
+  test('score 60 with minQualityScore 65 is rejected (not counted, not simulated)', () => {
+    const result = run({
+      config: score60(),
+      setup: signalCandles(),
+      fromMs: closeOf(0),
+      toMs: closeOf(2),
+      direction: 'long',
+    });
+    // Anchors still evaluate; the qualifying setup is gated before simulation.
+    assert.equal(result.stepsEvaluated, 2);
+    assert.equal(result.trades.length, 0);
+    assert.equal(result.metrics.setupsDetected, 0);
+    assert.equal(result.metrics.tradesClosed, 0);
+    assert.equal(result.metrics.totalR, 0);
+    assert.ok(result.notes.some((n) => n.includes("below the version's minQualityScore (65)")));
+    assertValidResult(result);
+  });
+
+  test('score 65 with minQualityScore 65 is accepted (the gate is inclusive)', () => {
+    const result = run({
+      config: score65(),
+      setup: signalCandles(),
+      fromMs: closeOf(0),
+      toMs: closeOf(2),
+      direction: 'long',
+    });
+    assert.equal(result.stepsEvaluated, 2);
+    assert.equal(result.trades.length, 1);
+    const trade = first(result.trades);
+    assert.equal(trade.qualityScore, 65);
+    assert.equal(trade.qualityGrade, 'C');
+    assert.equal(trade.entryPrice, 100);
+    assert.equal(trade.stopLossPrice, 99.999);
+    assert.equal(result.metrics.setupsDetected, 1);
+    assert.equal(result.metrics.tradesClosed, 1);
+    assertValidResult(result);
+  });
+
+  test('the enforced threshold is read from the version config, not hardcoded', () => {
+    // The same 60-scoring setup is accepted when the published config says 60
+    // (60 >= 60 — the live gate is inclusive)…
+    const accepted = run({
+      config: mkConfig(score60().ruleGroups, { minQualityScore: 60 }),
+      setup: signalCandles(),
+      fromMs: closeOf(0),
+      toMs: closeOf(2),
+      direction: 'long',
+    });
+    assert.equal(accepted.trades.length, 1);
+    assert.equal(first(accepted.trades).qualityScore, 60);
+    assert.equal(accepted.metrics.setupsDetected, 1);
+
+    // …and the 65-scoring setup is rejected when the config says 66.
+    const rejected = run({
+      config: mkConfig(score65().ruleGroups, { minQualityScore: 66, minRr: 4 }),
+      setup: signalCandles(),
+      fromMs: closeOf(0),
+      toMs: closeOf(2),
+      direction: 'long',
+    });
+    assert.equal(rejected.trades.length, 0);
+    assert.equal(rejected.metrics.setupsDetected, 0);
+    assert.ok(rejected.notes.some((n) => n.includes("below the version's minQualityScore (66)")));
+  });
+
+  test('the gate runs before level derivation: below-minimum setups record no no_levels rows', () => {
+    // ATR stops need 15+ candles, so 6 flat candles give a null candidate at
+    // every anchor — pre-gate these setups were recorded as no_levels trades.
+    const gated = run({
+      config: mkConfig(score60().ruleGroups, { stopLossMethod: 'atr' }),
+      setup: flat(6),
+      fromMs: closeOf(0),
+      toMs: closeOf(5) + 1,
+      direction: 'long',
+    });
+    assert.equal(gated.trades.length, 0);
+    assert.equal(gated.metrics.setupsDetected, 0);
+    assert.ok(gated.notes.some((n) => n.includes("below the version's minQualityScore (65)")));
+
+    // The identical setup with the gate opened (minQualityScore 0) records the
+    // very same setups — as no_levels — proving the gate, not level
+    // derivation, removed them.
+    const ungated = run({
+      config: mkConfig(score60().ruleGroups, { stopLossMethod: 'atr', minQualityScore: 0 }),
+      setup: flat(6),
+      fromMs: closeOf(0),
+      toMs: closeOf(5) + 1,
+      direction: 'long',
+    });
+    assert.equal(ungated.trades.length, 5);
+    for (const trade of ungated.trades) {
+      assert.equal(trade.exitReason, 'no_levels');
+      assert.equal(trade.qualityScore, 53);
+    }
+    assert.equal(ungated.metrics.setupsDetected, 5);
+    assert.equal(ungated.metrics.tradesClosed, 0);
+  });
+
+  test('setups meeting the configured minimum keep their existing behaviour', () => {
+    // The pin fixture scores 75 (B) against the default minimum 65: the gate
+    // is a no-op for it — same trades, same scores, same counts.
+    const setup = hourly([NORMAL, BULL_PIN, NORMAL, NORMAL]);
+    const result = run({ config: longPins(), setup, fromMs: closeOf(0), toMs: closeOf(3), direction: 'long' });
+    assert.ok(result.trades.length > 0);
+    for (const trade of result.trades) {
+      assert.equal(trade.qualityScore, 75);
+      assert.equal(trade.qualityGrade, 'B');
+    }
+    assert.equal(result.metrics.setupsDetected, result.trades.length);
+    assertValidResult(result);
+  });
+});

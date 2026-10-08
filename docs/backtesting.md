@@ -33,8 +33,10 @@ recorded transactionally.
   exactly live semantics.
 - Derives entry/stop/targets through the **real M4 math**
   (`detectionLevels` over the M3 candidate), scores every setup through the
-  **real M5 engine** (`scoreSetupQuality`), and enters at the signal-candle
-  close (`entryTiming: 'signal_close'`).
+  **real M5 engine** (`scoreSetupQuality`), and **gates qualification on the
+  published version's `risk.minQualityScore`** — the same gate live alerts
+  enforce — before a setup is counted or simulated, and enters at the
+  signal-candle close (`entryTiming: 'signal_close'`).
 - Exits on the setup timeframe in pinned order — stop, then target, then
   max-hold, then range end — with same-candle ties resolving to the stop
   (`sameCandleRule: 'stop_first'`); equality with a level counts as a touch.
@@ -127,13 +129,15 @@ on top of the Phase 2 API — no engine, service or schema change.
 
 ## Engine contract
 
-Pinned as **`m6-backtest-4`** (`BACKTEST_ENGINE_VERSION` in
+Pinned as **`m6-backtest-5`** (`BACKTEST_ENGINE_VERSION` in
 `@veltrixeye/contracts`), stored on every run row. Any change to anchors,
-evaluation, coverage, exits, costs, or metrics requires a new version string
-(`m6-backtest-1` → `m6-backtest-2` is the M6.2 long-window coverage fix;
-`m6-backtest-2` → `m6-backtest-3` is the instrument-aware cost-unit fix;
-`m6-backtest-3` → `m6-backtest-4` threads the authoritative pip size into M3
-level derivation — see "Pip-authoritative levels" below).
+evaluation, coverage, qualification, exits, costs, or metrics requires a new
+version string (`m6-backtest-1` → `m6-backtest-2` is the M6.2 long-window
+coverage fix; `m6-backtest-2` → `m6-backtest-3` is the instrument-aware
+cost-unit fix; `m6-backtest-3` → `m6-backtest-4` threads the authoritative pip
+size into M3 level derivation — see "Pip-authoritative levels" below;
+`m6-backtest-4` → `m6-backtest-5` enforces the version's `minQualityScore`
+gate on qualifying setups — see "Quality-score gate" below).
 
 Bounds (pinned in contracts, none configurable):
 
@@ -274,6 +278,40 @@ fixture and policy produce the same `pnlR` on EURUSD and XAUUSD (one pip is
 one pip), while their price-unit levels differ by exactly the pip-size ratio.
 The `m3-deterministic-eval-3` engine applies the same rule to live evaluation
 (`EvaluationService` resolves the identical column), so replay and live agree.
+
+## Quality-score gate (engine `m6-backtest-5`)
+
+Pre-`m6-backtest-5`, the replay scored every qualifying setup with the real M5
+engine but never enforced the published version's `risk.minQualityScore`:
+the score was recorded on the trade and shown in the UI ("min score 65"), yet a
+setup scoring below the minimum was still counted in `setupsDetected` and
+simulated as a trade. Live, `AlertService.generateAlert` DOES gate on
+`score.total >= version.config.risk.minQualityScore` — so backtest
+qualification disagreed with the alert gate it was supposed to measure.
+
+Now the replay applies the identical gate, in the same order:
+
+1. M3 evaluates the anchor (unchanged);
+2. the passing direction is scored with the real M5 engine
+   (`scoreSetupQuality`) at the anchor — one score per setup, computed once;
+3. `score.total < config.risk.minQualityScore` ⇒ the setup is **skipped
+   entirely**: no trade row (not even a `no_levels` row) and no
+   `setupsDetected` count — exactly the silence the live gate produces;
+4. only a setup that clears the gate proceeds to M4 level derivation and the
+   exit simulation.
+
+The threshold is read from the published version config (the immutable row
+the run replays), never from the request: the backtest UI's "min score N" badge
+and the enforced gate are now the same number. Setups meeting the configured
+minimum are unaffected — the gate is inclusive (`score.total ===
+minQualityScore` qualifies), matching the live `>=` comparison. A run that
+filters setups records a deterministic note
+(`N qualifying setup(s) scored below the version's minQualityScore …`).
+
+This is a qualification-semantics change, so the engine version is bumped
+(`m6-backtest-4` → `m6-backtest-5`); stored runs keep their pinned version and
+results, and replay idempotency is unchanged (the version config is already
+pinned by `strategy_version_id` in the idempotency key).
 
 ## HTTP API (Phase 2)
 
