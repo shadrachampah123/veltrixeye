@@ -352,6 +352,94 @@ describe('m6 backtests api', () => {
     assert.equal(body.truncated, false);
   });
 
+  test('minQualityScore gate: setups below the published version threshold are not counted', async () => {
+    const owner = await registerUser();
+    // The PUBLISHED version config is the gate's source: its only qualifying
+    // setups score 60 (a satisfied required filter plus an unsatisfied
+    // confirmation ⇒ 0 of 15 confirmation points) against minQualityScore 65 —
+    // the same gate AlertService.generateAlert enforces live.
+    const lowScoreConfig = {
+      ...alwaysPassConfig('GBPUSD'),
+      ruleGroups: [
+        {
+          name: 'Mixed',
+          logic: 'OR',
+          position: 0,
+          conditions: [
+            {
+              conditionType: 'volatility_filter',
+              classification: 'required',
+              timeframeRole: 'setup',
+              params: { metric: 'body_range', period: 2, min: 0 },
+              position: 0,
+            },
+            {
+              conditionType: 'rejection_candle',
+              classification: 'confirmation',
+              timeframeRole: 'setup',
+              params: { direction: 'bearish', minWickBodyRatio: 2 },
+              position: 0,
+            },
+          ],
+        },
+      ],
+    };
+    const shapes: Shape[] = [
+      [100, 100.0005, 99.9998, 100.0002],
+      [100, 100.0005, 99.998, 100], // bull pin ⇒ one qualifying long at its close
+      [100, 100.0005, 99.9998, 100.0002],
+    ];
+    await seedMixedCandles('GBPUSD', shapes, T0);
+
+    // Published minimum 65: the 60-scoring setup is gated — no trade, no count.
+    const gated = await createPublishedVersion(owner.cookie, lowScoreConfig);
+    const gatedRes = await app.inject({
+      method: 'POST',
+      url: '/api/backtests',
+      headers: { cookie: owner.cookie, 'x-forwarded-for': freshIp() },
+      payload: {
+        strategyId: gated.strategyId,
+        versionId: gated.versionId,
+        instrument: { assetClass: 'forex', symbol: 'GBPUSD' },
+        direction: 'long',
+        from: T0,
+        to: T0 + 3 * HOUR,
+      },
+    });
+    assert.equal(gatedRes.statusCode, 201, gatedRes.body);
+    const gatedBody = gatedRes.json();
+    assert.equal(gatedBody.run.engineVersion, BACKTEST_ENGINE_VERSION);
+    assert.equal(gatedBody.run.metrics.stepsEvaluated, 2);
+    assert.equal(gatedBody.run.metrics.setupsDetected, 0);
+    assert.equal(gatedBody.trades.length, 0);
+    assert.ok(gatedBody.run.notes.some((n: string) => n.includes("below the version's minQualityScore (65)")));
+
+    // Same candles, same rules, published minimum 60: the identical setup
+    // qualifies — the enforced threshold is the version's configured value.
+    const open = await createPublishedVersion(owner.cookie, {
+      ...lowScoreConfig,
+      risk: { ...RISK, minQualityScore: 60 },
+    });
+    const openRes = await app.inject({
+      method: 'POST',
+      url: '/api/backtests',
+      headers: { cookie: owner.cookie, 'x-forwarded-for': freshIp() },
+      payload: {
+        strategyId: open.strategyId,
+        versionId: open.versionId,
+        instrument: { assetClass: 'forex', symbol: 'GBPUSD' },
+        direction: 'long',
+        from: T0,
+        to: T0 + 3 * HOUR,
+      },
+    });
+    assert.equal(openRes.statusCode, 201, openRes.body);
+    const openBody = openRes.json();
+    assert.equal(openBody.run.metrics.setupsDetected, 1);
+    assert.equal(openBody.trades.length, 1);
+    assert.equal(openBody.trades[0].qualityScore, 60);
+  });
+
   test('deterministic config_hash: same canonical config replays with created=false', async () => {
     const owner = await registerUser();
     const { strategyId, versionId } = await createPublishedVersion(owner.cookie, alwaysPassConfig('EURUSD'));

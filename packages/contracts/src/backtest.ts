@@ -37,7 +37,12 @@ import type { StrategyVersionConfig } from './strategies.js';
  *    sourced from market data (no spread feed exists);
  *  - every timeframe ROLE the version reads must be covered over the anchors
  *    the run evaluates: a required bias/entry series that ends early is a
- *    fail-closed error, never a stale replay (see `MAX_BACKTEST_ROLE_CANDLES`).
+ *    fail-closed error, never a stale replay (see `MAX_BACKTEST_ROLE_CANDLES`);
+ *  - qualification includes the quality gate: a setup that passes M3 is scored
+ *    with the real M5 engine and must reach the published version's
+ *    `risk.minQualityScore` — the same gate `AlertService.generateAlert`
+ *    enforces live — before it is counted (`setupsDetected`) or simulated as
+ *    a trade (`m6-backtest-5`).
  *
  * Phase 1 ships these contracts, the 0011 migration, and the pure engine.
  * The Phase 2 service adds retention checks, compute bounds, persistence,
@@ -53,9 +58,14 @@ import type { StrategyVersionConfig } from './strategies.js';
  *  - `m6-backtest-3` — instrument-aware (pip-size) cost conversion;
  *  - `m6-backtest-4` — the replay's M3 level derivation receives the SAME
  *    authoritative `instrument_risk_specs.pip_size` used for costs, so a
- *    pip-denominated risk buffer converts identically everywhere in the run.
+ *    pip-denominated risk buffer converts identically everywhere in the run;
+ *  - `m6-backtest-5` — qualification gate: a qualifying setup is scored with
+ *    the real M5 engine and gated by the published version's
+ *    `risk.minQualityScore` (the same gate live alerts enforce) BEFORE it
+ *    becomes a simulated trade, so below-minimum setups are not counted in
+ *    `setupsDetected` and produce no trade rows.
  */
-export const BACKTEST_ENGINE_VERSION = 'm6-backtest-4';
+export const BACKTEST_ENGINE_VERSION = 'm6-backtest-5';
 
 /** Max evaluated anchors (setup closes) per backtest run. */
 export const MAX_BACKTEST_STEPS = 4500;
@@ -239,7 +249,9 @@ export type BacktestTrade = z.infer<typeof backtestTradeDtoSchema>;
 
 /**
  * Run aggregates. Denominators (pinned — see docs/backtesting.md):
- *  - `setupsDetected` counts EVERY qualifying signal, including `no_levels`;
+ *  - `setupsDetected` counts every qualifying signal that also clears the
+ *    version's `minQualityScore` gate (`m6-backtest-5`), including
+ *    `no_levels`;
  *  - `tradesClosed` counts trades with any exit except `no_levels`;
  *  - `wins` = closed trades with `pnlR > 0`; `losses` = `pnlR < 0`
  *    (breakeven `pnlR === 0` counts in neither, but in all denominators);
