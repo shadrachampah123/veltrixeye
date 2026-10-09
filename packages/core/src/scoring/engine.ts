@@ -5,6 +5,7 @@ import {
   TAKE_PROFIT_METHODS,
   type TakeProfitMethod,
   type ConditionOutcome,
+  type GroupOutcome,
   type M5ScoringContext,
   type QualityScoringEngine,
   type ScoreComponent,
@@ -30,7 +31,7 @@ import { Errors } from '../errors.js';
  *  - fails safely: unevaluable conditions (insufficient_data/unsupported)
  *    never earn points and always reduce data sufficiency.
  *
- * Formula (pinned as `m5-quality-score-2`, docs/setup-scoring.md):
+ * Formula (pinned as `m5-quality-score-3`, docs/setup-scoring.md):
  *  - seven fixed components whose weights sum to 100; component scores are
  *    0–100 and the total is the weight-weighted average rounded to the
  *    nearest integer (then clamped to 0–100);
@@ -73,21 +74,22 @@ export const M5_FAILING_DIRECTION_CAP = 64;
  */
 export function scoreSetupQuality(context: M5ScoringContext): SetupQualityScore {
   const { evaluation, asOfMs } = context;
-  const conditions = evaluation.groups.flatMap((g) => g.conditions);
+  const groups = evaluation.groups;
+  const conditions = groups.flatMap((g) => g.conditions);
 
   const components: ScoreComponent[] = [
     gateComponent(
       'required_conditions',
       'Required condition strength',
       M5_COMPONENT_WEIGHTS.required_conditions,
-      conditions.filter((c) => c.classification === 'required'),
+      scoringUnits(groups, (c) => c.classification === 'required'),
       'required',
     ),
     gateComponent(
       'confirmation_conditions',
       'Confirmation condition strength',
       M5_COMPONENT_WEIGHTS.confirmation_conditions,
-      conditions.filter((c) => c.classification === 'confirmation'),
+      scoringUnits(groups, (c) => c.classification === 'confirmation'),
       'confirmation',
     ),
     clearanceComponent(
@@ -98,12 +100,12 @@ export function scoreSetupQuality(context: M5ScoringContext): SetupQualityScore 
       'optional_support',
       'Optional condition support',
       M5_COMPONENT_WEIGHTS.optional_support,
-      conditions.filter((c) => c.classification === 'optional'),
+      scoringUnits(groups, (c) => c.classification === 'optional'),
       'no optional conditions declared — no additional support',
     ),
     alignmentComponent(
       M5_COMPONENT_WEIGHTS.directional_alignment,
-      conditions.filter((c) => c.timeframeRole === 'htf_bias' && c.classification !== 'disqualifying'),
+      scoringUnits(groups, (c) => c.timeframeRole === 'htf_bias' && c.classification !== 'disqualifying'),
     ),
     completenessComponent(M5_COMPONENT_WEIGHTS.setup_completeness, context),
     dataSufficiencyComponent(M5_COMPONENT_WEIGHTS.data_sufficiency, conditions, evaluation.sessionFilters),
@@ -152,15 +154,63 @@ function component(
   };
 }
 
-/** satisfied / declared for a classification; vacuous gates earn full marks. */
+/**
+ * One scoring unit: a single AND-group condition, or a whole OR group.
+ * An OR group's members are mutually exclusive alternatives (M3 passes the
+ * group when ANY member is satisfied), so the group is ONE unit, satisfied
+ * when any of its in-scope members is satisfied. Scoring each alternative
+ * separately would cap a directional pair (bullish vs bearish) at 50%.
+ */
+export interface ScoringUnit {
+  satisfied: boolean;
+  /** Human-readable detail, e.g. `b (unsatisfied)` or `Stage 1 (OR): a (unsatisfied) | b (satisfied)`. */
+  detail: string;
+  isOrGroup: boolean;
+}
+
+/**
+ * Build scoring units for the conditions matching `include`, in group order.
+ * AND groups contribute one unit per matching condition (exactly the
+ * pre-`m5-quality-score-3` behaviour); OR groups contribute one unit in total.
+ */
+export function scoringUnits(groups: GroupOutcome[], include: (c: ConditionOutcome) => boolean): ScoringUnit[] {
+  const units: ScoringUnit[] = [];
+  for (const group of groups) {
+    const members = group.conditions.filter(include);
+    if (members.length === 0) continue;
+    if (group.logic === 'OR') {
+      units.push({
+        satisfied: members.some((c) => c.status === 'satisfied'),
+        detail: `${group.name} (OR): ${members.map((c) => `${c.conditionType} (${c.status})`).join(' | ')}`,
+        isOrGroup: true,
+      });
+      continue;
+    }
+    for (const c of members) {
+      units.push({
+        satisfied: c.status === 'satisfied',
+        detail: `${c.conditionType} (${c.status})`,
+        isOrGroup: false,
+      });
+    }
+  }
+  return units;
+}
+
+/** Explanation noun: plain "conditions" when only AND members are scored (unchanged text). */
+function unitNoun(units: ScoringUnit[]): string {
+  return units.some((u) => u.isOrGroup) ? 'scoring units (OR groups count once)' : 'conditions';
+}
+
+/** satisfied / units for a classification; vacuous gates earn full marks. */
 function gateComponent(
   name: 'required_conditions' | 'confirmation_conditions',
   label: string,
   weight: number,
-  declared: ConditionOutcome[],
+  units: ScoringUnit[],
   kind: 'required' | 'confirmation',
 ): ScoreComponent {
-  if (declared.length === 0) {
+  if (units.length === 0) {
     return component(
       name,
       label,
@@ -169,14 +219,14 @@ function gateComponent(
       `no ${kind} conditions declared — nothing to satisfy (vacuously clear)`,
     );
   }
-  const satisfied = declared.filter((c) => c.status === 'satisfied').length;
-  const fraction = satisfied / declared.length;
-  const unsatisfied = declared.filter((c) => c.status !== 'satisfied');
+  const satisfied = units.filter((u) => u.satisfied).length;
+  const fraction = satisfied / units.length;
+  const unsatisfied = units.filter((u) => !u.satisfied);
   const explanation =
-    satisfied === declared.length
-      ? `${satisfied}/${declared.length} ${kind} conditions satisfied at the anchor`
-      : `${satisfied}/${declared.length} ${kind} conditions satisfied; not satisfied: ${unsatisfied
-          .map((c) => `${c.conditionType} (${c.status})`)
+    satisfied === units.length
+      ? `${satisfied}/${units.length} ${kind} ${unitNoun(units)} satisfied at the anchor`
+      : `${satisfied}/${units.length} ${kind} ${unitNoun(units)} satisfied; not satisfied: ${unsatisfied
+          .map((u) => u.detail)
           .join(', ')}`;
   return component(name, label, weight, fraction, explanation);
 }
@@ -213,20 +263,20 @@ function evidenceComponent(
   name: M5ComponentName,
   label: string,
   weight: number,
-  declared: ConditionOutcome[],
+  units: ScoringUnit[],
   emptyExplanation: string,
 ): ScoreComponent {
-  if (declared.length === 0) {
+  if (units.length === 0) {
     return component(name, label, weight, 0, emptyExplanation);
   }
-  const satisfied = declared.filter((c) => c.status === 'satisfied').length;
-  const fraction = satisfied / declared.length;
+  const satisfied = units.filter((u) => u.satisfied).length;
+  const fraction = satisfied / units.length;
   const explanation =
-    satisfied === declared.length
-      ? `${satisfied}/${declared.length} optional conditions support the setup`
-      : `${satisfied}/${declared.length} optional conditions satisfied; unsupporting: ${declared
-          .filter((c) => c.status !== 'satisfied')
-          .map((c) => `${c.conditionType} (${c.status})`)
+    satisfied === units.length
+      ? `${satisfied}/${units.length} optional ${unitNoun(units)} support the setup`
+      : `${satisfied}/${units.length} optional ${unitNoun(units)} satisfied; unsupporting: ${units
+          .filter((u) => !u.satisfied)
+          .map((u) => u.detail)
           .join(', ')}`;
   return component(name, label, weight, fraction, explanation);
 }
@@ -235,8 +285,8 @@ function evidenceComponent(
  * Directional alignment: non-disqualifying conditions evaluated on the
  * higher-timeframe bias role. Absence earns nothing (no alignment evidence).
  */
-function alignmentComponent(weight: number, declared: ConditionOutcome[]): ScoreComponent {
-  if (declared.length === 0) {
+function alignmentComponent(weight: number, units: ScoringUnit[]): ScoreComponent {
+  if (units.length === 0) {
     return component(
       'directional_alignment',
       'Directional alignment (HTF)',
@@ -245,14 +295,14 @@ function alignmentComponent(weight: number, declared: ConditionOutcome[]): Score
       'no higher-timeframe bias conditions declared — no directional-alignment evidence',
     );
   }
-  const satisfied = declared.filter((c) => c.status === 'satisfied').length;
-  const fraction = satisfied / declared.length;
+  const satisfied = units.filter((u) => u.satisfied).length;
+  const fraction = satisfied / units.length;
   const explanation =
-    satisfied === declared.length
-      ? `${satisfied}/${declared.length} higher-timeframe bias conditions align with the setup direction`
-      : `${satisfied}/${declared.length} higher-timeframe bias conditions satisfied; misaligned/unevaluated: ${declared
-          .filter((c) => c.status !== 'satisfied')
-          .map((c) => `${c.conditionType} (${c.status})`)
+    satisfied === units.length
+      ? `${satisfied}/${units.length} higher-timeframe bias ${unitNoun(units)} align with the setup direction`
+      : `${satisfied}/${units.length} higher-timeframe bias ${unitNoun(units)} satisfied; misaligned/unevaluated: ${units
+          .filter((u) => !u.satisfied)
+          .map((u) => u.detail)
           .join(', ')}`;
   return component('directional_alignment', 'Directional alignment (HTF)', weight, fraction, explanation);
 }

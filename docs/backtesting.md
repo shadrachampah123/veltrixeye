@@ -129,7 +129,7 @@ on top of the Phase 2 API — no engine, service or schema change.
 
 ## Engine contract
 
-Pinned as **`m6-backtest-5`** (`BACKTEST_ENGINE_VERSION` in
+Pinned as **`m6-backtest-6`** (`BACKTEST_ENGINE_VERSION` in
 `@veltrixeye/contracts`), stored on every run row. Any change to anchors,
 evaluation, coverage, qualification, exits, costs, or metrics requires a new
 version string (`m6-backtest-1` → `m6-backtest-2` is the M6.2 long-window
@@ -137,7 +137,10 @@ coverage fix; `m6-backtest-2` → `m6-backtest-3` is the instrument-aware
 cost-unit fix; `m6-backtest-3` → `m6-backtest-4` threads the authoritative pip
 size into M3 level derivation — see "Pip-authoritative levels" below;
 `m6-backtest-4` → `m6-backtest-5` enforces the version's `minQualityScore`
-gate on qualifying setups — see "Quality-score gate" below).
+gate on qualifying setups — see "Quality-score gate" below;
+`m6-backtest-5` → `m6-backtest-6` moves qualification to the M5
+`m5-quality-score-3` engine, which counts each OR group once. Runs cached under
+`m6-backtest-5` are never reused: the run lookup is keyed on the engine version).
 
 Bounds (pinned in contracts, none configurable):
 
@@ -279,7 +282,7 @@ one pip), while their price-unit levels differ by exactly the pip-size ratio.
 The `m3-deterministic-eval-3` engine applies the same rule to live evaluation
 (`EvaluationService` resolves the identical column), so replay and live agree.
 
-## Quality-score gate (engine `m6-backtest-5`)
+## Quality-score gate (engine `m6-backtest-6`)
 
 Pre-`m6-backtest-5`, the replay scored every qualifying setup with the real M5
 engine but never enforced the published version's `risk.minQualityScore`:

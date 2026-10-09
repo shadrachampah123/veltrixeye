@@ -63,9 +63,12 @@ import type { StrategyVersionConfig } from './strategies.js';
  *    the real M5 engine and gated by the published version's
  *    `risk.minQualityScore` (the same gate live alerts enforce) BEFORE it
  *    becomes a simulated trade, so below-minimum setups are not counted in
- *    `setupsDetected` and produce no trade rows.
+ *    `setupsDetected` and produce no trade rows;
+ *  - `m6-backtest-6` — the M5 quality score counts each OR group as one
+ *    scoring unit (`m5-quality-score-3`), so qualification changes for
+ *    OR-group strategies. Runs cached under `m6-backtest-5` are never reused.
  */
-export const BACKTEST_ENGINE_VERSION = 'm6-backtest-5';
+export const BACKTEST_ENGINE_VERSION = 'm6-backtest-6';
 
 /** Max evaluated anchors (setup closes) per backtest run. */
 export const MAX_BACKTEST_STEPS = 4500;

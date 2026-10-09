@@ -36,11 +36,15 @@ triggers, completes, invalidates, or expires a setup — M4 owns lifecycle.
 
 ## Scoring engine contract
 
-The engine is pinned as **`m5-quality-score-2`**
+The engine is pinned as **`m5-quality-score-3`**
 (`M5_SCORE_ENGINE_VERSION` in `@veltrixeye/contracts`), stored in
 `setup_scores.engine_version`. The formula below is frozen for this
 version: **any formula change MUST ship under a new version string** — the
-same version must always mean the same score. (`m5-quality-score-1` was
+same version must always mean the same score. (`m5-quality-score-2` counted every
+member of an OR group as a separate condition, so a directional pair — bullish
+vs. bearish — could never score above 50% of its component. `m5-quality-score-3`
+counts each OR group as ONE scoring unit; see "OR groups" below. Rows written by
+`m5-quality-score-2` are never read for alert gating. `m5-quality-score-1` was
 identical except that the setup-completeness TP sub-check always required
 all three take-profit targets, which wrongly removed 2.5 points from
 `structure`-method versions whose TP2/TP3 are intentionally null.)
@@ -53,7 +57,7 @@ the anchor — nothing else.
 `generatedAt` is the ISO-8601 rendering of the anchor, never a wall-clock
 read.
 
-## Formula (`m5-quality-score-2`)
+## Formula (`m5-quality-score-3`)
 
 Seven fixed components; weights sum to exactly 100. Each component reports
 a 0–100 `score`, a raw contribution (`points`), a maximum contribution
@@ -70,6 +74,26 @@ a 0–100 `score`, a raw contribution (`points`), a maximum contribution
 | 5 | `directional_alignment` | 10 | 100 × (satisfied / declared) for non-disqualifying conditions on the `htf_bias` timeframe role. None declared ⇒ **0**. |
 | 6 | `setup_completeness` | 10 | Four equal sub-checks (2.5 each): candidate entry/stop derived; the TP targets the version's `takeProfitMethod` is expected to derive were derived (`rr`/`manual` ⇒ all three TP targets; `structure` ⇒ TP1 only, because the structure method derives a single structural target and TP2/TP3 are intentionally null); achievable R:R ≥ the version's `minRr`; every session filter satisfied at the anchor (no filters ⇒ vacuously satisfied). |
 | 7 | `data_sufficiency` | 5 | 100 × (evaluable / total) across conditions + session filters, where evaluable means `satisfied` or `unsatisfied`. Nothing declared ⇒ **0**. |
+
+### OR groups (`m5-quality-score-3`)
+
+M3 passes an OR group when ANY member is satisfied, so its members are
+mutually exclusive alternatives. Components 1, 2, 4 and 5 therefore score
+**scoring units**, not raw conditions:
+
+- an **AND** group contributes one unit per in-scope condition (unchanged from v2);
+- an **OR** group contributes **one** unit in total, satisfied when any of its
+  in-scope members (for that component's classification) is `satisfied`.
+
+Worked example — the v7 shape (three OR stages, all required/confirmation
+members on the htf/setup/entry roles): for a passing LONG the bullish side of
+each stage is satisfied and the bearish side is `unsatisfied` (and the reverse
+for SHORT). Per-condition scoring (v2) gave required 12.5/25, confirmation
+7.5/15 and alignment 5/10 — a ceiling of 60. Group-level scoring (v3) gives
+required 25/25, confirmation 15/15 and alignment 10/10 — a total of 85 with
+the other components unchanged. Components 3 (disqualifier clearance) and 7
+(data sufficiency) are **unchanged**: a satisfied disqualifier vetoes whatever
+its group logic, and sufficiency counts evaluability per condition.
 
 Design rule: **gate components** (1–3) treat "none declared" as vacuously
 clear and award full points — mirroring M3's pass semantics; **evidence

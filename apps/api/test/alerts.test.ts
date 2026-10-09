@@ -673,6 +673,43 @@ describe('m6 alerts api (phase 3)', () => {
     assert.equal(await auditCount(owner.userId, 'alert.delivery_recorded'), 0);
   });
 
+  test('a stale M5 score from an earlier engine version can never gate an alert', async () => {
+    const owner = await registerUser();
+    const { strategyId, versionId } = await createPublishedVersion(owner.cookie, engulfConfig('EURUSD'));
+    await seedCandles('EURUSD', BULLISH_SHAPES, AS_OF + 18 * HOUR);
+    const setupId = await detectSetup(owner.cookie, strategyId, versionId, 'EURUSD', AS_OF + 18 * HOUR);
+    const setupRow = await pool.query<{ as_of_ms: string }>('SELECT as_of_ms FROM setups WHERE id = $1', [setupId]);
+    const anchor = Number(setupRow.rows[0]!.as_of_ms);
+
+    // A pre-m5-quality-score-3 row at the SAME anchor, with an implausible total.
+    // It is the newest row, yet it must be ignored by the alert gate.
+    await pool.query(
+      `INSERT INTO setup_scores (setup_id, engine_version, total, grade, components, created_at, as_of_ms)
+       VALUES ($1, 'm5-quality-score-2', 99, 'A+', '[]', to_timestamp($2 / 1000.0), $2)`,
+      [setupId, anchor],
+    );
+
+    // Stale-only ⇒ the same documented 400 as "never scored" — no alert, no side effects.
+    const alertsBefore = await countRows('alerts');
+    const stale = await generate(owner.cookie, setupId);
+    assert.equal(stale.statusCode, 400, stale.body);
+    assert.match(stale.json().error.message, /no quality score at its detection anchor/);
+    assert.equal(await countRows('alerts'), alertsBefore);
+
+    // Scoring under the current engine adds a current-version row, which is what gates.
+    const score = await scoreSetup(owner.cookie, setupId);
+    const current = await pool.query<{ engine_version: string }>(
+      `SELECT engine_version FROM setup_scores WHERE setup_id = $1 AND as_of_ms = $2 AND engine_version = 'm5-quality-score-3'`,
+      [setupId, anchor],
+    );
+    assert.equal(current.rows.length, 1);
+    const after = await generate(owner.cookie, setupId);
+    const body = after.json();
+    const usedScore = body.alert?.qualityScore ?? body.gate?.qualityScore;
+    assert.equal(usedScore, score.total);
+    assert.notEqual(usedScore, 99);
+  });
+
   test('minQualityScore gate: score == gate generates, score < gate is silent with skippedReason', async () => {
     const owner = await registerUser();
 

@@ -3,6 +3,7 @@ import type pg from 'pg';
 import {
   ALERT_TRIGGER_STATES,
   DEFAULT_NOTIFICATION_CHANNEL,
+  M5_SCORE_ENGINE_VERSION,
   MAX_ALERT_DELIVERIES,
   type AlertDetailDto,
   type AlertDto,
@@ -669,12 +670,19 @@ export class AlertService {
     return res.rows[0] ?? null;
   }
 
+  /**
+   * The score that may gate an alert: the newest row for this anchor produced
+   * by the CURRENT M5 engine only. Rows from earlier engine versions (e.g. a
+   * pre-OR-group `m5-quality-score-2` value) are never read here, so a stale
+   * score cannot gate or title an alert. No current-version row ⇒ the caller
+   * asks the user to score the setup first.
+   */
   private async readScoreAtAnchor(setupId: string, asOfMs: number): Promise<ScoreRow | null> {
     const res = await this.pool.query<ScoreRow>(
       `SELECT * FROM setup_scores
-       WHERE setup_id = $1 AND as_of_ms = $2
+       WHERE setup_id = $1 AND as_of_ms = $2 AND engine_version = $3
        ORDER BY created_at DESC, id DESC LIMIT 1`,
-      [setupId, asOfMs],
+      [setupId, asOfMs, M5_SCORE_ENGINE_VERSION],
     );
     return res.rows[0] ?? null;
   }

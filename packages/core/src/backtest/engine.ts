@@ -542,7 +542,7 @@ interface TradeSimulationInput {
   dirEval: DirectionEvaluation;
   /**
    * The M5 quality score computed at the anchor by the caller — already
-   * gated by the version's `minQualityScore` (m6-backtest-5). Simulating a
+   * gated by the version's `minQualityScore` (m6-backtest-6). Simulating a
    * trade never re-scores: one anchor, one score, one gate.
    */
   score: SetupQualityScore;

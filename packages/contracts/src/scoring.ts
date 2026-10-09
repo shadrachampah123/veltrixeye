@@ -47,7 +47,7 @@ export function qualityGrade(score: number): QualityGrade {
  * The formula behind this version is documented in docs/setup-scoring.md and
  * frozen: any future formula change MUST introduce a new version string.
  */
-export const M5_SCORE_ENGINE_VERSION = 'm5-quality-score-2';
+export const M5_SCORE_ENGINE_VERSION = 'm5-quality-score-3';
 
 /** Default/max page size for the score-history endpoint. */
 export const DEFAULT_SCORE_HISTORY_LIMIT = 50;
