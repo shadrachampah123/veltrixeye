@@ -1191,10 +1191,10 @@ describe('m6 look-ahead protection', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Quality-score gate (m6-backtest-5): qualification matches the live alert gate
+// Quality-score gate (m6-backtest-6): qualification matches the live alert gate
 // ---------------------------------------------------------------------------
 
-describe('m6-backtest-5 minQualityScore gate', () => {
+describe('m6-backtest-6 minQualityScore gate', () => {
   /**
    * Scores exactly 60 (grade "ignore"): the required volatility filter is
    * satisfied and the single confirmation (a bearish pin) is not, so the
@@ -1210,11 +1210,13 @@ describe('m6-backtest-5 minQualityScore gate', () => {
     ]);
 
   /**
-   * Scores exactly 65 (grade "C"): one of two confirmations is satisfied
-   * (7.5 of 15) and `minRr: 4` exceeds the achievable 3R (completeness 7.5
-   * of 10) — 25 + 7.5 + 20 + 0 + 0 + 7.5 + 5 = 65.
+   * Scores 73 (grade "C") under `m5-quality-score-3`: the OR confirmation
+   * group is ONE scoring unit and one of its two alternatives is satisfied,
+   * so confirmation earns the full 15 (the old per-member count gave 7.5 and
+   * a total of 65). `minRr: 4` exceeds the achievable 3R (completeness 7.5 of
+   * 10) — 25 + 15 + 20 + 0 + 0 + 7.5 + 5 = 72.5 → 73.
    */
-  const score65 = () =>
+  const score73 = () =>
     mkConfig(
       [
         group('Mixed', 'OR', [
@@ -1247,9 +1249,9 @@ describe('m6-backtest-5 minQualityScore gate', () => {
     assertValidResult(result);
   });
 
-  test('score 65 with minQualityScore 65 is accepted (the gate is inclusive)', () => {
+  test('score 73 with minQualityScore 73 is accepted (the gate is inclusive)', () => {
     const result = run({
-      config: score65(),
+      config: mkConfig(score73().ruleGroups, { minRr: 4, minQualityScore: 73 }),
       setup: signalCandles(),
       fromMs: closeOf(0),
       toMs: closeOf(2),
@@ -1258,7 +1260,7 @@ describe('m6-backtest-5 minQualityScore gate', () => {
     assert.equal(result.stepsEvaluated, 2);
     assert.equal(result.trades.length, 1);
     const trade = first(result.trades);
-    assert.equal(trade.qualityScore, 65);
+    assert.equal(trade.qualityScore, 73);
     assert.equal(trade.qualityGrade, 'C');
     assert.equal(trade.entryPrice, 100);
     assert.equal(trade.stopLossPrice, 99.999);
@@ -1281,9 +1283,9 @@ describe('m6-backtest-5 minQualityScore gate', () => {
     assert.equal(first(accepted.trades).qualityScore, 60);
     assert.equal(accepted.metrics.setupsDetected, 1);
 
-    // …and the 65-scoring setup is rejected when the config says 66.
+    // …and the 73-scoring setup is rejected when the config says 74.
     const rejected = run({
-      config: mkConfig(score65().ruleGroups, { minQualityScore: 66, minRr: 4 }),
+      config: mkConfig(score73().ruleGroups, { minQualityScore: 74, minRr: 4 }),
       setup: signalCandles(),
       fromMs: closeOf(0),
       toMs: closeOf(2),
@@ -1291,7 +1293,7 @@ describe('m6-backtest-5 minQualityScore gate', () => {
     });
     assert.equal(rejected.trades.length, 0);
     assert.equal(rejected.metrics.setupsDetected, 0);
-    assert.ok(rejected.notes.some((n) => n.includes("below the version's minQualityScore (66)")));
+    assert.ok(rejected.notes.some((n) => n.includes("below the version's minQualityScore (74)")));
   });
 
   test('the gate runs before level derivation: below-minimum setups record no no_levels rows', () => {

@@ -112,7 +112,7 @@ describe('m5 scoring engine — determinism and shape', () => {
 
   test('score version is the pinned m5 identifier', () => {
     const score = scoreSetupQuality(ctx(richEvaluation()));
-    assert.equal(score.engineVersion, 'm5-quality-score-2');
+    assert.equal(score.engineVersion, 'm5-quality-score-3');
     assert.equal(score.engineVersion, M5_SCORE_ENGINE_VERSION);
     const engine = createQualityScoringEngine();
     assert.equal(engine.version, M5_SCORE_ENGINE_VERSION);
@@ -499,5 +499,186 @@ describe('m5 scoring engine — QualityScoringEngine adapter boundary', () => {
       }),
       /direction/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// m5-quality-score-3: an OR group is ONE scoring unit (mutually exclusive
+// alternatives). AND groups, clearance and data sufficiency are unchanged.
+// ---------------------------------------------------------------------------
+
+/**
+ * The v7 shape: three OR stages. For a LONG passing direction the bullish side
+ * is satisfied and the bearish side unsatisfied in every stage (handlers return
+ * `unsatisfied` for the opposite direction). A SHORT is the mirror image.
+ */
+function v7Evaluation(direction: 'long' | 'short'): DirectionEvaluation {
+  const long = direction === 'long';
+  const sat = (on: boolean) => (on ? 'satisfied' : 'unsatisfied');
+  return dirEval({
+    direction,
+    groups: [
+      group(
+        'Stage 1',
+        [
+          cond('liquidity_sweep', 'required', sat(long), 'htf_bias'), // below → long context
+          cond('liquidity_sweep', 'required', sat(!long), 'htf_bias'), // above → short context
+        ],
+        'OR',
+      ),
+      group(
+        'Stage 2',
+        [
+          cond('break_retest', 'required', sat(long), 'setup'),
+          cond('break_retest', 'required', sat(!long), 'setup'),
+        ],
+        'OR',
+      ),
+      group(
+        'Stage 3',
+        [
+          cond('rejection_candle', 'confirmation', sat(long), 'entry'),
+          cond('rejection_candle', 'confirmation', sat(!long), 'entry'),
+        ],
+        'OR',
+      ),
+    ],
+  });
+}
+
+describe('m5-quality-score-3 — OR groups count once', () => {
+  test('v7 passing LONG: each OR stage is one unit → 85 (not the 60 per-member count)', () => {
+    const score = scoreSetupQuality(ctx(v7Evaluation('long')));
+    assert.equal(byName(score, 'required_conditions').points, 25);
+    assert.equal(byName(score, 'required_conditions').score, 100);
+    assert.equal(byName(score, 'confirmation_conditions').points, 15);
+    assert.equal(byName(score, 'directional_alignment').points, 10);
+    assert.equal(byName(score, 'disqualifier_clearance').points, 20); // none declared
+    assert.equal(byName(score, 'optional_support').points, 0); // none declared
+    assert.equal(byName(score, 'setup_completeness').points, 10);
+    assert.equal(byName(score, 'data_sufficiency').points, 5);
+    assert.equal(score.total, 85);
+    assert.equal(score.grade, 'A');
+    assert.equal(score.engineVersion, 'm5-quality-score-3');
+    assert.ok(byName(score, 'required_conditions').explanation.includes('OR groups count once'));
+  });
+
+  test('v7 passing SHORT: the mirror image scores the same 85', () => {
+    const score = scoreSetupQuality(ctx(v7Evaluation('short')));
+    assert.equal(score.total, 85);
+    assert.equal(byName(score, 'required_conditions').points, 25);
+    assert.equal(byName(score, 'confirmation_conditions').points, 15);
+    assert.equal(byName(score, 'directional_alignment').points, 10);
+  });
+
+  test('the breakdown always sums to the total (both directions)', () => {
+    for (const direction of ['long', 'short'] as const) {
+      const score = scoreSetupQuality(ctx(v7Evaluation(direction)));
+      const sum = score.components.reduce((acc, c) => acc + c.points, 0);
+      assert.equal(Math.round(sum), score.total);
+    }
+  });
+
+  test('an OR group with NO satisfied alternative still earns nothing (fail closed)', () => {
+    const none = scoreSetupQuality(
+      ctx(
+        dirEval({
+          passed: false,
+          groups: [
+            group('Stage 1', [cond('liquidity_sweep', 'required', 'unsatisfied', 'htf_bias'), cond('liquidity_sweep', 'required', 'insufficient_data', 'htf_bias')], 'OR'),
+          ],
+        }),
+      ),
+    );
+    assert.equal(byName(none, 'required_conditions').points, 0);
+    assert.equal(byName(none, 'directional_alignment').points, 0);
+    assert.ok(none.total <= M5_FAILING_DIRECTION_CAP);
+  });
+
+  test('a satisfied OR alternative still counts when another member is unevaluable', () => {
+    const score = scoreSetupQuality(
+      ctx(
+        dirEval({
+          groups: [group('Stage 2', [cond('break_retest', 'required', 'satisfied'), cond('break_retest', 'required', 'insufficient_data')], 'OR')],
+        }),
+      ),
+    );
+    assert.equal(byName(score, 'required_conditions').points, 25);
+  });
+
+  test('OR-group unit explanation lists the unsatisfied alternatives', () => {
+    const score = scoreSetupQuality(
+      ctx(
+        dirEval({
+          groups: [group('Stage 3', [cond('rejection_candle', 'confirmation', 'unsatisfied', 'entry'), cond('rejection_candle', 'confirmation', 'satisfied', 'entry')], 'OR')],
+        }),
+      ),
+    );
+    const confirmation = byName(score, 'confirmation_conditions');
+    assert.equal(confirmation.points, 15);
+    assert.ok(confirmation.explanation.includes('1/1 confirmation'));
+  });
+});
+
+describe('m5-quality-score-3 — existing AND-group and no-OR behaviour is unchanged', () => {
+  test('AND groups still count per condition: 2 required, 1 satisfied → 50% (12.5 points)', () => {
+    const score = scoreSetupQuality(
+      ctx(dirEval({ groups: [group('gate', [cond('a', 'required', 'satisfied'), cond('b', 'required', 'unsatisfied')])] })),
+    );
+    assert.equal(byName(score, 'required_conditions').score, 50);
+    assert.equal(byName(score, 'required_conditions').points, 12.5);
+    assert.ok(byName(score, 'required_conditions').explanation.includes('b (unsatisfied)'));
+    assert.ok(!byName(score, 'required_conditions').explanation.includes('OR groups'));
+  });
+
+  test('a mixed AND group inside an OR-free strategy is scored identically to v2', () => {
+    // Fully supported passing setup (rich fixture) and the minimal passing setup keep their
+    // v2 totals: 100/A+ and 75/B.
+    assert.equal(scoreSetupQuality(ctx(richEvaluation())).total, 100);
+    const minimal = scoreSetupQuality(
+      ctx(dirEval({ groups: [group('gate', [cond('a', 'required', 'satisfied')])] })),
+    );
+    assert.equal(minimal.total, 75);
+    assert.equal(minimal.grade, 'B');
+  });
+
+  test('disqualifiers inside an OR group stay per-condition (veto semantics are not averaged away)', () => {
+    const score = scoreSetupQuality(
+      ctx(
+        dirEval({
+          groups: [
+            group('gate', [cond('a', 'required', 'satisfied')]),
+            group('veto', [cond('news_filter', 'disqualifying', 'satisfied', 'any'), cond('spread_filter', 'disqualifying', 'unsatisfied', 'any')], 'OR'),
+          ],
+        }),
+      ),
+    );
+    assert.equal(byName(score, 'disqualifier_clearance').points, 10); // 1 of 2 cleared, not one unit
+    assert.ok(byName(score, 'disqualifier_clearance').explanation.includes('news_filter (satisfied)'));
+  });
+
+  test('optional OR group counts once, optional AND group counts per condition', () => {
+    const orOptional = scoreSetupQuality(
+      ctx(
+        dirEval({
+          groups: [
+            group('gate', [cond('a', 'required', 'satisfied')]),
+            group('support', [cond('o1', 'optional', 'satisfied'), cond('o2', 'optional', 'unsatisfied')], 'OR'),
+          ],
+        }),
+      ),
+    );
+    assert.equal(byName(orOptional, 'optional_support').points, 15);
+    const andOptional = scoreSetupQuality(
+      ctx(
+        dirEval({
+          groups: [
+            group('gate', [cond('a', 'required', 'satisfied')]),
+            group('support', [cond('o1', 'optional', 'satisfied'), cond('o2', 'optional', 'unsatisfied')]),
+          ],
+        }),
+      ),
+    );
+    assert.equal(byName(andOptional, 'optional_support').points, 7.5);
   });
 });
