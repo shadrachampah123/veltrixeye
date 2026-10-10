@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { isProviderError, type ProviderFailureKind } from '@veltrixeye/contracts';
 import { TwelveDataClient, type FetchFn } from '../src/client.js';
-import { TwelveDataProvider } from '../src/provider.js';
+import { TwelveDataProvider, TWELVE_DATA_PAGE_SIZE } from '../src/provider.js';
 
 // ---------------------------------------------------------------------------
 // Mock fetch harness (no network)
@@ -56,6 +56,10 @@ function value(datetime: string, open: string, high = open, low = open, close = 
 function day(datetime: string, o: string, h: string, l: string, c: string, volume?: string) {
   return value(datetime, o, h, l, c, volume);
 }
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const utcDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+const vendorDateTime = (ms: number) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
 
 const EURUSD = { assetClass: 'forex' as const, symbol: 'EURUSD' };
 
@@ -237,7 +241,48 @@ test('provider: resampled timeframes request the anchor interval and aggregate',
   assert.equal(candles[1]!.time, Date.UTC(2026, 8, 13, 0, 3, 0));
 });
 
-test('provider: short page ends pagination with a single call', async () => {
+test('provider: a short intermediate page advances to the next date chunk', async () => {
+  const seen: URL[] = [];
+  const from = Date.UTC(2000, 0, 1);
+  const chunkEnd = from + TWELVE_DATA_PAGE_SIZE * DAY_MS;
+  const laterBar = chunkEnd + DAY_MS;
+  const to = laterBar + DAY_MS;
+  let calls = 0;
+  const { provider } = wire(() => {
+    calls += 1;
+    return calls === 1
+      ? ok(timeSeriesBody([day(utcDate(from), '1', '1', '1', '1')]))
+      : ok(timeSeriesBody([day(utcDate(laterBar), '2', '2', '2', '2')]));
+  }, seen);
+  const candles = await provider.getHistoricalCandles({ instrument: EURUSD, timeframe: '1d', from, to });
+
+  assert.deepEqual(candles.map((c) => c.time), [from, laterBar]);
+  assert.equal(calls, 2);
+  assert.equal(seen[0]!.searchParams.get('end_date'), vendorDateTime(chunkEnd));
+  assert.equal(seen[1]!.searchParams.get('start_date'), vendorDateTime(chunkEnd));
+});
+
+test('provider: an empty intermediate page advances safely to the next date chunk', async () => {
+  const seen: URL[] = [];
+  const from = Date.UTC(2000, 0, 1);
+  const chunkEnd = from + TWELVE_DATA_PAGE_SIZE * DAY_MS;
+  const laterBar = chunkEnd + DAY_MS;
+  const to = laterBar + DAY_MS;
+  let calls = 0;
+  const { provider } = wire(() => {
+    calls += 1;
+    return calls === 1
+      ? ok(timeSeriesBody([]))
+      : ok(timeSeriesBody([day(utcDate(laterBar), '2', '2', '2', '2')]));
+  }, seen);
+  const candles = await provider.getHistoricalCandles({ instrument: EURUSD, timeframe: '1d', from, to });
+
+  assert.deepEqual(candles.map((c) => c.time), [laterBar]);
+  assert.equal(calls, 2);
+  assert.equal(seen[1]!.searchParams.get('start_date'), vendorDateTime(chunkEnd));
+});
+
+test('provider: a terminal short page stops after one call', async () => {
   const seen: URL[] = [];
   const { provider } = wire(() => ok(timeSeriesBody([day('2026-09-10', '1', '1', '1', '1')])), seen);
   const candles = await provider.getHistoricalCandles({
@@ -250,18 +295,20 @@ test('provider: short page ends pagination with a single call', async () => {
   assert.equal(seen.length, 1);
 });
 
-test('provider: full 5000-bar page advances the cursor (no end_date walking)', async () => {
+test('provider: full 5000-bar page advances its cursor and fetches the following bar', async () => {
   const seen: URL[] = [];
   let calls = 0;
   const start = Date.UTC(2020, 0, 1);
-  const full = Array.from({ length: 5000 }, (_, i) => {
-    const d = new Date(start + i * 86_400_000);
-    const iso = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-    return day(iso, '1', '1', '1', '1');
-  });
+  const full = Array.from({ length: TWELVE_DATA_PAGE_SIZE }, (_, i) =>
+    day(utcDate(start + i * DAY_MS), '1', '1', '1', '1'),
+  );
+  const lastBar = start + (TWELVE_DATA_PAGE_SIZE - 1) * DAY_MS;
+  const followingBar = lastBar + DAY_MS;
   const { provider } = wire(() => {
     calls += 1;
-    return calls === 1 ? ok(timeSeriesBody(full)) : ok(timeSeriesBody([]));
+    return calls === 1
+      ? ok(timeSeriesBody(full))
+      : ok(timeSeriesBody([day(utcDate(followingBar), '2', '2', '2', '2')]));
   }, seen);
   const candles = await provider.getHistoricalCandles({
     instrument: EURUSD,
@@ -269,14 +316,30 @@ test('provider: full 5000-bar page advances the cursor (no end_date walking)', a
     from: start,
     to: Date.UTC(2040, 0, 1),
   });
-  assert.equal(candles.length, 5000);
+  assert.equal(candles.length, TWELVE_DATA_PAGE_SIZE + 1);
+  assert.equal(candles.at(-1)!.time, followingBar);
   assert.equal(calls, 2);
-  // second page advances start_date to/past the last bar seen (the +1ms
-  // cursor truncates to the same second at vendor date resolution; the
-  // provider dedupes any re-fetched bar by timestamp)
-  const lastBar = start + 4999 * 86_400_000;
-  const startDate = seen[1]!.searchParams.get('start_date')!;
-  assert.ok(new Date(`${startDate.replace(' ', 'T')}Z`).getTime() >= lastBar, startDate);
+  // The full-page cursor remains lastBar + 1ms (formatted to the same
+  // second), rather than jumping to the end of the date chunk.
+  assert.equal(seen[1]!.searchParams.get('start_date'), vendorDateTime(lastBar + 1));
+});
+
+test('provider: repeated full pages stop when the pagination cursor makes no progress', async () => {
+  const seen: URL[] = [];
+  const repeated = Array.from({ length: TWELVE_DATA_PAGE_SIZE }, () => day('2026-09-10', '1', '1', '1', '1'));
+  let calls = 0;
+  const { provider } = wire(() => {
+    calls += 1;
+    return ok(timeSeriesBody(repeated));
+  }, seen);
+  const candles = await provider.getHistoricalCandles({
+    instrument: EURUSD,
+    timeframe: '1d',
+    from: Date.UTC(2026, 8, 10),
+    to: Date.UTC(2040, 0, 1),
+  });
+  assert.equal(candles.length, 1); // repeated timestamps are deduplicated
+  assert.equal(calls, 2); // second full page makes no timestamp progress
 });
 
 test('provider: page with no in-window bars stops pagination (no-progress guard)', async () => {

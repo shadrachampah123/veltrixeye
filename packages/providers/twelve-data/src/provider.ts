@@ -126,7 +126,6 @@ export class TwelveDataProvider implements MarketDataProvider {
         endDate: formatTwelveDate(end),
         exchange,
       });
-      if (result.bars.length === 0) break;
       let pageLast = -1;
       for (const bar of result.bars) {
         const time = twelveDateTimeToMs(bar.datetime, result.exchangeTimezone);
@@ -134,12 +133,18 @@ export class TwelveDataProvider implements MarketDataProvider {
         byTime.set(time, toCandle(bar, time));
         if (time > pageLast) pageLast = time;
       }
-      if (pageLast < 0) break; // page carried no in-window bars — nothing more to page
-      if (pageLast <= lastProgress) break; // no forward progress — never loop forever
-      lastProgress = pageLast;
-      if (result.bars.length < TWELVE_DATA_PAGE_SIZE) break; // short page = range exhausted
-      // Full page: there may be more bars at/after the last timestamp.
-      cursor = pageLast + 1;
+      if (result.bars.length >= TWELVE_DATA_PAGE_SIZE) {
+        if (pageLast < 0) break; // full page carried no in-window bars — no safe cursor to follow
+        if (pageLast <= lastProgress) break; // no forward progress — never loop forever
+        lastProgress = pageLast;
+        // Full page: there may be more bars at/after the last timestamp.
+        cursor = pageLast + 1;
+        continue;
+      }
+      // A short (including empty) response exhausts this date chunk, not the
+      // whole request. Advance to the next chunk when requested time remains.
+      if (end >= to) break;
+      cursor = end;
     }
     return [...byTime.values()].sort((a, b) => a.time - b.time);
   }
