@@ -16,9 +16,28 @@
  * malformed.
  *
  * This mirrors the clamp the scheduled warmer already applies
- * (`Math.max(nowMs - lookbackMs, retentionCutoff + 1)`).
+ * (`Math.max(nowMs - lookbackMs, retentionCutoffMs(timeframe, nowMs) + 1)`).
+ *
+ * Clock skew: `nowMs` here is the *browser's* clock, while the API validates
+ * `from` against its own (`retentionCutoffMs(timeframe, Date.now())` on the
+ * server). A browser running even a few seconds behind the server computes a
+ * cutoff that is *earlier* than the server's, so a start sitting exactly on the
+ * browser's cutoff still breaches the server's window and the read is rejected.
+ * The clamp therefore keeps `RETENTION_SAFETY_MARGIN_MS` of headroom past the
+ * cutoff — comfortably beyond real-world NTP skew — so the request survives the
+ * server's validation at the cost of at most one candle of history.
  */
 import { retentionCutoffMs, RETENTION_DAYS, type Timeframe } from '@veltrixeye/contracts';
+
+/**
+ * Headroom kept past the retention cutoff when clamping `from`.
+ *
+ * The browser derives the window from its own clock and the API validates with
+ * the server's; any browser that is behind the server would otherwise land on a
+ * start the server considers too old. 60s dwarfs observed clock skew (NTP
+ * disciplines to milliseconds) and costs at most one candle of history.
+ */
+export const RETENTION_SAFETY_MARGIN_MS = 60_000;
 
 /** Minutes per bar for every canonical timeframe. */
 export const TIMEFRAME_MINUTES: Record<string, number> = {
@@ -51,15 +70,16 @@ export interface CandleRange {
 /**
  * Resolve the window for a read of `limit` candles at `timeframe` ending now.
  *
- * The start is clamped to the retention cutoff, so the result is always
- * acceptable to the API's retention guard. Pure — `nowMs` is injected so the
+ * The start is clamped to the retention cutoff plus a safety margin, so the
+ * result is always acceptable to the API's retention guard even when the
+ * server's clock runs ahead of the browser's. Pure — `nowMs` is injected so the
  * boundary is testable.
  */
 export function candleRequestRange(timeframe: Timeframe, limit: number, nowMs: number): CandleRange {
   const to = nowMs;
   const minutes = TIMEFRAME_MINUTES[timeframe] ?? 1440;
   const requestedFrom = to - limit * minutes * 60_000;
-  const from = Math.max(requestedFrom, retentionCutoffMs(timeframe, to));
+  const from = Math.max(requestedFrom, retentionCutoffMs(timeframe, to) + RETENTION_SAFETY_MARGIN_MS);
   return {
     from,
     to,
