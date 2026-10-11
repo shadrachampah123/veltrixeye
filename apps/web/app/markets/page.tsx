@@ -11,7 +11,7 @@ import { WatchlistPanel, MarketSelector } from '@/components/watchlist';
 import { BRAND } from '@/lib/brand';
 
 const GRID_TIMEFRAMES: Timeframe[] = ['1m', '5m', '15m', '1h', '1d'];
-const BACKFILL_TIMEFRAMES: Timeframe[] = ['1m', '5m', '15m', '1h', '1d'];
+const BACKFILL_TIMEFRAMES: Timeframe[] = ['1m', '5m', '15m', '1h', '4h', '1d'];
 
 function MarketsContent() {
   const [providers, setProviders] = React.useState<RegisteredProvider[] | null>(null);
@@ -277,7 +277,7 @@ function BackfillCard({ instruments, onDone }: { instruments: MarketInstrument[]
         <div>
           <Button onClick={() => void run()} disabled={busy || selected.length === 0}>{busy ? 'Backfilling…' : `Backfill ${selected.length} instrument(s)`}</Button>
         </div>
-        <p className="text-xs text-ink-400">Retention: 1m 30d · 5m 90d · 15m 180d · 1h 1y · daily 5y. Ranges beyond retention rejected. M8.7 safety preserved — no live trading.</p>
+        <p className="text-xs text-ink-400">Retention: 1m 30d · 5m 90d · 15m 180d · 1h/4h 365d · daily 5y. Ranges beyond retention rejected. M8.7 safety preserved — no live trading.</p>
       </div>
     </Card>
   );
