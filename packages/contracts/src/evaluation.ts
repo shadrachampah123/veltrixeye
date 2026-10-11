@@ -117,6 +117,11 @@ export type SessionFilterOutcome = z.infer<typeof sessionFilterOutcomeSchema>;
  * Deterministic candidate trade levels derived from the version's risk config
  * at the anchor (pure; never persisted in M3 — M4 persists setups).
  * `achievableRr` is the reward:risk the pinned target method offers.
+ *
+ * Legs are ORIENTED for the direction they belong to: a long candidate's
+ * `stopLossPrice` sits below its `entryPrice` and its targets above; a short
+ * candidate's stop sits above its entry and its targets below. `riskDistance`
+ * and `achievableRr` are direction-neutral.
  */
 export const candidateLevelsSchema = z
   .object({
