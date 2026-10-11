@@ -7,27 +7,11 @@ import { AppShell, PageHeader } from '@/components/app-shell';
 import { RequireAuth } from '@/components/auth-context';
 import { api, ApiError } from '@/lib/api';
 import { Alert, Badge, Button, Card, CardHeader, Field, Select, Spinner } from '@/components/ui';
+import { candleRequestRange, type CandleRange } from '@/lib/market-range';
 import type { CandlesResponseDto, CoverageDto, Timeframe } from '@veltrixeye/contracts';
 
 const TIMEFRAMES: Timeframe[] = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w'];
 const LIMITS = [100, 500, 1000, 5000];
-
-const TIMEFRAME_MINUTES: Record<string, number> = {
-  '1m': 1,
-  '3m': 3,
-  '5m': 5,
-  '15m': 15,
-  '30m': 30,
-  '1h': 60,
-  '2h': 120,
-  '4h': 240,
-  '8h': 480,
-  '12h': 720,
-  '1d': 1440,
-  '3d': 4320,
-  '1w': 10080,
-  '1M': 43200,
-};
 
 function formatCandleTime(ms: number): string {
   return new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
@@ -42,6 +26,7 @@ function InstrumentContent() {
   const [limit, setLimit] = React.useState(500);
   const [data, setData] = React.useState<CandlesResponseDto | null>(null);
   const [coverage, setCoverage] = React.useState<CoverageDto[] | null>(null);
+  const [range, setRange] = React.useState<CandleRange | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -49,10 +34,13 @@ function InstrumentContent() {
     setLoading(true);
     setError(null);
     const to = Date.now();
-    const minutes = TIMEFRAME_MINUTES[timeframe] ?? 1440;
-    const from = to - limit * minutes * 60_000;
+    // Retention caps how far back a read may reach, so the start is clamped to
+    // the cutoff: without it, wide selections (e.g. 5,000 daily candles) are
+    // rejected outright instead of returning the newest candles we do hold.
+    const candleWindow = candleRequestRange(timeframe, limit, to);
+    setRange(candleWindow);
     Promise.all([
-      api.getCandles({ assetClass, symbol, timeframe, from: String(from), to: String(to), limit: String(limit) }),
+      api.getCandles({ assetClass, symbol, timeframe, from: String(candleWindow.from), to: String(candleWindow.to), limit: String(limit) }),
       api.getCoverage(),
     ])
       .then(([candles, cov]) => {
@@ -129,6 +117,11 @@ function InstrumentContent() {
                 <Badge tone="info">fetched missing range from provider</Badge>
               ) : (
                 <Badge tone="success">served from store</Badge>
+              )}
+              {range?.clamped && (
+                <Badge tone="warning">
+                  window shortened to {range.retentionDays}d {timeframe} retention
+                </Badge>
               )}
               {coverage && coverage.length > 0 && (
                 <span className="font-mono text-xs text-ink-400">
