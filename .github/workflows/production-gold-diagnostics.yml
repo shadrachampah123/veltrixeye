@@ -165,29 +165,49 @@ jobs:
         # interpolated as `${{ inputs.* }}` into the shell — so a crafted input
         # cannot inject shell syntax into this step.
         env:
-          DIAG_STRATEGY: ${{ inputs.strategy }}
-          DIAG_VERSION: ${{ inputs.version }}
-          DIAG_SYMBOL: ${{ inputs.symbol }}
-          DIAG_ASSET_CLASS: ${{ inputs.asset_class }}
+          # `inputs.*` is EMPTY on a `push` event — it only exists for
+          # `workflow_dispatch`. Every input therefore falls back to the same
+          # documented default the dispatch form offers, so the automatic run
+          # and the manual run target exactly the same thing. (Without these
+          # fallbacks the push run failed input validation with an empty
+          # version.)
+          DIAG_STRATEGY: ${{ inputs.strategy || 'gold' }}
+          DIAG_VERSION: ${{ inputs.version || '8' }}
+          DIAG_SYMBOL: ${{ inputs.symbol || 'XAUUSD' }}
+          DIAG_ASSET_CLASS: ${{ inputs.asset_class || 'commodity' }}
         run: |
           set -euo pipefail
           case "$DIAG_VERSION" in
             ''|*[!0-9]*) echo "::error title=Invalid input::version must be a positive integer, got '$DIAG_VERSION'"; exit 1 ;;
           esac
           mkdir -p diagnostics-out
+          # stderr is captured (and uploaded) rather than lost: on failure the
+          # log below shows it. The script redacts connection strings,
+          # `password=`, bearer tokens and e-mail addresses before printing,
+          # and the workflow masks DATABASE_URL, so neither can leak a
+          # credential.
+          set +e
           npx tsx scripts/diagnostics/gold-v8-production-evidence.ts \
             --strategy "$DIAG_STRATEGY" \
             --version "$DIAG_VERSION" \
             --symbol "$DIAG_SYMBOL" \
             --asset-class "$DIAG_ASSET_CLASS" \
-            --out diagnostics-out > diagnostics-out/stdout.md
+            --out diagnostics-out > diagnostics-out/stdout.md 2> diagnostics-out/stderr.txt
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error title=Diagnostic failed::exit $STATUS — stderr follows (script-redacted; secrets masked)"
+            cat diagnostics-out/stderr.txt
+            exit "$STATUS"
+          fi
 
       - name: Publish report to the job summary
         if: always()
+        # Same fallbacks: `inputs.*` is empty when this run came from a push.
         env:
-          DIAG_VERSION: ${{ inputs.version }}
-          DIAG_SYMBOL: ${{ inputs.symbol }}
-          DIAG_ASSET_CLASS: ${{ inputs.asset_class }}
+          DIAG_VERSION: ${{ inputs.version || '8' }}
+          DIAG_SYMBOL: ${{ inputs.symbol || 'XAUUSD' }}
+          DIAG_ASSET_CLASS: ${{ inputs.asset_class || 'commodity' }}
         run: |
           set -euo pipefail
           {
@@ -211,5 +231,6 @@ jobs:
             diagnostics-out/gold-v8-production-evidence.json
             diagnostics-out/gold-v8-production-evidence.md
             diagnostics-out/stdout.md
+            diagnostics-out/stderr.txt
           if-no-files-found: warn
           retention-days: 30
