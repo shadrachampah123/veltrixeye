@@ -129,15 +129,28 @@ candles behind it.
 
 When the version's risk config demands it, the engine derives a
 **candidate** deterministically: entry is the last closed setup candle's
-close; the stop is `fixed` (entry − buffer), `structure` (last confirmed
-pivot low below entry for longs or pivot high above entry for shorts, with a
-window-extreme fallback), or `atr` (entry − ATR(14) − buffer). RR
-take-profits remain LONG-convention at `entry + riskDistance × {tp1Rr,
-tp2Rr, tp3Rr}` with `achievableRr = tp3Rr`. A `structure` TP method stores
-the nearest opposing swing as its sole TP1 (lowest pivot high above entry
-for longs, highest pivot low below entry for shorts) and measures
-`achievableRr` to that target. A degenerate candidate (non-positive risk
-distance) is `null` and noted — never fabricated.
+close; the stop is `fixed` (buffer below entry for longs, above it for
+shorts), `structure` (last confirmed pivot low below entry for longs or pivot
+high above entry for shorts, with a window-extreme fallback), or `atr`
+(ATR(14) + buffer on the same side). Every leg is **direction-oriented**
+(`m3-deterministic-eval-3` follow-up): a long candidate stops below its entry
+with targets above it, a short candidate stops above its entry with targets
+below it. RR take-profits sit at `riskDistance × {tp1Rr, tp2Rr, tp3Rr}`
+beyond the entry in the setup's direction, with `achievableRr = tp3Rr`. A
+`structure` TP method stores the nearest opposing swing as its sole TP1
+(lowest pivot high above entry for longs, highest pivot low below entry for
+shorts) and measures `achievableRr` to that target. A degenerate candidate
+(non-positive risk distance, non-positive leg) is `null` and noted — never
+fabricated.
+
+`riskDistance` and `achievableRr` are direction-neutral, so `rr_requirement`
+and M5's completeness check read the same values whichever way the legs are
+oriented, and M4's `detectionLevels` keeps its orientation **idempotent** (a
+leg already on its direction's side is stored unchanged). Persisted setups,
+scores, alerts and M6 replays therefore carry the exact same numbers as
+before the orientation fix — only the per-direction evaluation DTO became
+self-consistent (a short candidate can no longer report a stop below its
+entry or a `tp1Rr: 1` target that equals its structure stop).
 
 The buffer → price conversion is **pip-authoritative** (`m3-deterministic-eval-2`):
 a `pips` buffer is multiplied by the instrument's pip size from

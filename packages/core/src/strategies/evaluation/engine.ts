@@ -350,10 +350,11 @@ function evaluateDirection(
  *                   below entry for longs (minus buffer), pivot high above
  *                   entry for shorts (plus buffer); fallback: the window low
  *                   (long) / window high (short) if strictly beyond entry;
- *  - fixed SL     = entry − stopLossBuffer (LONG-convention; M4 mirrors for
- *                   shorts — direction-neutral for M3's riskDistance);
- *  - atr SL       = entry − ATR(14) − buffer (LONG-convention, same reason);
- *  - rr method    = TP1/2/3 at risk multiples above entry (LONG-convention),
+ *  - fixed SL     = stopLossBuffer below entry for longs, above it for shorts;
+ *  - atr SL       = ATR(14) + buffer below entry for longs, above it for
+ *                   shorts;
+ *  - rr method    = TP1/2/3 at risk multiples beyond entry in the setup's
+ *                   direction (above for longs, below for shorts),
  *                   achievableRr = tp3Rr (direction-neutral);
  *  - structure TP = the nearest opposing swing for `direction` stored as
  *                   TP1, with achievableRr measured to that target (TP2/TP3
@@ -361,6 +362,15 @@ function evaluateDirection(
  *                   when no target exists);
  *  - manual       = no targets (achievableRr null) — rr_requirement reports
  *                   "unsupported" for that method.
+ *
+ * Every leg is direction-ORIENTED (`m3-deterministic-eval-3`): a short
+ * candidate's stop sits above its entry and its targets below, so the DTO can
+ * never report a stop on the wrong side of the entry or a target equal to the
+ * stop (the `tp1Rr = 1` + structure-stop shape used to yield exactly that).
+ * `distance`-based consumers are unaffected (riskDistance/achievableRr are
+ * direction-neutral), and M4's `detectionLevels` keeps its legs
+ * idempotently, so persisted setups, scoring and replays keep the same
+ * numbers for both directions.
  *
  * Returns null when the configured method's minimum data is unavailable or
  * the resulting risk distance is not strictly positive.
@@ -380,11 +390,16 @@ export function deriveCandidate(
   // null without one, so the candidate fails closed (never an assumed pip).
   const buffer = bufferToPrice(risk.stopLossBuffer, risk.stopLossBufferUnit, entry, pipSize);
   if (buffer === null) return null;
-  // Structure stops are per-direction (stop-side pivots); fixed/atr stops and
-  // rr targets stay LONG-convention (stops below, targets above) because M3's
-  // consumers only read their direction-neutral riskDistance/achievableRr and
-  // M4 mirrors those legs for shorts at persistence time.
+  // Every leg is oriented for the direction it is derived for
+  // (`m3-deterministic-eval-3`): a long candidate stops below entry with
+  // targets above; a short candidate stops above entry with targets below.
+  // M4's `detectionLevels` orientation is idempotent by design, so a leg that
+  // is already on its direction's side is kept unchanged — the persisted
+  // setup, its scoring and any replay read exactly the same numbers either
+  // way, and only the per-direction evaluation DTO becomes self-consistent.
   const isLong = direction === 'long';
+  /** +1 for long legs (stop below, targets above), −1 for short legs. */
+  const side = isLong ? 1 : -1;
 
   let stop: number | null = null;
   let basis: string;
@@ -407,13 +422,13 @@ export function deriveCandidate(
         : `structure stop at window extreme ${extreme} plus buffer`;
     }
   } else if (risk.stopLossMethod === 'fixed') {
-    stop = entry - buffer;
-    basis = `fixed stop ${risk.stopLossBuffer}${risk.stopLossBufferUnit} from entry`;
+    stop = entry - side * buffer;
+    basis = `fixed stop ${risk.stopLossBuffer}${risk.stopLossBufferUnit} ${isLong ? 'below' : 'above'} entry`;
   } else {
     const atr = atrWilder(window, CANDIDATE_ATR_PERIOD);
     if (atr === null) return null;
-    stop = entry - atr - buffer;
-    basis = `ATR(${CANDIDATE_ATR_PERIOD}) ${atr} below entry plus buffer`;
+    stop = entry - side * (atr + buffer);
+    basis = `ATR(${CANDIDATE_ATR_PERIOD}) ${atr} ${isLong ? 'below' : 'above'} entry plus buffer`;
   }
   if (stop === null || !Number.isFinite(stop) || stop <= 0) return null;
   const riskDistance = Math.abs(entry - stop);
@@ -424,9 +439,9 @@ export function deriveCandidate(
   let tp3: number | null = null;
   let achievableRr: number | null = null;
   if (risk.takeProfitMethod === 'rr') {
-    tp1 = entry + riskDistance * risk.tp1Rr;
-    tp2 = entry + riskDistance * risk.tp2Rr;
-    tp3 = entry + riskDistance * risk.tp3Rr;
+    tp1 = entry + side * riskDistance * risk.tp1Rr;
+    tp2 = entry + side * riskDistance * risk.tp2Rr;
+    tp3 = entry + side * riskDistance * risk.tp3Rr;
     achievableRr = risk.tp3Rr;
   } else if (risk.takeProfitMethod === 'structure') {
     const target = structuralTarget(window, direction, entry);
