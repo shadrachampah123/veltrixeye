@@ -10,9 +10,15 @@
 #   proposed from evidence and never from assumption.
 #
 # WHAT THIS DELIBERATELY CANNOT DO
-#   * It is `workflow_dispatch` ONLY. No push, pull_request, schedule or
-#     workflow_call trigger: it never runs on its own and nothing else can
-#     invoke it.
+#   * TRIGGERS are limited to `workflow_dispatch` (manual, from the Actions
+#     tab) and `push` to the single branch `arena/f7a581d4-veltrixeye`. There
+#     is no `pull_request`, no `schedule` and no `workflow_call` trigger, and
+#     no other branch is accepted — so a push to `main` (which also auto-
+#     deploys the Render API) can never start it, and nothing outside this
+#     repository can invoke it.
+#   * Even when it runs automatically on push it only SELECTs: the push path
+#     is byte-identical to the manual path (same job, same script, same
+#     read-only transaction).
 #   * LEAST PRIVILEGE: the job grants itself `contents: read` and NOTHING else
 #     — no `packages: write`, no `id-token: write`, no `pull-requests: write`,
 #     no `actions: write`. It cannot open or merge a PR, publish a package, or
@@ -37,14 +43,24 @@
 #     secret.
 #
 # OPERATION
-#   Actions → "Production Gold diagnostics (read-only)" → Run workflow.
-#   Requires the repository secret `DATABASE_URL` to exist. If it does not, the
-#   run fails fast with an explicit message and NOTHING is attempted — no
-#   credential is invented, guessed or defaulted.
+#   Automatic: every push to `arena/f7a581d4-veltrixeye` starts it.
+#   Manual: Actions → "Production Gold diagnostics (read-only)" → Run workflow
+#   (select the `arena/f7a581d4-veltrixeye` branch).
+#
+#   Both paths require the repository secret `DATABASE_URL`. If it is absent
+#   the run fails at the first step with an explicit message and NOTHING is
+#   attempted — no credential is invented, guessed or defaulted.
 
 name: Production Gold diagnostics (read-only)
 
 on:
+  # Branch-restricted on purpose: this is the ONLY branch the workflow file
+  # lives on, and the only branch allowed to start it. A push to `main` must
+  # never trigger a production read (and would also redeploy the API).
+  push:
+    branches:
+      - arena/f7a581d4-veltrixeye
+
   workflow_dispatch:
     inputs:
       strategy:
@@ -68,7 +84,9 @@ on:
 permissions:
   contents: read
 
-# One diagnostic at a time; a manual re-run supersedes an in-flight one.
+# One diagnostic at a time. `cancel-in-progress: false` so a run started by a
+# push is never cancelled mid-flight by a later push (or a manual dispatch) —
+# a half-finished read is worse than a queued one.
 concurrency:
   group: production-gold-diagnostics
   cancel-in-progress: false
