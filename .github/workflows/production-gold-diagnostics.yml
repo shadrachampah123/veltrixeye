@@ -32,7 +32,9 @@
 #   * TLS: `verify-full` only (certificate chain AND hostname verified). There
 #     is no fallback to unauthenticated TLS or plaintext. See the script header.
 #   * The evidence report is NOT copied into the job summary (a summary is
-#     visible to every reader of the repository). It is downloadable from the
+#     visible to every reader of the repository) and NOT printed to the step
+#     log. stdout and stderr go to files only, and the script's stdout is a
+#     one-line status. The report is downloadable from the
 #     `gold-v8-production-evidence` artifact, retained for 7 days.
 #   * NO TRADING: it never constructs an execution or risk service, and no
 #     broker/transport credential exists in this repository's CI surface.
@@ -186,11 +188,11 @@ jobs:
             ''|*[!0-9]*) echo "::error title=Invalid input::version must be a positive integer, got '$DIAG_VERSION'"; exit 1 ;;
           esac
           mkdir -p diagnostics-out
-          # stderr is captured (and uploaded) rather than lost: on failure the
-          # log below shows it. The script redacts connection strings,
-          # `password=`, bearer tokens and e-mail addresses before printing,
-          # and the workflow masks DATABASE_URL, so neither can leak a
-          # credential.
+          # stdout and stderr are both written to files, never to this log.
+          # stdout carries only a one-line status from the script. stderr holds
+          # the script's own scrubbed messages and is uploaded in the artifact.
+          # Neither is printed here, so a failure cannot echo the connection
+          # string, the password or any evidence into the step log.
           set +e
           npx tsx scripts/diagnostics/gold-v8-production-evidence.ts \
             --strategy "$DIAG_STRATEGY" \
@@ -201,10 +203,12 @@ jobs:
           STATUS=$?
           set -e
           if [ "$STATUS" -ne 0 ]; then
-            echo "::error title=Diagnostic failed::exit $STATUS — stderr follows (script-redacted; secrets masked)"
-            cat diagnostics-out/stderr.txt
+            # Minimal status only. The detail is in the uploaded artifact
+            # (stderr.txt), not in this log.
+            echo "::error title=Diagnostic failed::exit $STATUS. Details are in the 'gold-v8-production-evidence' artifact (stderr.txt); they are not printed to this log."
             exit "$STATUS"
           fi
+          echo "Diagnostic completed (exit 0). Evidence is in the 'gold-v8-production-evidence' artifact (retained 7 days); it is not printed here."
 
       - name: Record run status in the job summary (report stays in the artifact)
         if: always()

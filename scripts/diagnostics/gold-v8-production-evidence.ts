@@ -40,6 +40,11 @@
  *     A missing `DATABASE_URL` is a hard stop (exit 2) — no credential is
  *     invented, guessed or defaulted.
  *
+ *   - NO REPORT ON STDOUT OR STDERR. The evidence is written to the JSON and
+ *     Markdown files only. stdout carries a one-line completion status. Errors
+ *     print a machine-readable code (SQLSTATE or Node TLS code), never the
+ *     driver message, stack or connection string.
+ *
  *   - NOTHING IS TRIGGERED. This file imports `pg` and `node:*` ONLY. It never
  *     constructs `ScannerService`, `AlertService`, `NotificationWorker`,
  *     `SetupService`, or any execution/risk service, so it cannot start a
@@ -246,6 +251,19 @@ function tlsUrlProblem(rawUrl: string): string | null {
     }
   }
   return null;
+}
+
+/**
+ * The machine-readable error code of a driver or Node error, for printing.
+ * Postgres SQLSTATE codes (e.g. 28P01 bad password, 3D000 no such database,
+ * 42501 permission denied) and Node TLS codes (e.g. UNABLE_TO_VERIFY_LEAF_SIGNATURE)
+ * carry no data. Error MESSAGES are never printed: a database message can echo
+ * row values, and a connection message can echo the URL. Anything that is not a
+ * short code prints as UNKNOWN.
+ */
+function errorCodeOf(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && /^[A-Za-z0-9_]{1,40}$/.test(code) ? code : 'UNKNOWN';
 }
 
 // ---------------------------------------------------------------------------
@@ -912,7 +930,7 @@ async function main(): Promise<number> {
   try {
     client = await pool.connect();
   } catch (err) {
-    console.error(`[gold-diagnostic] cannot reach the database: ${redact((err as Error).message)}`);
+    console.error(`[gold-diagnostic] cannot reach the database (error code: ${errorCodeOf(err)}). The driver message is withheld; it can contain the connection string.`);
     await pool.end().catch(() => {});
     return 3;
   }
@@ -1270,7 +1288,7 @@ async function main(): Promise<number> {
     evidence.safety.everyQueryRanInsideBeginReadOnly = ro.allQueriesInsideReadOnly;
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error(`[gold-diagnostic] query failed: ${redact((err as Error).message)}`);
+    console.error(`[gold-diagnostic] query failed (error code: ${errorCodeOf(err)}). The database message is withheld; it can contain row values.`);
     return 3;
   } finally {
     client.release();
@@ -1297,9 +1315,13 @@ async function main(): Promise<number> {
   writeFileSync(jsonPath, `${JSON.stringify(finalEvidence, null, 2)}\n`, 'utf8');
   writeFileSync(mdPath, markdown, 'utf8');
 
-  console.info(markdown);
-  console.info(`\n[gold-diagnostic] JSON  ${jsonPath}`);
-  console.info(`[gold-diagnostic] MD    ${mdPath}`);
+  // stdout carries a status line only. The report is never printed: it is in
+  // the two files above, which the workflow uploads as the 7-day artifact.
+  console.info(`[gold-diagnostic] completed. Evidence written to ${opts.outDir}/ (JSON and Markdown).`);
+  console.info(`[gold-diagnostic] output check: secretsRedacted=${finalEvidence.safety.secretsRedacted}.`);
+  console.info(
+    '[gold-diagnostic] The report is NOT printed here. Download the "gold-v8-production-evidence" workflow artifact (retained 7 days).',
+  );
   return 0;
 }
 
@@ -1556,6 +1578,6 @@ main()
     process.exit(code);
   })
   .catch((err: unknown) => {
-    console.error(`[gold-diagnostic] unexpected failure: ${redact((err as Error).message)}`);
+    console.error(`[gold-diagnostic] unexpected failure (error code: ${errorCodeOf(err)}). The message is withheld.`);
     process.exit(3);
   });
