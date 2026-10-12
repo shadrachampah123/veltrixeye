@@ -1,5 +1,116 @@
 # Vercel Preview replacement — safety audit and execution handoff
 
+## Current safe Preview route — no token replacement requested
+
+**The prior token-replacement next action is superseded by the current request.**
+Deployment writes remain disabled. The safe route identified now is **build-only
+Preview validation**, not creation of a hosted Vercel deployment. No new build
+or deployment result is claimed by this investigation.
+
+### Verified no-deployment test route
+
+Vercel's [official build documentation](https://vercel.com/docs/cli/build), updated
+2026-10-07, states that `vercel build` builds locally/in CI, writes local
+`.vercel/output` artifacts, and defaults to Preview variables. A deployment is
+created only by a separate deploy command. The intended command is:
+
+```text
+vercel build --target=preview --non-interactive
+```
+
+This is safe **only with fail-closed setup**, not as an unguarded one-liner:
+
+- Pin the reviewed CLI version and use isolated copies of the two exact SHAs.
+- Use reviewed local/repository-derived build settings and an allowlisted,
+  non-secret Preview environment. Do not pull/copy production environment data.
+- Require the local settings cache before invoking the CLI. Cache absence must
+  stop the check, not trigger setup, linking, importing, or automatic pulls.
+- Do not use `--yes`, `--prod`, `--id`, `--project`, interactive setup, or any
+  deploy/pull/link/create/promote/alias command. Never run bare `vercel`.
+- Use a credential-cleared environment and isolated local/global-config paths;
+  telemetry disabled; reserved `API_INTERNAL_BASE=https://preview-api.invalid`.
+  No Vercel credential is needed by the cached local-build path.
+- Do not follow CLI-generated "next: deploy" suggestions. Save only local build
+  status, exact SHA, `target: preview`, and filtered build/artifact evidence.
+- Outputs remain in excluded scratch storage, never in Git. The working
+  checkout must not be linked to the existing live Vercel project.
+
+The official [CLI source at `c628be7`](https://github.com/vercel/vercel/blob/c628be7835e03a965b93e9cf9e2bd5ac2acbf5eb/packages/cli/src/commands/build/index.ts)
+(package version **59.11.7**) was inspected read-only. It defaults target to
+Preview; cached settings skip its pull/setup branch; non-interactive/no-`--yes`
+returns an error if settings are missing; no `--id` uses a local Preview env
+file rather than fetching deployment env data; the build path writes local
+output and returns instead of creating a deployment. The
+[entrypoint](https://github.com/vercel/vercel/blob/c628be7835e03a965b93e9cf9e2bd5ac2acbf5eb/packages/cli/src/index.ts)
+explicitly permits `build` without an auth token.
+
+**Availability/provenance caveat:** there is no `.vercel/project.json`, repo
+link, or Preview env cache in this checkout. Do not imply cloud settings were
+successfully fetched. The agent must prepare and validate isolated, repo-derived
+local test inputs, or stop if the pinned CLI cannot use them without remote
+setup. Such inputs are local test configuration, not verified cloud project
+configuration. The CLI build route is verified from official documentation and
+source; it has **not yet been executed** for this task.
+
+Both exact commits already passed `npm ci`, `next build`, web typecheck and
+272 web tests each in the previous session. A Vercel Build Output check is an
+additional packaging/Preview-build test. **Neither local check exercises
+Vercel's server-side Git information retrieval or provides a hosted Preview URL.**
+
+### Hosted Preview route — conditional, not currently available
+
+The [official environment documentation](https://vercel.com/docs/deployments/environments#first-deployment)
+says that after a project's first Production deployment already exists, later
+non-production-branch/Preview deployments follow the normal Preview rules.
+Thus an **already-initialized, separate non-live project** is a documented route
+that avoids making this task the project's first deployment. Before enabling
+any future write, read-only checks must establish its identity, existing
+initialization, root `apps/web`, repository link, isolation, no live domains or
+production secrets, and explicit Preview targeting. Never fall back to the live
+`veltrixeye` project.
+
+No such isolated initialized candidate has been verified. The last actual
+inferred-scope project-list response (2026-10-12 20:42 UTC) contained **zero
+projects**, and the token could not access the existing project's team. This
+is a timestamped observation, not proof that no other account has a suitable
+project. No project lookup/create/deployment is attempted to fill the gap.
+
+### Routes not accepted as Production-safe workarounds
+
+- A new/empty project, even with no `--prod`, a non-production branch, omitted
+  REST target, or Preview-only variables: the documented first-Production rule
+  still applies. No supported first-deployment override was verified.
+- `--skip-domain`: [official deploy docs](https://vercel.com/docs/cli/deploy#skip-domain)
+  require `--prod`; it skips promotion/domain assignment, **not** Production
+  deployment classification. Staged Production is also still Production.
+- Static/placeholder bootstrap, no-Git initial upload, prebuilt upload, or
+  connect/disconnect tricks: no verified exception to first-Production behavior.
+- Anonymous/temporary deployment: the reviewed
+  [deploy source](https://github.com/vercel/vercel/blob/c628be7835e03a965b93e9cf9e2bd5ac2acbf5eb/packages/cli/src/commands/deploy/index.ts)
+  explicitly sets `target = 'production'` when an anonymous link is created.
+- Custom/staging environment: a different environment and possibly a paid-plan
+  feature, not proof that a new project's first deployment can be Preview-only.
+- `vercel deploy --dry`: the reviewed source requires an existing link and
+  exits before creating a deployment, but this is only an upload/packaging
+  inspection, not a build test, Git retrieval test, or hosted Preview. It is not
+  used to avoid cached-build prerequisites or to create/link a project.
+- `build --yes` / `pull --yes`: [build](https://vercel.com/docs/cli/build#yes) and
+  [pull](https://vercel.com/docs/cli/pull#yes) can enter automatic project setup.
+  They are excluded even though build itself is a local operation.
+
+### One safe next action for the user
+
+**Approve build-only Preview validation of the two exact SHAs, with no project
+creation, upload, deployment, automatic setup/pull/link, or token change.**
+
+- Baseline: `d4c33301add7d8ecd8bf45c359a7bad4795acb9f`
+- PR #104 head: `3b0e26409c7ea2159292c33b38ff09decf7da47d`
+
+The agent handles implementation and reports whether each local build/output
+check actually passes. This approval is **not** permission to deploy, initialize
+Production, promote, or merge. All deployment writes stay disabled. PR #104
+remains open/draft and Gold debugging remains paused.
+
 ## Current permission investigation (from `a395d70`)
 
 The previous suggestion to obtain an Owner management token was broader than
@@ -252,7 +363,7 @@ principal's RBAC permissions. A Project token for the old live project cannot
 create a new sibling project. A project scope is suitable for the current
 read-only evidence phase, but not for the original separate-project bootstrap.
 
-## One clear next action (requirements now verified)
+## Previous token next action (superseded — do not act on it now)
 
 **Replace the existing private Actions secret `VERCEL_PREVIEW_TOKEN_5648E2F6`
 with an unexpired Vercel token explicitly scoped to

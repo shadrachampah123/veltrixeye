@@ -852,12 +852,11 @@
     "newWorkflowNoticePublished": false
   },
   "nextSingleManualAction": {
-    "verifiedRequired": true,
-    "action": "Replace VERCEL_PREVIEW_TOKEN_5648E2F6 privately with an unexpired Vercel token scoped to shadrachampah123s-projects / team_Mzs68E6FMzdUnXcEbaQ52LuK. For the originally intended separate-project provisioning, select Team -> All Projects; Full Account/Owner are not mandatory. Token creator must have the required team/project capabilities. No value in chat.",
-    "readOnlyMinimumCanBeNarrower": "For existing-project/deployment/log reads only, Project -> veltrixeye with appropriate read/log capability can suffice; this cannot provision the separate project.",
-    "secretSettingsUrl": "https://github.com/shadrachampah123/veltrixeye/settings/secrets/actions/VERCEL_PREVIEW_TOKEN_5648E2F6",
-    "allDeploymentWritesStillDisabled": true,
-    "firstDeploymentRiskSafelyAvoided": false
+    "action": "Approve build-only Preview validation of d4c33301add7d8ecd8bf45c359a7bad4795acb9f and 3b0e26409c7ea2159292c33b38ff09decf7da47d, with no project creation, deployment, upload, automatic setup/pull/link or token replacement.",
+    "tokenReplacementRequested": false,
+    "mergeAuthorized": false,
+    "deploymentAuthorized": false,
+    "noHostedPreviewSuccessClaimed": true
   },
   "continuation": {
     "startedAtUtc": "2026-10-12T19:50:27.430834+00:00",
@@ -1267,5 +1266,126 @@
       "productionRiskAvoidedByCredentialCorrection": false
     },
     "rbacCaveat": "Scope and RBAC are independent. Read-only project/deployment/build-log capability is required; do not assume every plan's Viewer role includes log access. No membership permission was read for the inaccessible target team."
+  },
+  "safePreviewRouteInvestigation": {
+    "verifiedAtUtc": "2026-10-12T21:03:44.856149+00:00",
+    "startedFromSha": "f7b085c1517f7e076123734fd137dfb8e71c0d51",
+    "tokenReplacementRequested": false,
+    "deploymentWritesEnabled": false,
+    "recommendedRoute": "Local/CI Preview build only; no hosted deployment",
+    "documentation": [
+      {
+        "url": "https://vercel.com/docs/cli/build",
+        "updated": "2026-10-07",
+        "facts": [
+          "Build operates locally/in CI and emits .vercel/output.",
+          "Preview is the default build environment.",
+          "--target can select preview explicitly.",
+          "--yes can automatically pull settings/env and is excluded."
+        ]
+      },
+      {
+        "url": "https://vercel.com/docs/cli/pull",
+        "updated": "2026-07-15",
+        "facts": [
+          "Pull stores env/settings for offline build use.",
+          "--yes can enter new-project setup; not used."
+        ]
+      },
+      {
+        "url": "https://vercel.com/docs/deployments/environments#first-deployment",
+        "facts": [
+          "First new-project deployment is Production.",
+          "Later non-production branches/Preview follow normal rules after initialization."
+        ]
+      },
+      {
+        "url": "https://vercel.com/docs/cli/deploy#skip-domain",
+        "updated": "2026-09-18",
+        "facts": [
+          "--skip-domain requires --prod and does not convert Production to Preview.",
+          "Build and deploy are separate operations."
+        ]
+      }
+    ],
+    "officialSourceInspection": {
+      "repository": "vercel/vercel",
+      "sha": "c628be7835e03a965b93e9cf9e2bd5ac2acbf5eb",
+      "sourcePackageVersion": "59.11.7",
+      "sourceDate": "2026-09-08T18:09:19Z",
+      "buildPath": "packages/cli/src/commands/build/index.ts",
+      "entrypointPath": "packages/cli/src/index.ts",
+      "settingsPath": "packages/cli/src/util/projects/project-settings.ts",
+      "deployPath": "packages/cli/src/commands/deploy/index.ts",
+      "verifiedFacts": [
+        "build is allowed without a token.",
+        "Local cached settings skip pull/setup branch.",
+        "Non-interactive without --yes fails when cached settings are missing.",
+        "Without --id, env is read from local .env.preview.local, not fetched from a deployment.",
+        "Build writes local artifacts and returns. CLI deploy suggestions must not be followed.",
+        "Anonymous deployment setup explicitly sets target to production.",
+        "Dry run requires an existing link and exits before the deployment path."
+      ]
+    },
+    "buildOnlyPlan": {
+      "command": [
+        "vercel",
+        "build",
+        "--target=preview",
+        "--non-interactive"
+      ],
+      "projectCreationAllowed": false,
+      "deploymentAllowed": false,
+      "tokenOrCloudCredentialsPassed": false,
+      "automaticSetupPullLinkAllowed": false,
+      "useProdIdProjectYesOrBareVercelAllowed": false,
+      "requireValidatedLocalSettingsAndPreviewEnv": true,
+      "missingCacheBehavior": "Stop. Never auto pull/link/create as a fallback.",
+      "localInputs": "Isolated repo-derived test inputs; not represented as fetched/verified cloud settings.",
+      "rootDirectory": "apps/web",
+      "apiPlaceholder": "https://preview-api.invalid",
+      "outputStorage": "Excluded scratch only; no generated build artifacts committed.",
+      "actualCliBuildExecuted": false,
+      "newResultsClaimed": false,
+      "safeByNotCreatingDeployment": true,
+      "provesProviderGitRetrievalWorks": false,
+      "hostedPreviewUrlCreated": false
+    },
+    "conditionalHostedRoute": {
+      "route": "Already initialized, separate non-live project; Preview-only request after read-only validation.",
+      "candidateVerified": false,
+      "firstDeploymentRiskWouldBeAvoidedByExistingInitialization": true,
+      "latestAccessibleProjectListAtUtc": "2026-10-12T20:42:03.601Z",
+      "latestAccessibleProjectCount": 0,
+      "existingLiveProjectMustNotBeFallback": true,
+      "freshProjectPreviewOnlyGuaranteeFound": false
+    },
+    "rejectedWorkarounds": [
+      "initial non-production Git branch",
+      "omitted target/default Preview",
+      "--skip-domain/staged Production",
+      "placeholder/static/prebuilt first upload",
+      "anonymous temporary deployment",
+      "unverified custom-env first-deployment exception"
+    ],
+    "checksThisTurn": {
+      "existingSafetyTests": 40,
+      "passed": 40,
+      "failed": 0,
+      "cloudVercelMutations": 0,
+      "newProjectCreated": false,
+      "newDeploymentsRequested": false,
+      "productionChanged": false,
+      "pr104Merged": false,
+      "goldDebuggingResumed": false
+    }
+  },
+  "supersededTokenNextAction": {
+    "verifiedRequired": true,
+    "action": "Replace VERCEL_PREVIEW_TOKEN_5648E2F6 privately with an unexpired Vercel token scoped to shadrachampah123s-projects / team_Mzs68E6FMzdUnXcEbaQ52LuK. For the originally intended separate-project provisioning, select Team -> All Projects; Full Account/Owner are not mandatory. Token creator must have the required team/project capabilities. No value in chat.",
+    "readOnlyMinimumCanBeNarrower": "For existing-project/deployment/log reads only, Project -> veltrixeye with appropriate read/log capability can suffice; this cannot provision the separate project.",
+    "secretSettingsUrl": "https://github.com/shadrachampah123/veltrixeye/settings/secrets/actions/VERCEL_PREVIEW_TOKEN_5648E2F6",
+    "allDeploymentWritesStillDisabled": true,
+    "firstDeploymentRiskSafelyAvoided": false
   }
 }
