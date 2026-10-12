@@ -37,14 +37,15 @@ jobs:
           node-version: 22
 
       - name: Verify read-only safeguards offline (no credentials)
-        run: node --test scripts/deployment/test/vercel-preview-validation.test.mjs
+        run: node --test scripts/deployment/test/*.test.mjs
 
-      - name: Audit token scope and the existing exact Preview deployments (GET only)
-        # The value is never printed. It is exposed only to this read-only step.
-        # The helper exits 2 to keep the unsafe new-project bootstrap BLOCKED.
+      - name: Diagnose minimum token permissions and inferred scope (four GETs only)
+        # Never print token values, IDs, names, prefixes/suffixes, or raw responses.
+        # An expected project-scope 403 is not treated as an invalid credential.
+        # No team query is added to account metadata or inferred-scope reads.
         env:
           VERCEL_PREVIEW_TOKEN: ${{ secrets.VERCEL_PREVIEW_TOKEN_5648E2F6 }}
-        run: node scripts/deployment/vercel-preview-validation.mjs > "$RUNNER_TEMP/vercel-preview-evidence.json"
+        run: node scripts/deployment/vercel-token-permissions.mjs > "$RUNNER_TEMP/vercel-preview-evidence.json"
 
       - name: Publish filtered evidence (no token or raw historical logs)
         if: always()
@@ -54,11 +55,12 @@ jobs:
           const path = `${process.env.RUNNER_TEMP}/vercel-preview-evidence.json`;
           if (!existsSync(path)) process.exit(0);
           const e = JSON.parse(readFileSync(path, 'utf8'));
-          const rows = e.deployments.map(d => `| ${d.role} | \`${d.requestedSha}\` | ${d.state ?? 'not read'} |`);
+          const rows = (e.probes ?? []).map(p => `| ${p.label} | \`${p.path}\` | ${p.httpStatus ?? 'not available'} |`);
           appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
-            `## Read-only Vercel Preview audit: ${e.status}`,
-            e.blocker ? `Blocker: \`${e.blocker.code}\`.` : '',
-            '| Existing deployment | Expected commit | API state |',
+            `## Read-only token-scope diagnosis: ${e.status}`,
+            e.diagnosis ? `Diagnosis: \`${e.diagnosis.code}\` (${e.diagnosis.confidence}).` : '',
+            e.blocker ? `Deployment gate: \`${e.blocker.code}\`.` : '',
+            '| Read-only probe | Endpoint | HTTP status |',
             '| --- | --- | --- |', ...rows, '',
             'No new project or deployment was requested. No Vercel writes are possible in this job.',
             'Filtered evidence is also available in the vercel-preview-evidence artifact (7 days).', '',

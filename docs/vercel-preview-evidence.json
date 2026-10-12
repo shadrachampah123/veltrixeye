@@ -852,9 +852,7 @@
     "newWorkflowNoticePublished": false
   },
   "nextSingleManualAction": {
-    "action": "Have the Vercel team owner replace VERCEL_PREVIEW_TOKEN_5648E2F6 privately with a management token authorized for shadrachampah123s-projects / team_Mzs68E6FMzdUnXcEbaQ52LuK, including team-read and intended project/Git/deployment permissions. Never paste the value in chat.",
-    "secretSettingsUrl": "https://github.com/shadrachampah123/veltrixeye/settings/secrets/actions/VERCEL_PREVIEW_TOKEN_5648E2F6",
-    "doesNotWaiveFirstProductionSafetyBlocker": true
+    "action": "Deferred pending read-only diagnostics. Do not replace the token or grant Owner/Full Account access solely because the prior team endpoint returned 403."
   },
   "continuation": {
     "startedAtUtc": "2026-10-12T19:50:27.430834+00:00",
@@ -1001,6 +999,102 @@
       ],
       "explicitCommitMarker": "[vercel-safety-audit]",
       "automaticRejectedCredentialRetries": false
+    }
+  },
+  "permissionInvestigation": {
+    "startedFromSha": "a395d70d100eb075fb5abd3b3f65b66e07b39467",
+    "verifiedDocsAtUtc": "2026-10-12T20:41:13.385951+00:00",
+    "canonicalTargetRevalidated": {
+      "teamId": "team_Mzs68E6FMzdUnXcEbaQ52LuK",
+      "slug": "shadrachampah123s-projects",
+      "existingProjectId": "prj_Rg2CpBEW2UAL99WMYOqugtEOWGwn",
+      "sourceGithubBotCommentId": 6123108228,
+      "sourceUpdatedAt": "2026-10-12T15:06:39Z"
+    },
+    "documentation": [
+      {
+        "url": "https://vercel.com/docs/accounts/access-tokens",
+        "updated": "2026-09-08",
+        "verifiedFacts": [
+          "Full Account, Team, Project are distinct scopes.",
+          "Project scope denies team/user resources and other projects.",
+          "Team -> All Projects is the team-scoped option.",
+          "Scoped tokens infer their team/project without teamId.",
+          "Project-scoped tokens cannot mint new tokens."
+        ]
+      },
+      {
+        "url": "https://vercel.com/docs/rest-api/authentication/get-auth-token-metadata",
+        "verifiedFacts": [
+          "GET /v5/user/tokens/current reads current-token metadata.",
+          "No credential ID, name, prefix, suffix or raw metadata will be published."
+        ]
+      },
+      {
+        "url": "https://vercel.com/docs/rest-api/getting-started",
+        "verifiedFacts": [
+          "GET /v10/projects is a documented read-only credential check for all three token scopes.",
+          "Array and paginated project-list responses are both valid.",
+          "403 is permission denial, not proof of expiration or an invalid value."
+        ]
+      },
+      {
+        "url": "https://vercel.com/docs/rbac/access-roles/extended-permissions",
+        "verifiedFacts": [
+          "Developer can receive Create Project; Member/Owner already include it.",
+          "Full Production Deployment is a different extended permission, not requested here."
+        ]
+      },
+      {
+        "url": "https://vercel.com/docs/deployments/environments#first-deployment",
+        "verifiedFacts": [
+          "First deployment of a new project is Production even from a non-production branch.",
+          "No safe bypass was proved; all writes stay disabled."
+        ]
+      }
+    ],
+    "correctionsToPreviousAdvice": [
+      "A project-scoped token can be valid while GET /v2/teams/{id} returns 403.",
+      "Owner role and Full Account scope are not blanket minimum requirements.",
+      "The prior 403 alone does not establish the current token scope or why it was denied."
+    ],
+    "minimumForCurrentReadOnlyProjectEvidence": {
+      "tokenScope": "Existing-project scope can suffice for project/deployment/log reads; team read is an additional resource.",
+      "privileges": "Read-only project/deployment/build-log access; no Owner, mutation or token-creation privilege required."
+    },
+    "minimumForFutureSeparateProjectProvisioning": {
+      "tokenScope": "Team shadrachampah123s-projects -> All Projects, not Full Account and not an existing-project-only token.",
+      "roleCapability": "Developer plus Create Project, with rights to configure/link the new project and read/create Preview deployments; Member is sufficient but broader. Owner is not mandatory.",
+      "productionPrivilegeRequired": false,
+      "enabled": false,
+      "readChecksDoNotProveAllFutureMutationPermissions": true
+    },
+    "boundedGetOnlyDiagnostic": {
+      "endpoints": [
+        "/v5/user/tokens/current",
+        "/v10/projects?limit=100",
+        "/v2/teams?limit=100",
+        "/v2/teams/team_Mzs68E6FMzdUnXcEbaQ52LuK"
+      ],
+      "implicitTeamOrSlugQuery": false,
+      "maxRequests": 4,
+      "rawDataSaved": false,
+      "tokenFragmentsSaved": false,
+      "headerNormalizationIsPrivate": true,
+      "mutationRequests": 0,
+      "runtimeResult": null
+    },
+    "offlineVerification": {
+      "tests": 40,
+      "passed": 40,
+      "failed": 0,
+      "yamlShellSecretScopeAndNoticeValidation": "PASS"
+    },
+    "manualActionRequestedBeforeDiagnosis": false,
+    "fileHashesSha256": {
+      ".github/workflows/vercel-preview-validation.yml": "e480ae25f23fd3ceed567e8004d85530e3f709d6ee1e8638d5165600575ca068",
+      "scripts/deployment/vercel-token-permissions.mjs": "b8db5f110c4ba5f424471b3325a1399b8630785e340bf26e1a0be805ad441c3d",
+      "scripts/deployment/test/vercel-token-permissions.test.mjs": "1322acfbdca6a5d29b42935364a036bc3b68f5682983b9615a4fa941e8b1aeb3"
     }
   }
 }

@@ -1,6 +1,46 @@
 # Vercel Preview replacement — safety audit and execution handoff
 
-## Current decision
+## Current permission investigation (from `a395d70`)
+
+The previous suggestion to obtain an Owner management token was broader than
+verified minimum requirements. **No manual troubleshooting or credential change
+is requested yet.** A valid project-scoped token is documented to reject
+team/user-resource requests, so the old GET-team 403 alone is inconclusive.
+
+The canonical existing-project team was revalidated from Vercel's fresh GitHub
+bot metadata: `shadrachampah123s-projects`, `team_Mzs68E6FMzdUnXcEbaQ52LuK`,
+project `prj_Rg2CpBEW2UAL99WMYOqugtEOWGwn`.
+
+Official sources checked:
+
+- [Access-token scope levels](https://vercel.com/docs/accounts/access-tokens):
+  Full Account, Team, and Project are different resource scopes. Selecting a team
+  then **All Projects** produces Team scope; selecting one project does not.
+- [Read-only API getting started](https://vercel.com/docs/rest-api/getting-started):
+  `GET /v10/projects` works in the token's own scope without forcing a team ID.
+- [Current-token metadata](https://vercel.com/docs/rest-api/authentication/get-auth-token-metadata):
+  `GET /v5/user/tokens/current` is supported. This user-level request may itself
+  be denied to a valid project-scoped token; denial is not a validity test.
+- [Extended RBAC permissions](https://vercel.com/docs/rbac/access-roles/extended-permissions):
+  Developer + **Create Project** is narrower than Owner. Member includes
+  creation rights, but is broader. **Full Production Deployment** is distinct
+  and not required/requested for Preview work.
+
+The agent has prepared exactly four independent GET-only probes. Current-token
+metadata, inferred-scope project listing, team discovery, and the exact expected
+team are queried **without an automatically appended `teamId` or `slug`**.
+Only known enums, booleans, counts and the already-known expected team identity
+are published. Token IDs/names/prefixes/suffixes, unknown team/project identities,
+private user data, env arrays, and raw responses are omitted. Minor pasted
+Bearer-prefix/whitespace issues can be normalized inside the private job;
+privilege/scope escalation and token creation/modification are not attempted.
+
+Both the prior safety suite and new scope suite pass: **40/40 offline tests**.
+Runtime diagnosis is pending. Nothing in these tests proves the real token
+scope or mutation permissions. The new-project first-Production risk has **not**
+been safely avoided; all project/deployment writes stay disabled.
+
+## Previous audit decision (historical)
 
 **BLOCKED: the supplied token cannot access the expected Vercel team.**
 The GET-only [audit run 38300476511](https://github.com/shadrachampah123/veltrixeye/actions/runs/38300476511)
@@ -163,21 +203,19 @@ The filtered live result was recovered from Checks annotation
 `114981905252` through `api.github.com`, rather than requiring dashboard or
 external artifact-storage troubleshooting. It is saved in the evidence file.
 
-## Next single manual action
+## Next action — wait for evidence
 
-**Have the Vercel team owner replace the existing repository Actions secret
-`VERCEL_PREVIEW_TOKEN_5648E2F6` with a management token explicitly authorized for
-`shadrachampah123s-projects` / `team_Mzs68E6FMzdUnXcEbaQ52LuK`, including team-read
-and the intended project/Git/deployment permissions.**
-Use the [existing secret's private GitHub UI](https://github.com/shadrachampah123/veltrixeye/settings/secrets/actions/VERCEL_PREVIEW_TOKEN_5648E2F6);
-**do not paste the value in chat**. No production application secret should be
-reused or copied. A deployment-protection bypass credential is not a project
-management authorization.
+**No manual action is requested before the new read-only diagnosis completes.**
+The earlier Owner-token replacement instruction is superseded pending evidence.
+If it is only a request-target/header issue, the agent can correct the client
+without revealing or replacing the stored value. A token cannot self-grant
+missing membership/scope or mint a broader credential through these read-only
+checks. The documented path to a different resource scope is replacement at
+creation, not any scope-update endpoint enabled in this task.
 
-After that, the agent can explicitly rerun the **read-only** audit to verify
-scope and inspect the old Preview logs. No more credential attempts are made in
-this turn. **Fixing authorization alone does not waive the independent first-
-Production-deployment safety blocker.** A new isolated project's initialization
-still needs a separately authorized exception or an already initialized isolated
-project; neither is assumed. No Production initialization, promotion, or merge
-is requested or performed here.
+Project creation requires Team -> All Projects scope and a principal with
+Create Project and new-project configuration/Git/Preview permissions. Existing
+project/deployment-log reads may use a narrower Project token and read-only
+role. No Full Account/Owner/Billing/Full Production Deployment grant is presumed.
+No creation or deployment will occur until the first-Production risk is proved
+safely avoided. PR #104 and the Gold investigation remain untouched.
