@@ -247,7 +247,10 @@ function tlsUrlProblem(rawUrl: string): string | null {
         return 'DATABASE_URL sets sslmode to a value other than verify-full. Only authenticated TLS is accepted; remove the parameter or set it to verify-full. Nothing was attempted.';
       }
     } else if (k.startsWith('ssl') || k === 'uselibpqcompat') {
-      return `DATABASE_URL carries the TLS parameter "${key}". TLS is configured by this script only (verify-full); remove it. Nothing was attempted.`;
+      // Fixed text on purpose: the parameter NAME is user-supplied and could
+      // carry credential material (for example `ssl<password>`), so it is
+      // never echoed. Only the fact that a TLS parameter is present is reported.
+      return 'DATABASE_URL carries a TLS parameter (an ssl* setting or uselibpqcompat). TLS is configured by this script only (verify-full); remove it. Nothing was attempted.';
     }
   }
   return null;
