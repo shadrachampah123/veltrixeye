@@ -55,16 +55,31 @@
  *   - READ COST IS BOUNDED. `statement_timeout` is set for the session and
  *     every row-returning query is `LIMIT`ed.
  *
+ *   - AUTHENTICATED TLS ONLY. The only accepted mode is `verify-full`
+ *     (certificate chain AND hostname verified). It is the default. There is
+ *     no fallback to unauthenticated TLS and no fallback to plaintext: a
+ *     `DATABASE_SSL_MODE` other than `verify-full`, an `sslmode` other than
+ *     `verify-full` in the URL, any other `ssl*` URL parameter (which would
+ *     override the pool's TLS setting), or `NODE_TLS_REJECT_UNAUTHORIZED=0`
+ *     each stop the run with exit 2 before any connection is attempted.
+ *
+ *   - SAFETY FIELDS ARE MEASURED, NOT ASSERTED. The `safety.*` booleans in the
+ *     report are computed at runtime (see `ReadOnlySession` and the output
+ *     check in `main()`). The list of things this script is designed NOT to
+ *     trigger is kept separately as `declaredNotVerified` and is labelled as
+ *     declared design intent, not as verified evidence.
+ *
  * USAGE
  *   DATABASE_URL='postgres://…' \
  *     npx tsx scripts/diagnostics/gold-v8-production-evidence.ts \
  *       [--strategy <uuid|name-substring>] [--version 8] \
  *       [--symbol XAUUSD] [--asset-class commodity] [--out <dir>]
+ *   (DATABASE_SSL_MODE defaults to verify-full; it is the only accepted value.)
  *
  * EXIT CODES
  *   0  evidence collected (whether or not anything is found)
- *   2  DATABASE_URL missing/empty — configuration error, nothing attempted
- *   3  connection or query failure
+ *   2  DATABASE_URL missing/empty, or TLS configuration refused — nothing attempted
+ *   3  connection or query failure, or the output check failed — nothing written
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -96,6 +111,141 @@ function redact(text: string): string {
 function safeText(value: unknown, max = 300): string | null {
   if (value === null || value === undefined) return null;
   return redact(String(value)).slice(0, max);
+}
+
+/**
+ * Literal secret values that must never appear in output: the whole
+ * connection string and, when present, its password (encoded and decoded).
+ */
+function secretValuesFrom(rawUrl: string): string[] {
+  const values = [rawUrl];
+  try {
+    const url = new URL(rawUrl);
+    for (const p of [url.password, safeDecode(url.password)]) {
+      if (p.length >= 4) values.push(p);
+    }
+  } catch {
+    // Unparseable URL: the raw value above is still checked.
+  }
+  return values;
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** True when `text` still contains credential material (before or after redaction). */
+function leaksSecret(text: string, secretValues: readonly string[]): boolean {
+  if (secretValues.some((v) => text.includes(v))) return true;
+  return SECRET_PATTERNS.some((pattern) => {
+    pattern.lastIndex = 0;
+    return pattern.test(text);
+  });
+}
+
+/** Scrub credential material from one string: redaction patterns plus literal secrets. */
+function scrubSecrets(text: string, secretValues: readonly string[]): string {
+  let out = redact(text);
+  for (const v of secretValues) out = out.split(v).join('[redacted]');
+  return out;
+}
+
+/**
+ * Apply `fn` to every string in a JSON-like value (keys included). Plain and
+ * null-prototype objects are walked, so a row object cannot slip past the
+ * check. Dates and other class instances are returned unchanged; they carry no
+ * free text that this report renders.
+ */
+function mapStrings<T>(value: T, fn: (s: string) => string): T {
+  if (typeof value === 'string') return fn(value) as T;
+  if (Array.isArray(value)) return value.map((v) => mapStrings(v, fn)) as T;
+  if (value !== null && typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return value;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[fn(k)] = mapStrings(v, fn);
+    }
+    return out as T;
+  }
+  return value;
+}
+
+/**
+ * Guard for every query the script issues. It refuses to run a query unless
+ * the explicit `BEGIN READ ONLY` transaction is open, and it records what the
+ * server reported from inside that transaction. The report's
+ * `everyQueryRanInsideBeginReadOnly` is derived from these runtime facts.
+ */
+class ReadOnlySession {
+  private open = false;
+  private observedReadOnly = false;
+  private rolledBack = false;
+  private violations = 0;
+
+  constructor(private readonly client: pg.PoolClient) {}
+
+  async begin(): Promise<void> {
+    await this.client.query('BEGIN READ ONLY');
+    this.open = true;
+  }
+
+  /** Record `transaction_read_only` as the server reported it inside the transaction. */
+  observeTransactionReadOnly(value: string): void {
+    this.observedReadOnly = value === 'on';
+  }
+
+  async query<R extends pg.QueryResultRow = pg.QueryResultRow>(text: string, values?: unknown[]): Promise<pg.QueryResult<R>> {
+    if (!this.open) {
+      this.violations += 1;
+      throw new Error('internal: query issued outside the explicit read-only transaction');
+    }
+    return this.client.query<R>(text, values);
+  }
+
+  async end(): Promise<void> {
+    await this.client.query('ROLLBACK');
+    this.open = false;
+    this.rolledBack = true;
+  }
+
+  /** True only if the txn was observed read-only, every query ran inside it, and it was rolled back. */
+  get allQueriesInsideReadOnly(): boolean {
+    return this.violations === 0 && this.observedReadOnly && this.rolledBack;
+  }
+}
+
+/**
+ * Validate the TLS-related parameters of DATABASE_URL. The pool is configured
+ * with `ssl: { rejectUnauthorized: true }`, but pg-connection-string merges any
+ * `sslmode`/`ssl*` URL parameter over that option, so they are checked here and
+ * anything other than `sslmode=verify-full` is refused. Returns a message, or
+ * null when the URL is acceptable. The URL itself is never included in messages.
+ */
+function tlsUrlProblem(rawUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return 'DATABASE_URL could not be parsed as a URL (URL-encode special characters in the password). Nothing was attempted.';
+  }
+  // Every occurrence is checked: a repeated key could otherwise hide a weaker
+  // value behind an acceptable first one.
+  for (const [key, value] of url.searchParams.entries()) {
+    const k = key.toLowerCase();
+    if (k === 'sslmode') {
+      if (value !== 'verify-full') {
+        return 'DATABASE_URL sets sslmode to a value other than verify-full. Only authenticated TLS is accepted; remove the parameter or set it to verify-full. Nothing was attempted.';
+      }
+    } else if (k.startsWith('ssl') || k === 'uselibpqcompat') {
+      return `DATABASE_URL carries the TLS parameter "${key}". TLS is configured by this script only (verify-full); remove it. Nothing was attempted.`;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +295,9 @@ function parseOptions(argv: readonly string[]): Options {
 interface ConnectionEvidence {
   database: string;
   serverVersion: string;
+  /** Requested by this run (configuration, not observed). */
+  tlsRequestedMode: 'verify-full';
+  /** Observed from pg_stat_ssl for this session. */
   ssl: boolean | null;
   defaultTransactionReadOnly: string;
   transactionReadOnly: string;
@@ -521,10 +674,23 @@ const Q_SCANNER_CURSORS = `
 interface Evidence {
   generatedAt: string;
   target: Options;
+  /**
+   * Runtime-measured safety facts. Each is computed from what the session and
+   * the output actually were. A fact that cannot be established stays false.
+   */
   safety: {
+    /** `default_transaction_read_only` reported as `on` for this session. */
     connectionOpenedWithDefaultTransactionReadOnly: boolean;
+    /** Every query went through `ReadOnlySession` inside an observed read-only txn, which was rolled back. */
     everyQueryRanInsideBeginReadOnly: boolean;
+    /** No credential material was found in the output before the final scrub. */
     secretsRedacted: boolean;
+  };
+  /**
+   * DECLARED design intent. These describe what the code is written not to
+   * do. They are NOT verified by this run and the report labels them so.
+   */
+  declaredNotVerified: {
     triggersNothing: string[];
   };
   connection: ConnectionEvidence | null;
@@ -659,18 +825,40 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  const sslMode = process.env['DATABASE_SSL_MODE'] ?? 'require';
-  const ssl =
-    sslMode === 'verify-full'
-      ? { rejectUnauthorized: true }
-      : sslMode === 'require'
-        ? { rejectUnauthorized: false }
-        : undefined;
+  // --- TLS: authenticated by default, fail-closed ---------------------------
+  // verify-full is the default and the ONLY accepted mode. Nothing falls back
+  // to unauthenticated TLS or to plaintext. If the production database needs a
+  // private CA, that is a configuration blocker to report, not a reason to
+  // disable verification here.
+  const sslMode = process.env['DATABASE_SSL_MODE']?.trim() || 'verify-full';
+  if (sslMode !== 'verify-full') {
+    console.error(
+      '[gold-diagnostic] DATABASE_SSL_MODE must be verify-full (the only accepted value). ' +
+        'Unauthenticated TLS and plaintext are refused. Nothing was attempted.',
+    );
+    return 2;
+  }
+  if (process.env['NODE_TLS_REJECT_UNAUTHORIZED'] === '0') {
+    console.error(
+      '[gold-diagnostic] NODE_TLS_REJECT_UNAUTHORIZED=0 disables certificate verification for the whole process. ' +
+        'Unset it. Nothing was attempted.',
+    );
+    return 2;
+  }
+  const urlProblem = tlsUrlProblem(rawUrl);
+  if (urlProblem !== null) {
+    console.error(`[gold-diagnostic] ${urlProblem}`);
+    return 2;
+  }
+  const secretValues = secretValuesFrom(rawUrl);
 
   const pool = new pg.Pool({
     connectionString: rawUrl,
     max: 2,
-    ssl,
+    // Certificate chain and hostname are both verified (Node TLS default for
+    // rejectUnauthorized: true). The URL is checked above so that it cannot
+    // override this with sslmode/ssl parameters.
+    ssl: { rejectUnauthorized: true },
     application_name: 'veltrixeye-gold-diagnostic',
     // The load-bearing safety switch: EVERY session this pool opens comes up
     // with read-only as its transaction default.
@@ -680,10 +868,13 @@ async function main(): Promise<number> {
   const evidence: Evidence = {
     generatedAt: new Date().toISOString(),
     target: opts,
+    // Starts false. Each flag is set to true only by a runtime check below.
     safety: {
-      connectionOpenedWithDefaultTransactionReadOnly: true,
-      everyQueryRanInsideBeginReadOnly: true,
-      secretsRedacted: true,
+      connectionOpenedWithDefaultTransactionReadOnly: false,
+      everyQueryRanInsideBeginReadOnly: false,
+      secretsRedacted: false,
+    },
+    declaredNotVerified: {
       triggersNothing: [
         'no ScannerService — no scan is started',
         'no AlertService — no alert is generated',
@@ -726,26 +917,33 @@ async function main(): Promise<number> {
     return 3;
   }
 
+  const ro = new ReadOnlySession(client);
   try {
     // One explicit read-only transaction for the whole session: nothing this
     // script ever issues can mutate the database, whatever the role's grants.
-    await client.query('BEGIN READ ONLY');
+    // Every later query goes through `ro`, which refuses to run outside it.
+    await ro.begin();
     // Bound the read cost on a live production database.
-    await client.query("SET LOCAL statement_timeout = '30s'");
+    await ro.query("SET LOCAL statement_timeout = '30s'");
 
-    const connRes = await client.query<Record<string, unknown>>(Q_CONNECTION);
-    const versionRes = await client.query<{ server_version: string }>(Q_SERVER_VERSION);
+    const connRes = await ro.query<Record<string, unknown>>(Q_CONNECTION);
+    const versionRes = await ro.query<{ server_version: string }>(Q_SERVER_VERSION);
     let sslValue: boolean | null = null;
     try {
-      const sslRes = await client.query<{ ssl: boolean }>(Q_SSL);
+      const sslRes = await ro.query<{ ssl: boolean }>(Q_SSL);
       sslValue = sslRes.rows[0]?.ssl ?? null;
     } catch {
       sslValue = null; // pg_stat_ssl unavailable — not evidence, ignored
     }
     const c = connRes.rows[0] ?? {};
+    // Runtime facts, read from the server rather than assumed:
+    evidence.safety.connectionOpenedWithDefaultTransactionReadOnly =
+      String(c['default_tx_read_only'] ?? '') === 'on';
+    ro.observeTransactionReadOnly(String(c['tx_read_only'] ?? ''));
     evidence.connection = {
       database: String(c['database'] ?? ''),
       serverVersion: redact(String(versionRes.rows[0]?.server_version ?? '')),
+      tlsRequestedMode: 'verify-full',
       ssl: sslValue,
       defaultTransactionReadOnly: String(c['default_tx_read_only'] ?? ''),
       transactionReadOnly: String(c['tx_read_only'] ?? ''),
@@ -761,7 +959,7 @@ async function main(): Promise<number> {
     };
 
     try {
-      const migRes = await client.query<{ version: number; name: string; applied_at: string }>(Q_MIGRATIONS);
+      const migRes = await ro.query<{ version: number; name: string; applied_at: string }>(Q_MIGRATIONS);
       evidence.migrations = migRes.rows.map((r) => ({
         version: Number(r.version),
         name: String(r.name),
@@ -772,7 +970,7 @@ async function main(): Promise<number> {
     }
 
     // --- candidate strategies ------------------------------------------------
-    const stratRes = await client.query<StrategyRow>(Q_CANDIDATE_STRATEGIES, [
+    const stratRes = await ro.query<StrategyRow>(Q_CANDIDATE_STRATEGIES, [
       `%${opts.strategy}%`,
       opts.symbol,
       opts.assetClass,
@@ -789,7 +987,7 @@ async function main(): Promise<number> {
 
     // --- versions ------------------------------------------------------------
     if (strategyIds.length > 0) {
-      const verRes = await client.query<VersionRow>(Q_VERSIONS, [strategyIds]);
+      const verRes = await ro.query<VersionRow>(Q_VERSIONS, [strategyIds]);
       evidence.versions = verRes.rows.map((r) => ({
         id: String(r.id),
         strategy_id: String(r.strategy_id),
@@ -803,7 +1001,7 @@ async function main(): Promise<number> {
     // --- instrument + authoritative pip size ----------------------------------
     // Reported whether or not the target version exists: a missing pip size is
     // itself the finding, so it must never be hidden behind "no v8".
-    const instRes = await client.query<Record<string, unknown>>(Q_INSTRUMENT_SPEC, [opts.assetClass, opts.symbol]);
+    const instRes = await ro.query<Record<string, unknown>>(Q_INSTRUMENT_SPEC, [opts.assetClass, opts.symbol]);
     evidence.instrument = instRes.rows[0]
       ? {
           id: String(instRes.rows[0]['id'] ?? ''),
@@ -828,7 +1026,7 @@ async function main(): Promise<number> {
     const instrumentId = evidence.instrument ? String(evidence.instrument['id']) : null;
 
     // --- candle coverage ------------------------------------------------------
-    const covRes = await client.query<CandleCoverageRow>(Q_CANDLE_COVERAGE, [opts.assetClass, opts.symbol]);
+    const covRes = await ro.query<CandleCoverageRow>(Q_CANDLE_COVERAGE, [opts.assetClass, opts.symbol]);
     evidence.candleCoverage = covRes.rows.map((r) => ({
       timeframe: String(r.timeframe),
       candles: Number(r.candles),
@@ -856,17 +1054,17 @@ async function main(): Promise<number> {
         changelog: v8.changelog,
       };
 
-      const tfRes = await client.query<TimeframeRow>(Q_TIMEFRAMES, [v8.id]);
+      const tfRes = await ro.query<TimeframeRow>(Q_TIMEFRAMES, [v8.id]);
       evidence.timeframes = tfRes.rows.map((r) => ({ role: String(r.role), timeframe: String(r.timeframe) }));
       const roleToTimeframe = new Map<string, string>(evidence.timeframes.map((t) => [t.role, t.timeframe]));
 
-      const riskRes = await client.query<RiskRow>(Q_RISK, [v8.id]);
+      const riskRes = await ro.query<RiskRow>(Q_RISK, [v8.id]);
       evidence.risk = riskRes.rows[0] ?? null;
 
-      const scopeRes = await client.query<{ mode: string; instruments: unknown }>(Q_SCOPE, [v8.id]);
+      const scopeRes = await ro.query<{ mode: string; instruments: unknown }>(Q_SCOPE, [v8.id]);
       evidence.marketScope = scopeRes.rows[0] ?? null;
 
-      const condRes = await client.query<ConditionRow>(Q_CONDITIONS, [v8.id]);
+      const condRes = await ro.query<ConditionRow>(Q_CONDITIONS, [v8.id]);
       evidence.conditions = condRes.rows.map((r) => ({
         group_id: String(r.group_id),
         group_name: String(r.group_name),
@@ -880,12 +1078,12 @@ async function main(): Promise<number> {
         position: r.position === null || r.position === undefined ? null : Number(r.position),
       }));
 
-      const sfRes = await client.query<{ session: string; mode: string; timezone: string }>(Q_SESSION_FILTERS, [
+      const sfRes = await ro.query<{ session: string; mode: string; timezone: string }>(Q_SESSION_FILTERS, [
         v8.id,
       ]);
       evidence.sessionFilters = sfRes.rows;
 
-      const fRes = await client.query<{ filter_type: string; enabled: boolean; params: unknown; position: number }>(
+      const fRes = await ro.query<{ filter_type: string; enabled: boolean; params: unknown; position: number }>(
         Q_FILTERS,
         [v8.id],
       );
@@ -948,16 +1146,16 @@ async function main(): Promise<number> {
 
       // --- setup / alert / delivery evidence ---------------------------------
       if (instrumentId) {
-        const totalRes = await client.query<{ total: number }>(Q_SETUP_TOTAL, [v8.id, instrumentId]);
+        const totalRes = await ro.query<{ total: number }>(Q_SETUP_TOTAL, [v8.id, instrumentId]);
         evidence.setups.total = Number(totalRes.rows[0]?.total ?? 0);
 
-        const stateRes = await client.query<{ state: string; setups: number }>(Q_SETUP_STATE_COUNTS, [
+        const stateRes = await ro.query<{ state: string; setups: number }>(Q_SETUP_STATE_COUNTS, [
           v8.id,
           instrumentId,
         ]);
         evidence.setups.byState = stateRes.rows.map((r) => ({ state: String(r.state), setups: Number(r.setups) }));
 
-        const latestRes = await client.query<SetupRow>(Q_LATEST_SETUPS, [v8.id, instrumentId]);
+        const latestRes = await ro.query<SetupRow>(Q_LATEST_SETUPS, [v8.id, instrumentId]);
         evidence.setups.latest = latestRes.rows.map((r) => ({
           id: String(r.id),
           state: String(r.state),
@@ -977,7 +1175,7 @@ async function main(): Promise<number> {
 
         const setupIds = evidence.setups.latest.map((s) => s.id);
         if (setupIds.length > 0) {
-          const scoresRes = await client.query<Record<string, unknown>>(Q_SETUP_SCORES, [setupIds]);
+          const scoresRes = await ro.query<Record<string, unknown>>(Q_SETUP_SCORES, [setupIds]);
           evidence.setups.scores = scoresRes.rows.map((r) => ({
             setupId: String(r['setup_id'] ?? ''),
             engineVersion: String(r['engine_version'] ?? ''),
@@ -987,7 +1185,7 @@ async function main(): Promise<number> {
             createdAt: isoOrNull(r['created_at']),
           }));
 
-          const evRes = await client.query<Record<string, unknown>>(Q_SETUP_EVENTS, [setupIds]);
+          const evRes = await ro.query<Record<string, unknown>>(Q_SETUP_EVENTS, [setupIds]);
           evidence.setups.stateEvents = evRes.rows.map((r) => ({
             setupId: String(r['setup_id'] ?? ''),
             fromState: r['from_state'] ?? null,
@@ -997,7 +1195,7 @@ async function main(): Promise<number> {
           }));
         }
 
-        const alertRes = await client.query<AlertRow>(Q_ALERTS, [v8.id, instrumentId]);
+        const alertRes = await ro.query<AlertRow>(Q_ALERTS, [v8.id, instrumentId]);
         evidence.alerts = alertRes.rows.map((r) => ({
           id: String(r.id),
           setup_id: String(r.setup_id),
@@ -1011,7 +1209,7 @@ async function main(): Promise<number> {
           created_at: isoOrNull(r.created_at) ?? '',
         }));
 
-        const adRes = await client.query<Record<string, unknown>>(Q_ALERT_DELIVERIES, [v8.id, instrumentId]);
+        const adRes = await ro.query<Record<string, unknown>>(Q_ALERT_DELIVERIES, [v8.id, instrumentId]);
         evidence.alertDeliveries = adRes.rows.map((r) => ({
           alert_id: String(r['alert_id'] ?? ''),
           channel: String(r['channel'] ?? ''),
@@ -1021,7 +1219,7 @@ async function main(): Promise<number> {
           created_at: isoOrNull(r['created_at']) ?? '',
         }));
 
-        const ndRes = await client.query<Record<string, unknown>>(Q_NOTIFICATION_DELIVERIES, [v8.id, instrumentId]);
+        const ndRes = await ro.query<Record<string, unknown>>(Q_NOTIFICATION_DELIVERIES, [v8.id, instrumentId]);
         evidence.notificationDeliveries = ndRes.rows.map((r) => ({
           alert_id: String(r['alert_id'] ?? ''),
           channel: String(r['channel'] ?? ''),
@@ -1036,7 +1234,7 @@ async function main(): Promise<number> {
           created_at: isoOrNull(r['created_at']) ?? '',
         }));
 
-        const curRes = await client.query<Record<string, unknown>>(Q_SCANNER_CURSORS, [v8.id, instrumentId]);
+        const curRes = await ro.query<Record<string, unknown>>(Q_SCANNER_CURSORS, [v8.id, instrumentId]);
         evidence.scannerCursors = curRes.rows.map((r) => ({
           timeframe: String(r['timeframe'] ?? ''),
           last_candle_time: String(r['last_candle_time'] ?? ''),
@@ -1048,7 +1246,7 @@ async function main(): Promise<number> {
     }
 
     // --- scanner runs (global, non-identifying columns only) ------------------
-    const runRes = await client.query<ScannerRunRow>(Q_SCANNER_RUNS);
+    const runRes = await ro.query<ScannerRunRow>(Q_SCANNER_RUNS);
     evidence.scannerRuns = runRes.rows.map((r) => ({
       id: String(r.id),
       status: String(r.status),
@@ -1068,7 +1266,8 @@ async function main(): Promise<number> {
       error: safeText(r.error, 300),
     }));
 
-    await client.query('ROLLBACK');
+    await ro.end();
+    evidence.safety.everyQueryRanInsideBeginReadOnly = ro.allQueriesInsideReadOnly;
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error(`[gold-diagnostic] query failed: ${redact((err as Error).message)}`);
@@ -1078,14 +1277,27 @@ async function main(): Promise<number> {
     await pool.end().catch(() => {});
   }
 
+  // --- output check: measure, scrub, verify — before anything is written ----
+  // Every string in the evidence (keys included) is checked for credential
+  // material. `secretsRedacted` is true only if the raw evidence was already
+  // clean. If anything had to be scrubbed, the report says so.
+  const leakedBeforeScrub = anyStringLeaks(evidence, secretValues);
+  const finalEvidence: Evidence = mapStrings(evidence, (s) => scrubSecrets(s, secretValues));
+  finalEvidence.safety.secretsRedacted = !leakedBeforeScrub;
+  if (anyStringLeaks(finalEvidence, secretValues)) {
+    console.error('[gold-diagnostic] output check failed: credential material survived scrubbing. Nothing was written.');
+    return 3;
+  }
+
   // --- write report ---------------------------------------------------------
+  const markdown = renderMarkdown(finalEvidence);
   mkdirSync(opts.outDir, { recursive: true });
   const jsonPath = path.join(opts.outDir, 'gold-v8-production-evidence.json');
   const mdPath = path.join(opts.outDir, 'gold-v8-production-evidence.md');
-  writeFileSync(jsonPath, `${JSON.stringify(evidence, null, 2)}\n`, 'utf8');
-  writeFileSync(mdPath, renderMarkdown(evidence), 'utf8');
+  writeFileSync(jsonPath, `${JSON.stringify(finalEvidence, null, 2)}\n`, 'utf8');
+  writeFileSync(mdPath, markdown, 'utf8');
 
-  console.info(renderMarkdown(evidence));
+  console.info(markdown);
   console.info(`\n[gold-diagnostic] JSON  ${jsonPath}`);
   console.info(`[gold-diagnostic] MD    ${mdPath}`);
   return 0;
@@ -1094,6 +1306,16 @@ async function main(): Promise<number> {
 // ---------------------------------------------------------------------------
 // Markdown rendering
 // ---------------------------------------------------------------------------
+
+/** True if any string in `value` (keys included) still carries credential material. */
+function anyStringLeaks(value: unknown, secretValues: readonly string[]): boolean {
+  let found = false;
+  mapStrings(value, (s) => {
+    if (leaksSecret(s, secretValues)) found = true;
+    return s;
+  });
+  return found;
+}
 
 function jsonBlock(value: unknown): string {
   return ['```json', JSON.stringify(value ?? null, null, 2), '```'].join('\n');
@@ -1112,16 +1334,23 @@ function renderMarkdown(e: Evidence): string {
 
   out.push('## 1. Safety / read-only proof');
   out.push('');
+  out.push('### 1.1 Runtime-verified (measured during this run)');
+  out.push('');
   out.push(`- Connection opened with \`default_transaction_read_only=on\`: **${e.safety.connectionOpenedWithDefaultTransactionReadOnly}**`);
-  out.push(`- Every query inside one \`BEGIN READ ONLY\` … \`ROLLBACK\`: **${e.safety.everyQueryRanInsideBeginReadOnly}**`);
-  out.push(`- All output passed through credential redaction: **${e.safety.secretsRedacted}**`);
-  out.push('- Nothing triggered:');
-  for (const line of e.safety.triggersNothing) out.push(`  - ${line}`);
+  out.push(`- Every query ran inside one \`BEGIN READ ONLY\` … \`ROLLBACK\` (server reported read-only; no query issued outside it): **${e.safety.everyQueryRanInsideBeginReadOnly}**`);
+  out.push(`- No credential material in the raw output before the final scrub (\`false\` = material was found and scrubbed): **${e.safety.secretsRedacted}**`);
+  out.push('');
+  out.push('### 1.2 Declared design intent (NOT verified by this run)');
+  out.push('');
+  out.push('These describe what the code is written not to do. They are not runtime evidence.');
+  out.push('');
+  for (const line of e.declaredNotVerified.triggersNothing) out.push(`- ${line}`);
   out.push('');
   if (e.connection) {
     out.push(`- Database: \`${e.connection.database}\` (role name intentionally not printed)`);
     out.push(`- Server: ${e.connection.serverVersion.split(',').slice(0, 1).join('')}`);
-    out.push(`- TLS: ${e.connection.ssl === null ? 'unknown' : e.connection.ssl ? 'yes' : 'no'}`);
+    out.push(`- TLS requested by this run: \`${e.connection.tlsRequestedMode}\` (configuration: certificate chain and hostname verified by the client)`);
+    out.push(`- TLS observed for this session (\`pg_stat_ssl\`): ${e.connection.ssl === null ? 'unknown' : e.connection.ssl ? 'yes' : 'no'}`);
     out.push(`- \`default_transaction_read_only\` = \`${e.connection.defaultTransactionReadOnly}\``);
     out.push(`- \`transaction_read_only\` (inside the txn) = \`${e.connection.transactionReadOnly}\``);
     out.push(`- \`statement_timeout\` = \`${e.connection.statementTimeout}\``);

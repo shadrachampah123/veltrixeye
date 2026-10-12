@@ -23,11 +23,17 @@
 #     — no `packages: write`, no `id-token: write`, no `pull-requests: write`,
 #     no `actions: write`. It cannot open or merge a PR, publish a package, or
 #     mint a cloud token.
-#   * The only secret it reads is `DATABASE_URL`. It is passed through `env`,
-#     immediately masked with `::add-mask::`, and never echoed, printed,
-#     written to the report or exposed to a third-party action. The diagnostic
-#     script additionally redacts connection strings, `password=`, bearer
-#     tokens and e-mail addresses from everything it prints.
+#   * The only secret it reads is `DATABASE_URL`. It is scoped to the
+#     diagnostic step's `env` alone (never job-level, so `npm ci` and every
+#     other step run without it), immediately masked with `::add-mask::`, and
+#     never echoed, printed, written to the report or exposed to a third-party
+#     action. The diagnostic script additionally redacts connection strings,
+#     `password=`, bearer tokens and e-mail addresses from everything it prints.
+#   * TLS: `verify-full` only (certificate chain AND hostname verified). There
+#     is no fallback to unauthenticated TLS or plaintext. See the script header.
+#   * The evidence report is NOT copied into the job summary (a summary is
+#     visible to every reader of the repository). It is downloadable from the
+#     `gold-v8-production-evidence` artifact, retained for 7 days.
 #   * NO TRADING: it never constructs an execution or risk service, and no
 #     broker/transport credential exists in this repository's CI surface.
 #   * NO SCANNER EXECUTION: it does not construct `ScannerService` and performs
@@ -48,7 +54,7 @@
 #   (select the `arena/f7a581d4-veltrixeye` branch).
 #
 #   Both paths require the repository secret `DATABASE_URL`. If it is absent
-#   the run fails at the first step with an explicit message and NOTHING is
+#   the diagnostic step fails with an explicit message and NOTHING is
 #   attempted — no credential is invented, guessed or defaulted.
 
 name: Production Gold diagnostics (read-only)
@@ -97,19 +103,53 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
-    env:
-      # The ONLY secret this workflow touches. Never echoed, never persisted.
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      DATABASE_SSL_MODE: require
-      DATABASE_POOL_MAX: '2'
+    # No job-level `env`: the production secret must not be visible to any
+    # step other than the diagnostic step below (npm ci, checkout, setup, and
+    # the summary/artifact steps all run without it).
 
     steps:
-      - name: Verify the read-only database secret is configured
-        # No `set -x`: this step must never trace the value into the log.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies (npm ci)
+        run: |
+          set -euo pipefail
+          npm ci
+
+      - name: Run read-only production diagnostic
+        id: diagnostic
+        # No `set -x`: the environment here carries the secret. This is the
+        # ONLY step that receives DATABASE_URL.
+        #
+        # The dispatch inputs are passed through `env` and quoted — NEVER
+        # interpolated as `${{ inputs.* }}` into the shell — so a crafted input
+        # cannot inject shell syntax into this step.
+        env:
+          # The ONLY secret this workflow touches. Never echoed, never persisted.
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # Authenticated TLS only: certificate chain and hostname verified.
+          DATABASE_SSL_MODE: verify-full
+          DATABASE_POOL_MAX: '2'
+          # `inputs.*` is EMPTY on a `push` event — it only exists for
+          # `workflow_dispatch`. Every input therefore falls back to the same
+          # documented default the dispatch form offers, so the automatic run
+          # and the manual run target exactly the same thing. (Without these
+          # fallbacks the push run failed input validation with an empty
+          # version.)
+          DIAG_STRATEGY: ${{ inputs.strategy || 'gold' }}
+          DIAG_VERSION: ${{ inputs.version || '8' }}
+          DIAG_SYMBOL: ${{ inputs.symbol || 'XAUUSD' }}
+          DIAG_ASSET_CLASS: ${{ inputs.asset_class || 'commodity' }}
         run: |
           set -euo pipefail
           # Belt and braces on top of GitHub's automatic secret masking: register
-          # the value as a mask for every later step in this job.
+          # the value as a mask before anything else in this step runs.
           if [ -n "${DATABASE_URL:-}" ]; then
             echo "::add-mask::${DATABASE_URL}"
           fi
@@ -142,41 +182,6 @@ jobs:
             exit 1
           fi
           echo "DATABASE_URL is configured (value masked and never printed)."
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install dependencies (npm ci)
-        run: |
-          set -euo pipefail
-          npm ci
-
-      - name: Run read-only production diagnostic
-        id: diagnostic
-        # No `set -x`: the environment here carries the secret.
-        #
-        # The dispatch inputs are passed through `env` and quoted — NEVER
-        # interpolated as `${{ inputs.* }}` into the shell — so a crafted input
-        # cannot inject shell syntax into this step.
-        env:
-          # `inputs.*` is EMPTY on a `push` event — it only exists for
-          # `workflow_dispatch`. Every input therefore falls back to the same
-          # documented default the dispatch form offers, so the automatic run
-          # and the manual run target exactly the same thing. (Without these
-          # fallbacks the push run failed input validation with an empty
-          # version.)
-          DIAG_STRATEGY: ${{ inputs.strategy || 'gold' }}
-          DIAG_VERSION: ${{ inputs.version || '8' }}
-          DIAG_SYMBOL: ${{ inputs.symbol || 'XAUUSD' }}
-          DIAG_ASSET_CLASS: ${{ inputs.asset_class || 'commodity' }}
-        run: |
-          set -euo pipefail
           case "$DIAG_VERSION" in
             ''|*[!0-9]*) echo "::error title=Invalid input::version must be a positive integer, got '$DIAG_VERSION'"; exit 1 ;;
           esac
@@ -201,9 +206,13 @@ jobs:
             exit "$STATUS"
           fi
 
-      - name: Publish report to the job summary
+      - name: Record run status in the job summary (report stays in the artifact)
         if: always()
         # Same fallbacks: `inputs.*` is empty when this run came from a push.
+        # The evidence report is deliberately NOT written here. A job summary is
+        # visible to everyone with read access to the repository and is kept
+        # separately from the artifact. The report is downloadable from the
+        # `gold-v8-production-evidence` artifact (retention: 7 days).
         env:
           DIAG_VERSION: ${{ inputs.version || '8' }}
           DIAG_SYMBOL: ${{ inputs.symbol || 'XAUUSD' }}
@@ -213,14 +222,12 @@ jobs:
           {
             echo "## Production Gold diagnostics — v$DIAG_VERSION / $DIAG_ASSET_CLASS/$DIAG_SYMBOL"
             echo ""
-            echo "Read-only evidence report (connection string, credentials and personal data removed)."
-            echo ""
+            if [ -f diagnostics-out/gold-v8-production-evidence.md ]; then
+              echo "Read-only evidence report produced. It is NOT copied into this summary: download the \`gold-v8-production-evidence\` artifact from this run (retained 7 days)."
+            else
+              echo "_The diagnostic produced no report; see the log of the diagnostic step._"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ -f diagnostics-out/gold-v8-production-evidence.md ]; then
-            cat diagnostics-out/gold-v8-production-evidence.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "_The diagnostic produced no report; see the log above._" >> "$GITHUB_STEP_SUMMARY"
-          fi
 
       - name: Upload evidence artifact
         if: always()
@@ -233,4 +240,4 @@ jobs:
             diagnostics-out/stdout.md
             diagnostics-out/stderr.txt
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 7
