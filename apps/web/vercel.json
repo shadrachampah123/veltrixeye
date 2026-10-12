@@ -2,5 +2,10 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
   "installCommand": "cd ../.. && npm ci",
-  "buildCommand": "next build"
+  "buildCommand": "next build",
+  "git": {
+    "deploymentEnabled": {
+      "arena/5648e2f6-veltrixeye": false
+    }
+  }
 }

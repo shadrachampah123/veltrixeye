@@ -1,0 +1,920 @@
+{
+  "verifiedAtUtc": "2026-10-12T18:28:21.905230+00:00",
+  "repository": "shadrachampah123/veltrixeye",
+  "workingBranch": "arena/5648e2f6-veltrixeye",
+  "remoteMainSha": "c16155cc4c01c7af61b0a96b82a957c545f1ab41",
+  "pr104": {
+    "baseRefName": "main",
+    "headRefName": "arena/33fb2786-veltrixeye",
+    "headRefOid": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+    "isDraft": true,
+    "mergeable": "MERGEABLE",
+    "number": 104,
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-12T12:10:52Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38246663342/job/114802125259",
+        "name": "test (Node 22, ubuntu, embedded-postgres)",
+        "startedAt": "2026-10-12T12:03:53Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-12T12:10:40Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38246657565/job/114802105339",
+        "name": "test (Node 22, ubuntu, embedded-postgres)",
+        "startedAt": "2026-10-12T12:03:49Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "StatusContext",
+        "context": "Vercel",
+        "startedAt": "2026-10-12T13:08:48Z",
+        "state": "FAILURE",
+        "targetUrl": "https://vercel.com/shadrachampah123s-projects/veltrixeye/41zQipvnddHe9imqFozKkJMPKYEu"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-12T13:08:50Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://vercel.com/github",
+        "name": "Vercel Preview Comments",
+        "startedAt": "2026-10-12T13:08:50Z",
+        "status": "COMPLETED",
+        "workflowName": ""
+      }
+    ],
+    "updatedAt": "2026-10-12T15:06:39Z",
+    "url": "https://github.com/shadrachampah123/veltrixeye/pull/104"
+  },
+  "knownGood": {
+    "sha": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+    "commitStatuses": [
+      {
+        "context": "Vercel",
+        "state": "success",
+        "description": "Deployment has completed",
+        "target_url": "https://vercel.com/shadrachampah123s-projects/veltrixeye/5vDJqshQvh6MAkzA7LyVVCyPVZQJ",
+        "created_at": "2026-10-12T15:06:38Z",
+        "updated_at": "2026-10-12T15:06:38Z"
+      },
+      {
+        "context": "Vercel",
+        "state": "success",
+        "description": "Deployment has completed",
+        "target_url": "https://vercel.com/shadrachampah123s-projects/veltrixeye/HdJPEqJpLFEFKG5MNEpcfynqYnRe",
+        "created_at": "2026-10-12T11:31:35Z",
+        "updated_at": "2026-10-12T11:31:35Z"
+      },
+      {
+        "context": "Vercel",
+        "state": "pending",
+        "description": "Vercel is deploying your app",
+        "target_url": "https://vercel.com/shadrachampah123s-projects/veltrixeye/HdJPEqJpLFEFKG5MNEpcfynqYnRe",
+        "created_at": "2026-10-12T11:30:17Z",
+        "updated_at": "2026-10-12T11:30:17Z"
+      }
+    ],
+    "githubDeployment": {
+      "id": 7012993979,
+      "sha": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+      "ref": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+      "environment": "Preview",
+      "production_environment": false,
+      "created_at": "2026-10-12T11:31:35Z",
+      "updated_at": "2026-10-12T15:06:38Z",
+      "statuses": [
+        {
+          "state": "success",
+          "description": "Deployment has completed",
+          "environment": "Preview",
+          "environment_url": "https://veltrixeye-l4jpdxldc-shadrachampah123s-projects.vercel.app",
+          "log_url": "https://veltrixeye-l4jpdxldc-shadrachampah123s-projects.vercel.app",
+          "created_at": "2026-10-12T15:06:38Z",
+          "updated_at": "2026-10-12T15:06:38Z"
+        },
+        {
+          "state": "success",
+          "description": "Deployment has completed",
+          "environment": "Preview",
+          "environment_url": "https://veltrixeye-5dxpaml91-shadrachampah123s-projects.vercel.app",
+          "log_url": "https://veltrixeye-5dxpaml91-shadrachampah123s-projects.vercel.app",
+          "created_at": "2026-10-12T11:31:35Z",
+          "updated_at": "2026-10-12T11:31:35Z"
+        }
+      ]
+    },
+    "ciRuns": [
+      {
+        "id": 38243065027,
+        "name": "CI",
+        "event": "pull_request",
+        "head_sha": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-10-12T11:30:18Z",
+        "updated_at": "2026-10-12T11:37:17Z",
+        "html_url": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38243065027"
+      },
+      {
+        "id": 38243058602,
+        "name": "CI",
+        "event": "push",
+        "head_sha": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-10-12T11:30:14Z",
+        "updated_at": "2026-10-12T11:35:51Z",
+        "html_url": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38243058602"
+      }
+    ],
+    "githubCommitRetrieval": {
+      "status": 200,
+      "sha": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+      "parentShas": [
+        "d4f64917f0b865920294e99981b1694e4b1bf26b"
+      ]
+    },
+    "localValidation": [
+      {
+        "sha": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+        "step": "install",
+        "command": "npm ci",
+        "directory": ".",
+        "startedAtUtc": "2026-10-12T18:07:28.817752+00:00",
+        "completedAtUtc": "2026-10-12T18:07:45.974615+00:00",
+        "durationSeconds": 17.16,
+        "exitCode": 0,
+        "node": "v22.22.3",
+        "npm": "10.9.8",
+        "environment": {
+          "CI": "1",
+          "NEXT_TELEMETRY_DISABLED": "1",
+          "VERCEL_ENV": "preview",
+          "API_INTERNAL_BASE": "https://preview-api.invalid"
+        },
+        "credentialEnvironmentInherited": false,
+        "next": "15.5.25",
+        "logTail": [
+          "npm warn deprecated eslint@9.39.5: This version is no longer supported. Please see https://eslint.org/version-support for other options.",
+          "",
+          "added 287 packages, and audited 294 packages in 17s",
+          "",
+          "85 packages are looking for funding",
+          "  run `npm fund` for details",
+          "",
+          "10 vulnerabilities (3 moderate, 5 high, 2 critical)",
+          "",
+          "To address issues that do not require attention, run:",
+          "  npm audit fix",
+          "",
+          "To address all issues (including breaking changes), run:",
+          "  npm audit fix --force",
+          "",
+          "Run `npm audit` for details."
+        ]
+      },
+      {
+        "sha": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+        "step": "build",
+        "command": "next build",
+        "directory": "apps/web",
+        "startedAtUtc": "2026-10-12T18:08:17.191953+00:00",
+        "completedAtUtc": "2026-10-12T18:08:51.674764+00:00",
+        "durationSeconds": 34.48,
+        "exitCode": 0,
+        "node": "v22.22.3",
+        "npm": "10.9.8",
+        "environment": {
+          "CI": "1",
+          "NEXT_TELEMETRY_DISABLED": "1",
+          "VERCEL_ENV": "preview",
+          "API_INTERNAL_BASE": "https://preview-api.invalid"
+        },
+        "credentialEnvironmentInherited": false,
+        "next": "15.5.25",
+        "logTail": [
+          "⚠ No build cache found. Please configure build caching for faster rebuilds. Read more: https://nextjs.org/docs/messages/no-cache",
+          "   ▲ Next.js 15.5.25",
+          "",
+          "   Creating an optimized production build ...",
+          " ✓ Compiled successfully in 10.3s",
+          "   Linting and checking validity of types ...",
+          "",
+          " ⚠ The Next.js plugin was not detected in your ESLint configuration. See https://nextjs.org/docs/app/api-reference/config/eslint#migrating-existing-config",
+          "",
+          "./components/notification-preferences.tsx",
+          "11:3  Warning: Unused eslint-disable directive (no problems were reported from '@typescript-eslint/no-unused-vars').",
+          "",
+          "info  - Need to disable some ESLint rules? Learn more here: https://nextjs.org/docs/app/api-reference/config/eslint#disabling-rules",
+          "   Collecting page data ...",
+          "   Generating static pages (0/18) ...",
+          "   Generating static pages (4/18) ",
+          "   Generating static pages (8/18) ",
+          "   Generating static pages (13/18) ",
+          " ✓ Generating static pages (18/18)",
+          "   Finalizing page optimization ...",
+          "   Collecting build traces ...",
+          "",
+          "Route (app)                                   Size  First Load JS",
+          "┌ ○ /                                        389 B         142 kB",
+          "├ ○ /_not-found                              988 B         104 kB",
+          "├ ○ /alerts                                2.38 kB         151 kB",
+          "├ ƒ /alerts/[id]                           4.25 kB         149 kB",
+          "├ ○ /backtests                                2 kB         151 kB",
+          "├ ƒ /backtests/[id]                        1.21 kB         152 kB",
+          "├ ○ /backtests/new                         3.79 kB         155 kB",
+          "├ ○ /dashboard                              4.8 kB         162 kB",
+          "├ ○ /login                                 1.72 kB         144 kB",
+          "├ ○ /markets                               4.67 kB         150 kB",
+          "├ ƒ /markets/[assetClass]/[symbol]         2.14 kB         147 kB",
+          "├ ○ /register                              1.93 kB         144 kB",
+          "├ ○ /scanner                               4.65 kB         156 kB",
+          "├ ○ /settings                              10.6 kB         161 kB",
+          "├ ○ /setups                                2.47 kB         161 kB",
+          "├ ƒ /setups/[id]                           3.56 kB         162 kB",
+          "├ ○ /strategies                            4.12 kB         149 kB",
+          "├ ƒ /strategies/[id]                       3.68 kB         149 kB",
+          "├ ƒ /strategies/[id]/edit                    994 B         153 kB",
+          "├ ƒ /strategies/[id]/versions/[versionId]  6.64 kB         155 kB",
+          "├ ○ /strategies/new                          422 B         152 kB",
+          "├ ○ /trading                               8.16 kB         153 kB",
+          "└ ○ /workbench                             4.16 kB         153 kB",
+          "+ First Load JS shared by all               103 kB",
+          "  ├ chunks/18-2c82660ce7c4918d.js          46.4 kB",
+          "  ├ chunks/87c73c54-24122e7b92478d00.js    54.2 kB",
+          "  └ other shared chunks (total)            1.92 kB",
+          "",
+          "",
+          "○  (Static)   prerendered as static content",
+          "ƒ  (Dynamic)  server-rendered on demand",
+          ""
+        ]
+      },
+      {
+        "sha": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+        "step": "web-tests",
+        "command": "npm run test --workspace @veltrixeye/web",
+        "directory": ".",
+        "startedAtUtc": "2026-10-12T18:11:37.330714+00:00",
+        "completedAtUtc": "2026-10-12T18:11:46.990201+00:00",
+        "durationSeconds": 9.66,
+        "exitCode": 0,
+        "node": "v22.22.3",
+        "npm": "10.9.8",
+        "environment": {
+          "CI": "1",
+          "NEXT_TELEMETRY_DISABLED": "1",
+          "VERCEL_ENV": "preview",
+          "API_INTERNAL_BASE": "https://preview-api.invalid"
+        },
+        "credentialEnvironmentInherited": false,
+        "next": "15.5.25",
+        "logTail": [
+          "  ---",
+          "  duration_ms: 0.290109",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: a created setup, a replay and a non-qualifying direction read differently",
+          "ok 228 - a created setup, a replay and a non-qualifying direction read differently",
+          "  ---",
+          "  duration_ms: 3.837238",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: the detection tally separates created, existing and no-setup outcomes",
+          "ok 229 - the detection tally separates created, existing and no-setup outcomes",
+          "  ---",
+          "  duration_ms: 0.551496",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: a replayed score is never described as new",
+          "ok 230 - a replayed score is never described as new",
+          "  ---",
+          "  duration_ms: 0.170105",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: a same-state transition is reported as a no-op",
+          "ok 231 - a same-state transition is reported as a no-op",
+          "  ---",
+          "  duration_ms: 0.366913",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: setup facts come from the DTO without inventing values",
+          "ok 232 - setup facts come from the DTO without inventing values",
+          "  ---",
+          "  duration_ms: 0.372237",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: the whole browser workflow runs from a published version to an acknowledged alert",
+          "ok 233 - the whole browser workflow runs from a published version to an acknowledged alert",
+          "  ---",
+          "  duration_ms: 36.770775",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: a quality-gate skip is a valid outcome of the same journey, not an error",
+          "ok 234 - a quality-gate skip is a valid outcome of the same journey, not an error",
+          "  ---",
+          "  duration_ms: 0.614766",
+          "  type: 'test'",
+          "  ...",
+          "1..234",
+          "# tests 272",
+          "# suites 12",
+          "# pass 272",
+          "# fail 0",
+          "# cancelled 0",
+          "# skipped 0",
+          "# todo 0",
+          "# duration_ms 9494.349703"
+        ]
+      },
+      {
+        "sha": "d4c33301add7d8ecd8bf45c359a7bad4795acb9f",
+        "step": "web-typecheck",
+        "command": "npm run typecheck --workspace @veltrixeye/web",
+        "directory": ".",
+        "startedAtUtc": "2026-10-12T18:11:47.106619+00:00",
+        "completedAtUtc": "2026-10-12T18:11:57.382077+00:00",
+        "durationSeconds": 10.28,
+        "exitCode": 0,
+        "node": "v22.22.3",
+        "npm": "10.9.8",
+        "environment": {
+          "CI": "1",
+          "NEXT_TELEMETRY_DISABLED": "1",
+          "VERCEL_ENV": "preview",
+          "API_INTERNAL_BASE": "https://preview-api.invalid"
+        },
+        "credentialEnvironmentInherited": false,
+        "next": "15.5.25",
+        "logTail": [
+          "",
+          "> @veltrixeye/web@0.1.0 typecheck",
+          "> tsc --noEmit",
+          ""
+        ]
+      }
+    ]
+  },
+  "failing": {
+    "sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+    "commitStatuses": [
+      {
+        "context": "Vercel",
+        "state": "failure",
+        "description": "Deployment has failed — run this Vercel CLI command: npx vercel inspect dpl_41zQipvnddHe9imqFozKkJMPKYEu --logs",
+        "target_url": "https://vercel.com/shadrachampah123s-projects/veltrixeye/41zQipvnddHe9imqFozKkJMPKYEu",
+        "created_at": "2026-10-12T13:08:48Z",
+        "updated_at": "2026-10-12T13:08:48Z"
+      },
+      {
+        "context": "Vercel",
+        "state": "pending",
+        "description": "Vercel is deploying your app",
+        "target_url": "https://vercel.com/shadrachampah123s-projects/veltrixeye/41zQipvnddHe9imqFozKkJMPKYEu",
+        "created_at": "2026-10-12T13:08:45Z",
+        "updated_at": "2026-10-12T13:08:45Z"
+      },
+      {
+        "context": "Vercel",
+        "state": "failure",
+        "description": "Deployment has failed — run this Vercel CLI command: npx vercel inspect dpl_Fyh5eLWbzmGGL2Cp1nWJCFHa8YhW --logs",
+        "target_url": "https://vercel.com/shadrachampah123s-projects/veltrixeye/Fyh5eLWbzmGGL2Cp1nWJCFHa8YhW",
+        "created_at": "2026-10-12T12:03:56Z",
+        "updated_at": "2026-10-12T12:03:56Z"
+      },
+      {
+        "context": "Vercel",
+        "state": "pending",
+        "description": "Vercel is deploying your app",
+        "target_url": "https://vercel.com/shadrachampah123s-projects/veltrixeye/Fyh5eLWbzmGGL2Cp1nWJCFHa8YhW",
+        "created_at": "2026-10-12T12:03:52Z",
+        "updated_at": "2026-10-12T12:03:52Z"
+      }
+    ],
+    "githubDeployment": {
+      "id": 7013588409,
+      "sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+      "ref": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+      "environment": "Preview",
+      "production_environment": false,
+      "created_at": "2026-10-12T12:03:56Z",
+      "updated_at": "2026-10-12T13:08:49Z",
+      "statuses": [
+        {
+          "state": "failure",
+          "description": "Deployment has failed — run this Vercel CLI command: npx vercel inspect dpl_41zQipvnddHe9imqFozKkJMPKYEu --logs",
+          "environment": "Preview",
+          "environment_url": "https://veltrixeye-okpig0jf5-shadrachampah123s-projects.vercel.app",
+          "log_url": "https://veltrixeye-okpig0jf5-shadrachampah123s-projects.vercel.app",
+          "created_at": "2026-10-12T13:08:49Z",
+          "updated_at": "2026-10-12T13:08:49Z"
+        },
+        {
+          "state": "failure",
+          "description": "Deployment has failed — run this Vercel CLI command: npx vercel inspect dpl_Fyh5eLWbzmGGL2Cp1nWJCFHa8YhW --logs",
+          "environment": "Preview",
+          "environment_url": "https://veltrixeye-h25srqgw1-shadrachampah123s-projects.vercel.app",
+          "log_url": "https://veltrixeye-h25srqgw1-shadrachampah123s-projects.vercel.app",
+          "created_at": "2026-10-12T12:03:56Z",
+          "updated_at": "2026-10-12T12:03:56Z"
+        }
+      ]
+    },
+    "ciRuns": [
+      {
+        "id": 38246663342,
+        "name": "CI",
+        "event": "pull_request",
+        "head_sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-10-12T12:03:49Z",
+        "updated_at": "2026-10-12T12:10:53Z",
+        "html_url": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38246663342"
+      },
+      {
+        "id": 38246657565,
+        "name": "CI",
+        "event": "push",
+        "head_sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-10-12T12:03:46Z",
+        "updated_at": "2026-10-12T12:10:41Z",
+        "html_url": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38246657565"
+      }
+    ],
+    "githubCommitRetrieval": {
+      "status": 200,
+      "sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+      "parentShas": [
+        "d4c33301add7d8ecd8bf45c359a7bad4795acb9f"
+      ]
+    },
+    "localValidation": [
+      {
+        "sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+        "step": "install",
+        "command": "npm ci",
+        "directory": ".",
+        "startedAtUtc": "2026-10-12T18:07:28.822220+00:00",
+        "completedAtUtc": "2026-10-12T18:07:45.988280+00:00",
+        "durationSeconds": 17.17,
+        "exitCode": 0,
+        "node": "v22.22.3",
+        "npm": "10.9.8",
+        "environment": {
+          "CI": "1",
+          "NEXT_TELEMETRY_DISABLED": "1",
+          "VERCEL_ENV": "preview",
+          "API_INTERNAL_BASE": "https://preview-api.invalid"
+        },
+        "credentialEnvironmentInherited": false,
+        "next": "15.5.25",
+        "logTail": [
+          "npm warn deprecated eslint@9.39.5: This version is no longer supported. Please see https://eslint.org/version-support for other options.",
+          "",
+          "added 287 packages, and audited 294 packages in 17s",
+          "",
+          "85 packages are looking for funding",
+          "  run `npm fund` for details",
+          "",
+          "10 vulnerabilities (3 moderate, 5 high, 2 critical)",
+          "",
+          "To address issues that do not require attention, run:",
+          "  npm audit fix",
+          "",
+          "To address all issues (including breaking changes), run:",
+          "  npm audit fix --force",
+          "",
+          "Run `npm audit` for details."
+        ]
+      },
+      {
+        "sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+        "step": "build",
+        "command": "next build",
+        "directory": "apps/web",
+        "startedAtUtc": "2026-10-12T18:09:08.623086+00:00",
+        "completedAtUtc": "2026-10-12T18:09:44.165598+00:00",
+        "durationSeconds": 35.54,
+        "exitCode": 0,
+        "node": "v22.22.3",
+        "npm": "10.9.8",
+        "environment": {
+          "CI": "1",
+          "NEXT_TELEMETRY_DISABLED": "1",
+          "VERCEL_ENV": "preview",
+          "API_INTERNAL_BASE": "https://preview-api.invalid"
+        },
+        "credentialEnvironmentInherited": false,
+        "next": "15.5.25",
+        "logTail": [
+          "⚠ No build cache found. Please configure build caching for faster rebuilds. Read more: https://nextjs.org/docs/messages/no-cache",
+          "   ▲ Next.js 15.5.25",
+          "",
+          "   Creating an optimized production build ...",
+          " ✓ Compiled successfully in 10.7s",
+          "   Linting and checking validity of types ...",
+          "",
+          " ⚠ The Next.js plugin was not detected in your ESLint configuration. See https://nextjs.org/docs/app/api-reference/config/eslint#migrating-existing-config",
+          "",
+          "./components/notification-preferences.tsx",
+          "11:3  Warning: Unused eslint-disable directive (no problems were reported from '@typescript-eslint/no-unused-vars').",
+          "",
+          "info  - Need to disable some ESLint rules? Learn more here: https://nextjs.org/docs/app/api-reference/config/eslint#disabling-rules",
+          "   Collecting page data ...",
+          "   Generating static pages (0/18) ...",
+          "   Generating static pages (4/18) ",
+          "   Generating static pages (8/18) ",
+          "   Generating static pages (13/18) ",
+          " ✓ Generating static pages (18/18)",
+          "   Finalizing page optimization ...",
+          "   Collecting build traces ...",
+          "",
+          "Route (app)                                   Size  First Load JS",
+          "┌ ○ /                                        389 B         142 kB",
+          "├ ○ /_not-found                              988 B         104 kB",
+          "├ ○ /alerts                                2.38 kB         151 kB",
+          "├ ƒ /alerts/[id]                           4.25 kB         149 kB",
+          "├ ○ /backtests                                2 kB         151 kB",
+          "├ ƒ /backtests/[id]                        1.21 kB         152 kB",
+          "├ ○ /backtests/new                         3.79 kB         155 kB",
+          "├ ○ /dashboard                              4.8 kB         162 kB",
+          "├ ○ /login                                 1.72 kB         144 kB",
+          "├ ○ /markets                               4.67 kB         150 kB",
+          "├ ƒ /markets/[assetClass]/[symbol]         2.15 kB         147 kB",
+          "├ ○ /register                              1.93 kB         144 kB",
+          "├ ○ /scanner                               4.65 kB         156 kB",
+          "├ ○ /settings                              10.6 kB         161 kB",
+          "├ ○ /setups                                2.47 kB         161 kB",
+          "├ ƒ /setups/[id]                           3.56 kB         162 kB",
+          "├ ○ /strategies                            4.12 kB         149 kB",
+          "├ ƒ /strategies/[id]                       3.68 kB         149 kB",
+          "├ ƒ /strategies/[id]/edit                    993 B         153 kB",
+          "├ ƒ /strategies/[id]/versions/[versionId]  6.64 kB         155 kB",
+          "├ ○ /strategies/new                          422 B         152 kB",
+          "├ ○ /trading                               8.16 kB         153 kB",
+          "└ ○ /workbench                             4.16 kB         153 kB",
+          "+ First Load JS shared by all               103 kB",
+          "  ├ chunks/18-2c82660ce7c4918d.js          46.4 kB",
+          "  ├ chunks/87c73c54-24122e7b92478d00.js    54.2 kB",
+          "  └ other shared chunks (total)            1.92 kB",
+          "",
+          "",
+          "○  (Static)   prerendered as static content",
+          "ƒ  (Dynamic)  server-rendered on demand",
+          ""
+        ]
+      },
+      {
+        "sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+        "step": "web-tests",
+        "command": "npm run test --workspace @veltrixeye/web",
+        "directory": ".",
+        "startedAtUtc": "2026-10-12T18:09:44.292127+00:00",
+        "completedAtUtc": "2026-10-12T18:09:54.763665+00:00",
+        "durationSeconds": 10.47,
+        "exitCode": 0,
+        "node": "v22.22.3",
+        "npm": "10.9.8",
+        "environment": {
+          "CI": "1",
+          "NEXT_TELEMETRY_DISABLED": "1",
+          "VERCEL_ENV": "preview",
+          "API_INTERNAL_BASE": "https://preview-api.invalid"
+        },
+        "credentialEnvironmentInherited": false,
+        "next": "15.5.25",
+        "logTail": [
+          "  ---",
+          "  duration_ms: 0.339784",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: a created setup, a replay and a non-qualifying direction read differently",
+          "ok 228 - a created setup, a replay and a non-qualifying direction read differently",
+          "  ---",
+          "  duration_ms: 1.057116",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: the detection tally separates created, existing and no-setup outcomes",
+          "ok 229 - the detection tally separates created, existing and no-setup outcomes",
+          "  ---",
+          "  duration_ms: 0.540783",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: a replayed score is never described as new",
+          "ok 230 - a replayed score is never described as new",
+          "  ---",
+          "  duration_ms: 0.124697",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: a same-state transition is reported as a no-op",
+          "ok 231 - a same-state transition is reported as a no-op",
+          "  ---",
+          "  duration_ms: 0.39665",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: setup facts come from the DTO without inventing values",
+          "ok 232 - setup facts come from the DTO without inventing values",
+          "  ---",
+          "  duration_ms: 0.486997",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: the whole browser workflow runs from a published version to an acknowledged alert",
+          "ok 233 - the whole browser workflow runs from a published version to an acknowledged alert",
+          "  ---",
+          "  duration_ms: 45.623391",
+          "  type: 'test'",
+          "  ...",
+          "# Subtest: a quality-gate skip is a valid outcome of the same journey, not an error",
+          "ok 234 - a quality-gate skip is a valid outcome of the same journey, not an error",
+          "  ---",
+          "  duration_ms: 0.656739",
+          "  type: 'test'",
+          "  ...",
+          "1..234",
+          "# tests 272",
+          "# suites 12",
+          "# pass 272",
+          "# fail 0",
+          "# cancelled 0",
+          "# skipped 0",
+          "# todo 0",
+          "# duration_ms 10270.360995"
+        ]
+      },
+      {
+        "sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
+        "step": "web-typecheck",
+        "command": "npm run typecheck --workspace @veltrixeye/web",
+        "directory": ".",
+        "startedAtUtc": "2026-10-12T18:09:54.883696+00:00",
+        "completedAtUtc": "2026-10-12T18:10:05.757010+00:00",
+        "durationSeconds": 10.87,
+        "exitCode": 0,
+        "node": "v22.22.3",
+        "npm": "10.9.8",
+        "environment": {
+          "CI": "1",
+          "NEXT_TELEMETRY_DISABLED": "1",
+          "VERCEL_ENV": "preview",
+          "API_INTERNAL_BASE": "https://preview-api.invalid"
+        },
+        "credentialEnvironmentInherited": false,
+        "next": "15.5.25",
+        "logTail": [
+          "",
+          "> @veltrixeye/web@0.1.0 typecheck",
+          "> tsc --noEmit",
+          ""
+        ]
+      }
+    ]
+  },
+  "handoffPlan": {
+    "sha": "b4ee92536e79c90d2e688f4e9fd66c40931ac566",
+    "branch": "arena/f1b08a14-veltrixeye",
+    "githubDeployment": {
+      "id": 7019273473,
+      "sha": "b4ee92536e79c90d2e688f4e9fd66c40931ac566",
+      "ref": "b4ee92536e79c90d2e688f4e9fd66c40931ac566",
+      "environment": "Preview",
+      "production_environment": false,
+      "created_at": "2026-10-12T17:10:28Z",
+      "updated_at": "2026-10-12T17:10:28Z",
+      "statuses": [
+        {
+          "state": "success",
+          "description": "Deployment has completed",
+          "environment": "Preview",
+          "environment_url": "https://veltrixeye-6tvf5tdfj-shadrachampah123s-projects.vercel.app",
+          "log_url": "https://veltrixeye-6tvf5tdfj-shadrachampah123s-projects.vercel.app",
+          "created_at": "2026-10-12T17:10:28Z",
+          "updated_at": "2026-10-12T17:10:28Z"
+        }
+      ]
+    },
+    "commitStatuses": [
+      {
+        "context": "Vercel",
+        "state": "success",
+        "description": "Deployment has completed",
+        "target_url": "https://vercel.com/shadrachampah123s-projects/veltrixeye/A2427vnoh3R6mbqLcXjETG29P7V9",
+        "created_at": "2026-10-12T17:10:28Z",
+        "updated_at": "2026-10-12T17:10:28Z"
+      }
+    ]
+  },
+  "lastRecordedProduction": {
+    "id": 7001153486,
+    "sha": "c16155cc4c01c7af61b0a96b82a957c545f1ab41",
+    "ref": "c16155cc4c01c7af61b0a96b82a957c545f1ab41",
+    "environment": "Production",
+    "production_environment": false,
+    "created_at": "2026-10-11T20:14:13Z",
+    "updated_at": "2026-10-11T20:14:13Z",
+    "statuses": [
+      {
+        "state": "success",
+        "description": "Deployment has completed",
+        "environment": "Production",
+        "environment_url": "https://veltrixeye-7quar9qpp-shadrachampah123s-projects.vercel.app",
+        "log_url": "https://veltrixeye-7quar9qpp-shadrachampah123s-projects.vercel.app",
+        "created_at": "2026-10-11T20:14:13Z",
+        "updated_at": "2026-10-11T20:14:13Z"
+      }
+    ],
+    "sourceCaveat": "GitHub deployment metadata only; the live Vercel domain alias was not queried."
+  },
+  "changesBaselineToFailing": [
+    "package.json",
+    "scripts/diagnostics/gold-v8-production-evidence.ts",
+    "scripts/diagnostics/test/gold-v8-production-evidence.test.ts"
+  ],
+  "webPackagesLockfileTreeSha256": {
+    "d4c33301add7d8ecd8bf45c359a7bad4795acb9f": "05901e46fc6a52468d73506bfcdbd228c90fd4902fc48bace0397c7629f3a9f8",
+    "3b0e26409c7ea2159292c33b38ff09decf7da47d": "05901e46fc6a52468d73506bfcdbd228c90fd4902fc48bace0397c7629f3a9f8"
+  },
+  "errorEvidence": {
+    "reportedExactVercelError": "Git information retrieval failed for this deployment",
+    "source": "User handoff; Vercel deployment internals are inaccessible in this session. GitHub confirms failure and deployment IDs, not this internal error string.",
+    "independentlyVerifiedInternalError": false
+  },
+  "access": {
+    "arenaVercelConnector": "unsupported",
+    "localVercelCliInstalled": false,
+    "localVercelEnvironmentCredentialNames": [],
+    "standardVercelAuthAndProjectLinkFilesPresent": false,
+    "sandboxOutboundVercelHostsAllowed": false,
+    "githubActionsSecretMetadata": {
+      "status": 403,
+      "message": "Resource not accessible by integration",
+      "secretValuesRead": false
+    },
+    "reportedChatGPTVercelTeam403": "User handoff only; not independently repeated by Arena."
+  },
+  "safety": {
+    "vercelProjectCreated": false,
+    "existingVercelProjectModified": false,
+    "productionDeploymentCreated": false,
+    "domainsChanged": false,
+    "productionSecretsReadOrCopied": false,
+    "goldDiagnosticRun": false,
+    "merged": false,
+    "branchPushed": false,
+    "githubPrEdited": false
+  },
+  "existingProjectIdentity": {
+    "projectId": "prj_Rg2CpBEW2UAL99WMYOqugtEOWGwn",
+    "teamId": "team_Mzs68E6FMzdUnXcEbaQ52LuK",
+    "source": "Existing public vercel[bot] comment on PR #104 (comment ID 6123108228)."
+  },
+  "githubRepositoryId": 1368661677,
+  "gitConnectivityCheck": {
+    "exitCode": 0,
+    "missingObjectsReported": false,
+    "note": "Only dangling fetched commits were reported: refs were fetched without creating local branches. Both exact commits and the remote PR head are accessible."
+  },
+  "automationVerification": {
+    "liveVercelApiExecuted": false,
+    "githubWorkflowExecuted": false,
+    "branchPushed": false,
+    "testCommand": "node --test scripts/deployment/test/vercel-preview-validation.test.mjs",
+    "testMode": "Offline fixtures; not live deployment evidence",
+    "tests": 18,
+    "passed": 18,
+    "failed": 0,
+    "changedScriptsLintExitCode": 0,
+    "workflowValidation": {
+      "yamlParser": "PyYAML 6.0.3",
+      "yamlStructuralValidation": "PASS",
+      "shellSyntaxValidation": "PASS",
+      "summaryStepRuntimeWithAuthorizationBlocker": "PASS",
+      "actionlintRun": false,
+      "githubWorkflowExecuted": false,
+      "liveVercelApiExecuted": false,
+      "statusNoticeRuntimeWithAuthorizationBlocker": "PASS"
+    },
+    "noCredentialPreflight": {
+      "exitCode": 2,
+      "evidence": {
+        "verifiedAtUtc": "2026-10-12T18:21:16.448Z",
+        "repository": "shadrachampah123/veltrixeye",
+        "projectName": "veltrixeye-preview-validation-5648e2f6",
+        "teamId": "team_Mzs68E6FMzdUnXcEbaQ52LuK",
+        "status": "BLOCKED",
+        "projectCreationRequested": false,
+        "projectCreated": false,
+        "project": null,
+        "deployments": [],
+        "safety": {
+          "existingProjectMutated": false,
+          "productionRequested": false,
+          "domainsAdded": false,
+          "productionSecretsCopied": false,
+          "goldDiagnosticRun": false,
+          "merged": false
+        },
+        "blocker": {
+          "code": "NO_VERCEL_PREVIEW_TOKEN",
+          "message": "Safety check refused: NO_VERCEL_PREVIEW_TOKEN"
+        },
+        "completedAtUtc": "2026-10-12T18:21:16.448Z"
+      }
+    },
+    "apiShapeSources": {
+      "vercelSdk": {
+        "version": "1.28.43",
+        "registryUrl": "https://registry.npmjs.org/@vercel/sdk/-/sdk-1.28.43.tgz"
+      },
+      "vercelTerraformProvider": {
+        "sha": "ebf7a2a04771ae3446c53905d5d35b1f4d304ced",
+        "projectApiSourceUrl": "https://github.com/vercel/terraform-provider-vercel/blob/ebf7a2a04771ae3446c53905d5d35b1f4d304ced/client/project.go"
+      }
+    },
+    "filesSha256": {
+      ".github/workflows/vercel-preview-validation.yml": "cf0c583aa92900d996e9988f8d29cfdbbb6042182ed86f7fac7c2e4e3926a9d5",
+      "scripts/deployment/vercel-preview-validation.mjs": "4ad0135ff8c8c875bc02f87cab2708b87d085bdb858bf6d48089599f57a105dd",
+      "scripts/deployment/test/vercel-preview-validation.test.mjs": "f36d071b0d13ffebd4c80b1ee58c094165a3ac5a6499fea60ec7ee99b07e4fa9"
+    },
+    "statusPublicationConfiguredViaGithubChecksAnnotations": true,
+    "existingGithubChecksAnnotationMetadataReadConfirmed": true,
+    "newWorkflowNoticePublished": false
+  },
+  "nextSingleManualAction": {
+    "action": "Pending the read-only audit; do not re-add the already supplied secret or authorize a Production deployment implicitly."
+  },
+  "continuation": {
+    "startedAtUtc": "2026-10-12T19:50:27.430834+00:00",
+    "recovery": {
+      "allFiveFilesRecovered": true,
+      "recordedFileHashesMatchedBeforeEdits": true,
+      "previousLocalCommitObjectRecovered": false,
+      "localBranch": "arena/5648e2f6-veltrixeye"
+    },
+    "workflowOnGithubBeforePush": false,
+    "sessionBranchOnGithubBeforePush": false,
+    "secretAdded": {
+      "source": "User report",
+      "name": "VERCEL_PREVIEW_TOKEN_5648E2F6",
+      "runtimePresenceVerified": false,
+      "valueRequestedReadPrintedOrCommitted": false,
+      "nameMetadataRequestStatus": 403
+    },
+    "originalOfflineTests": {
+      "tests": 18,
+      "passed": 18,
+      "failed": 0,
+      "limitations": "Mocks do not prove the first new-project deployment remains Preview."
+    },
+    "currentOfflineTests": {
+      "tests": 22,
+      "passed": 22,
+      "failed": 0,
+      "mode": "Read-only policy; no real credential or Vercel write"
+    },
+    "firstDeploymentPolicy": {
+      "verifiedFromCurrentVercelDocumentation": true,
+      "url": "https://vercel.com/docs/deployments/environments#first-deployment",
+      "exactQuote": "The first deployment of a new project is always a production deployment.",
+      "alsoAppliesToNonProductionBranches": true,
+      "apiFirstDeploymentWasNotExperimentedWith": true,
+      "sourceProviderSha": "ebf7a2a04771ae3446c53905d5d35b1f4d304ced",
+      "mutatingBootstrapEnabled": false
+    },
+    "branchPushSafetyGuard": {
+      "path": "apps/web/vercel.json",
+      "gitDeploymentEnabled": {
+        "arena/5648e2f6-veltrixeye": false
+      },
+      "source": "https://vercel.com/docs/project-configuration/git-configuration#git.deploymentenabled",
+      "mainConfigurationChanged": false
+    },
+    "workflowValidation": {
+      "yamlAndSecretScope": "PASS",
+      "allShellSyntax": "PASS",
+      "publisherRuntime": "PASS",
+      "actionlintRun": false
+    },
+    "readOnlyAudit": {
+      "remoteRunStarted": false,
+      "apiResults": null,
+      "newProjectCreated": false,
+      "newDeploymentsRequested": false
+    },
+    "fileHashesSha256": {
+      ".github/workflows/vercel-preview-validation.yml": "932bbcacffefe176cc377dc4c1a70a6af81256a70ed4677a86933c9b7428564d",
+      "scripts/deployment/vercel-preview-validation.mjs": "da5dc5c819679255d91b795263ea1308bf25faa609e6c66c403d5d4835ccb012",
+      "scripts/deployment/test/vercel-preview-validation.test.mjs": "1968fed82045a90404855764bd5036424eb8c4507524cf0f435291c7282717ea",
+      "apps/web/vercel.json": "be1c55f303abecf5090b22832f793d72e6debc93e5ad244f5c4c6879c1193035"
+    }
+  }
+}

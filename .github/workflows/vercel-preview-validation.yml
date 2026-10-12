@@ -1,0 +1,71 @@
+name: Isolated Vercel Preview safety audit
+
+# No mutating bootstrap is enabled. Vercel's first-deployment rule conflicts
+# with the current prohibition on ANY Production deployment in a new project.
+on:
+  push:
+    branches: ["arena/5648e2f6-veltrixeye"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolated-vercel-preview-5648e2f6
+  cancel-in-progress: false
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout this branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify read-only safeguards offline (no credentials)
+        run: node --test scripts/deployment/test/vercel-preview-validation.test.mjs
+
+      - name: Audit token scope and the existing exact Preview deployments (GET only)
+        # The value is never printed. It is exposed only to this read-only step.
+        # The helper exits 2 to keep the unsafe new-project bootstrap BLOCKED.
+        env:
+          VERCEL_PREVIEW_TOKEN: ${{ secrets.VERCEL_PREVIEW_TOKEN_5648E2F6 }}
+        run: node scripts/deployment/vercel-preview-validation.mjs > "$RUNNER_TEMP/vercel-preview-evidence.json"
+
+      - name: Publish filtered evidence (no token or raw historical logs)
+        if: always()
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+          const path = `${process.env.RUNNER_TEMP}/vercel-preview-evidence.json`;
+          if (!existsSync(path)) process.exit(0);
+          const e = JSON.parse(readFileSync(path, 'utf8'));
+          const rows = e.deployments.map(d => `| ${d.role} | \`${d.requestedSha}\` | ${d.state ?? 'not read'} |`);
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+            `## Read-only Vercel Preview audit: ${e.status}`,
+            e.blocker ? `Blocker: \`${e.blocker.code}\`.` : '',
+            '| Existing deployment | Expected commit | API state |',
+            '| --- | --- | --- |', ...rows, '',
+            'No new project or deployment was requested. No Vercel writes are possible in this job.',
+            'Filtered evidence is also available in the vercel-preview-evidence artifact (7 days).', '',
+          ].join('\n'));
+          // Checks notices can be read through api.github.com even if artifact
+          // storage hosts are outside the agent sandbox's network allowlist.
+          const notice = JSON.stringify(e).replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+          process.stdout.write(`::notice file=docs/vercel-replacement-plan.md,line=1,title=Isolated Preview audit evidence::${notice}\n`);
+          NODE
+
+      - name: Upload filtered evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vercel-preview-evidence
+          path: ${{ runner.temp }}/vercel-preview-evidence.json
+          if-no-files-found: ignore
+          retention-days: 7
