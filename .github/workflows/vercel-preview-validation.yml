@@ -5,6 +5,10 @@ name: Isolated Vercel Preview safety audit
 on:
   push:
     branches: ["arena/5648e2f6-veltrixeye"]
+    paths:
+      - .github/workflows/vercel-preview-validation.yml
+      - scripts/deployment/**
+      - apps/web/vercel.json
 
 permissions:
   contents: read
@@ -15,6 +19,10 @@ concurrency:
 
 jobs:
   preview:
+    # Do not retry a rejected credential on documentation/housekeeping pushes.
+    # After authorization is repaired, an agent can explicitly request a new
+    # GET-only audit with this marker in a code-changing commit message.
+    if: contains(github.event.head_commit.message, '[vercel-safety-audit]')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

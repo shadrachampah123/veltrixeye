@@ -2,10 +2,15 @@
 
 ## Current decision
 
-**Do not run the former mutating bootstrap.** The token has been added according
-to the user; runtime scope verification is being performed using a **GET-only
-GitHub Actions audit**. Project creation and all deployments remain disabled.
-No merge or Production deployment is authorized, including in a new project.
+**BLOCKED: the supplied token cannot access the expected Vercel team.**
+The GET-only [audit run 38300476511](https://github.com/shadrachampah123/veltrixeye/actions/runs/38300476511)
+ran on `6006435c0d49b81524b00a14767ddda505198dbc`. The private secret was present,
+but the very first request returned **HTTP 403**, code **`forbidden`**, message
+**`Not authorized`**. The runner made exactly one Vercel request, then stopped.
+
+The original unsafe mutating bootstrap remains disabled. No project/deployment,
+domain/alias/secret write, merge, or Gold execution occurred. No Production
+deployment is authorized, including in a new project.
 
 The original five files were recovered on `arena/5648e2f6-veltrixeye`, and their
 three recorded workflow/helper/test hashes matched. The previously reported
@@ -45,7 +50,10 @@ authorization. No first deployment is attempted merely to test this behavior.
 ## Safe workflow now prepared
 
 `.github/workflows/vercel-preview-validation.yml` is now named **Isolated Vercel
-Preview safety audit**. It runs only on pushes to this session branch, with
+Preview safety audit**. It exists on GitHub on this session branch (not `main`),
+workflow ID `382510867`. Future executions require an explicit
+`[vercel-safety-audit]` code-changing commit marker on this branch, so evidence
+and housekeeping pushes do not retry a rejected credential. It has
 `contents: read`, no PR trigger, and no Gold trigger. The Vercel credential is
 available only in the audit step, never in checkout, setup, offline tests, or
 publication steps. The helper's HTTP transport is hardcoded **GET only** and
@@ -128,17 +136,48 @@ Those are local build results, not new Vercel deployment results.
   distinguished from real API results. Actionlint/live API acceptance are not
   assumed from offline tests.
 
-## Next single action / actual results
+## Actual runtime results (not offline mocks)
 
-The read-only runtime result will be added here and to the evidence after the
-job completes. Until then, token scope and old build-log access are **pending**,
-not assumed successful. The new project and new deployments are **not created**.
+- Workflow: **present on GitHub**, push-triggered on this branch.
+- Run: `38300476511`, completed 2026-10-12 19:52:17 UTC, conclusion **failure**.
+  The helper deliberately exits 2 for a blocker; this is not a web build failure.
+- Checkout, Node setup, **22 offline tests**, filtered publication, and artifact
+  upload succeeded in Actions.
+- Secret runtime presence: **verified true**. Its value was never returned to
+  the agent, printed, exposed, or committed. It was used privately only in the
+  HTTPS Authorization header to the Vercel API.
+- Exact request: **GET `/v2/teams/team_Mzs68E6FMzdUnXcEbaQ52LuK`**.
+  Response: **403 / `forbidden` / `Not authorized`**, observed at
+  2026-10-12 19:52:13 UTC.
+- Team scope/role and creation/deploy/log permissions: **not verified**.
+  This response does not prove the token is absent or identify its actual scope.
+- Isolated-project lookup: **not attempted** after authorization failed.
+  Project existence is unknown; **no project was created by this task**.
+- Both exact-SHA new Preview deployments: **not attempted**.
+- Existing deployment metadata/build logs: **not retrieved from Vercel** in this
+  run because the team-read check failed first. The historical outcomes/URLs in
+  the table remain GitHub evidence, not new Vercel audit results.
+- Mutation requests: **zero**; no automatic retry of the rejected credential.
 
-If runtime authorization is sufficient, the remaining decision is a **separate,
-explicit authorization** for Vercel's required one-time Production-labelled
-initialization **only in the new isolated project**, without live domains,
-production secrets, a production backend, or any change to the existing project.
-That exception is **not granted** by the current request; no such initialization
-will occur without it. If the token is rejected instead, the next single action
-will be to correct its team scope/permissions privately, based on the exact API
-error. No manual dashboard troubleshooting checklist is required.
+The filtered live result was recovered from Checks annotation
+`114981905252` through `api.github.com`, rather than requiring dashboard or
+external artifact-storage troubleshooting. It is saved in the evidence file.
+
+## Next single manual action
+
+**Have the Vercel team owner replace the existing repository Actions secret
+`VERCEL_PREVIEW_TOKEN_5648E2F6` with a management token explicitly authorized for
+`shadrachampah123s-projects` / `team_Mzs68E6FMzdUnXcEbaQ52LuK`, including team-read
+and the intended project/Git/deployment permissions.**
+Use the [existing secret's private GitHub UI](https://github.com/shadrachampah123/veltrixeye/settings/secrets/actions/VERCEL_PREVIEW_TOKEN_5648E2F6);
+**do not paste the value in chat**. No production application secret should be
+reused or copied. A deployment-protection bypass credential is not a project
+management authorization.
+
+After that, the agent can explicitly rerun the **read-only** audit to verify
+scope and inspect the old Preview logs. No more credential attempts are made in
+this turn. **Fixing authorization alone does not waive the independent first-
+Production-deployment safety blocker.** A new isolated project's initialization
+still needs a separately authorized exception or an already initialized isolated
+project; neither is assumed. No Production initialization, promotion, or merge
+is requested or performed here.

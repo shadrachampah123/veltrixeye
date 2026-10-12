@@ -360,7 +360,8 @@
           ""
         ]
       }
-    ]
+    ],
+    "verifiedThisContinuationFrom": "GitHub statuses only; the failed team authorization prevented fresh Vercel metadata/log reads."
   },
   "failing": {
     "sha": "3b0e26409c7ea2159292c33b38ff09decf7da47d",
@@ -677,7 +678,8 @@
           ""
         ]
       }
-    ]
+    ],
+    "verifiedThisContinuationFrom": "GitHub statuses only; the failed team authorization prevented fresh Vercel metadata/log reads."
   },
   "handoffPlan": {
     "sha": "b4ee92536e79c90d2e688f4e9fd66c40931ac566",
@@ -745,7 +747,7 @@
   },
   "errorEvidence": {
     "reportedExactVercelError": "Git information retrieval failed for this deployment",
-    "source": "User handoff; Vercel deployment internals are inaccessible in this session. GitHub confirms failure and deployment IDs, not this internal error string.",
+    "source": "User handoff for the Git retrieval error; GitHub confirms historical failures. This continuation verified a separate Vercel 403/forbidden/Not authorized through the private Actions audit, which stopped before deployment/log reads.",
     "independentlyVerifiedInternalError": false
   },
   "access": {
@@ -769,7 +771,7 @@
     "productionSecretsReadOrCopied": false,
     "goldDiagnosticRun": false,
     "merged": false,
-    "branchPushed": false,
+    "branchPushed": true,
     "githubPrEdited": false
   },
   "existingProjectIdentity": {
@@ -850,7 +852,9 @@
     "newWorkflowNoticePublished": false
   },
   "nextSingleManualAction": {
-    "action": "Pending the read-only audit; do not re-add the already supplied secret or authorize a Production deployment implicitly."
+    "action": "Have the Vercel team owner replace VERCEL_PREVIEW_TOKEN_5648E2F6 privately with a management token authorized for shadrachampah123s-projects / team_Mzs68E6FMzdUnXcEbaQ52LuK, including team-read and intended project/Git/deployment permissions. Never paste the value in chat.",
+    "secretSettingsUrl": "https://github.com/shadrachampah123/veltrixeye/settings/secrets/actions/VERCEL_PREVIEW_TOKEN_5648E2F6",
+    "doesNotWaiveFirstProductionSafetyBlocker": true
   },
   "continuation": {
     "startedAtUtc": "2026-10-12T19:50:27.430834+00:00",
@@ -865,9 +869,10 @@
     "secretAdded": {
       "source": "User report",
       "name": "VERCEL_PREVIEW_TOKEN_5648E2F6",
-      "runtimePresenceVerified": false,
-      "valueRequestedReadPrintedOrCommitted": false,
-      "nameMetadataRequestStatus": 403
+      "runtimePresenceVerified": true,
+      "nameMetadataRequestStatus": 403,
+      "tokenValueReturnedToAgentPrintedExposedOrCommitted": false,
+      "usedPrivatelyInActionsAuthorizationHeaderOnly": true
     },
     "originalOfflineTests": {
       "tests": 18,
@@ -888,7 +893,8 @@
       "alsoAppliesToNonProductionBranches": true,
       "apiFirstDeploymentWasNotExperimentedWith": true,
       "sourceProviderSha": "ebf7a2a04771ae3446c53905d5d35b1f4d304ced",
-      "mutatingBootstrapEnabled": false
+      "mutatingBootstrapEnabled": false,
+      "initialProductionExceptionAuthorized": false
     },
     "branchPushSafetyGuard": {
       "path": "apps/web/vercel.json",
@@ -902,19 +908,99 @@
       "yamlAndSecretScope": "PASS",
       "allShellSyntax": "PASS",
       "publisherRuntime": "PASS",
-      "actionlintRun": false
+      "actionlintRun": false,
+      "explicitMarkerRetryGate": "PASS",
+      "publisherRuntimeWithActual403": "PASS"
     },
     "readOnlyAudit": {
-      "remoteRunStarted": false,
-      "apiResults": null,
+      "remoteRunStarted": true,
+      "apiResults": {
+        "verifiedAtUtc": "2026-10-12T19:52:13.406Z",
+        "status": "BLOCKED",
+        "mode": "READ_ONLY",
+        "repository": "shadrachampah123/veltrixeye",
+        "projectName": "veltrixeye-preview-validation-5648e2f6",
+        "teamId": "team_Mzs68E6FMzdUnXcEbaQ52LuK",
+        "authorization": {
+          "tokenPresent": true,
+          "teamAccessVerified": false,
+          "creationPermissionExercised": false,
+          "previewDeploymentPermissionExercised": false
+        },
+        "project": null,
+        "isolatedProjectExists": null,
+        "projectCreated": false,
+        "deployments": [],
+        "requests": [
+          {
+            "method": "GET",
+            "path": "/v2/teams/team_Mzs68E6FMzdUnXcEbaQ52LuK",
+            "httpStatus": 403
+          }
+        ],
+        "safety": {
+          "mutationsRequested": 0,
+          "readOnlyTransport": true,
+          "productionRequested": false,
+          "domainsOrAliasesWritten": false,
+          "environmentOrSecretEndpointsAccessed": false,
+          "rawHistoricalLogsPublished": false,
+          "goldDiagnosticRun": false,
+          "merged": false
+        },
+        "blocker": {
+          "code": "forbidden",
+          "message": "Not authorized",
+          "httpStatus": 403
+        },
+        "completedAtUtc": "2026-10-12T19:52:13.648Z"
+      },
+      "run": {
+        "id": 38300476511,
+        "name": "Isolated Vercel Preview safety audit",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "failure",
+        "head_sha": "6006435c0d49b81524b00a14767ddda505198dbc",
+        "created_at": "2026-10-12T19:52:06Z",
+        "updated_at": "2026-10-12T19:52:17Z",
+        "html_url": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38300476511"
+      },
+      "workflowId": 382510867,
+      "checkRunId": 114981905252,
+      "checksNoticeTitle": "Isolated Preview audit evidence",
       "newProjectCreated": false,
-      "newDeploymentsRequested": false
+      "newDeploymentsRequested": false,
+      "newPreviewUrlsCreated": [],
+      "buildLogsRetrievedThisContinuation": false,
+      "sourceCaveat": "This actual run is a GET-only credential audit, not a Preview redeployment or successful bootstrap."
     },
     "fileHashesSha256": {
-      ".github/workflows/vercel-preview-validation.yml": "932bbcacffefe176cc377dc4c1a70a6af81256a70ed4677a86933c9b7428564d",
+      ".github/workflows/vercel-preview-validation.yml": "23cd94479313c929778df186aa5e2e541d2474bce97ba112924ac94bcbd024d4",
       "scripts/deployment/vercel-preview-validation.mjs": "da5dc5c819679255d91b795263ea1308bf25faa609e6c66c403d5d4835ccb012",
       "scripts/deployment/test/vercel-preview-validation.test.mjs": "1968fed82045a90404855764bd5036424eb8c4507524cf0f435291c7282717ea",
       "apps/web/vercel.json": "be1c55f303abecf5090b22832f793d72e6debc93e5ad244f5c4c6879c1193035"
+    },
+    "verifiedAtUtc": "2026-10-12T20:04:26.423895+00:00",
+    "workflowOnGithubAfterPush": true,
+    "sourceCommitSha": "6006435c0d49b81524b00a14767ddda505198dbc",
+    "ciForAuditSource": {
+      "id": 38300476376,
+      "name": "CI",
+      "head_sha": "6006435c0d49b81524b00a14767ddda505198dbc",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38300476376"
+    },
+    "githubDeploymentsForAuditSourceSha": [],
+    "currentWorkflowRetryGate": {
+      "paths": [
+        ".github/workflows/vercel-preview-validation.yml",
+        "scripts/deployment/**",
+        "apps/web/vercel.json"
+      ],
+      "explicitCommitMarker": "[vercel-safety-audit]",
+      "automaticRejectedCredentialRetries": false
     }
   }
 }
