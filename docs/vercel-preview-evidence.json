@@ -852,7 +852,12 @@
     "newWorkflowNoticePublished": false
   },
   "nextSingleManualAction": {
-    "action": "Deferred pending read-only diagnostics. Do not replace the token or grant Owner/Full Account access solely because the prior team endpoint returned 403."
+    "verifiedRequired": true,
+    "action": "Replace VERCEL_PREVIEW_TOKEN_5648E2F6 privately with an unexpired Vercel token scoped to shadrachampah123s-projects / team_Mzs68E6FMzdUnXcEbaQ52LuK. For the originally intended separate-project provisioning, select Team -> All Projects; Full Account/Owner are not mandatory. Token creator must have the required team/project capabilities. No value in chat.",
+    "readOnlyMinimumCanBeNarrower": "For existing-project/deployment/log reads only, Project -> veltrixeye with appropriate read/log capability can suffice; this cannot provision the separate project.",
+    "secretSettingsUrl": "https://github.com/shadrachampah123/veltrixeye/settings/secrets/actions/VERCEL_PREVIEW_TOKEN_5648E2F6",
+    "allDeploymentWritesStillDisabled": true,
+    "firstDeploymentRiskSafelyAvoided": false
   },
   "continuation": {
     "startedAtUtc": "2026-10-12T19:50:27.430834+00:00",
@@ -1082,7 +1087,122 @@
       "tokenFragmentsSaved": false,
       "headerNormalizationIsPrivate": true,
       "mutationRequests": 0,
-      "runtimeResult": null
+      "runtimeResult": {
+        "verifiedAtUtc": "2026-10-12T20:42:02.930Z",
+        "status": "BLOCKED",
+        "mode": "TOKEN_PERMISSIONS_GET_ONLY",
+        "repository": "shadrachampah123/veltrixeye",
+        "expectedTeam": {
+          "id": "team_Mzs68E6FMzdUnXcEbaQ52LuK",
+          "slug": "shadrachampah123s-projects"
+        },
+        "projectName": "veltrixeye-preview-validation-5648e2f6",
+        "deployments": [],
+        "projectCreated": false,
+        "credentialHandling": {
+          "present": true,
+          "whitespaceTrimmed": false,
+          "duplicateBearerPrefixRemoved": false,
+          "containsRemainingWhitespace": false,
+          "tokenIdentifiersOrFragmentsPublished": false
+        },
+        "probes": [
+          {
+            "label": "current-token-metadata",
+            "method": "GET",
+            "path": "/v5/user/tokens/current",
+            "query": "",
+            "httpStatus": 200,
+            "selected": {
+              "responseShapeVerified": true,
+              "tokenType": "token",
+              "origin": "manual",
+              "expired": false,
+              "revoked": null,
+              "markedLeaked": null,
+              "scopeMetadataPresent": true,
+              "scopeKinds": [
+                "team"
+              ],
+              "expectedTeamScopePresent": false,
+              "expectedTeamScopeExpired": false,
+              "explicitProjectRestrictionPresent": false,
+              "restrictionMatchesExistingProject": false
+            }
+          },
+          {
+            "label": "projects-in-inferred-token-scope",
+            "method": "GET",
+            "path": "/v10/projects",
+            "query": "?limit=100",
+            "httpStatus": 200,
+            "selected": {
+              "responseShapeVerified": true,
+              "returnedCount": 0,
+              "pageMayBeIncomplete": false,
+              "existingProjectVisible": false,
+              "existingProjectOwningTeamMatches": false,
+              "anyExpectedTeamProjectVisible": false,
+              "proposedIsolatedNameVisible": false
+            }
+          },
+          {
+            "label": "team-membership-discovery",
+            "method": "GET",
+            "path": "/v2/teams",
+            "query": "?limit=100",
+            "httpStatus": 200,
+            "selected": {
+              "responseShapeVerified": true,
+              "returnedCount": 1,
+              "pageMayBeIncomplete": false,
+              "expectedTeamReturned": false,
+              "expectedTeam": null
+            }
+          },
+          {
+            "label": "expected-team-without-redundant-query",
+            "method": "GET",
+            "path": "/v2/teams/team_Mzs68E6FMzdUnXcEbaQ52LuK",
+            "query": "",
+            "httpStatus": 403,
+            "selected": null,
+            "error": {
+              "code": "forbidden",
+              "reasonClass": "generic-not-authorized",
+              "exactGenericMessage": "Not authorized"
+            }
+          }
+        ],
+        "safety": {
+          "mutationsRequested": 0,
+          "projectCreationEnabled": false,
+          "deploymentWritesEnabled": false,
+          "tokenCreationOrModificationEnabled": false,
+          "secretOrEnvironmentEndpointsAccessed": false,
+          "rawResponsesPublished": false,
+          "firstDeploymentRiskSafelyAvoided": false,
+          "goldDiagnosticRun": false,
+          "merged": false
+        },
+        "diagnosis": {
+          "code": "TOKEN_SCOPE_DOES_NOT_COVER_EXPECTED_TEAM",
+          "confidence": "metadata-and-denial-verified",
+          "limitedBy": [],
+          "projectReadAccessConfirmed": true,
+          "expectedExistingProjectVisible": false,
+          "requiredTeamReadAccessConfirmed": false,
+          "creationOrDeploymentPermissionProvenByWrites": false,
+          "prior403AloneProvesTokenInvalid": false,
+          "ownerRoleIsMandatory": false
+        },
+        "blocker": {
+          "code": "DEPLOYMENT_WRITES_REMAIN_DISABLED",
+          "message": "Read-only diagnosis only; the new-project first Production risk has not been safely avoided."
+        },
+        "diagnosticCompleted": true,
+        "completedAtUtc": "2026-10-12T20:42:03.601Z"
+      }
     },
     "offlineVerification": {
       "tests": 40,
@@ -1095,6 +1215,57 @@
       ".github/workflows/vercel-preview-validation.yml": "e480ae25f23fd3ceed567e8004d85530e3f709d6ee1e8638d5165600575ca068",
       "scripts/deployment/vercel-token-permissions.mjs": "b8db5f110c4ba5f424471b3325a1399b8630785e340bf26e1a0be805ad441c3d",
       "scripts/deployment/test/vercel-token-permissions.test.mjs": "1322acfbdca6a5d29b42935364a036bc3b68f5682983b9615a4fa941e8b1aeb3"
-    }
+    },
+    "verifiedAtUtc": "2026-10-12T20:48:35.054393+00:00",
+    "runtimeRun": {
+      "id": 38305897863,
+      "name": "Isolated Vercel Preview safety audit",
+      "head_sha": "2141c3622d134f3d375be30d7b12b3d4072d5965",
+      "status": "completed",
+      "conclusion": "failure",
+      "created_at": "2026-10-12T20:41:55Z",
+      "updated_at": "2026-10-12T20:42:07Z",
+      "html_url": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38305897863"
+    },
+    "runtimeCheckRunId": 114999750521,
+    "diagnosticSourceCommit": "2141c3622d134f3d375be30d7b12b3d4072d5965",
+    "ciForDiagnosticSource": {
+      "id": 38305897860,
+      "head_sha": "2141c3622d134f3d375be30d7b12b3d4072d5965",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/shadrachampah123/veltrixeye/actions/runs/38305897860"
+    },
+    "verifiedExplanation": {
+      "credentialAccepted": true,
+      "unexpired": true,
+      "origin": "manual",
+      "observedScopeKinds": [
+        "team"
+      ],
+      "expectedTeamInGrantedScopes": false,
+      "ownScopeProjectsReturned": 0,
+      "visibleTeamCount": 1,
+      "expectedTeamVisible": false,
+      "expectedTeamGetWithoutQueryStatus": 403,
+      "cause": "The authenticated token scope does not cover the requested Vercel team.",
+      "notProved": [
+        "Token creator is not a member of the target team.",
+        "Token is invalid or expired.",
+        "Owner role is required."
+      ],
+      "minorHeaderFormatCorrectionApplicable": false,
+      "tokenIdentifiersNamesPrefixesSuffixesOtherTeamIdsOrRawDataPublished": false
+    },
+    "correctionWithoutExposure": {
+      "clientCanFixDuplicateBearerOrWhitespacePrivately": true,
+      "thisCredentialHasSuchFormattingIssue": false,
+      "readOnlyCallsCanRescopeOrEscalateCredential": false,
+      "currentTeamOnlyScopeCanMintReplacementToken": false,
+      "documentedDifferentScopePath": "Create a separately scoped replacement and store directly in the existing private GitHub Actions secret, not chat.",
+      "fullAccountTokenRequestedForAutomaticMinting": false,
+      "productionRiskAvoidedByCredentialCorrection": false
+    },
+    "rbacCaveat": "Scope and RBAC are independent. Read-only project/deployment/build-log capability is required; do not assume every plan's Viewer role includes log access. No membership permission was read for the inaccessible target team."
   }
 }

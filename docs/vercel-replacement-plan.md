@@ -3,9 +3,11 @@
 ## Current permission investigation (from `a395d70`)
 
 The previous suggestion to obtain an Owner management token was broader than
-verified minimum requirements. **No manual troubleshooting or credential change
-is requested yet.** A valid project-scoped token is documented to reject
-team/user-resource requests, so the old GET-team 403 alone is inconclusive.
+verified minimum requirements. **The read-only diagnosis is now complete.** A valid project-scoped token is
+documented to reject team/user-resource requests, so the old GET-team 403 alone
+was inconclusive. The new metadata checks have proved a different-team scope
+mismatch for this particular token; no Owner/full-account grant is necessary
+merely because a team endpoint was denied.
 
 The canonical existing-project team was revalidated from Vercel's fresh GitHub
 bot metadata: `shadrachampah123s-projects`, `team_Mzs68E6FMzdUnXcEbaQ52LuK`,
@@ -36,8 +38,8 @@ Bearer-prefix/whitespace issues can be normalized inside the private job;
 privilege/scope escalation and token creation/modification are not attempted.
 
 Both the prior safety suite and new scope suite pass: **40/40 offline tests**.
-Runtime diagnosis is pending. Nothing in these tests proves the real token
-scope or mutation permissions. The new-project first-Production risk has **not**
+The live diagnosis below is independent evidence of the token's scope.
+Nothing in the offline tests or read checks proves future mutation permissions. The new-project first-Production risk has **not**
 been safely avoided; all project/deployment writes stay disabled.
 
 ## Previous audit decision (historical)
@@ -203,19 +205,73 @@ The filtered live result was recovered from Checks annotation
 `114981905252` through `api.github.com`, rather than requiring dashboard or
 external artifact-storage troubleshooting. It is saved in the evidence file.
 
-## Next action — wait for evidence
+## Verified live scope diagnosis — no guesses
 
-**No manual action is requested before the new read-only diagnosis completes.**
-The earlier Owner-token replacement instruction is superseded pending evidence.
-If it is only a request-target/header issue, the agent can correct the client
-without revealing or replacing the stored value. A token cannot self-grant
-missing membership/scope or mint a broader credential through these read-only
-checks. The documented path to a different resource scope is replacement at
-creation, not any scope-update endpoint enabled in this task.
+[Run 38305897863](https://github.com/shadrachampah123/veltrixeye/actions/runs/38305897863)
+executed commit `2141c3622d134f3d375be30d7b12b3d4072d5965` at 2026-10-12
+20:42 UTC. **40/40 safeguards passed in Actions**; the credential step exits 2
+because all deployment writes remain disabled, not because the diagnosis failed.
 
-Project creation requires Team -> All Projects scope and a principal with
-Create Project and new-project configuration/Git/Preview permissions. Existing
-project/deployment-log reads may use a narrower Project token and read-only
-role. No Full Account/Owner/Billing/Full Production Deployment grant is presumed.
-No creation or deployment will occur until the first-Production risk is proved
-safely avoided. PR #104 and the Gold investigation remain untouched.
+| Read-only request | Actual status | Whitelisted finding |
+|---|---|---|
+| `GET /v5/user/tokens/current` (no team query) | **200** | Manual token; unexpired; Team scope; **requested team absent from granted scopes** |
+| `GET /v10/projects?limit=100` (inferred scope) | **200** | Credential accepted; zero projects visible in its scope |
+| `GET /v2/teams?limit=100` | **200** | One visible team; requested team not returned |
+| `GET /v2/teams/team_Mzs68E6FMzdUnXcEbaQ52LuK` (no extra query) | **403** | `forbidden` / `Not authorized` |
+
+**Verified cause:** the token is accepted, but its granted Team scope does not
+cover the requested team. This is not an invalid/expired credential diagnosis,
+a missing GitHub secret, a query-string formatting problem, or proof that its
+creator needs Owner access. The token creator's membership/RBAC in the denied
+team is **unknown**, not presumed absent. The target team ID/slug was revalidated
+from the Vercel bot's project association; it is not invented from the token.
+
+No leading/trailing whitespace or pasted Bearer prefix was present. Those
+formatting mistakes could have been corrected privately by the client, but are
+**not** the cause here. Scope cannot be added by any enabled GET request. The
+current Team-only credential cannot mint a broader token; Vercel documents that
+programmatic token creation needs full-account scope. **No such broader token,
+minting operation, scope edit, role grant, or secret value is requested here.**
+
+No token ID/name/prefix/suffix, unknown team/project identity, private user data,
+raw response or env field was published or saved. The filtered actual result is
+retained in the evidence JSON. Four GET requests; **zero Vercel writes**.
+
+## Minimum access — distinguish current reads from future provisioning
+
+| Phase | Narrowest relevant resource scope | Required capabilities |
+|---|---|---|
+| Existing Preview metadata/build-log investigation | Project -> existing `veltrixeye`, in `shadrachampah123s-projects` | Read project/deployment metadata and build logs; verify the applicable plan/role actually includes logs. Team/user metadata may legitimately be denied. |
+| Separately creating/configuring a new project (still disabled) | Team -> **All Projects** in the same team | Create Project plus new-project configuration/Git-link/Preview deployment and log access. Developer + Create Project is narrower than Owner; Member includes creation but is broader. |
+| Operating only the eventual initialized isolated project | Project -> that isolated project | Its needed Preview/configuration/log capabilities only, after a safe first-deployment path exists. |
+
+Full Account and Owner are **not blanket minimums**. Full Production Deployment,
+production secrets, billing, DNS/alias writes, and token-minting authority are
+not requested for this task. Token resource scope does not itself change the
+principal's RBAC permissions. A Project token for the old live project cannot
+create a new sibling project. A project scope is suitable for the current
+read-only evidence phase, but not for the original separate-project bootstrap.
+
+## One clear next action (requirements now verified)
+
+**Replace the existing private Actions secret `VERCEL_PREVIEW_TOKEN_5648E2F6`
+with an unexpired Vercel token explicitly scoped to
+`shadrachampah123s-projects` / `team_Mzs68E6FMzdUnXcEbaQ52LuK`.**
+For the originally intended separate-project provisioning, the verified scope
+selector is **that team -> All Projects**, not an individual existing project
+and not Full Account. Its creator needs the stated Create Project and
+new-project configuration/Git/Preview capabilities; an Owner token is not
+mandatory. For continuing only old-project read/log work, a Project token for
+`veltrixeye` is sufficient where its principal has the required read/log access.
+Do not expand RBAC privileges solely to make a diagnostic team endpoint pass.
+
+Use the [existing secret's private GitHub UI](https://github.com/shadrachampah123/veltrixeye/settings/secrets/actions/VERCEL_PREVIEW_TOKEN_5648E2F6)
+without pasting any value in chat. This is one specific authorization correction,
+not a dashboard troubleshooting checklist. A missing membership or MFA/SAML
+requirement must not be assumed from the old generic 403.
+
+**This repairs authentication only.** The first deployment of a new project is
+still documented as Production; no safe bypass has been proved. All project and
+deployment writes remain disabled. No Production exception is sought or assumed,
+no project/deployment/alias/secret/role change is made, PR #104 is not merged,
+and Gold debugging remains paused.
