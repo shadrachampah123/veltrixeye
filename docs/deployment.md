@@ -349,10 +349,46 @@ migrations are unaffected.
   `unavailable`; nothing is ever recorded as delivered without a provider.
 - **Draining the outbox** — the in-process ticker runs every
   `NOTIFICATION_WORKER_INTERVAL_MS` (60 s) while the instance is awake. On a
-  free instance (which sleeps), point a **Render Cron Job** at
-  `POST /api/internal/notifications/deliveries/run` with the
-  `x-veltrixeye-worker-token` header every minute or two; it is safe to run
-  alongside the ticker, because jobs are claimed with `FOR UPDATE SKIP LOCKED`.
+  free instance (which sleeps), delivery must be driven from outside; there are
+  two supported ways, and **either one is sufficient**:
+
+  1. **The scanner heartbeat (recommended, no second secret).** Every
+     `POST /api/internal/scanner/run` drains one bounded delivery batch
+     (≤ 5 jobs, ≤ 10 s) *before* it scans, using the same process's own worker.
+     A scheduler that already calls that endpoint every 5 minutes with
+     `SCANNER_WORKER_TOKEN` therefore covers delivery as well — including a
+     scheduler that holds no `NOTIFICATION_WORKER_TOKEN` at all. The batch is
+     best-effort: a delivery failure is recorded and logged but can never turn a
+     successful scan into a failed heartbeat.
+  2. **A dedicated cron** — point a **Render Cron Job** at
+     `POST /api/internal/notifications/deliveries/run` with the
+     `x-veltrixeye-worker-token` header every minute or two, using
+     `NOTIFICATION_WORKER_TOKEN`. Note that the scanner and notification routes
+     compare the SAME header name against DIFFERENT configured secrets, so this
+     job must carry the notification token, not the scanner token.
+
+  Both are safe alongside the ticker and alongside each other, because jobs are
+  claimed with `FOR UPDATE SKIP LOCKED`.
+- **Watching delivery without a token** — `GET /api/health` reports a
+  `workers.notifications` block (`lastSuccessAt`, `lastFailureAt`,
+  `lastFailureCode`, `successes`, `failures`, `successAgeMs`) and the same for
+  `workers.scanner`. A `lastSuccessAt` that keeps moving proves the schedule is
+  executing; a `successes` count stuck at zero with a `lastFailureCode` set is
+  the signature of a scheduler that is reaching the API and being refused.
+
+  The two blocks answer different questions, because they are recorded on
+  different paths:
+
+  | Block | Recorded by | The question it answers |
+  |---|---|---|
+  | `workers.notifications` | the in-process ticker **and** the internal endpoint | is outbox delivery running **at all**? |
+  | `workers.scanner` | **only** `POST /api/internal/scanner/run` | is the external scheduler actually reaching this API and authenticating? |
+
+  So if `workers.notifications` is advancing while `workers.scanner` stays at
+  `successes: 0`, delivery is fine but the scheduler is not executing the scan —
+  check the scheduler's URL, method and token before assuming the scan is
+  working. Both blocks are timestamps, counters and a machine code; never a
+  message, an identifier or a secret.
 - **Housekeeping** —
   `POST /api/internal/notifications/deliveries/maintenance` (same token)
   recovers stale work, applies retention (delivered 30 d, failed 120 d) and

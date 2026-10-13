@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { migrationStatus, MIGRATIONS_DIR, type MigrationStatus } from '@veltrixeye/core';
 import type { AppContext } from '../app.js';
+import { workerLivenessSnapshot } from '../worker-liveness.js';
 
 /**
  * Health endpoints. Both are unauthenticated by design (load balancers and
@@ -9,17 +10,31 @@ import type { AppContext } from '../app.js';
  *
  *  - `GET /api/health`        liveness — the process answers HTTP. Never
  *                             touches the database, so a database blip does
- *                             not restart a healthy process.
+ *                             not restart a healthy process. It also reports
+ *                             the in-memory worker liveness registry (last
+ *                             success/failure per scheduled worker, counts and
+ *                             a machine code only), which is the ONLY way to
+ *                             confirm that an external scheduler is actually
+ *                             executing the scanner and delivery workers
+ *                             without holding a worker token.
  *  - `GET /api/health/ready`  readiness — database reachable AND the schema
  *                             this build expects is applied. 503 otherwise,
  *                             so a platform health check refuses to put an
  *                             unmigrated instance into service.
  *
  * Migration state is read-only (`migrationStatus`); nothing here can change
- * the schema.
+ * the schema. The worker snapshot is process-local state read from memory — it
+ * never queries the database, so `GET /api/health` keeps its "never touches the
+ * database" contract.
  */
 export async function healthRoutes(app: FastifyInstance, ctx: AppContext): Promise<void> {
-  app.get('/api/health', async () => ({ status: 'ok', uptime: process.uptime() }));
+  app.get('/api/health', async () => ({
+    status: 'ok',
+    uptime: process.uptime(),
+    // Timestamps, counters and a short machine code per scheduled worker — no
+    // tenant identifier, no queue contents, no provider text, no secret.
+    workers: workerLivenessSnapshot(),
+  }));
 
   app.get('/api/health/ready', async (_req, reply) => {
     try {

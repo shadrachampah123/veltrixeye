@@ -10,9 +10,12 @@ import {
 import { Errors, redactScannerRunForViewer, resolveEntitlements } from '@veltrixeye/core';
 import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
+import { consoleDeliveryLogger } from '../delivery-worker.js';
 import { sendZodError } from '../errors.js';
+import { drainNotificationOutbox } from '../notification-heartbeat.js';
 import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js';
 import { consoleScannerLogger, runScannerWorkerCycle } from '../scanner-worker.js';
+import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from '../worker-liveness.js';
 
 /**
  * Scanner routes (M7.5 / F3) — live scanner / production market flow.
@@ -22,7 +25,7 @@ import { consoleScannerLogger, runScannerWorkerCycle } from '../scanner-worker.j
  * | GET /api/scanner/health | session | Real production state: provider availability, last run, last successful, active runs, data freshness. Never mock/static. |
  * | GET /api/scanner/runs | session | List recent scanner runs (observability), owner-scoped. |
  * | POST /api/scanner/trigger | session | Manual trigger (entitlement-gated). Uses advisory locking to prevent overlapping. |
- * | POST /api/internal/scanner/run | worker token | Sleep-safe external scheduler trigger: recovers stale runs and executes one system scan under advisory lock. 404 when no token is configured. |
+ * | POST /api/internal/scanner/run | worker token | Sleep-safe external scheduler trigger: recovers stale runs, drains one bounded notification-delivery batch, then executes one system scan under advisory lock. 404 when no token is configured. |
  * | POST /api/internal/scanner/maintenance | worker token | Stale-run recovery + bounded operational status. 404 when no token is configured. |
  *
  * Security:
@@ -240,17 +243,47 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       return;
     }
 
-    const result = await runScannerWorkerCycle(ctx.scanner, {
-      runArgs: {
-        force: parsed.data.force,
-        leaseMs: parsed.data.leaseMs ?? config.scanner.leaseMs,
-      },
-      scheduledIngestion: config.scheduledIngestion.enabled
-        ? ctx.scheduledIngestion
-        : undefined,
-      logger: consoleScannerLogger('[scanner]'),
+    // Ops heartbeat: drain ONE bounded notification batch, then scan.
+    //
+    // An external scheduler holds a single shared secret, and the scanner and
+    // notification endpoints compare that one header against two DIFFERENT
+    // configured values. A scheduler carrying only SCANNER_WORKER_TOKEN would
+    // therefore wake the instance, run the scan, and never touch the delivery
+    // endpoint — leaving the outbox to the in-process ticker, which stops the
+    // moment the platform sleeps. Draining here puts delivery on the same
+    // five-minute schedule as scanning, with no second cron job, no second
+    // secret and no scheduler change.
+    //
+    // Bounded and best-effort by design: a delivery problem must never turn a
+    // successful scan into a failed heartbeat. The outcome is recorded in the
+    // worker liveness registry (served by `GET /api/health`) and logged with
+    // counts only, so an operator can see whether delivery is actually running.
+    await drainNotificationOutbox({
+      worker: ctx.deliveryWorker,
+      batchSize: config.notification.worker.batchSize,
+      logger: consoleDeliveryLogger('[notifications]'),
     });
-    return reply.code(200).send(result);
+
+    recordWorkerStart('scanner');
+    try {
+      const result = await runScannerWorkerCycle(ctx.scanner, {
+        runArgs: {
+          force: parsed.data.force,
+          leaseMs: parsed.data.leaseMs ?? config.scanner.leaseMs,
+        },
+        scheduledIngestion: config.scheduledIngestion.enabled
+          ? ctx.scheduledIngestion
+          : undefined,
+        logger: consoleScannerLogger('[scanner]'),
+      });
+      recordWorkerSuccess('scanner');
+      return reply.code(200).send(result);
+    } catch (err) {
+      // A failed scan stays a visible non-2xx failure for the scheduler (the
+      // existing behaviour) and is recorded so it is visible without a token.
+      recordWorkerFailure('scanner', err);
+      throw err;
+    }
   });
 
   // POST /api/internal/scanner/maintenance — stale-run recovery + operational status (F3)

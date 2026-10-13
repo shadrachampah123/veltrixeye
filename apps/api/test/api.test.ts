@@ -145,6 +145,34 @@ describe('health', () => {
     assert.equal(res.json().status, 'ok');
   });
 
+  // An external scheduler's success cannot be observed from outside the
+  // platform without this: a green cron run and a running instance are both
+  // consistent with a scheduler that is being refused. The liveness block is
+  // the only unauthenticated proof that a worker actually executed.
+  test('GET /api/health → reports per-worker liveness without a token, and no secret text', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/health' });
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as {
+      workers: {
+        scanner: { lastSuccessAt: string | null; lastFailureCode: string | null; successes: number; failures: number };
+        notifications: { lastSuccessAt: string | null; lastFailureCode: string | null; successes: number; failures: number };
+      };
+    };
+
+    assert.ok(body.workers, 'health must expose the worker liveness registry');
+    for (const worker of [body.workers.scanner, body.workers.notifications]) {
+      assert.equal(typeof worker.successes, 'number');
+      assert.equal(typeof worker.failures, 'number');
+      // Fresh process: no success yet is the truthful answer, not a fake green.
+      assert.equal(worker.lastSuccessAt, null);
+      assert.equal(worker.lastFailureCode, null);
+    }
+    // Nothing but timestamps, counts and a machine code — never a message,
+    // a credential or a connection string.
+    assert.equal(JSON.stringify(body).includes('postgres://'), false);
+    assert.equal(JSON.stringify(body).includes('password'), false);
+  });
+
   test('GET /api/health/ready → 200 ready (db up)', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/health/ready' });
     assert.equal(res.statusCode, 200);

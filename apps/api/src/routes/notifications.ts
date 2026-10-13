@@ -12,6 +12,7 @@ import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
 import { createSessionAuth, type AuthenticatedRequest } from '../session-auth.js';
+import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from '../worker-liveness.js';
 
 /**
  * M7.3 notification routes.
@@ -180,8 +181,18 @@ export async function notificationRoutes(
       sendZodError(reply, parsed.error, 'body');
       return;
     }
-    const result = await ctx.deliveryWorker.runOnce(parsed.data.batchSize);
-    return result;
+    // Exactly ONE batch per call: the liveness wrapper must never add a second
+    // invocation, which would drain the queue and report an empty result.
+    recordWorkerStart('notifications');
+    try {
+      const result = await ctx.deliveryWorker.runOnce(parsed.data.batchSize);
+      recordWorkerSuccess('notifications');
+      return result;
+    } catch (err) {
+      // Existing behaviour: a failed batch stays a visible 5xx for the caller.
+      recordWorkerFailure('notifications', err);
+      throw err;
+    }
   });
 
   // POST /api/internal/notifications/deliveries/maintenance — recovery + cleanup
