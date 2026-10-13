@@ -228,6 +228,17 @@ export const MIN_SCANNER_LEASE_MS = 30_000;
 export const MAX_SCANNER_LEASE_MS = 2 * 60 * 60_000;
 
 /**
+ * Terminal scanner-run retention (M7 audit finding F15).
+ *
+ * `scanner_runs` gains ~288 rows/day at the 5-minute cadence. Completed and
+ * failed runs older than this many days are pruned by the scanner maintenance
+ * sweep. `running` runs and `scanner_cursors` are never pruned.
+ */
+export const DEFAULT_SCANNER_RUN_RETENTION_DAYS = 90;
+export const MIN_SCANNER_RUN_RETENTION_DAYS = 1;
+export const MAX_SCANNER_RUN_RETENTION_DAYS = 3650;
+
+/**
  * Body of the internal scanner worker trigger (`POST /api/internal/scanner/run`).
  *
  * Strictly forbids tenant/content parameters (`strategyId`, `userId`,

@@ -12,6 +12,9 @@ import {
   DEFAULT_NOTIFICATION_TIMEOUT_MS,
   DEFAULT_NOTIFICATION_WORKER_INTERVAL_MS,
   DEFAULT_SCANNER_LEASE_MS,
+  DEFAULT_SCANNER_RUN_RETENTION_DAYS,
+  MAX_SCANNER_RUN_RETENTION_DAYS,
+  MIN_SCANNER_RUN_RETENTION_DAYS,
   MAX_NOTIFICATION_BATCH_SIZE,
   MAX_SCANNER_LEASE_MS,
   MIN_SCANNER_LEASE_MS,
@@ -241,6 +244,15 @@ const baseEnvSchema = z.object({
   /** How long a running scanner run may stay `running` before it is recovered. */
   SCANNER_LEASE_MS: intEnv(MIN_SCANNER_LEASE_MS, MAX_SCANNER_LEASE_MS, DEFAULT_SCANNER_LEASE_MS),
   /**
+   * Retention for terminal (completed/failed) `scanner_runs` rows, in days (F15).
+   * Pruned by the scanner maintenance sweep; running runs and cursors are kept.
+   */
+  SCANNER_RUN_RETENTION_DAYS: intEnv(
+    MIN_SCANNER_RUN_RETENTION_DAYS,
+    MAX_SCANNER_RUN_RETENTION_DAYS,
+    DEFAULT_SCANNER_RUN_RETENTION_DAYS,
+  ),
+  /**
    * Shared secret for `POST /api/internal/scanner/{run,maintenance}` (F3).
    * EMPTY = those routes do not exist (404), so an unconfigured deployment
    * exposes no administrative surface at all.
@@ -467,6 +479,8 @@ export interface ScannerConfig {
   retryBaseMs: number;
   retryMaxMs: number;
   leaseMs: number;
+  /** Terminal scanner-run retention in days (F15). */
+  runRetentionDays: number;
   /** Empty ⇒ the internal scanner worker routes are not registered (404). */
   workerToken: string;
 }
@@ -593,6 +607,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       retryBaseMs: values.SCANNER_RETRY_BASE_MS,
       retryMaxMs: values.SCANNER_RETRY_MAX_MS,
       leaseMs: values.SCANNER_LEASE_MS,
+      runRetentionDays: values.SCANNER_RUN_RETENTION_DAYS,
       workerToken: values.SCANNER_WORKER_TOKEN,
     },
     scheduledIngestion: {
