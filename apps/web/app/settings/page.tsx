@@ -78,6 +78,37 @@ function SettingsContent() {
       });
   }, []);
 
+  /**
+   * BOTH server-derived billing surfaces are re-read together. The checkout
+   * panel asks for this after a checkout attempt: the first checkout writes the
+   * subscription row and its immutable pricing lock, which moves the server
+   * facts BOTH reads answer from — `GET /api/billing/me` (the checkout panel's
+   * state) and `GET /api/billing/portal` (the overview moves `free` →
+   * `awaiting_verification`). Re-reading only one of them would leave two
+   * server-derived cards on this page contradicting each other until a manual
+   * reload. These are plain reads of the session user's own state: no action,
+   * no confirmation and no authority rides along.
+   */
+  const reloadBillingSurfaces = React.useCallback(() => {
+    loadBilling();
+    loadPortal();
+  }, [loadBilling, loadPortal]);
+
+  /**
+   * Verified payment evidence was recorded during THIS UI session (the answer
+   * to an explicit "Verify payment" click). The fact is lifted so the checkout
+   * and subscription panels state the same thing, AND the portal overview is
+   * re-read, because the evidence row just written moves the portal's
+   * server-derived state (`awaiting_verification` →
+   * `evidence_awaiting_activation`). The overview must not keep stating a
+   * server state this page itself moved. Still display-only: the server keeps
+   * deriving `paymentConfirmed` from the activation fact, never from this.
+   */
+  const handleEvidenceRecorded = React.useCallback(() => {
+    setEvidenceRecorded(true);
+    loadPortal();
+  }, [loadPortal]);
+
   React.useEffect(() => {
     loadSessions();
     loadBilling();
@@ -201,8 +232,8 @@ function SettingsContent() {
             billing={billing}
             unavailable={billingUnavailable}
             evidenceRecorded={evidenceRecorded}
-            onEvidenceRecorded={() => setEvidenceRecorded(true)}
-            onBillingChange={loadBilling}
+            onEvidenceRecorded={handleEvidenceRecorded}
+            onBillingChange={reloadBillingSurfaces}
           />
 
           <PlanComparison currentPlan={billing?.subscription.plan ?? user.plan} mode={billing?.mode ?? null} />
