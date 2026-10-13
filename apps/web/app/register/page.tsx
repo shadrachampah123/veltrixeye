@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '@/lib/api';
 import { Alert, Button, Field, Input } from '@/components/ui';
+import { LegalFooter } from '@/components/legal';
 import { BRAND } from '@/lib/brand';
 import { useAuth } from '@/components/auth-context';
 
@@ -94,6 +95,9 @@ export default function RegisterPage() {
             </Link>
           </p>
         </form>
+        <footer className="mt-6">
+          <LegalFooter />
+        </footer>
       </div>
     </div>
   );

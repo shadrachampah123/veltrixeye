@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import { AuthProvider } from '@/components/auth-context';
+import { CookieNotice } from '@/components/cookie-notice';
 import { BRAND } from '@/lib/brand';
 
 export const metadata: Metadata = {
@@ -17,6 +18,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body>
         <AuthProvider>{children}</AuthProvider>
+        <CookieNotice />
       </body>
     </html>
   );

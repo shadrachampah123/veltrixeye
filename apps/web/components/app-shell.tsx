@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { BRAND } from '@/lib/brand';
 import { useAuth } from '@/components/auth-context';
+import { LegalFooter } from '@/components/legal';
 import { Badge } from '@/components/ui';
 
 const NAV = [
@@ -173,6 +174,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <span>·</span>
               <span>{BRAND.safety.riskNote}</span>
             </div>
+          </div>
+          <div className="mx-auto mt-2 max-w-7xl">
+            <LegalFooter />
           </div>
         </footer>
       </div>
