@@ -1,3 +1,4 @@
+/* global self, clients, fetch */
 /**
  * M9.2 Service Worker — Web Push handling
  * No hard-coded branding, uses push payload data.

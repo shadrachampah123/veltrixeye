@@ -54,7 +54,6 @@ import {
   RiskEngineService,
   ExecutionAuthorizationService,
   createAuthorizationContextHandoff,
-  type AuthorizationContextHandoff,
   ExecutionCompositionService,
   type ProviderRegistry,
   type NotificationProviderRegistry,

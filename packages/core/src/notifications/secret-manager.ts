@@ -40,7 +40,7 @@ function parseBase64Key(raw: string): Buffer {
     throw new SecretManagerError('WEBHOOK_SECRET_ENCRYPTION_KEY is required for secret encryption');
   }
   // Accept base64 (standard or url-safe) or hex? Spec says 32-byte base64.
-  let normalized = raw.trim();
+  const normalized = raw.trim();
   // Try base64 decode
   try {
     const buf = Buffer.from(normalized, 'base64');

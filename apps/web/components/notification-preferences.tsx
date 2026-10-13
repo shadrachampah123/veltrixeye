@@ -8,7 +8,6 @@ import { isPushSupported, getPermissionState, registerServiceWorker, getExisting
 import type { NotificationPreferencesResponse, StrategyNotificationPreference } from '@veltrixeye/contracts';
 
 function NotificationPreferencesPanel() {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [prefs, setPrefs] = React.useState<NotificationPreferencesResponse | null>(null);
   void prefs;
   const [strategyPrefs, setStrategyPrefs] = React.useState<StrategyNotificationPreference[] | null>(null);

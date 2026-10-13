@@ -2,7 +2,6 @@ import type pg from 'pg';
 import {
   notificationPreferenceRequestSchema,
   notificationPreferenceSchema,
-  notificationPreferencesRequestSchema,
   notificationPreferencesResponseSchema,
   pushSubscriptionRequestSchema,
   quietHoursSchema,
@@ -11,7 +10,6 @@ import {
   type NotificationChannel,
   type NotificationPreference,
   type NotificationPreferenceRequest,
-  type NotificationPreferencesRequest,
   type NotificationPreferencesResponse,
   type PushSubscriptionRequest,
   type QuietHours,

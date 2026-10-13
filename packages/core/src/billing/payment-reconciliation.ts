@@ -7,7 +7,6 @@ import {
   type BillingProviderMode,
 } from '@veltrixeye/contracts';
 import {
-  BILLING_PAYMENT_RECONCILIATION_FAILURE_REASONS,
   type BillingPaymentReconciliationFailureReason,
   type BillingVerifiedTransaction,
 } from '@veltrixeye/contracts';

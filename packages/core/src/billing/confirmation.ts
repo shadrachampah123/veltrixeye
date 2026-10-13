@@ -4,7 +4,9 @@ import { z } from 'zod';
 import {
   BILLING_PROVIDER,
   billingPaymentVerificationResultSchema,
+  type BillingPaymentEvidence,
   type BillingPaymentVerificationResult,
+  type ProviderSubscriptionState,
   type BillingProviderMode,
   type BillingVerifiedTransaction,
 } from '@veltrixeye/contracts';
@@ -14,7 +16,6 @@ import { BillingPricingSnapshotStore } from './snapshots.js';
 import { reconcileBillingPaymentEvidence } from './payment-reconciliation.js';
 import {
   BillingVerifiedTransactionStore,
-  billingVerifiedTransactionEvidenceHash,
   billingVerifiedTransactionIdempotencyKey,
 } from './verified-transactions.js';
 
@@ -151,7 +152,7 @@ export class BillingPaymentConfirmationService {
       requestedAt: this.now().toISOString(),
     });
 
-    let observed: import('@veltrixeye/contracts').ProviderSubscriptionState;
+    let observed: ProviderSubscriptionState;
     try {
       observed = await provider.verifySubscription(request);
     } catch (error) {
@@ -220,7 +221,7 @@ export class BillingPaymentConfirmationService {
     }
 
     const store = new BillingVerifiedTransactionStore(this.options.db, this.mode);
-    let evidence: import('@veltrixeye/contracts').BillingPaymentEvidence;
+    let evidence: BillingPaymentEvidence;
     let replayed = false;
     try {
       const existingByKey = await store.findByIdempotencyKey(

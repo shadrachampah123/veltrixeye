@@ -5,7 +5,6 @@ import {
   BILLING_PROVIDER,
   billingPaymentCurrencySchema,
   billingProviderModeSchema,
-  type BillingPaymentCurrency,
   type BillingProviderMode,
 } from '@veltrixeye/contracts';
 import { billingPaymentEvidenceSchema, type BillingPaymentEvidence, type BillingVerifiedTransaction } from '@veltrixeye/contracts';
