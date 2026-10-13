@@ -455,6 +455,7 @@ export function createAppContext(
     retryMaxMs: config.scanner.retryMaxMs,
     expectedIntervalMs: config.scanner.intervalMs,
     leaseMs: config.scanner.leaseMs,
+    runRetentionDays: config.scanner.runRetentionDays,
     redact: (text) =>
       redactSecrets(text, [
         config.TWELVE_DATA_API_KEY,

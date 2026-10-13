@@ -1,6 +1,9 @@
 import type pg from 'pg';
 import {
   DEFAULT_SCANNER_LEASE_MS,
+  DEFAULT_SCANNER_RUN_RETENTION_DAYS,
+  MAX_SCANNER_RUN_RETENTION_DAYS,
+  MIN_SCANNER_RUN_RETENTION_DAYS,
   SCANNER_ADVISORY_LOCK_KEY,
   SCANNER_MAX_RETRIES,
   SCANNER_RETRY_BASE_MS,
@@ -60,6 +63,8 @@ export interface ScannerServiceOptions {
   retryMaxMs?: number;
   expectedIntervalMs?: number;
   leaseMs?: number;
+  /** Terminal (completed/failed) scanner-run retention in days (F15). */
+  runRetentionDays?: number;
   logger?: ScannerLogger;
   /**
    * Optional secret-redaction callback (defence in depth) applied to error
@@ -72,6 +77,20 @@ export interface ScannerLogger {
   info(message: string, meta?: Record<string, unknown>): void;
   warn(message: string, meta?: Record<string, unknown>): void;
   error(message: string, meta?: Record<string, unknown>): void;
+}
+
+/** Rows deleted per statement by the terminal-run retention sweep (F15). */
+const SCANNER_RUN_PRUNE_BATCH_SIZE = 500;
+/** Upper bound on statements per sweep so one maintenance call stays short. */
+const SCANNER_RUN_PRUNE_MAX_BATCHES = 20;
+
+/** Clamp a retention window to the documented bounds; invalid ⇒ default. */
+export function clampRetentionDays(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_SCANNER_RUN_RETENTION_DAYS;
+  return Math.min(
+    MAX_SCANNER_RUN_RETENTION_DAYS,
+    Math.max(MIN_SCANNER_RUN_RETENTION_DAYS, Math.trunc(value)),
+  );
 }
 
 const DEFAULT_LOGGER: ScannerLogger = {
@@ -301,6 +320,7 @@ export class ScannerService {
   private readonly retryMaxMs: number;
   private readonly expectedIntervalMs: number;
   private readonly leaseMs: number;
+  private readonly runRetentionDays: number;
   private readonly logger: ScannerLogger;
   private readonly redact: (text: string) => string;
   private readonly inFlightRuns = new Set<Promise<unknown>>();
@@ -322,6 +342,7 @@ export class ScannerService {
     this.retryMaxMs = options.retryMaxMs ?? SCANNER_RETRY_MAX_MS;
     this.expectedIntervalMs = options.expectedIntervalMs ?? SCANNER_EXPECTED_INTERVAL_MS;
     this.leaseMs = options.leaseMs ?? DEFAULT_SCANNER_LEASE_MS;
+    this.runRetentionDays = clampRetentionDays(options.runRetentionDays);
     this.logger = options.logger ?? DEFAULT_LOGGER;
     this.redact = options.redact ?? ((text: string) => text);
   }
@@ -462,6 +483,64 @@ export class ScannerService {
       this.logger.warn('recovered stale scanner runs', { recovered, leaseMs });
     }
     return { recovered };
+  }
+
+  /**
+   * Bounded retention for the `scanner_runs` ledger (M7 audit finding F15).
+   *
+   * Deletes `completed` and `failed` runs whose `started_at` is older than the
+   * configured retention window. Safety rules:
+   *  - `running` and `partial` rows are never deleted (only the two terminal
+   *    statuses the retention policy names are candidates);
+   *  - `scanner_cursors` is a separate table and is never touched;
+   *  - the newest terminal run and the newest completed run (the rows behind
+   *    `getHealth().lastRun` / `lastSuccessfulRun`) are always kept, so health
+   *    output does not regress when the system has been idle past retention;
+   *  - at most `SCANNER_RUN_PRUNE_BATCH_SIZE` rows per statement, at most
+   *    `SCANNER_RUN_PRUNE_MAX_BATCHES` statements per sweep, `FOR UPDATE SKIP
+   *    LOCKED` so a concurrent sweep or writer never blocks;
+   *  - idempotent: a repeat sweep deletes only rows that became eligible since
+   *    the last one (none, if nothing aged out). Terminal rows never change
+   *    status, so there is no race with `completeRun` / `recoverStaleRuns`,
+   *    which only touch `running` rows.
+   *
+   * Logs counts only (no run ids, tenant or strategy data). Returns the number
+   * of rows deleted in this sweep.
+   */
+  async pruneTerminalRuns(args: { retentionDays?: number } = {}): Promise<number> {
+    const retentionDays = clampRetentionDays(args.retentionDays ?? this.runRetentionDays);
+    let deleted = 0;
+    for (let batch = 0; batch < SCANNER_RUN_PRUNE_MAX_BATCHES; batch++) {
+      const res = await this.pool.query(
+        `DELETE FROM scanner_runs
+          WHERE id IN (
+            SELECT r.id FROM scanner_runs r
+             WHERE r.status IN ('completed', 'failed')
+               AND r.started_at < now() - ($1::int * interval '1 day')
+               AND r.id NOT IN (
+                 SELECT k.id FROM scanner_runs k
+                  WHERE k.status IN ('completed', 'failed')
+                  ORDER BY k.started_at DESC LIMIT 1
+               )
+               AND r.id NOT IN (
+                 SELECT k.id FROM scanner_runs k
+                  WHERE k.status = 'completed'
+                  ORDER BY k.finished_at DESC NULLS LAST LIMIT 1
+               )
+             ORDER BY r.started_at ASC
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED
+          )`,
+        [retentionDays, SCANNER_RUN_PRUNE_BATCH_SIZE],
+      );
+      const n = res.rowCount ?? 0;
+      deleted += n;
+      if (n < SCANNER_RUN_PRUNE_BATCH_SIZE) break;
+    }
+    if (deleted > 0) {
+      this.logger.info('scanner run retention', { deleted, retentionDays });
+    }
+    return deleted;
   }
 
   /**
@@ -655,6 +734,7 @@ export class ScannerService {
   ): Promise<ScannerInternalMaintenanceResponse> {
     const leaseMs = args.leaseMs ?? this.leaseMs;
     const { recovered } = await this.recoverStaleRuns(leaseMs);
+    await this.pruneTerminalRuns();
     const health = await this.getHealth();
     return {
       recovered,

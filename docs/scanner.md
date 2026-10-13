@@ -141,7 +141,7 @@ All session endpoints check `canAccessScanner` entitlement server-side (free →
 **Internal worker API (F3: token-protected, sleep-safe external scheduler invocation):**
 
 - `POST /api/internal/scanner/run` — recovers stale running scans (`started_at < now - leaseMs`), then executes one system scan under PostgreSQL advisory lock `SCANNER_ADVISORY_LOCK_KEY` (875421009). Accepts strict JSON `{ force?: boolean, leaseMs?: number }`; returns operator-redacted `{ run, skipped, reason?, recovered }`.
-- `POST /api/internal/scanner/maintenance` — recovers stale running scans and returns bounded operational health `{ recovered, activeRuns, recentFailures, status, isProviderAvailable }` without tenant identifiers or provider secrets.
+- `POST /api/internal/scanner/maintenance` — recovers stale running scans, then prunes terminal `scanner_runs` older than `SCANNER_RUN_RETENTION_DAYS` (F15; bounded, counts-only log, response shape unchanged), and returns bounded operational health `{ recovered, activeRuns, recentFailures, status, isProviderAvailable }` without tenant identifiers or provider secrets.
 - Both internal routes require `x-veltrixeye-worker-token: <SCANNER_WORKER_TOKEN>` (validated in constant time over SHA-256 digests; session cookies alone return `401`) and return `404` when `SCANNER_WORKER_TOKEN` is unset. Rate limited 30/min.
 - In-process `startScannerWorkerTicker` (`apps/api/src/scanner-worker.ts`) runs the same `runWorkerOnce()` + periodic `runMaintenance()` cycle with in-process overlap protection, unref'd timers, and a `stop()` method that awaits both the active tick and `ScannerService.waitForInFlight()` before shutdown closes the database pool.
 
@@ -227,6 +227,7 @@ Comprehensive tests added:
 - `SCANNER_ENABLED` (bool, default false) — run scanner ticker in-process
 - `SCANNER_INTERVAL_MS` (int 30s–1h, default 300000 = 5m)
 - `SCANNER_LEASE_MS` (int 30s–2h, default 1800000 = 30m) — stale running scan recovery horizon
+- `SCANNER_RUN_RETENTION_DAYS` (int 1–3650, default 90) — terminal `scanner_runs` retention. The maintenance sweep (`runMaintenance`, run by the internal maintenance route and every 6th in-process ticker cycle) deletes `completed`/`failed` runs whose `started_at` is older than this window, in bounded batches. `running` and `partial` runs, `scanner_cursors`, and the newest terminal run and newest completed run (the rows behind health's `lastRun`/`lastSuccessfulRun`) are always kept. Logs contain counts only.
 - `SCANNER_PROVIDER_TIMEOUT_MS` (int 1s–120s, default 15000)
 - `SCANNER_MAX_RETRIES` (int 0–10, default 3)
 - `SCANNER_RETRY_BASE_MS` (int 100–60000, default 1000)
