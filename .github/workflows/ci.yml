@@ -75,47 +75,33 @@ jobs:
           test -f packages/providers/paystack/src/index.ts
           echo "Paystack workspace present and resolvable"
 
-      - name: Test (all workspaces, including safety) with retry for known flaky concurrency test
+      - name: Test (all workspaces, including safety)
         id: test
         run: |
-          set -eux
+          set -euxo pipefail
           echo "availableParallelism=$(node -e 'console.log(require("os").availableParallelism())')"
           # The test harness boots real PostgreSQL via embedded-postgres.
-          # One test (concurrent duplicate submissions) is known to be flaky due to a race
-          # on client_order_id unique constraint — it fails ~20% of runs locally and in CI
-          # (in CI the rate appears higher, ~50%). Root cause is in PaperExecutionService:
-          # two concurrent simulate() calls both check existence then INSERT same client_order_id.
-          # We retry up to 10 times to get a stable green, WITHOUT modifying source or skipping safety.
-          # This is a CI-only workaround; the flakiness is pre-existing, not introduced by this PR.
-          set +e
-          MAX_RETRIES=10
-          ATTEMPT=1
-          while [ $ATTEMPT -le $MAX_RETRIES ]; do
-            echo "=== Test attempt $ATTEMPT/$MAX_RETRIES ==="
-            rm -rf .test
-            taskset -c 0 npm test 2>&1 | tee /tmp/test.log
-            EXIT_CODE=${PIPESTATUS[0]}
-            echo "EXIT_CODE=$EXIT_CODE" | tee -a /tmp/test.log
-            echo "=== SUMMARY attempt $ATTEMPT ==="
-            grep -E "^# (tests|pass|fail|suites)|^> @veltrixeye|EXIT_CODE|not ok" /tmp/test.log | tail -50 || true
-            if [ $EXIT_CODE -eq 0 ]; then
-              echo "Tests passed on attempt $ATTEMPT"
-              tail -n 500 /tmp/test.log > /tmp/test-tail.log || true
-              grep -B5 -A30 "not ok" /tmp/test.log > /tmp/fail.log || true
-              exit 0
-            fi
-            echo "Tests failed on attempt $ATTEMPT, checking if flaky test..."
-            grep -E "concurrent duplicate submissions" /tmp/test.log || true
-            if [ $ATTEMPT -lt $MAX_RETRIES ]; then
-              echo "Retrying after 5s..."
-              sleep 5
-            fi
-            ATTEMPT=$((ATTEMPT+1))
-          done
-          echo "All $MAX_RETRIES attempts failed"
+          #
+          # This step used to run the whole suite in a retry loop (up to 10
+          # attempts) to mask a flaky duplicate-key failure on
+          # execution_orders_client_order_id_idx. That race was fixed in 5a0ae5f
+          # (advisory-lock serialization + post-lock identity re-read in
+          # PaperExecutionService.runFillTransaction) and is now pinned by the
+          # deterministic TOCTOU regression test in
+          # packages/core/test/paper-execution.test.ts ("a twin that read the
+          # identity before the winner committed replays"). One authoritative
+          # run replaces the loop: no retries, no masking. A failure here is a
+          # real failure.
+          rm -rf .test
+          status=0
+          taskset -c 0 npm test 2>&1 | tee /tmp/test.log || status=$?
+          echo "=== SUMMARY ==="
+          grep -E "^# (tests|pass|fail|suites)|^> @veltrixeye|not ok" /tmp/test.log | tail -50 || true
+          # Capture the debugging artifacts on BOTH outcomes, then fail with the
+          # suite's real exit status (pipefail keeps the pipe honest).
           tail -n 500 /tmp/test.log > /tmp/test-tail.log || true
           grep -B5 -A30 "not ok" /tmp/test.log > /tmp/fail.log || true
-          exit $EXIT_CODE
+          exit $status
 
       - name: Upload test log artifact (for debugging)
         if: always()
@@ -138,7 +124,7 @@ jobs:
             let tail = '';
             try { fail = fs.readFileSync('/tmp/fail.log', 'utf8'); } catch (e) { fail = `no fail.log: ${e.message}`; }
             try { tail = fs.readFileSync('/tmp/test-tail.log', 'utf8'); } catch (e) { tail = `no tail: ${e.message}`; }
-            const body = `❌ CI test step failed on \`${{ github.head_ref || github.ref_name }}\` @ \`${{ github.sha }}\` after retries\n\n**Failing tests (grep not ok):**\n\`\`\`\n${fail.slice(0, 20000)}\n\`\`\`\n\n**Tail (last 500 lines):**\n\`\`\`\n${tail.slice(0, 20000)}\n\`\`\`\n`;
+            const body = `❌ CI test step failed on \`${{ github.head_ref || github.ref_name }}\` @ \`${{ github.sha }}\` (single authoritative run, no retries)\n\n**Failing tests (grep not ok):**\n\`\`\`\n${fail.slice(0, 20000)}\n\`\`\`\n\n**Tail (last 500 lines):**\n\`\`\`\n${tail.slice(0, 20000)}\n\`\`\`\n`;
             github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,

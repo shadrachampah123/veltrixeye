@@ -21,6 +21,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type pg from 'pg';
 import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 
 import {
@@ -285,6 +286,78 @@ async function seedEntryPrice(
 async function countRows(sql: string, params: unknown[]): Promise<number> {
   const res = await pool.query<{ n: string }>(sql, params);
   return Number(res.rows[0]?.n ?? 0);
+}
+
+/* -------------------------------------------------------------------------- */
+/* deterministic identity TOCTOU gate (check-then-insert window)               */
+/* -------------------------------------------------------------------------- */
+
+const ORDER_IDENTITY_LOOKUP = 'FROM execution_orders WHERE client_order_id';
+
+/**
+ * Deterministic reproduction harness for the historical duplicate
+ * `client_order_id` race.
+ *
+ * The fill transaction reads `execution_orders` by `client_order_id` BEFORE it
+ * serializes on the advisory locks. This harness wraps the pool so the first
+ * such read executed INSIDE a transaction is genuinely stale: the query runs
+ * immediately (while no order exists for the identity) and its empty result is
+ * handed back only after `release()` — i.e. after a concurrent twin has
+ * committed the same identity. `parked` resolves as soon as that read is held,
+ * so a test can sequence the interleaving with no timers and no sleeps: the
+ * exact window that produced
+ * `duplicate key value violates unique constraint "execution_orders_client_order_id_idx"`.
+ */
+function createStaleIdentityReadGate(realPool: pg.Pool): {
+  pool: pg.Pool;
+  parked: Promise<void>;
+  release: () => void;
+} {
+  let armed = true;
+  let markParked!: () => void;
+  let releaseGate!: () => void;
+  const parked = new Promise<void>((resolve) => {
+    markParked = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    releaseGate = resolve;
+  });
+
+  const wrapClient = (client: pg.PoolClient): pg.PoolClient => {
+    const originalQuery = (client as any).query.bind(client);
+    return new Proxy(client, {
+      get(target, prop, receiver) {
+        if (prop === 'query') {
+          return (text: unknown, params?: unknown[]) => {
+            if (armed && typeof text === 'string' && text.includes(ORDER_IDENTITY_LOOKUP)) {
+              armed = false;
+              // The read runs NOW (stale: the identity is still empty) and is
+              // delivered only once the twin has committed.
+              const staleRead = originalQuery(text, params);
+              markParked();
+              return released.then(() => staleRead);
+            }
+            return originalQuery(text, params);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? (value as any).bind(target) : value;
+      },
+    });
+  };
+
+  const pool = new Proxy(realPool, {
+    get(target, prop, receiver) {
+      if (prop === 'connect') {
+        const originalConnect = (target as any).connect.bind(target);
+        return async () => wrapClient(await originalConnect());
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === 'function' ? (value as any).bind(target) : value;
+    },
+  });
+
+  return { pool, parked, release: () => releaseGate() };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1379,6 +1452,108 @@ describe('M8.3 paper simulator — idempotency and failure paths', () => {
     assert.equal(
       await countRows('SELECT count(*)::text AS n FROM execution_positions WHERE user_id = $1', [user.id]),
       1,
+    );
+  });
+
+  /**
+   * The historical flake, made deterministic.
+   *
+   * A twin that read the identity BEFORE the winner committed (the classic
+   * check-then-insert window) must be recovered inside the fill transaction:
+   * the advisory-lock serialization re-reads `client_order_id` after the lock
+   * and replays the existing order. Without that post-lock re-check the loser
+   * inserts blindly and the raw `23505` on
+   * `execution_orders_client_order_id_idx` escapes to the caller (the CI retry
+   * loop added in f0803f9/feb437f existed to hide exactly that).
+   */
+  test('a twin that read the identity before the winner committed replays (no raw unique violation)', async () => {
+    const user = await makeUser();
+    const profileId = await makeProfile(user.id);
+    const setup = await makeSetup(user.id);
+    await seedEntryPrice(setup.instrumentId);
+
+    // A dedicated simulator instance whose pool exposes the deterministic
+    // stale-read gate. It shares the real risk engine, market source, kill
+    // switches, automation state, audit sink and database: only the
+    // interleaving is controlled.
+    const gate = createStaleIdentityReadGate(pool);
+    const gatedRegistry = createExecutionProviderRegistry();
+    const gatedRef: { service?: PaperExecutionService } = {};
+    gatedRegistry.register(
+      createPaperExecutionProvider({
+        simulator: {
+          submitAuthorizedOrder: (args) => gatedRef.service!.submitAuthorizedOrder(args),
+        },
+      }),
+    );
+    const gatedPaper = new PaperExecutionService(
+      gate.pool,
+      {
+        market,
+        risk,
+        killSwitches,
+        automation,
+        audit,
+        provider: () => gatedRegistry.get('paper'),
+      },
+      serviceOptions,
+    );
+    gatedRef.service = gatedPaper;
+
+    // Loser: reads the identity, enters its fill transaction and parks on the
+    // pre-lock identity read — which has genuinely returned "no order".
+    const loser = gatedPaper.simulate({
+      userId: user.id,
+      setupId: setup.setupId,
+      executionProfileId: profileId,
+      nowMs: T0,
+    });
+    await gate.parked;
+
+    // Winner: completes the SAME deterministic identity while the loser is
+    // parked inside its open transaction.
+    const winner = await gatedPaper.simulate({
+      userId: user.id,
+      setupId: setup.setupId,
+      executionProfileId: profileId,
+      nowMs: T0,
+    });
+    assert.equal(winner.simulated, true, 'the first call fills');
+    assert.ok(winner.order && winner.position);
+
+    // Let the stale read resolve. The loser must recover the conflict as a
+    // replay of the winner's order — never a second row and never a raw
+    // unique-constraint error.
+    gate.release();
+    const settled = await Promise.allSettled([loser]);
+    const outcome = settled[0]!;
+    assert.equal(
+      outcome.status,
+      'fulfilled',
+      outcome.status === 'rejected'
+        ? `stale twin escaped as a raw error: ${String((outcome as PromiseRejectedResult).reason)}`
+        : undefined,
+    );
+    if (outcome.status !== 'fulfilled') return;
+    const replay = outcome.value;
+
+    assert.equal(replay.order!.id, winner.order!.id, 'the twin replays the existing order identity');
+    assert.equal(replay.position!.id, winner.position!.id, 'the twin replays the existing position');
+    assert.equal(replay.order!.status, 'filled');
+    assert.equal(
+      await countRows('SELECT count(*)::text AS n FROM execution_orders WHERE user_id = $1', [user.id]),
+      1,
+      'exactly one order exists',
+    );
+    assert.equal(
+      await countRows('SELECT count(*)::text AS n FROM execution_positions WHERE user_id = $1', [user.id]),
+      1,
+      'exactly one position exists',
+    );
+    assert.equal(
+      await countRows('SELECT count(*)::text AS n FROM execution_fills WHERE user_id = $1', [user.id]),
+      1,
+      'exactly one fill exists',
     );
   });
 
