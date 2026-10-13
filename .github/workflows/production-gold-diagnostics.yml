@@ -1,0 +1,247 @@
+# Production Gold (XAUUSD / v8) diagnostics — READ-ONLY.
+#
+# WHAT THIS DOES
+#   Runs `scripts/diagnostics/gold-v8-production-evidence.ts` against the
+#   production database and uploads the resulting evidence report as a build
+#   artifact. It exists to establish, from production data, the ACTUAL v8 4H
+#   liquidity-sweep `timeframe_role` and `anchorOffsetCandles`, the
+#   authoritative XAUUSD pip size, the candle coverage evaluation can read, and
+#   the setup/alert/delivery evidence that exists — so that any correction is
+#   proposed from evidence and never from assumption.
+#
+# WHAT THIS DELIBERATELY CANNOT DO
+#   * TRIGGERS are limited to `workflow_dispatch` (manual, from the Actions
+#     tab) and `push` to the single branch `arena/f7a581d4-veltrixeye`. There
+#     is no `pull_request`, no `schedule` and no `workflow_call` trigger, and
+#     no other branch is accepted — so a push to `main` (which also auto-
+#     deploys the Render API) can never start it, and nothing outside this
+#     repository can invoke it.
+#   * Even when it runs automatically on push it only SELECTs: the push path
+#     is byte-identical to the manual path (same job, same script, same
+#     read-only transaction).
+#   * LEAST PRIVILEGE: the job grants itself `contents: read` and NOTHING else
+#     — no `packages: write`, no `id-token: write`, no `pull-requests: write`,
+#     no `actions: write`. It cannot open or merge a PR, publish a package, or
+#     mint a cloud token.
+#   * The only secret it reads is `DATABASE_URL`. It is scoped to the
+#     diagnostic step's `env` alone (never job-level, so `npm ci` and every
+#     other step run without it), immediately masked with `::add-mask::`, and
+#     never echoed, printed, written to the report or exposed to a third-party
+#     action. The diagnostic script additionally redacts connection strings,
+#     `password=`, bearer tokens and e-mail addresses from everything it prints.
+#   * TLS: `verify-full` only (certificate chain AND hostname verified). There
+#     is no fallback to unauthenticated TLS or plaintext. See the script header.
+#   * The evidence report is NOT copied into the job summary (a summary is
+#     visible to every reader of the repository) and NOT printed to the step
+#     log. stdout and stderr go to files only, and the script's stdout is a
+#     one-line status. The report is downloadable from the
+#     `gold-v8-production-evidence` artifact, retained for 7 days.
+#   * NO TRADING: it never constructs an execution or risk service, and no
+#     broker/transport credential exists in this repository's CI surface.
+#   * NO SCANNER EXECUTION: it does not construct `ScannerService` and performs
+#     no `scanner/trigger` call; it only SELECTs the scanner ledger.
+#   * NO NOTIFICATION DELIVERY: it does not construct `NotificationWorker` and
+#     calls no delivery route; it only SELECTs `notification_deliveries`.
+#   * NO DATABASE MUTATION: the script opens its pool with the startup option
+#     `-c default_transaction_read_only=on` and runs every query inside a
+#     single `BEGIN READ ONLY` … `ROLLBACK`. The report records the enforced
+#     setting and the connecting role's effective write privileges as proof.
+#   * Only first-party actions are used (actions/checkout, actions/setup-node,
+#     actions/upload-artifact). No third-party action is asked to handle the
+#     secret.
+#
+# OPERATION
+#   Automatic: every push to `arena/f7a581d4-veltrixeye` starts it.
+#   Manual: Actions → "Production Gold diagnostics (read-only)" → Run workflow
+#   (select the `arena/f7a581d4-veltrixeye` branch).
+#
+#   Both paths require the repository secret `DATABASE_URL`. If it is absent
+#   the diagnostic step fails with an explicit message and NOTHING is
+#   attempted — no credential is invented, guessed or defaulted.
+
+name: Production Gold diagnostics (read-only)
+
+on:
+  # Branch-restricted on purpose: this is the ONLY branch the workflow file
+  # lives on, and the only branch allowed to start it. A push to `main` must
+  # never trigger a production read (and would also redeploy the API).
+  push:
+    branches:
+      - arena/f7a581d4-veltrixeye
+
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: 'Strategy name substring (or a full strategy UUID)'
+        required: false
+        default: 'gold'
+      version:
+        description: 'Strategy version_number to inspect'
+        required: false
+        default: '8'
+      symbol:
+        description: 'Instrument symbol'
+        required: false
+        default: 'XAUUSD'
+      asset_class:
+        description: 'Instrument asset class'
+        required: false
+        default: 'commodity'
+
+# Least privilege: read the repo to check it out, and nothing else.
+permissions:
+  contents: read
+
+# One diagnostic at a time. `cancel-in-progress: false` so a run started by a
+# push is never cancelled mid-flight by a later push (or a manual dispatch) —
+# a half-finished read is worse than a queued one.
+concurrency:
+  group: production-gold-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  evidence:
+    name: Collect v8/XAUUSD evidence (read-only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # No job-level `env`: the production secret must not be visible to any
+    # step other than the diagnostic step below (npm ci, checkout, setup, and
+    # the summary/artifact steps all run without it).
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies (npm ci)
+        run: |
+          set -euo pipefail
+          npm ci
+
+      - name: Run read-only production diagnostic
+        id: diagnostic
+        # No `set -x`: the environment here carries the secret. This is the
+        # ONLY step that receives DATABASE_URL.
+        #
+        # The dispatch inputs are passed through `env` and quoted — NEVER
+        # interpolated as `${{ inputs.* }}` into the shell — so a crafted input
+        # cannot inject shell syntax into this step.
+        env:
+          # The ONLY secret this workflow touches. Never echoed, never persisted.
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # Authenticated TLS only: certificate chain and hostname verified.
+          DATABASE_SSL_MODE: verify-full
+          DATABASE_POOL_MAX: '2'
+          # `inputs.*` is EMPTY on a `push` event — it only exists for
+          # `workflow_dispatch`. Every input therefore falls back to the same
+          # documented default the dispatch form offers, so the automatic run
+          # and the manual run target exactly the same thing. (Without these
+          # fallbacks the push run failed input validation with an empty
+          # version.)
+          DIAG_STRATEGY: ${{ inputs.strategy || 'gold' }}
+          DIAG_VERSION: ${{ inputs.version || '8' }}
+          DIAG_SYMBOL: ${{ inputs.symbol || 'XAUUSD' }}
+          DIAG_ASSET_CLASS: ${{ inputs.asset_class || 'commodity' }}
+        run: |
+          set -euo pipefail
+          # Belt and braces on top of GitHub's automatic secret masking: register
+          # the value as a mask before anything else in this step runs.
+          if [ -n "${DATABASE_URL:-}" ]; then
+            echo "::add-mask::${DATABASE_URL}"
+          fi
+          if [ -z "${DATABASE_URL:-}" ]; then
+            echo "::error title=Missing required secret::DATABASE_URL"
+            {
+              echo "### Required repository secret is not configured"
+              echo ""
+              echo "This workflow reads the production database through a repository secret named exactly:"
+              echo ""
+              echo "\`\`\`"
+              echo "DATABASE_URL"
+              echo "\`\`\`"
+              echo ""
+              echo "It must hold a connection string for a role whose ONLY grants on the production"
+              echo "database are SELECT on:"
+              echo ""
+              echo "\`schema_migrations\`, \`strategies\`, \`strategy_versions\`, \`strategy_timeframes\`,"
+              echo "\`strategy_rule_groups\`, \`strategy_conditions\`, \`strategy_risk_config\`,"
+              echo "\`strategy_market_scopes\`, \`strategy_market_scope_instruments\`,"
+              echo "\`strategy_session_filters\`, \`strategy_filters\`, \`instruments\`,"
+              echo "\`instrument_risk_specs\`, \`candles\`, \`setups\`, \`setup_state_events\`,"
+              echo "\`setup_scores\`, \`alerts\`, \`alert_deliveries\`, \`notification_deliveries\`,"
+              echo "\`scanner_runs\`, \`scanner_cursors\`."
+              echo ""
+              echo "The role must NOT hold INSERT/UPDATE/DELETE on any of them, must not own the"
+              echo "tables and must not be a superuser. No credential is invented, defaulted or"
+              echo "guessed, and the secret's value is never printed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "DATABASE_URL is configured (value masked and never printed)."
+          case "$DIAG_VERSION" in
+            ''|*[!0-9]*) echo "::error title=Invalid input::version must be a positive integer, got '$DIAG_VERSION'"; exit 1 ;;
+          esac
+          mkdir -p diagnostics-out
+          # stdout and stderr are both written to files, never to this log.
+          # stdout carries only a one-line status from the script. stderr holds
+          # the script's own scrubbed messages and is uploaded in the artifact.
+          # Neither is printed here, so a failure cannot echo the connection
+          # string, the password or any evidence into the step log.
+          set +e
+          npx tsx scripts/diagnostics/gold-v8-production-evidence.ts \
+            --strategy "$DIAG_STRATEGY" \
+            --version "$DIAG_VERSION" \
+            --symbol "$DIAG_SYMBOL" \
+            --asset-class "$DIAG_ASSET_CLASS" \
+            --out diagnostics-out > diagnostics-out/stdout.md 2> diagnostics-out/stderr.txt
+          STATUS=$?
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            # Minimal status only. The detail is in the uploaded artifact
+            # (stderr.txt), not in this log.
+            echo "::error title=Diagnostic failed::exit $STATUS. Details are in the 'gold-v8-production-evidence' artifact (stderr.txt); they are not printed to this log."
+            exit "$STATUS"
+          fi
+          echo "Diagnostic completed (exit 0). Evidence is in the 'gold-v8-production-evidence' artifact (retained 7 days); it is not printed here."
+
+      - name: Record run status in the job summary (report stays in the artifact)
+        if: always()
+        # Same fallbacks: `inputs.*` is empty when this run came from a push.
+        # The evidence report is deliberately NOT written here. A job summary is
+        # visible to everyone with read access to the repository and is kept
+        # separately from the artifact. The report is downloadable from the
+        # `gold-v8-production-evidence` artifact (retention: 7 days).
+        env:
+          DIAG_VERSION: ${{ inputs.version || '8' }}
+          DIAG_SYMBOL: ${{ inputs.symbol || 'XAUUSD' }}
+          DIAG_ASSET_CLASS: ${{ inputs.asset_class || 'commodity' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Production Gold diagnostics — v$DIAG_VERSION / $DIAG_ASSET_CLASS/$DIAG_SYMBOL"
+            echo ""
+            if [ -f diagnostics-out/gold-v8-production-evidence.md ]; then
+              echo "Read-only evidence report produced. It is NOT copied into this summary: download the \`gold-v8-production-evidence\` artifact from this run (retained 7 days)."
+            else
+              echo "_The diagnostic produced no report; see the log of the diagnostic step._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gold-v8-production-evidence
+          path: |
+            diagnostics-out/gold-v8-production-evidence.json
+            diagnostics-out/gold-v8-production-evidence.md
+            diagnostics-out/stdout.md
+            diagnostics-out/stderr.txt
+          if-no-files-found: warn
+          retention-days: 7
