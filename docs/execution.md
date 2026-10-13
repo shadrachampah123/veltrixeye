@@ -80,9 +80,22 @@ client_order_id = "ve-" + sha256(identity)[0..24)  -- UNIQUE, future orders
 
 The setup already encodes strategy/version/instrument/direction/anchor, so
 the identity is complete. Retries, HTTP replays and concurrent twins collapse
-onto the first row (`ON CONFLICT`-safe insert + re-read), returning it with
-`replayed: true` — a duplicate order is impossible at the database level.
-Covered by sequential-replay and 8-way concurrent tests.
+onto the first row — a duplicate order is impossible at the database level:
+
+- the fill transaction takes `pg_advisory_xact_lock` on the same
+  `(risk-policy, user)` → `(risk:user, profile)` keys the M8.2 risk engine
+  uses, so two fills for one profile serialize (across connections and
+  across processes);
+- it re-reads `execution_orders.client_order_id` **after** the lock is granted
+  and answers a concurrent twin with a replay receipt pointing at the
+  existing order instead of inserting;
+- `execution_orders_client_order_id_idx` stays the final authority, but a raw
+  unique-constraint error never reaches a caller.
+
+Covered by sequential-replay, 8-way concurrent and a deterministic TOCTOU
+regression test: a twin whose identity read provably happened *before* the
+winner committed must replay the winner's order (and the same position) rather
+than raising `23505` on `client_order_id`.
 
 ## Safety gates
 
@@ -267,7 +280,10 @@ persisted, never logged.
   gate ordering, valid long/short simulations, SL/TP exits, fees/slippage,
   risk-decision forgery/citation/invalid-engine-version refusal, kill-switch
   and automation-OFF blocking, idempotent replay and duplicate-fill no-ops,
-  stale/missing market data, deterministic fill/order/close failure paths,
+  deterministic stale-read (TOCTOU) concurrency — a twin that read the
+  identity before the winner committed replays the same order/position with no
+  raw unique-constraint error — stale/missing market data, deterministic
+  fill/order/close failure paths,
   reconciliation mismatch detection (never an auto-correction), tenant
   isolation, the append-only fill ledger and the migration CHECKs, plus an
   API-level assertion that no paper response carries credential material or
