@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * M10 Gate 9 §20/§21/§22 (B9) — reconciliation preserves provider uncertainty.
  *

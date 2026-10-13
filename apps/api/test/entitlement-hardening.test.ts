@@ -49,8 +49,6 @@ import {
   retireActiveEpochs, seedCommercialSubscription, seedPaymentEvidence, startBillingTestDb,
 } from '../../../packages/core/test/helpers/billing-checkout.js';
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
 let ctx: ReturnType<typeof createAppContext>;
 let app: Awaited<ReturnType<typeof buildApp>>;

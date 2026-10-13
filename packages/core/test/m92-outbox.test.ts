@@ -239,7 +239,8 @@ describe('M9.2 outbox — push channel + 3-way fairness', () => {
     const alertId = await makeAlert(user.id);
     // Enqueue with secret manager? Our outbox without manager stores plaintext for now, but we test that DTO hides it
     const enq = await enqueueChannel(alertId, user.id, 'push');
-    const row = await pool.query<{ signing_secret: string | null; signing_secret_encrypted: string | null }>('SELECT signing_secret, signing_secret_encrypted FROM notification_push_deliveries WHERE id=$1', [enq.row.id]);
+    const _row = await pool.query<{ signing_secret: string | null; signing_secret_encrypted: string | null }>('SELECT signing_secret, signing_secret_encrypted FROM notification_push_deliveries WHERE id=$1', [enq.row.id]);
+    assert.equal(_row.rowCount, 1, 'push delivery row exists');
     // Without secret manager, plaintext is stored; with manager, encrypted. Both should not leak via DTO
     const dto = await outbox.listForAlert(user.id, alertId);
     assert.equal(dto.length, 1);

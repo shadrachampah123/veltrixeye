@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * M8.1 — execution architecture (safety boundary) core tests.
  *

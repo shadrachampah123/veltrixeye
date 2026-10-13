@@ -14,12 +14,9 @@ import assert from 'node:assert/strict';
 import {
   B1,
   ScriptPool,
-  paperFill,
-  paperIdentity,
   profileRow,
   riskDecision,
   scriptHappyPath,
-  setupRow,
   stubProvider,
   stubRegistry,
   stubAutomation,

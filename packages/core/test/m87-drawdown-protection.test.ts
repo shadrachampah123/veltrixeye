@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * M8.7 — drawdown-based circuit breakers and equity protection (real Postgres).
  *

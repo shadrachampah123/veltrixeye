@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unused-vars */
+/* eslint-disable @typescript-eslint/no-unused-vars */
 /**
  * M7.3 — alert delivery over HTTP: outbox hand-off, owner scoping, the
  * internal worker endpoints and credential hygiene.

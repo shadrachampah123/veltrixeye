@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * M7.3 — durable outbox, delivery worker, retry/idempotency and provider
  * boundary. Runs against a real PostgreSQL (embedded), so every guarantee

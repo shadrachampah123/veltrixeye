@@ -109,6 +109,9 @@ describe('B1 H5 — mid-flight safety flips are caught at the fence', () => {
 
   test('authorization revoked after the mint → authorized', async () => {
     const pool = new ScriptPool();
+    // Closed over by the scripted query below, then assigned once. `const`
+    // would be a TDZ error inside the callback.
+    // eslint-disable-next-line prefer-const
     let w: ReturnType<typeof wireComposition>;
     // Revoke the live authorization while the fence is performing its first
     // fresh read (after the mint, before the fence's peek).

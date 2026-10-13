@@ -427,7 +427,7 @@ describe('B1 M6 — composed paper entry fills end-to-end', () => {
     let calls = 0;
     const flipKills = {
       ...killSwitches,
-      anyActive: async (args: unknown) => {
+      anyActive: async (_args: unknown) => {
         calls += 1;
         if (calls === 1) return { active: false, global: false, user: false, strategy: false, profile: false };
         return { active: true, global: true, user: false, strategy: false, profile: false };

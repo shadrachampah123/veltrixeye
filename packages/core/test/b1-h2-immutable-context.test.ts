@@ -15,7 +15,6 @@ import {
   profileRow,
   riskDecision,
   scriptHappyPath,
-  setupRow,
   wireComposition,
 } from './support/b1-harness.js';
 

@@ -28,7 +28,7 @@ let verifyStatus: string | null = 'success';
 let verifyPaidAt: string | null = '2026-09-24T10:01:00.000Z';
 let verifyCurrency: string | null = 'GHS';
 let verifyAmountOverride: number | null = null; // when set, overrides per-reference amount
-let referenceToEvidence = new Map<string, { amount: number; customerId: string | null; customerCode: string | null }>();
+const referenceToEvidence = new Map<string, { amount: number; customerId: string | null; customerCode: string | null }>();
 let ipCounter = 500;
 const nextIp = () => `203.0.113.${(ipCounter++ % 250) + 1}`;
 let customerSequence = 600_000;
@@ -96,7 +96,9 @@ before(async () => {
                 break;
               }
             }
-          } catch {}
+          } catch {
+            /* snapshot lookup is best-effort; fall through to defaults */
+          }
         }
         // Global overrides for failure simulation
         const finalAmount = verifyAmountOverride ?? amount ?? 48750;
@@ -372,7 +374,7 @@ describe('Step 7 route — authorization / isolation (server-derived reference, 
     // Create second user
     const b = await signedIn();
     await retireActiveEpochs(db.pool);
-    const factsB = await insertEpoch(db.pool);
+    await insertEpoch(db.pool);
     const provisionB = await app.inject({ method: 'POST', url: '/api/billing/customer', headers: { cookie: b.cookie }, remoteAddress: nextIp() });
     assert.equal(provisionB.statusCode, 200);
     const checkoutB = await app.inject({ method: 'POST', url: '/api/billing/checkout', headers: { cookie: b.cookie }, payload: PRO_MONTHLY, remoteAddress: nextIp() });
