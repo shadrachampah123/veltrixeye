@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { migrationStatus, MIGRATIONS_DIR, type MigrationStatus } from '@veltrixeye/core';
 import type { AppContext } from '../app.js';
 import { workerLivenessSnapshot } from '../worker-liveness.js';
+import { retentionLivenessSnapshot } from '../retention-liveness.js';
 
 /**
  * Health endpoints. Both are unauthenticated by design (load balancers and
@@ -16,7 +17,13 @@ import { workerLivenessSnapshot } from '../worker-liveness.js';
  *                             a machine code only), which is the ONLY way to
  *                             confirm that an external scheduler is actually
  *                             executing the scanner and delivery workers
- *                             without holding a worker token.
+ *                             without holding a worker token. Alongside it, the
+ *                             retention block reports the scanner-run sweep
+ *                             (F15): every attempt — including a zero-delete
+ *                             one — moves `lastSweepAt`, so "the sweep ran and
+ *                             had nothing to do" is distinguishable from "the
+ *                             sweep never ran". Reading either block NEVER
+ *                             triggers work; both are plain in-memory reads.
  *  - `GET /api/health/ready`  readiness — database reachable AND the schema
  *                             this build expects is applied. 503 otherwise,
  *                             so a platform health check refuses to put an
@@ -34,6 +41,11 @@ export async function healthRoutes(app: FastifyInstance, ctx: AppContext): Promi
     // Timestamps, counters and a short machine code per scheduled worker — no
     // tenant identifier, no queue contents, no provider text, no secret.
     workers: workerLivenessSnapshot(),
+    // F15: terminal scanner-run retention sweep state. Counts, timings and the
+    // effective window the sweep applied; never a row id, a tenant identifier,
+    // SQL text or an error message. A moving `lastSweepAt` is the proof that
+    // maintenance executes; a zero-delete sweep still moves it.
+    retention: retentionLivenessSnapshot(),
   }));
 
   app.get('/api/health/ready', async (_req, reply) => {

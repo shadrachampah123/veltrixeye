@@ -23,6 +23,7 @@ import {
   ScannerService,
   clampRetentionDays,
   hashPassword,
+  type RetentionSweepObservation,
 } from '../src/index.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -38,6 +39,22 @@ let strategies: StrategyService;
 let candleStore: CandleStore;
 let scanner: ScannerService;
 const logs: { message: string; meta?: Record<string, unknown> }[] = [];
+/**
+ * Test logger shared by the fixture service and the stub-pool services below.
+ * Captures every level: the sweep's own info line AND the warn an observer
+ * failure produces, so "nothing was logged" is only ever asserted per-message.
+ */
+const logger = {
+  info: (message: string, meta?: Record<string, unknown>) => logs.push({ message, meta }),
+  warn: (message: string, meta?: Record<string, unknown>) => logs.push({ message, meta }),
+  error: (message: string, meta?: Record<string, unknown>) => logs.push({ message, meta }),
+};
+/**
+ * Every sweep observation the fixture service reports, so the F15
+ * observability contract (a zero-delete sweep is still recorded) is pinned
+ * against the real pruning path rather than a mock.
+ */
+const sweeps: RetentionSweepObservation[] = [];
 
 before(async () => {
   const dataDir = path.join(REPO_ROOT, '.test', 'pg-scanner-retention');
@@ -57,16 +74,12 @@ before(async () => {
   users = new UserService(pool);
   strategies = new StrategyService(pool, audit);
   candleStore = new CandleStore(pool);
-  const logger = {
-    info: (message: string, meta?: Record<string, unknown>) => logs.push({ message, meta }),
-    warn: () => {},
-    error: () => {},
-  };
   // Only the pool, provider registry (empty ⇒ provider unavailable, harmless
   // for prune/health/maintenance) and logger are exercised by these tests.
   scanner = new ScannerService(pool, createProviderRegistry(), candleStore, {} as any, {} as any, {} as any, {} as any, {} as any, {
     logger,
     runRetentionDays: 90,
+    onRetentionSweep: (observation) => sweeps.push(observation),
   });
 }, { timeout: 180_000 });
 
@@ -284,5 +297,168 @@ describe('F15: scanner_runs retention — maintenance contract and logging', () 
     logs.length = 0;
     assert.equal(await scanner.pruneTerminalRuns({ retentionDays: 90 }), 0);
     assert.equal(logs.filter((l) => l.message === 'scanner run retention').length, 0);
+  });
+});
+
+/**
+ * The gap this closes: a sweep used to be observable ONLY through a log line
+ * emitted when it deleted something, so on a ledger young enough to have no
+ * eligible rows — production today — "ran and found nothing" and "never ran"
+ * looked identical. Every attempt must now be reported, and the report must
+ * stay free of row ids, SQL and error messages.
+ */
+describe('F15: retention sweep observability (every attempt is reported)', () => {
+  test('a zero-delete sweep is reported as completed — the case a log line cannot prove', async () => {
+    await resetRuns();
+    await insertRun('completed', '1 hour', '1 hour');
+    sweeps.length = 0;
+
+    assert.equal(await scanner.pruneTerminalRuns({ retentionDays: 90 }), 0);
+
+    assert.equal(sweeps.length, 1, 'a sweep that deleted nothing is still observed');
+    const observation = sweeps[0]!;
+    assert.equal(observation.outcome, 'completed');
+    if (observation.outcome !== 'completed') return;
+    assert.equal(observation.deleted, 0);
+    assert.equal(observation.retentionDays, 90, 'the applied window is carried');
+    assert.equal(observation.batches, 1, 'one bounded statement drains an empty candidate set');
+    assert.equal(observation.batchCeilingReached, false);
+    assert.ok(observation.durationMs >= 0, 'duration is non-negative');
+    assert.ok(
+      Math.abs(Date.now() - observation.sweptAtMs) < 60_000,
+      'the observation is stamped with the sweep clock, not a stale value',
+    );
+  });
+
+  test('a sweep that deletes rows reports the count, the window and the batch shape', async () => {
+    await resetRuns();
+    await insertRun('completed', '1 hour', '1 hour');
+    await insertRun('failed', '365 days');
+    const ancient = await insertRun('completed', '365 days', '365 days');
+    sweeps.length = 0;
+
+    const deleted = await scanner.pruneTerminalRuns({ retentionDays: 30 });
+    assert.equal(deleted, 2, 'the failed and the oldest completed run age out of a 30-day window');
+    assert.equal(await exists(ancient), false);
+
+    assert.equal(sweeps.length, 1);
+    const observation = sweeps[0]!;
+    assert.equal(observation.outcome, 'completed');
+    if (observation.outcome !== 'completed') return;
+    assert.equal(observation.deleted, 2);
+    assert.equal(observation.retentionDays, 30, 'the override window is reported, not the configured one');
+    assert.equal(observation.batchCeilingReached, false, 'a drained ledger does not report a backlog');
+  });
+
+  test('the observation never carries a row id, an SQL statement or a message', async () => {
+    await resetRuns();
+    const anchor = await insertRun('completed', '1 hour', '1 hour');
+    const expired = await insertRun('failed', '365 days');
+    sweeps.length = 0;
+    await scanner.pruneTerminalRuns({ retentionDays: 90 });
+
+    const serialized = JSON.stringify(sweeps);
+    assert.ok(!serialized.includes(anchor), 'no run id from the kept anchor row');
+    assert.ok(!serialized.includes(expired), 'no run id from the deleted row');
+    assert.ok(!/[0-9a-f]{8}-[0-9a-f]{4}-/i.test(serialized), 'no UUID-shaped value at all');
+    assert.ok(!serialized.includes('DELETE FROM'), 'no SQL text');
+    assert.ok(!serialized.includes('scanner_runs'), 'no table name');
+  });
+
+  test('a failing sweep is reported as failed and still rejects (never swallowed)', async () => {
+    const failure = Object.assign(new Error('connect ECONNREFUSED postgres://user:pw@host/db'), {
+      code: 'ECONNREFUSED',
+    });
+    const failing = new ScannerService(
+      { query: async () => { throw failure; } } as any,
+      createProviderRegistry(),
+      candleStore,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      { logger, runRetentionDays: 90, onRetentionSweep: (observation) => sweeps.push(observation) },
+    );
+    sweeps.length = 0;
+
+    await assert.rejects(
+      () => failing.pruneTerminalRuns({ retentionDays: 90 }),
+      /ECONNREFUSED/,
+      'a failed sweep must still surface to the maintenance caller',
+    );
+
+    assert.equal(sweeps.length, 1);
+    const observation = sweeps[0]!;
+    assert.equal(observation.outcome, 'failed');
+    if (observation.outcome !== 'failed') return;
+    assert.equal(observation.retentionDays, 90);
+    assert.equal(observation.error, failure, 'the observer receives the thrown value to reduce');
+    assert.ok(!JSON.stringify(sweeps).includes('postgres://'), 'the raw value is not serialized into the report');
+  });
+
+  test('the batch ceiling is reported when a full final batch stops the sweep', async () => {
+    // 20 statements x 500 rows: a pool that always reports a full batch makes
+    // the ceiling reachable without inserting 10,000 rows.
+    let statements = 0;
+    const fullBatch = new ScannerService(
+      { query: async () => { statements += 1; return { rowCount: 500 }; } } as any,
+      createProviderRegistry(),
+      candleStore,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      { logger, runRetentionDays: 90, onRetentionSweep: (observation) => sweeps.push(observation) },
+    );
+    sweeps.length = 0;
+
+    assert.equal(await fullBatch.pruneTerminalRuns({ retentionDays: 90 }), 10_000);
+    assert.equal(statements, 20, 'the sweep stays inside its 20-statement bound');
+
+    const observation = sweeps[0]!;
+    assert.equal(observation.outcome, 'completed');
+    if (observation.outcome !== 'completed') return;
+    assert.equal(observation.batches, 20);
+    assert.equal(observation.batchCeilingReached, true, 'a backlog past the ceiling is visible');
+  });
+
+  test('a broken observer can never break maintenance', async () => {
+    await resetRuns();
+    await insertRun('completed', '1 hour', '1 hour');
+    const ancient = await insertRun('failed', '365 days');
+    const throwing = new ScannerService(
+      pool,
+      createProviderRegistry(),
+      candleStore,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {
+        logger,
+        runRetentionDays: 90,
+        onRetentionSweep: () => { throw new Error('sink exploded at postgres://user:pw@host/db'); },
+      },
+    );
+    logs.length = 0;
+
+    assert.equal(
+      await throwing.pruneTerminalRuns({ retentionDays: 90 }),
+      1,
+      'the sweep still reports its result when the observer throws',
+    );
+    assert.equal(await exists(ancient), false, 'the prune still happened');
+
+    const warn = logs.find((l) => l.message === 'retention sweep observer failed');
+    assert.ok(warn, 'the broken observer is reported');
+    assert.deepEqual(Object.keys(warn!.meta ?? {}).sort(), ['error', 'outcome']);
+    assert.equal(warn!.meta!.error, 'error', 'only the error name is logged, never the message');
+    assert.ok(
+      !JSON.stringify(logs).includes('postgres://'),
+      'an observer error message can never reach the logs',
+    );
   });
 });

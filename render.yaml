@@ -102,6 +102,15 @@ services:
         value: '300000'
       - key: SCANNER_LEASE_MS
         value: '1800000'
+      # Terminal (completed/failed) scanner_runs retention, in days (F15).
+      # Pinned to the reviewed value so the effective window is auditable in
+      # the blueprint instead of being an implicit code default: '90' matches
+      # DEFAULT_SCANNER_RUN_RETENTION_DAYS, so declaring it changes nothing at
+      # runtime. `running`/`partial` runs, scanner_cursors, and the newest
+      # terminal + newest completed run are never pruned. The value the last
+      # sweep applied is reported by GET /api/health → retention.scannerRuns.
+      - key: SCANNER_RUN_RETENTION_DAYS
+        value: '90'
       - key: SCANNER_PROVIDER_TIMEOUT_MS
         value: '15000'
       - key: SCANNER_MAX_RETRIES
