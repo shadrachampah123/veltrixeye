@@ -63,6 +63,7 @@ import {
   type ExecutionProviderRegistry,
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
+import { recordRetentionSweep } from './retention-liveness.js';
 import type { PaystackFetchFn } from '@veltrixeye/provider-paystack';
 import { authRoutes } from './routes/auth.js';
 import { userRoutes } from './routes/users.js';
@@ -459,6 +460,11 @@ export function createAppContext(
     expectedIntervalMs: config.scanner.intervalMs,
     leaseMs: config.scanner.leaseMs,
     runRetentionDays: config.scanner.runRetentionDays,
+    // F15 observability: every sweep attempt (including one that deletes
+    // nothing) is recorded in-process so `GET /api/health` can prove the
+    // maintenance path executes without a worker token, a log search or a
+    // production SQL session. Counts and timings only — see retention-liveness.ts.
+    onRetentionSweep: (observation) => recordRetentionSweep(observation),
     redact: (text) =>
       redactSecrets(text, [
         config.TWELVE_DATA_API_KEY,

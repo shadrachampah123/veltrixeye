@@ -173,6 +173,58 @@ describe('health', () => {
     assert.equal(JSON.stringify(body).includes('password'), false);
   });
 
+  // F15: the retention sweep used to be observable only through a log line
+  // emitted when it deleted something, so on a ledger too young to have
+  // eligible rows "ran and found nothing" and "never ran" were identical. The
+  // block below is the unauthenticated proof that maintenance executes — and
+  // reading it must never itself trigger a sweep.
+  test('GET /api/health → reports the scanner-run retention sweep without a token, and no secret text', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/health' });
+    assert.equal(res.statusCode, 200);
+    const body = res.json() as {
+      retention: {
+        scannerRuns: {
+          lastSweepAt: string | null;
+          sweepAgeMs: number | null;
+          lastSweepDeleted: number | null;
+          lastSweepRetentionDays: number | null;
+          lastSweepDurationMs: number | null;
+          lastSweepBatchCeilingReached: boolean | null;
+          sweeps: number;
+          totalDeleted: number;
+          failures: number;
+          lastFailureAt: string | null;
+          lastFailureCode: string | null;
+        };
+      };
+    };
+
+    assert.ok(body.retention, 'health must expose the retention liveness block');
+    const entry = body.retention.scannerRuns;
+    assert.ok(entry, 'health must expose the scanner_runs sweep specifically');
+
+    // Fresh process in this suite: no sweep has run, and the endpoint says so
+    // rather than implying success. The effective window is undeclared until a
+    // sweep reports the one it applied.
+    assert.equal(typeof entry.sweeps, 'number');
+    assert.equal(typeof entry.totalDeleted, 'number');
+    assert.equal(typeof entry.failures, 'number');
+    assert.equal(entry.sweeps, 0);
+    assert.equal(entry.lastSweepAt, null);
+    assert.equal(entry.sweepAgeMs, null);
+    assert.equal(entry.lastSweepDeleted, null);
+    assert.equal(entry.lastSweepRetentionDays, null);
+    assert.equal(entry.lastSweepBatchCeilingReached, null);
+    assert.equal(entry.lastFailureAt, null);
+    assert.equal(entry.lastFailureCode, null);
+
+    // Counts, timestamps, a non-secret window and a machine code only.
+    const serialized = JSON.stringify(body.retention);
+    for (const forbidden of ['postgres://', 'password', 'DELETE FROM', 'scanner_runs WHERE']) {
+      assert.equal(serialized.includes(forbidden), false, `retention block must not expose "${forbidden}"`);
+    }
+  });
+
   test('GET /api/health/ready → 200 ready (db up)', async () => {
     const res = await app.inject({ method: 'GET', url: '/api/health/ready' });
     assert.equal(res.statusCode, 200);

@@ -412,6 +412,28 @@ migrations are unaffected.
   header) recovers stale `running` scans past `SCANNER_LEASE_MS` and returns
   bounded operational status without tenant identifiers or secrets. See
   [scanner.md](./scanner.md).
+- **Watching the retention sweep without a token** — `GET /api/health` reports a
+  `retention.scannerRuns` block: `lastSweepAt`, `sweepAgeMs`, `sweeps`,
+  `lastSweepDeleted`, `totalDeleted`, `lastSweepRetentionDays`,
+  `lastSweepDurationMs`, `lastSweepBatchCeilingReached`, `failures`,
+  `lastFailureAt` and `lastFailureCode`.
+
+  Every sweep **attempt** is recorded, including one that deletes nothing, so
+  the block answers the question the log line cannot: a moving `lastSweepAt`
+  with `lastSweepDeleted: 0` means the sweep ran and the ledger is inside the
+  window, whereas `sweeps: 0` on a long-lived instance means maintenance is not
+  executing at all. `lastSweepRetentionDays` is the effective window the sweep
+  applied (the blueprint pins `SCANNER_RUN_RETENTION_DAYS=90`), and
+  `lastSweepBatchCeilingReached: true` means the sweep stopped at its batch
+  ceiling with eligible rows still pending — retention is falling behind.
+
+  Like the worker blocks, the counters are **process-local**: a deploy or a
+  spin-down restarts them at zero, and the next sweep repopulates them. Reading
+  the block never triggers a sweep — it is a plain in-memory read, so polling
+  `/api/health` cannot mutate data. The only durable proof that past sweeps
+  actually deleted rows is the database itself (no expired `completed`/`failed`
+  rows remain); the process-local block proves the sweep is *running*, not what
+  it deleted before the last restart.
 
 ### Scheduled ingestion operations (P1)
 

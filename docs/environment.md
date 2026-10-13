@@ -73,7 +73,7 @@ git-ignored and never contain values you would commit.
 | `PUSH_PROVIDER_TIMEOUT_MS` | int 1000–120000 | `15000` | M9.2 per-attempt push provider budget. |
 | `SCANNER_ENABLED` | `true` \| `false` | `false` | M7.5 / F3 live scanner. `false` (dev default) ⇔ scanner only runs when triggered via API; `true` starts an overlap-safe in-process ticker that calls `scanner.runWorkerOnce()` every `SCANNER_INTERVAL_MS`. Safe with concurrent triggers and external scheduler invocations due to advisory locking. |
 | `SCANNER_INTERVAL_MS` | int 30000–3600000 | `300000` | Interval between scanner runs when `SCANNER_ENABLED=true` (5m default). |
-| `SCANNER_RUN_RETENTION_DAYS` | int 1–3650 | `90` | How long `completed` and `failed` `scanner_runs` rows are kept before the maintenance sweep prunes them (F15). `running` and `partial` rows and `scanner_cursors` are never pruned. |
+| `SCANNER_RUN_RETENTION_DAYS` | int 1–3650 | `90` | How long `completed` and `failed` `scanner_runs` rows are kept before the maintenance sweep prunes them (F15). `running` and `partial` rows and `scanner_cursors` are never pruned. Pinned to `90` in `render.yaml`; the window the last sweep applied is reported by `GET /api/health` → `retention.scannerRuns.lastSweepRetentionDays`. |
 | `SCANNER_LEASE_MS` | int 30000–7200000 | `1800000` | How long a `running` scan may remain open before `recoverStaleRuns` / `runWorkerOnce` marks it `failed` (`recovered: stale running run after restart`). |
 | `SCANNER_PROVIDER_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-request provider timeout for scanner fetches. |
 | `SCANNER_MAX_RETRIES` | int 0–10 | `3` | Retry attempts for transient provider failures. |

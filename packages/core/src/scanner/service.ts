@@ -56,6 +56,55 @@ import { checkFreshness, checkMultiTimeframeFreshness } from './freshness.js';
  *  - Structured operational logging (no secrets)
  */
 
+/**
+ * One retention sweep attempt, handed to the optional `onRetentionSweep`
+ * observer after EVERY sweep — including one that deleted nothing (the normal
+ * case in a young ledger) and one that failed.
+ *
+ * WHY THIS EXISTS. Before this observation existed, a sweep left a trace only
+ * when it deleted at least one row (a single info log). "No log line" was
+ * therefore indistinguishable between "the sweep ran and found nothing to do"
+ * and "the sweep never ran at all", and the operator surface exposed no sweep
+ * timing whatsoever. Observing every attempt closes that gap without reading
+ * logs or holding a worker token.
+ *
+ * PRIVACY CONTRACT — the observation carries counts, timings and the applied
+ * window only. Never a row id, a tenant/strategy identifier, an SQL statement,
+ * a provider payload or an error message (`failed` carries the thrown value
+ * only so a caller can reduce it to a bounded machine code).
+ */
+export type RetentionSweepObservation =
+  | {
+      outcome: 'completed';
+      /** Rows deleted by this sweep; 0 means nothing was eligible. */
+      deleted: number;
+      /** Terminal-run retention window the sweep applied, in days. */
+      retentionDays: number;
+      /** Bounded statements the sweep issued. */
+      batches: number;
+      /**
+       * True when the final permitted statement deleted a full batch, i.e. the
+       * sweep stopped at its ceiling and eligible rows may remain for the next
+       * sweep. False means the ledger is fully drained for this window.
+       */
+      batchCeilingReached: boolean;
+      /** Sweep duration in milliseconds. */
+      durationMs: number;
+      /** Completion time (epoch ms). */
+      sweptAtMs: number;
+    }
+  | {
+      outcome: 'failed';
+      /** Terminal-run retention window the sweep attempted to apply, in days. */
+      retentionDays: number;
+      /** Duration until the failure, in milliseconds. */
+      durationMs: number;
+      /** Failure time (epoch ms). */
+      sweptAtMs: number;
+      /** The thrown value, for the observer to reduce to a machine code. */
+      error: unknown;
+    };
+
 export interface ScannerServiceOptions {
   providerTimeoutMs?: number;
   maxRetries?: number;
@@ -71,6 +120,14 @@ export interface ScannerServiceOptions {
    * strings before they are stored on `scanner_runs` or written to logs.
    */
   redact?: (text: string) => string;
+  /**
+   * Optional observer invoked after every retention sweep attempt (including a
+   * zero-delete sweep and a failed one) so an operator surface can prove the
+   * maintenance path actually executes. Observability must never break
+   * maintenance: a throwing observer is caught, counted as a warn-level log and
+   * never propagates into `pruneTerminalRuns`.
+   */
+  onRetentionSweep?: (observation: RetentionSweepObservation) => void;
 }
 
 export interface ScannerLogger {
@@ -83,6 +140,20 @@ export interface ScannerLogger {
 const SCANNER_RUN_PRUNE_BATCH_SIZE = 500;
 /** Upper bound on statements per sweep so one maintenance call stays short. */
 const SCANNER_RUN_PRUNE_MAX_BATCHES = 20;
+
+/**
+ * Reduce any thrown value to a short, message-free machine code for logging.
+ *
+ * Only `name` (never `message`, whose text can echo row values or a connection
+ * string) is read, and it must match a strict bounded shape — so a hostile or
+ * merely unusual `name` cannot smuggle arbitrary text into a log line. This
+ * mirrors the normalization the API applies to the codes it serves
+ * unauthenticated, so an operator sees the same token in both places.
+ */
+function boundedErrorCode(err: unknown): string {
+  const name = err instanceof Error ? err.name : '';
+  return /^[A-Za-z][A-Za-z0-9_.-]{0,31}$/.test(name) ? name.toLowerCase() : 'unknown';
+}
 
 /** Clamp a retention window to the documented bounds; invalid ⇒ default. */
 export function clampRetentionDays(value: number | undefined): number {
@@ -323,6 +394,7 @@ export class ScannerService {
   private readonly runRetentionDays: number;
   private readonly logger: ScannerLogger;
   private readonly redact: (text: string) => string;
+  private readonly onRetentionSweep?: (observation: RetentionSweepObservation) => void;
   private readonly inFlightRuns = new Set<Promise<unknown>>();
 
   constructor(
@@ -345,6 +417,7 @@ export class ScannerService {
     this.runRetentionDays = clampRetentionDays(options.runRetentionDays);
     this.logger = options.logger ?? DEFAULT_LOGGER;
     this.redact = options.redact ?? ((text: string) => text);
+    this.onRetentionSweep = options.onRetentionSweep;
   }
 
   /** Number of currently in-flight scan invocations on this service instance. */
@@ -509,38 +582,87 @@ export class ScannerService {
    */
   async pruneTerminalRuns(args: { retentionDays?: number } = {}): Promise<number> {
     const retentionDays = clampRetentionDays(args.retentionDays ?? this.runRetentionDays);
+    const startedAtMs = Date.now();
     let deleted = 0;
-    for (let batch = 0; batch < SCANNER_RUN_PRUNE_MAX_BATCHES; batch++) {
-      const res = await this.pool.query(
-        `DELETE FROM scanner_runs
-          WHERE id IN (
-            SELECT r.id FROM scanner_runs r
-             WHERE r.status IN ('completed', 'failed')
-               AND r.started_at < now() - ($1::int * interval '1 day')
-               AND r.id NOT IN (
-                 SELECT k.id FROM scanner_runs k
-                  WHERE k.status IN ('completed', 'failed')
-                  ORDER BY k.started_at DESC LIMIT 1
-               )
-               AND r.id NOT IN (
-                 SELECT k.id FROM scanner_runs k
-                  WHERE k.status = 'completed'
-                  ORDER BY k.finished_at DESC NULLS LAST LIMIT 1
-               )
-             ORDER BY r.started_at ASC
-             LIMIT $2
-             FOR UPDATE SKIP LOCKED
-          )`,
-        [retentionDays, SCANNER_RUN_PRUNE_BATCH_SIZE],
-      );
-      const n = res.rowCount ?? 0;
-      deleted += n;
-      if (n < SCANNER_RUN_PRUNE_BATCH_SIZE) break;
+    let batches = 0;
+    let batchCeilingReached = false;
+    try {
+      for (let batch = 0; batch < SCANNER_RUN_PRUNE_MAX_BATCHES; batch++) {
+        const res = await this.pool.query(
+          `DELETE FROM scanner_runs
+            WHERE id IN (
+              SELECT r.id FROM scanner_runs r
+               WHERE r.status IN ('completed', 'failed')
+                 AND r.started_at < now() - ($1::int * interval '1 day')
+                 AND r.id NOT IN (
+                   SELECT k.id FROM scanner_runs k
+                    WHERE k.status IN ('completed', 'failed')
+                    ORDER BY k.started_at DESC LIMIT 1
+                 )
+                 AND r.id NOT IN (
+                   SELECT k.id FROM scanner_runs k
+                    WHERE k.status = 'completed'
+                    ORDER BY k.finished_at DESC NULLS LAST LIMIT 1
+                 )
+               ORDER BY r.started_at ASC
+               LIMIT $2
+               FOR UPDATE SKIP LOCKED
+            )`,
+          [retentionDays, SCANNER_RUN_PRUNE_BATCH_SIZE],
+        );
+        batches += 1;
+        const n = res.rowCount ?? 0;
+        deleted += n;
+        if (n < SCANNER_RUN_PRUNE_BATCH_SIZE) break;
+        // A full batch on the final permitted statement means the ceiling
+        // stopped us with eligible rows possibly still pending.
+        batchCeilingReached = batch === SCANNER_RUN_PRUNE_MAX_BATCHES - 1;
+      }
+    } catch (error) {
+      // Never swallow: the maintenance caller decides how to handle a failed
+      // sweep. The observation is recorded first so the failure is visible on
+      // the operator surface even though this call rejects.
+      this.notifyRetentionSweep({
+        outcome: 'failed',
+        retentionDays,
+        durationMs: Math.max(0, Date.now() - startedAtMs),
+        sweptAtMs: Date.now(),
+        error,
+      });
+      throw error;
     }
     if (deleted > 0) {
       this.logger.info('scanner run retention', { deleted, retentionDays });
     }
+    this.notifyRetentionSweep({
+      outcome: 'completed',
+      deleted,
+      retentionDays,
+      batches,
+      batchCeilingReached,
+      durationMs: Math.max(0, Date.now() - startedAtMs),
+      sweptAtMs: Date.now(),
+    });
     return deleted;
+  }
+
+  /**
+   * Hand one sweep observation to the optional observer. Observability is
+   * strictly subordinate to maintenance: a throwing observer is reduced to a
+   * bounded machine code in a warn-level log and never propagates, so a broken
+   * metrics sink can never stop retention or a scan cycle.
+   */
+  private notifyRetentionSweep(observation: RetentionSweepObservation): void {
+    const observer = this.onRetentionSweep;
+    if (observer === undefined) return;
+    try {
+      observer(observation);
+    } catch (err) {
+      this.logger.warn('retention sweep observer failed', {
+        error: boundedErrorCode(err),
+        outcome: observation.outcome,
+      });
+    }
   }
 
   /**
