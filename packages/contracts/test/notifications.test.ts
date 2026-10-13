@@ -26,7 +26,6 @@ import {
   notificationPreferenceSchema,
   notificationPreferenceRequestSchema,
   notificationPreferencesRequestSchema,
-  strategyNotificationPreferenceSchema,
   strategyNotificationPreferenceRequestSchema,
   pushSubscriptionSchema,
   pushSubscriptionRequestSchema,

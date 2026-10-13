@@ -23,7 +23,6 @@ import { insertUser, startBillingTestDb, insertEpoch } from './helpers/billing-c
    concurrent safe (first writer wins via UNIQUE), conflicting fails closed.
    ========================================================================== */
 
-const NOW = new Date('2026-09-24T10:00:00.000Z');
 const PAID_AT = '2026-09-24T10:01:00.000Z';
 const VERIFIED_AT = '2026-09-24T10:02:00.000Z';
 
@@ -55,7 +54,7 @@ async function setupContext() {
   // unique (catalogue_plan, billing_interval) active constraint does not fire.
   await db.pool.query("UPDATE billing_provider_plans SET status='retired', retired_at=now(), retired_reason='next test' WHERE status='active'");
   const facts = await insertEpoch(db.pool);
-  const { epoch, fx } = facts;
+  const { epoch } = facts;
   const snapshots = new BillingPricingSnapshotStore(db.pool);
   const { deriveSnapshot } = await import('./helpers/billing-checkout.js');
   const derived = deriveSnapshot(facts);
@@ -104,10 +103,6 @@ describe('Step 7 — idempotencyKey and evidenceHash are deterministic', () => {
 describe('Step 7 — durable evidence store: insert, lookup, idempotent replay, concurrent safe, conflicting fails closed', () => {
   it('inserts one evidence row and finds it by reference and by idempotencyKey', async () => {
     const { user, snapshot, subscriptionId } = await setupContext();
-    const reference = `ve-chk-${randomUUID().replaceAll('-', '')}${randomUUID().replaceAll('-', '').slice(0, 32)}`.slice(0, 70);
-    // Ensure reference shape is 64 hex style but we use ve-chk- prefix; pad to valid length.
-    const ref = `ve-chk-${'d'.repeat(64)}`.slice(0, 70);
-    // Use unique ref per test
     const uniqueRef = `ve-chk-${randomUUID().replaceAll('-', '').slice(0, 16)}${'e'.repeat(48)}`;
     const v = verified(uniqueRef, { paymentAmountMinor: Number(snapshot.snapshot.payment.paymentAmountMinor) });
     const store = new BillingVerifiedTransactionStore(db.pool);

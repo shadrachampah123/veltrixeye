@@ -309,6 +309,10 @@ export function createAppContext(
   // can be bound to it; the service resolves the provider lazily (below) so
   // there is no construction cycle.
   const paperMarket = new CandleStoreMarketPriceSource(pool);
+  // Assigned after `createPaperExecutionProvider` so the provider can close
+  // over the simulator without a construction cycle. `const` would be a TDZ
+  // error at `paperService.submitAuthorizedOrder` below.
+  // eslint-disable-next-line prefer-const
   let paperService: PaperExecutionService;
   const paperProvider = createPaperExecutionProvider({
     simulator: {

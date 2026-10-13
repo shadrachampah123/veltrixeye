@@ -56,6 +56,11 @@ jobs:
           set -eux
           npm run typecheck
 
+      - name: Lint
+        run: |
+          set -eux
+          npm run lint
+
       - name: Verify Dockerfile includes Paystack workspace (regression for PR #46 fix)
         run: |
           set -eux

@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * M8.2 — risk engine service (real Postgres).
  *
