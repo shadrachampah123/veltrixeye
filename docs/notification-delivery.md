@@ -116,12 +116,22 @@ Invocation (all three are safe to run at the same time):
 |---|---|---|
 | in-process ticker | `apps/api/src/delivery-worker.ts`, started in `server.ts` | `NOTIFICATION_WORKER_ENABLED` (default **true**), interval 60 s, overlap-guarded, `unref`'d, never throws |
 | scheduled HTTP call | `POST /api/internal/notifications/deliveries/run` | `NOTIFICATION_WORKER_TOKEN`; for an external cron (Render Cron Job) — the correct answer when the instance may be asleep |
+| scanner heartbeat | `POST /api/internal/scanner/run` (drains ≤ 5 jobs, ≤ 10 s before scanning) | uses this process's own worker, so a scheduler holding ONLY `SCANNER_WORKER_TOKEN` still gets delivery. Bounded and best-effort: never fails the scan |
 | manual | `worker.runOnce()` | scripts, tests, ops |
 
 The API is a container that a platform may stop at any time (the Render free
 tier spins down), so nothing depends on the ticker being alive: the lease plus
 stale recovery guarantees a job is never lost, and an external scheduler can
-drain the queue whenever it likes.
+drain the queue whenever it likes. The scanner heartbeat route is the one
+external trigger that is reachable with the scanner's own secret, which is why
+it drains a batch too — see *Alert delivery operations* in
+[deployment.md](./deployment.md).
+
+Whether delivery is actually running is observable WITHOUT a worker token:
+`GET /api/health` reports `workers.notifications` / `workers.scanner` with the
+last success, the last failure code and the counters. A never-advancing
+`lastSuccessAt` means the schedule is not executing, whatever the cron's own
+run status says.
 
 ## 5. Retry policy
 

@@ -15,6 +15,7 @@ import {
   hasScannerWorkerToken,
 } from '../src/routes/scanner.js';
 import { startScannerWorkerTicker } from '../src/scanner-worker.js';
+import { resetWorkerLivenessForTests } from '../src/worker-liveness.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 import {
   TIMEFRAMES,
@@ -620,6 +621,100 @@ describe('F3: Internal scanner worker endpoints & ticker', () => {
       assert.equal(maintBody.recovered, 0);
       assert.equal(maintBody.activeRuns, 0);
     } finally {
+      await workerApp.close();
+    }
+  });
+
+  test('ops heartbeat: /api/internal/scanner/run drains ONE bounded notification batch and records liveness', async () => {
+    const { app: workerApp, ctx: workerCtx } = await buildWorkerApp(WORKER_TOKEN);
+    resetWorkerLivenessForTests();
+    const batches: Array<number | undefined> = [];
+    // A scheduler holding only SCANNER_WORKER_TOKEN must still get notification
+    // delivery — that is the whole point of draining from the scan heartbeat.
+    workerCtx.deliveryWorker.runOnce = async (batchSize?: number) => {
+      batches.push(batchSize);
+      return {
+        claimed: 2,
+        delivered: 2,
+        retried: 0,
+        failed: 0,
+        unavailable: 0,
+        recovered: 0,
+        deadLettered: 0,
+        requeued: 0,
+      };
+    };
+    workerCtx.scanner.runWorkerOnce = async () => ({
+      run: null,
+      skipped: true,
+      reason: 'already_running',
+      recovered: 0,
+    });
+
+    try {
+      const res = await workerApp.inject({
+        method: 'POST',
+        url: '/api/internal/scanner/run',
+        headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+        payload: {},
+      });
+      assert.equal(res.statusCode, 200, res.body);
+
+      // Exactly one batch, clamped to the heartbeat bound — never the full
+      // ticker batch, so a slow provider cannot eat the scan's budget.
+      assert.equal(batches.length, 1);
+      assert.ok(batches[0] !== undefined && batches[0] <= 5, `batch must be bounded, got ${batches[0]}`);
+
+      // Both workers are now visible without a worker token.
+      const health = await workerApp.inject({ method: 'GET', url: '/api/health' });
+      assert.equal(health.statusCode, 200);
+      const workers = health.json().workers;
+      assert.equal(workers.notifications.successes, 1);
+      assert.equal(workers.notifications.lastFailureCode, null);
+      assert.ok(workers.notifications.lastSuccessAt, 'delivery liveness must be timestamped');
+      assert.equal(workers.scanner.successes, 1);
+    } finally {
+      await workerApp.close();
+    }
+  });
+
+  test('ops heartbeat: a failed delivery batch never fails the scan, and stays visible on /api/health', async () => {
+    const { app: workerApp, ctx: workerCtx } = await buildWorkerApp(WORKER_TOKEN);
+    resetWorkerLivenessForTests();
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    workerCtx.deliveryWorker.runOnce = async () => {
+      throw Object.assign(new Error('smtp password hunter2 rejected'), { code: 'EAUTH' });
+    };
+    workerCtx.scanner.runWorkerOnce = async () => ({
+      run: null,
+      skipped: true,
+      reason: 'already_running',
+      recovered: 0,
+    });
+
+    try {
+      const res = await workerApp.inject({
+        method: 'POST',
+        url: '/api/internal/scanner/run',
+        headers: { [SCANNER_WORKER_TOKEN_HEADER]: WORKER_TOKEN, 'x-forwarded-for': freshIp() },
+        payload: {},
+      });
+      // The scan succeeded, so the heartbeat is a success for scanning.
+      assert.equal(res.statusCode, 200, res.body);
+
+      const health = await workerApp.inject({ method: 'GET', url: '/api/health' });
+      const workers = health.json().workers;
+      // Delivery failure is visible (code only — never the message), and the
+      // failed worker has no success timestamp, so a dead scheduler cannot
+      // masquerade as a healthy one.
+      assert.equal(workers.notifications.failures, 1);
+      assert.equal(workers.notifications.lastFailureCode, 'eauth');
+      assert.equal(workers.notifications.lastSuccessAt, null);
+      assert.equal(JSON.stringify(health.json()).includes('hunter2'), false, 'no secret text may reach the payload');
+      assert.equal(workers.scanner.successes, 1);
+    } finally {
+      console.warn = originalWarn;
       await workerApp.close();
     }
   });

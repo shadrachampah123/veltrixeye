@@ -1,4 +1,5 @@
 import type { DeliveryWorker, DeliveryWorkerLogger } from '@veltrixeye/core';
+import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from './worker-liveness.js';
 
 /**
  * In-process invocation of the M7.3 delivery worker.
@@ -72,7 +73,19 @@ export function startDeliveryWorkerTicker(
             });
           }
         }
-        const result = await worker.runOnce(options.batchSize);
+        // Liveness is recorded here as well as on the internal endpoint so
+        // `GET /api/health` distinguishes "the ticker is draining" from "only
+        // an external scheduler is draining" — and, when neither has run,
+        // reports a stale timestamp instead of a healthy-looking instance.
+        recordWorkerStart('notifications');
+        let result: Awaited<ReturnType<DeliveryWorker['runOnce']>>;
+        try {
+          result = await worker.runOnce(options.batchSize);
+          recordWorkerSuccess('notifications');
+        } catch (err) {
+          recordWorkerFailure('notifications', err);
+          throw err;
+        }
         if (result.claimed > 0 || result.recovered > 0 || result.failed > 0 || result.unavailable > 0) {
           logger.info('notification worker batch', { ...result });
         }
