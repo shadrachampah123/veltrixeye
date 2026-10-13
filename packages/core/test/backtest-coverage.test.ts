@@ -463,6 +463,9 @@ function fakePool(): {
         state.trades.push(p as number[]);
         return { rows: [] };
       }
+      if (/SELECT id FROM users WHERE id = \$1 FOR UPDATE/.test(sql)) {
+        return { rows: [{ id: p[0] }] };
+      }
       if (/count\(\*\)/.test(sql)) return { rows: [{ c: 0 }] };
       return { rows: [] };
     },

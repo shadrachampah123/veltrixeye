@@ -300,13 +300,30 @@ export class BacktestService {
     try {
       await client.query('BEGIN');
 
+      // Serialize the monthly-limit check on a row that exists for every valid
+      // account. `SELECT … FROM subscriptions WHERE user_id = $1 FOR UPDATE`
+      // is a no-op when no subscription row exists (the Model C free state), so
+      // two concurrent free-user requests can both observe count = 99 and
+      // exceed the 100-run monthly cap. The `users` row is the durable identity
+      // of the account; locking it first serializes every caller, free or paid.
+      // Lock order is users then subscriptions to stay consistent with other
+      // account-level writers (entitlement grants lock `users` first).
+      const userLock = await client.query<{ id: string }>(
+        'SELECT id FROM users WHERE id = $1 FOR UPDATE',
+        [args.userId],
+      );
+      if (userLock.rows[0] === undefined) {
+        throw Errors.notFound('User not found');
+      }
+
       // M7.4 Atomic entitlement enforcement
       // `provider` and the durable activation fact are read for the
       // fail-closed entitlement gate: a provider-backed row is an unconfirmed
       // checkout — never a purchase — until an operator has authorized an
       // immutable activation fact for it (Billing Step 8, migration 0034).
       // The non-commercial operator grant (migration 0036) is read alongside
-      // them.
+      // them. The subscription `FOR UPDATE` still serializes with billing
+      // writers when a row exists; it cannot stand alone for the free state.
       const entitlementRes = await client.query<{ plan: string; status: string; provider: string | null; activated: boolean }>(`
         SELECT plan, status, provider,
                EXISTS (SELECT 1 FROM billing_subscription_activations a
@@ -316,8 +333,9 @@ export class BacktestService {
       // The non-commercial operator grant (migration 0036) is an ACCOUNT-level
       // authority, so it is read in its own statement against the unique
       // index: an account with no subscription row — the Model C free state,
-      // and the normal state of a granted account — still resolves its grant,
-      // and the `FOR UPDATE` row lock above is untouched. `null` fails closed.
+      // and the normal state of a granted account — still resolves its grant.
+      // `null` fails closed. Serialization for that state is the users-row
+      // lock above, not this subscription lock.
       const grantRes = await client.query<{ granted_plan: string | null }>(
         'SELECT plan AS granted_plan FROM billing_entitlement_grants WHERE user_id = $1',
         [args.userId],
