@@ -21,6 +21,9 @@ out/
 *.log
 npm-debug.log*
 
+# Read-only production diagnostic reports (never commit evidence output)
+diagnostics-out/
+
 # OS / editor
 .DS_Store
 .idea/
