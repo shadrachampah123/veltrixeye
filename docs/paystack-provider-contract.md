@@ -131,20 +131,22 @@ below) implements it as follows:
 | `findCustomer` | **implemented** | `GET /customer/:email_or_code` |
 | `createCustomer` | **implemented** | `POST /customer` |
 | `initializeCheckout` | **implemented** | `POST /transaction/initialize` |
-| `findSubscription` | **not implemented** | no verified subscription *read* operation (no subscription fetch is used) → `PaystackNotImplementedError` |
+| `findSubscription` | **implemented** | `GET /subscription/:id_or_code` — explicit id/code required; normalized subscription facts only (see §2.3(b)) |
 | `verifySubscription` | **implemented** (§2.3, Later-billing-PR #7) | `GET /transaction/verify/:reference` — our checkout reference only; the reported lifecycle state is always `unknown` |
 | `synchronizeSubscription` | **not implemented** | synchronization is performed by core's `BillingSubscriptionSyncService` (§2.3), which owns the database write; the adapter never applies state |
-| `cancelSubscription` | **not implemented** | the documented disable operation needs the subscription code **and** its `email_token`, which this build does not persist |
+| `cancelSubscription` | **implemented, non-immediate only** | Subscription GET obtains `email_token` transiently inside the client, then `POST /subscription/disable`; immediate cancellation is refused before I/O (see §2.4) |
 | `normalizeEvent` | **implemented** (§2.1) | **no provider call** — a pure normalization of the delivered payload against the published shapes in `src/events.ts`. Since Step 5.2 the operation is reachable from the network through the secure receiver (§2.2), which verifies the signature BEFORE calling it; the receiver lives outside this package, which a pinned test keeps receiver-free |
 
 Consequences:
 
 - `implemented` stays **`false`** on purpose. The seam defines eight operations:
-  this build makes real provider calls for four (customer fetch/create,
-  transaction initialize, transaction verify), normalizes events locally for a
-  fifth, and refuses the remaining three. A caller must treat a
-  non-implemented provider as unavailable rather than assume the rest work.
-- Unimplemented operations **reject with a typed error**; they never return a
+  this build makes real provider calls for six (customer fetch/create,
+  transaction initialize/verify, subscription lookup/cancellation), normalizes
+  events locally for a seventh, and refuses only `synchronizeSubscription`.
+  The aggregate flag is not a per-operation capability or product-authorization
+  flag; callers must respect each operation's contract and guards.
+- `PAYSTACK_UNIMPLEMENTED_REASONS` contains only `synchronizeSubscription`
+  (core owns synchronization). Unimplemented operations **reject with a typed error**; they never return a
   permissive default and never fall back to a different behaviour.
 - `PAYSTACK_IMPLEMENTED_OPERATIONS` and `PAYSTACK_UNIMPLEMENTED_REASONS` (both
   exported) are the single source of truth for the tables above, and a test
@@ -375,10 +377,24 @@ returned or stored. The provider must echo our reference
 normalize is `unexpected_response`; a 404 is never "no transaction" (the
 documented-ambiguous 404 classification applies).
 
-**(b) There is no subscription read.** No subscription GET is used or
-implemented. `findSubscription` stays refused, and `verifySubscription`
-refuses — before any call — a request that carries only a provider
-subscription identifier (`invalid_request`).
+**(b) Subscription lookup is implemented separately.** `findSubscription`
+uses `GET /subscription/:id_or_code`, with an explicit provider id/code (a
+local user id alone is refused before I/O). It validates echoed identity and
+configured mode/domain, returns `null` only for a clearly missing-subscription
+404, and rejects ambiguous/auth-shaped 404s or malformed responses. It maps
+provider statuses through `PAYSTACK_LIFECYCLE_STATE_FOR_STATUS`; unknown or
+ambiguous statuses remain `unknown`. It reports normalized identity, provider
+plan code and supported payment amount/currency, not a commercial plan,
+period, cancellation instant or verified payment. Credentials and raw payloads
+do not cross the seam. `non-renewing` maps to `unsubscribed`; the read does not
+turn it into a cancellation flag (`cancelAtPeriodEnd` remains `false`).
+
+Core sync prefers a locally bound subscription code, then id, and uses
+transaction verification only when neither exists. A `null` lookup is unusable,
+not evidence to cancel local state. `verifySubscription` still refuses a
+subscription-id-only request; it needs a checkout reference.
+`describe().verification.subscriptionRead: 'none'` remains literal metadata
+for the transaction-verification path, not an inventory of all adapter reads.
 
 **(c) Undocumented statuses fail closed — and the verify response documents
 no subscription status at all.** The published verify response carries a
@@ -401,18 +417,20 @@ all `null`), and synchronization never writes cancellation or period columns.
 moves only `status` (through `SUBSCRIPTION_STATUS_FOR_PROVIDER_STATE`, and only
 when a mapping exists), `provider_state` and the 0031 bookkeeping columns,
 guarded by `state_version` optimistic concurrency; it never writes `plan`. A
-provider-backed row still resolves to the free tier (`resolveEntitlements`,
-unchanged), `paymentConfirmed` stays pinned `false`, and the result pins
-`planChanged` / `entitlementsChanged` / `grantsExecution` to `false`. With the
-Paystack adapter the outcome is always `requires_manual_review`: the row is
+provider-backed row without activation remains free-entitled; sync does not
+create activation authority, and its result pins
+`planChanged` / `entitlementsChanged` / `grantsExecution` to `false`. The
+transaction-verification fallback yields `requires_manual_review`: the row is
 flagged (`sync_state = 'conflict'`, `sync_required = true`), its status is
-left exactly as it was, and the bound `received` ledger rows are settled
-`ignored`.
+unchanged, and bound `received` ledger rows are settled `ignored`. A bound
+subscription read can instead provide a mapped lifecycle state, subject to
+core's identity checks and synchronization rules.
 
-**(f) The Step 4 operator run is still pending.** No sandbox plan epoch is
-registered and no FX version is published in the deployed environment
-([billing.md](./billing.md) Step 4 runbook), so no checkout can be initialized
-there yet, and nothing in this section changes that.
+**(f) Sandbox operation requires separate provisioning evidence.** The original
+Step 4 notes recorded pending plan/FX provisioning. Source inspection and
+stub-transport tests do not establish current deployed provisioning or a real
+end-to-end management run. This reconciliation publishes no rate and registers
+no plan epoch; see [billing.md](./billing.md) for the Step 4 runbook.
 
 The route is `POST /api/billing/sync`: session-authenticated (the subject is
 always the session user), accepts **no** request body, per-IP rate-limited
@@ -421,6 +439,37 @@ mechanism; `BILLING_SYNC_RATE_LIMIT_MAX = 10` per minute), and refuses as
 `provider_unavailable` — with nothing written — when no provider is registered
 (`provider_not_registered`) or the verification yields no usable provider view
 (`verification_unavailable`).
+
+### 2.4 Non-immediate cancellation adapter (not self-service management)
+
+`cancelSubscription` validates the canonical request and refuses
+`immediate: true` with `invalid_request` before any provider call. It requires
+an explicit subscription id/code. The client reads that subscription, verifies
+its echoed identity and configured domain, and requires a nonblank
+`email_token`; only then does it POST the provider's code and token as
+form-encoded data to `/subscription/disable`. The credential exists transiently
+inside `PaystackClient.disableSubscription`, never on a seam request/result,
+in storage or logs; provider-authored disable errors redact it. There is no
+retry or assumed provider idempotency. Failed prerequisites prevent disable;
+a rejected/unreadable disable response never yields a successful state.
+
+An acknowledged disable returns `unsubscribed`, `cancelAtPeriodEnd: true`, the
+provider subscription code and the caller's canonical reason. Periods,
+`cancelAt`, `cancelledAt`, customer/plan/payment and transaction facts remain
+`null`: no immediate access termination or cancellation timestamp is invented.
+The adapter writes no local cancellation record and changes no entitlement.
+
+These facts are pinned by `test/find-subscription.test.ts` and
+`test/cancel-subscription.test.ts` in this provider package, using injected
+stub transports, not real provider mutations. The API has no cancellation
+route and the web portal is read-only, with no cancellation control, invoice
+or payment-history interface. **C-1** still requires an owner decision on
+customer-facing cancellation authorization and durable recording/reporting.
+**R-1** still requires an owner decision on genuine provider-issued invoices
+(with a verified invoice source) versus separately labelled local payment
+history. Subscription lookup, verified transactions and normalized invoice
+events are not an invoice retrieval/delivery feature. See
+[billing.md — Step 9b](./billing.md#self-serve-billing-management-scope-billing-step-9b).
 
 ## 3. Transport posture (`src/client.ts`)
 
@@ -706,5 +755,7 @@ The client/provider take an explicit `mode: 'test' | 'live'` (default
 - `name` is `paystack-sandbox`/`paystack-live`, `describe().mode` reports the
   mode, and **`live` stays `false` in both modes** — the execution gate is not
   part of the mode;
-- nothing else changed in the contract: five of eight operations, one HTTP
-  attempt, no retry, no idempotency header, receipts-only webhooks.
+- transport remains one attempt per HTTP request, with no retry or
+  idempotency header, and webhooks remain receipt-only. The current seven
+  implemented operations are listed in §2; cancellation uses a read followed
+  by a disable, not a single HTTP request.
