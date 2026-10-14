@@ -2164,3 +2164,44 @@ subscription id; `users.plan` and the account's `billing_customers` row are
 unchanged; and the next live checkout initializes against the active live epoch
 and writes the locked commercial row. Re-running on an already remediated
 account reports `absent` and writes nothing.
+
+## FX evidence validation (`npm run billing:fx:validate`)
+
+`npm run billing:fx:validate -- --dry-run` is a **dry-run-only** validator for a
+candidate USD→GHS rate and its evidence. It is a thin wrapper over
+`validateFxRateCandidate` (`packages/core/src/billing/fx-validation.ts`), which
+delegates currency, provenance vocabulary, precision, timestamp ordering and the
+15-minute freshness bound to the existing FX authority
+(`packages/core/src/billing/fx-rate-versions.ts`, `BILLING_FX_POLICY`) — it is
+not a competing source of truth, and it holds no publication path.
+
+A candidate must supply, explicitly: the exact decimal rate (a string, converted
+to the authority's scaled-integer form with no float), the claimed authoritative
+source, the provenance channel (`db|ops|import|config`), a provenance/reference,
+the base/quote currencies (USD→GHS), timezone-bearing capture and effective
+timestamps, the operator, and a reason. Missing, blank, malformed, stale
+(older than 900 s at the evaluation instant, `--as-of`), future-dated,
+not-yet-effective or back-dated evidence fails closed with a named issue.
+Publication or approval flags (`--publish`, `--approve`, `--apply`, …) are
+refused, not ignored, and a run without `--dry-run` is refused: there is no
+write mode.
+
+**The decision is always `need_source`.** No authoritative FX source has been
+approved in code or policy, so even a fully consistent candidate stays at
+`need_source` until an operator approval decision is taken and recorded outside
+this tool. A validated result means only "internally consistent evidence" —
+never approval, never publication. The historical 11.58 GHS/USD rate is not an
+approved current rate and is not used or defaulted anywhere in this tool.
+
+A dry run opens no database connection, calls no external service, reads no
+environment or setting, and writes nothing (the CLI imports no pool; this is
+pinned by source tests). Two limitations are printed on every run: a dry run
+cannot detect a conflict with an already-published version effective at the
+same instant (the durable authority's resolver must re-check ambiguity before
+any separately approved publication), and the provenance/reference is checked
+for presence and shape only — its truth is established by the approval
+decision, not by this validator.
+
+Exit codes: **0** the supplied evidence validates (decision still
+`need_source`); **1** validation refusal (nothing was written, because nothing
+is ever written); **2** usage error, including a run without `--dry-run`.

@@ -3,6 +3,7 @@ export * from './entitlements.js';
 export * from './entitlement-resolution.js';
 export * from './entitlement-grants.js';
 export * from './fx-rate-versions.js';
+export * from './fx-validation.js';
 export * from './pricing.js';
 export * from './provider-plans.js';
 export * from './provisioning.js';

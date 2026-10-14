@@ -17,6 +17,7 @@
     "dev": "concurrently -k -n db,api,web -c blue,magenta,cyan \"npm:db:dev\" \"npm:api:dev\" \"npm:web:dev\"",
     "db:dev": "node scripts/db/dev-up.mjs",
     "db:migrate": "tsx scripts/db/migrate-cli.ts",
+    "billing:fx:validate": "tsx scripts/billing/fx-validate.ts",
     "billing:activate": "tsx scripts/billing/activate.ts",
     "billing:grant": "tsx scripts/billing/grant-entitlements.ts",
     "billing:provision:live": "tsx scripts/billing/provision-live.ts",
