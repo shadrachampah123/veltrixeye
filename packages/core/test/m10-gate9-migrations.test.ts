@@ -9,6 +9,7 @@
  */
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { copyFileSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
@@ -18,6 +19,7 @@ import { createPool, MIGRATIONS_DIR, migrationStatus, runMigrations } from '../s
 
 let db: Awaited<ReturnType<typeof startEmbeddedPostgres>>;
 let pool: ReturnType<typeof createPool>;
+let poolClients = new Set<object>();
 let dir28: string;
 let fullDir: string;
 
@@ -25,6 +27,43 @@ function copyUpTo(destination: string, max: number | null): void {
   for (const file of readdirSync(MIGRATIONS_DIR)) {
     const match = /^(\d{4})_/.exec(file);
     if (match && (max === null || Number(match[1]) <= max)) copyFileSync(path.join(MIGRATIONS_DIR, file), path.join(destination, file));
+  }
+}
+
+type TestPool = ReturnType<typeof createPool>;
+
+function trackPoolClients(testPool: TestPool): Set<object> {
+  const clients = new Set<object>();
+  testPool.on('connect', (client) => {
+    clients.add(client);
+  });
+  testPool.on('remove', (client) => {
+    clients.delete(client);
+  });
+  return clients;
+}
+
+/**
+ * pg.Pool.end() removes clients from its internal list before each asynchronous
+ * Client.end() callback fires. Wait for the public `remove` events as well so
+ * the embedded server is not stopped while a pool-owned socket is still
+ * closing.
+ */
+async function endPoolAndWaitForClientRemoval(testPool: TestPool, clients: Set<object>): Promise<void> {
+  let resolveDrained!: () => void;
+  const drained = new Promise<void>((resolve) => {
+    resolveDrained = resolve;
+  });
+  const checkDrained = () => {
+    if (clients.size === 0) resolveDrained();
+  };
+  testPool.on('remove', checkDrained);
+  try {
+    await testPool.end();
+    checkDrained();
+    await drained;
+  } finally {
+    testPool.off('remove', checkDrained);
   }
 }
 
@@ -37,10 +76,11 @@ before(async () => {
   rmSync(dataDir, { recursive: true, force: true });
   db = await startEmbeddedPostgres({ dataDir, port: 5466, user: 'test', password: 'gate9', database: 'veltrixeye_gate9_migrations' });
   pool = createPool({ databaseUrl: db.dbUrl });
+  poolClients = trackPoolClients(pool);
 }, { timeout: 180_000 });
 
 after(async () => {
-  await pool?.end();
+  if (pool) await endPoolAndWaitForClientRemoval(pool, poolClients);
   await db?.stop();
   rmSync(dir28, { recursive: true, force: true });
   rmSync(fullDir, { recursive: true, force: true });
@@ -52,6 +92,7 @@ describe('M10 Gate 9 migrations — 0029_provider_mutation_persistence.sql', () 
     rmSync(freshDbDir, { recursive: true, force: true });
     const fresh = await startEmbeddedPostgres({ dataDir: freshDbDir, port: 5467, user: 'test', password: 'gate9f', database: 'veltrixeye_gate9_fresh' });
     const freshPool = createPool({ databaseUrl: fresh.dbUrl });
+    const freshPoolClients = trackPoolClients(freshPool);
     try {
       const result = await runMigrations(freshPool, fullDir);
       assert.ok(result.applied.includes('0029_provider_mutation_persistence.sql'));
@@ -86,10 +127,35 @@ describe('M10 Gate 9 migrations — 0029_provider_mutation_persistence.sql', () 
       );
       assert.equal(uncertainColumn[0]!.count, '1', 'no duplicate/rewritten order status column');
     } finally {
-      await freshPool.end();
+      await endPoolAndWaitForClientRemoval(freshPool, freshPoolClients);
+      assert.equal(freshPoolClients.size, 0, 'all pooled PostgreSQL clients close before stopping the cluster');
       await fresh.stop();
       rmSync(freshDbDir, { recursive: true, force: true });
     }
+  });
+
+  test('pool shutdown waits for client removal after end resolves', async () => {
+    const client = {};
+    const clients = new Set<object>([client]);
+    const events: string[] = [];
+    const fakePool = new EventEmitter() as EventEmitter & { end: () => Promise<void> };
+    fakePool.on('remove', (removed: object) => {
+      clients.delete(removed);
+      events.push('client removed');
+    });
+    fakePool.end = () => new Promise<void>((resolve) => {
+      setImmediate(() => {
+        events.push('pool end resolved');
+        resolve();
+        setImmediate(() => fakePool.emit('remove', client));
+      });
+    });
+
+    await endPoolAndWaitForClientRemoval(fakePool as unknown as TestPool, clients);
+    events.push('drained');
+
+    assert.deepEqual(events, ['pool end resolved', 'client removed', 'drained']);
+    assert.equal(clients.size, 0);
   });
 
   test('migration 0028 was not modified (checksum pinned by this suite)', async () => {
