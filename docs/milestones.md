@@ -903,16 +903,18 @@ canonical billing contracts and the Paystack provider seam — see
 - **Explicitly deferred to later billing PRs:** self-serve billing management
   (cancellation, invoices, payment methods, plan changes). **Billing Step 9b
   has since scoped that work without implementing any of it**: cancellation and
-  invoices are in scope but **blocked** by two unresolved decisions — C-1 (a
-  truthful Paystack cancellation needs the subscription's `email_token`, which
-  this build does not persist and Step 9b does not start persisting) and R-1
-  (`findSubscription` is unimplemented and there is no verified
-  subscription-read source, so no subscription lifecycle state may be claimed or
-  inferred) — while payment-method management and plan changes are **out** of
-  9b. See
+  invoices are in scope but **blocked** by two unresolved decisions — C-1
+  (whether to authorize customer-facing cancellation using the
+  implemented transient-token adapter, including durable recording/reporting)
+  and R-1 (genuine provider-issued invoices with a verified source versus
+  separately labelled local payment history). Subscription lookup and
+  non-immediate cancellation are implemented adapter operations, not a
+  self-service interface. Payment-method management and plan changes are
+  **out** of 9b. See
   [billing.md](./billing.md#self-serve-billing-management-scope-billing-step-9b);
-  nothing was built, and no endpoint, migration, provider operation or
-  authority was added. Refunds/proration/dunning execution, the Starter
+  the scope decision added no customer-facing endpoint, migration or
+  authority; the later adapter operations did not decide C-1/R-1.
+  Refunds/proration/dunning execution, the Starter
   **sellability** decision (Billing Step 10a decided Starter is **not sold** in
   this build; making it sellable would require widening all twelve gates
   documented in
