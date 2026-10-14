@@ -52,6 +52,11 @@ ENV NODE_ENV=production \
     PORT=4000
 
 COPY --from=deps --chown=node:node /app/node_modules ./node_modules
+# npm may keep production dependencies used by a single workspace nested under
+# that workspace instead of hoisting them (Nodemailer 10 is one such package).
+# The API consumes these workspace sources directly, so preserve their local
+# dependency directories in the runtime image as well.
+COPY --from=deps --chown=node:node /app/packages/core/node_modules ./packages/core/node_modules
 
 # Sources needed at runtime: the API entrypoint plus the two workspace
 # packages it imports (they resolve to .ts sources — see the note above).
