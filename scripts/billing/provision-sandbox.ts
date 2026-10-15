@@ -59,7 +59,13 @@
  *    a registered epoch makes the four combinations selectable by checkout
  *    and nothing else (`grantsExecution` / `paymentConfirmed` stay false);
  *  - never runs in a live domain: the mode gate refuses before the first
- *    connection, and no argument can change it.
+ *    connection, and no argument can change it;
+ *  - never writes to a production or unverified database: `--apply` is
+ *    refused BEFORE the pool exists unless `DATABASE_URL` resolves to a
+ *    verified local loopback target (see `localDatabaseTargetRejection`).
+ *    The provider-domain pin above proves nothing about which database the
+ *    connection string points at, so the two gates are independent and both
+ *    must pass. Dry runs are read-only and stay available either way.
  *
  * Exit codes: 0 on a clean dry run or a registered batch, 1 on a typed refusal
  * (nothing was written), 2 on a usage or configuration error.
@@ -98,7 +104,12 @@ const USAGE = [
   'in a single transaction (rolled back together on any refusal or conflict).',
   '',
   'Requires PAYSTACK_MODE exactly "test" (live mode is refused before any connection) and',
-  'DATABASE_URL. Never publishes or approves an FX rate, never calls a provider, never',
+  'DATABASE_URL. --apply additionally refuses any database target that is not a verified local',
+  'loopback host: a production or unverified database is refused before the first connection,',
+  'because the provider-domain pin says nothing about where DATABASE_URL points. Dry runs are',
+  'read-only and unaffected by that gate.',
+  '',
+  'Never publishes or approves an FX rate, never calls a provider, never',
   'confirms a payment and never grants execution.',
   '',
   'Exit codes: 0 on a clean dry run or a registered batch; 1 on a typed refusal (nothing',
@@ -278,6 +289,49 @@ function printOutcome(outcome: {
   );
 }
 
+/**
+ * The ONLY database targets `--apply` may write: loopback hosts — the local
+ * development database `npm run setup` writes into `.env`, and the embedded
+ * test databases the suites boot. Every other target (a managed production
+ * host, any remote or unparseable string, anything carrying a query or
+ * fragment that could redirect the real connection) is production-or-
+ * unverified and is refused BEFORE a pool exists, so no connection — let
+ * alone a write — can happen.
+ *
+ * The configured value is NEVER echoed: the refusal states only which rule
+ * failed, so no hostname, credential or connection-string fragment can
+ * reach a terminal or a log. Fail closed on every doubt: anything this
+ * function cannot positively verify as local is refused.
+ */
+const LOCAL_DATABASE_HOSTNAMES: ReadonlySet<string> = new Set([
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  '[::1]',
+]);
+
+function localDatabaseTargetRejection(databaseUrl: string): string | null {
+  let target: URL;
+  try {
+    target = new URL(databaseUrl);
+  } catch {
+    return 'the configured DATABASE_URL is not a parseable postgres connection target';
+  }
+  if (target.protocol !== 'postgres:' && target.protocol !== 'postgresql:') {
+    return 'the configured DATABASE_URL is not a postgres connection target';
+  }
+  if (!LOCAL_DATABASE_HOSTNAMES.has(target.hostname)) {
+    return 'the configured DATABASE_URL does not resolve to a local loopback host';
+  }
+  if (target.search !== '' || target.hash !== '') {
+    return (
+      'the configured DATABASE_URL carries query or fragment parameters that could redirect ' +
+      'the real connection'
+    );
+  }
+  return null;
+}
+
 async function main(): Promise<number> {
   let args: Args;
   try {
@@ -341,6 +395,26 @@ async function main(): Promise<number> {
         '        the mode is never inferred, defaulted or silently switched to make a run succeed.',
     );
     return 2;
+  }
+
+  // THE DATABASE-TARGET GATE (the `--apply` write path only): the provider
+  // domain above says nothing about WHERE this connection string points, so
+  // a sandbox-mode run against a production or unverified database must be
+  // impossible. `--apply` is refused here — before the evidence is even
+  // parsed and before any pool exists — unless DATABASE_URL is a verified
+  // local loopback target. Dry runs never write, so they are unaffected.
+  if (args.apply) {
+    const rejection = localDatabaseTargetRejection(databaseUrl);
+    if (rejection !== null) {
+      console.error(
+        `[billing:provision:sandbox] --apply refuses this database target: ${rejection}.\n` +
+          '        Sandbox epoch writes are only permitted against a verified LOCAL (loopback) database.\n' +
+          '        A production or unverified target is never written by this tool — PAYSTACK_MODE=test\n' +
+          '        proves the provider domain, never the database. Nothing was written.\n' +
+          '        Dry runs (the default) are read-only and unaffected by this gate.',
+      );
+      return 2;
+    }
   }
 
   let evidence: unknown;

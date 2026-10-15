@@ -33,10 +33,17 @@
  *     kind. Registering confirms no payment and grants no execution.
  *  6. THE SERVICE DRY-RUN ENTRY POINT — `validateSandboxPlanEpochs` returns
  *     the validated batch and cannot write.
+ *  7. THE DATABASE BOUNDARY — `PAYSTACK_MODE` is the provider gate, never
+ *     database isolation: `--apply` additionally refuses any `DATABASE_URL`
+ *     that is not a verified local loopback target (production-shaped,
+ *     remote-unverified, query-redirected, KEY=VALUE or unparseable), with
+ *     no target echoed, BEFORE the evidence is parsed or a pool exists;
+ *     dry runs skip the gate entirely and keep writing nothing.
  *
  * Nothing here contacts a provider, publishes an FX rate or touches a
  * production database: the suite boots its own embedded PostgreSQL, exactly
- * like the other billing suites.
+ * like the other billing suites. The refusal runs are networkless by
+ * construction — the guard fires while the target is still just a string.
  */
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, describe, test } from 'node:test';
@@ -274,6 +281,21 @@ describe('sandbox provisioning CLI — the boundary it keeps', () => {
     assert.doesNotMatch(cli, /resolveEntitlements|BillingActivationService|canAccessAutomation/, 'no entitlement or activation path');
     // Refusals state plainly that nothing was written.
     assert.match(cli, /Nothing was written/);
+  });
+
+  test('the --apply database gate is a loopback allowlist that runs before the pool exists', () => {
+    const cli = read('../../../scripts/billing/provision-sandbox.ts');
+    assert.match(cli, /loopback/, 'the write gate is a verified-local (loopback) allowlist');
+    assert.match(cli, /production or unverified/, 'the refusal states the rule, not the target');
+    // The gate must be evaluated BEFORE any pool is created — no connection,
+    // let alone a write, may exist when it refuses.
+    assert.ok(
+      cli.indexOf('localDatabaseTargetRejection(databaseUrl)') <
+        cli.indexOf('createPool({ databaseUrl })'),
+      'the database-target gate precedes pool creation',
+    );
+    // The gate is consulted only for the write path.
+    assert.match(cli, /if \(args\.apply\)/, 'the database gate belongs to --apply only');
   });
 
   test('the npm script is wired to the CLI', () => {
@@ -896,6 +918,95 @@ describe('sandbox provisioning — validateSandboxPlanEpochs cannot write', () =
         typeof error === 'object' && error !== null && 'reason' in error &&
         (error as { reason: unknown }).reason === 'currency_mismatch',
     );
+    assert.equal(await testEpochHistory(), historyBefore);
+    assert.equal(await auditCount(), auditsBefore);
+  });
+});
+
+/* ========================================================================== */
+/* 8. THE DATABASE BOUNDARY — `--apply` writes only to a verified local target */
+/* ========================================================================== */
+
+describe('sandbox provisioning CLI — the database boundary', () => {
+  // The provider-domain pin (`PAYSTACK_MODE=test`) is NOT database
+  // isolation: a test-mode run pointed at a production or unverified
+  // `DATABASE_URL` must be impossible. The gate fires before the evidence
+  // is parsed and before any pool exists, so every refusal below happens
+  // while the target is still just a string — no connection, no DNS, no
+  // write. (The hostnames used are reserved shapes only; nothing is ever
+  // resolved or dialled.) `--by` / `--reason` / `--fx-rate-version` are
+  // valid so the target gate is the FIRST thing that can refuse.
+  const requiredArgs = (evidence: readonly unknown[] = []): string[] => [
+    '--fx-rate-version', randomUUID(),
+    '--by', OPERATOR,
+    '--reason', REASON,
+    '--evidence', JSON.stringify(evidence),
+  ];
+
+  test('--apply refuses production-shaped and unverified database targets before any connection or write', async () => {
+    const historyBefore = await testEpochHistory();
+    const auditsBefore = await auditCount();
+    const targets: ReadonlyArray<readonly [string, string]> = [
+      ['production-shaped managed host', 'postgres://veltrix:fake-credential@dpg-sandbox-provisioning.render.com/veltrixeye'],
+      ['remote unverified host', 'postgres://veltrix:fake-credential@db.internal.example.invalid:5432/veltrixeye'],
+      ['loopback with a query that would redirect the real target', 'postgres://veltrix:fake-credential@127.0.0.1:5433/veltrixeye?host=db.example.invalid'],
+      ['KEY=VALUE (non-URL) form — not positively verifiable as local', 'host=db.example.invalid dbname=veltrixeye'],
+      ['unparseable garbage', 'not-a-connection-string'],
+    ];
+    for (const [label, databaseUrl] of targets) {
+      const result = cli(
+        { DATABASE_URL: databaseUrl, PAYSTACK_MODE: 'test' },
+        [...requiredArgs(), '--apply'],
+      );
+      assert.equal(result.status, 2, `${label} must be refused before any connection: ${result.stderr}`);
+      assert.match(result.stderr, /--apply refuses this database target/, label);
+      assert.match(result.stderr, /production or unverified/, label);
+      assert.match(result.stderr, /PAYSTACK_MODE=test/, label);
+      assert.match(result.stderr, /Nothing was written/, label);
+      // The refusal echoes NOTHING about the configured target — not the
+      // hostname, not the database name, not the credential.
+      assert.ok(!result.stderr.includes('render.com'), 'no hostname is echoed');
+      assert.ok(!result.stderr.includes('example.invalid'), 'no hostname is echoed');
+      assert.ok(!result.stderr.includes('fake-credential'), 'no credential is echoed');
+      assert.ok(!result.stderr.includes('veltrixeye'), 'no database name is echoed');
+      // The mode gate is untouched: this is the target gate firing.
+      assert.ok(!result.stderr.includes('must be exactly'), 'not the mode gate');
+    }
+    assert.equal(await testEpochHistory(), historyBefore, 'no epoch row was written');
+    assert.equal(await auditCount(), auditsBefore, 'no audit event was written');
+  });
+
+  test('the gate is --apply-only: dry runs skip it and keep their read-only behaviour', async () => {
+    const historyBefore = await testEpochHistory();
+    const auditsBefore = await auditCount();
+    // Same unverifiable target, WITHOUT --apply: the gate must not fire.
+    // The run reaches the normal read-only failure path (exit 1) — the
+    // configured target is merely an unreachable/garbage connection string
+    // to the pool, and a dry run cannot write in any case.
+    const result = cli(
+      { DATABASE_URL: 'not-a-connection-string', PAYSTACK_MODE: 'test' },
+      requiredArgs(),
+    );
+    assert.equal(result.status, 1, `dry-run failure taxonomy unchanged: ${result.stderr}`);
+    assert.doesNotMatch(result.stderr, /--apply refuses this database target/);
+    assert.equal(await testEpochHistory(), historyBefore, 'a dry run writes no epoch');
+    assert.equal(await auditCount(), auditsBefore, 'a dry run writes no audit event');
+  });
+
+  test('a verified local target passes the gate (it blocks nothing local)', async () => {
+    // Positive control, full stack: loopback DATABASE_URL, `--apply`, and a
+    // deliberately invalid FX id — the gate must PASS this target so the run
+    // proceeds into the service, where the ordinary typed refusal fires.
+    // Nothing is written on either side of the gate.
+    const historyBefore = await testEpochHistory();
+    const auditsBefore = await auditCount();
+    const result = cli(
+      { DATABASE_URL: 'postgres://127.0.0.1:5549/veltrixeye', PAYSTACK_MODE: 'test' },
+      ['--fx-rate-version', 'not-a-uuid', '--by', OPERATOR, '--reason', REASON, '--evidence', '[]', '--apply'],
+    );
+    assert.equal(result.status, 1, `past the gate, into the service: ${result.stderr}`);
+    assert.match(result.stderr, /refused \(invalid_evidence\)/);
+    assert.doesNotMatch(result.stderr, /--apply refuses this database target/);
     assert.equal(await testEpochHistory(), historyBefore);
     assert.equal(await auditCount(), auditsBefore);
   });

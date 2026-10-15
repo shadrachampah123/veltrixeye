@@ -1916,9 +1916,15 @@ approval, rate or mode option of any kind**: publication stays the separate
 approved operation from step 3 and the `need_source` source-approval gate is
 untouched. Only an explicit `--apply` registers, and it writes the four epochs
 plus ONE transactional `billing.provider_plans_registered` audit event
-naming the operator and the reason. Exit codes: 0 clean dry run or
-registered batch, 1 typed refusal (nothing written), 2 usage/configuration
-error.
+naming the operator and the reason. The provider-domain pin is never treated
+as database isolation: **`--apply` additionally refuses any `DATABASE_URL`
+that is not a verified local loopback target** — a production or unverified
+database is refused *before the first connection*, and the refusal echoes no
+part of the configured target; a committed run against a deployed database
+is therefore a separate, explicitly approved change, not something this tool
+will do silently. Dry runs are read-only and unaffected by that gate. Exit
+codes: 0 clean dry run or registered batch, 1 typed refusal (nothing
+written), 2 usage/configuration error.
 
 1. **Agree the inputs before touching anything.** This run needs: (a) the four
    plan amounts, derived from the catalogue
