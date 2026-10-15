@@ -79,7 +79,10 @@ import {
   composeBillingWebhookReceiver,
   type BillingCompositionStatus,
 } from './billing-composition.js';
+import type { FxSourceObservationService } from '@veltrixeye/core';
 import { scannerRoutes } from './routes/scanner.js';
+import { fxSourceRoutes } from './routes/fx-source.js';
+import { consoleFxSourceLogger, createFxSourceObservationService } from './fx-source-runner.js';
 import {
   executionRoutes,
   paperExecutionRoutes,
@@ -105,6 +108,15 @@ export interface AppContext {
   backtests: BacktestService;
   alerts: AlertService;
   scanner: ScannerService;
+  /**
+   * Billing FX source observations (read-only): reads the APPROVED publisher's
+   * page, validates and records what it published, and reports staleness. It
+   * holds no rate-version store and has no publication path — an observation
+   * never prices a payment and never bypasses the `need_source` approval
+   * boundary. Unconfigured transport is a normal state: the check reports
+   * `unavailable` instead of inventing a rate.
+   */
+  fxSource: FxSourceObservationService;
   /**
    * Billing PR3: the billing-provider registry (the only billing-provider-aware
    * object). It is EMPTY unless a sandbox Paystack key is configured — see
@@ -277,6 +289,15 @@ export function createAppContext(
       error: (msg, meta) => console.error(`[scheduled-ingestion] ${msg}`, meta ? JSON.stringify(meta) : ''),
     },
   });
+  // Billing FX source observations (read-only). The transport is the pinned
+  // Bank of Ghana reader (one host, one URL, ONE attempt, no retry, redirects
+  // refused); everything else — validation, dedup, the append-only record and
+  // staleness — is the core service. Nothing here publishes or approves.
+  const fxSource = createFxSourceObservationService(pool, {
+    timeoutMs: config.fxSource.timeoutMs,
+    logger: consoleFxSourceLogger('[fx-source]'),
+  });
+
   const backtests = new BacktestService(pool, strategies, candles);
   const alerts = new AlertService(pool, strategies, new StubAlertSender(), notifications, preferences);
   const scoring = new ScoringService(pool, strategies, evaluation);
@@ -528,6 +549,8 @@ export function createAppContext(
     alerts,
     // M7.5: live scanner
     scanner,
+    // Billing: read-only FX source observations (never the pricing authority)
+    fxSource,
     billingProviders: billing.registry,
     billingComposition: billing.status,
     billingWebhook,
@@ -673,6 +696,7 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
   await notificationRoutes(app, ctx, config);
   await billingRoutes(app, ctx, config);
   await scannerRoutes(app, ctx, config);
+  await fxSourceRoutes(app, ctx, config);
   await executionRoutes(app, ctx, config);
   await paperExecutionRoutes(app, ctx, config);
   await reconciliationRoutes(app, ctx, config);

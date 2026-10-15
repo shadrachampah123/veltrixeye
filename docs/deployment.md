@@ -398,6 +398,44 @@ migrations are unaffected.
   `provider_response_code` and redacted `last_error` say which. See
   [notification-delivery.md](./notification-delivery.md).
 
+### Billing FX source observations (read-only)
+
+- **What it does** — reads the Bank of Ghana's published daily interbank
+  USD→GHS rates page once, validates the published row and appends an immutable
+  observation. It never publishes a billing rate, never prices a payment and
+  cannot bypass the `need_source` approval boundary; the publisher URL is a
+  constant, so no deployment can choose another host. See
+  [billing.md](./billing.md).
+- **Verify the publisher FIRST** — the production page shape has not been
+  verified from the build environment. From an environment with egress to
+  `www.bog.gov.gh`:
+
+  ```bash
+  npm run billing:fx:source:probe -- --dry-run
+  ```
+
+  Confirm the reported `publishedOn`, buying/selling/mid and `validated: yes`.
+  The probe writes nothing (no database, no publication) and always prints
+  `decision: need_source`. Do not enable a schedule on an unverified page: every
+  run would record a typed `unparseable` failure.
+- **Scheduling across spin-downs** — set `FX_SOURCE_WORKER_TOKEN` (sync: false in
+  `render.yaml`) and point a **Render Cron Job** at
+  `POST /api/internal/billing/fx/source-check` with the
+  `x-veltrixeye-worker-token: <FX_SOURCE_WORKER_TOKEN>` header. Once a day is
+  more than enough (the publisher's figures change once per business day), and
+  the dedup key makes a more frequent schedule harmless. With no token the route
+  returns 404 and causes no outbound read; with no cron job nothing runs.
+- **Or in-process** — `FX_SOURCE_CHECK_ENABLED=true` runs the check on
+  `FX_SOURCE_CHECK_INTERVAL_MS` (default 6 h) while the instance is awake. Both
+  paths serialize through advisory lock `875421010`, so running both is safe.
+- **Watching it without a token** — `GET /api/health` reports
+  `workers.fxSource` (`lastSuccessAt`, `lastFailureAt`, `lastFailureCode`,
+  `successes`, `failures`, `inFlight`, `successAgeMs`). A moving `lastSuccessAt`
+  is the only unauthenticated proof that the scheduler is reaching the API and
+  authenticating; a scheduler that is refused leaves `successes` at 0. A failed
+  retrieval is a completed check with a reported outcome (the observation table
+  stays unchanged), which is exactly how a broken source becomes visible.
+
 ### Live scanner operations (M7.5 / F3)
 
 - **Scheduled scanning across spin-downs** — the in-process ticker

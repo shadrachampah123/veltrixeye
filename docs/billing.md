@@ -2253,3 +2253,124 @@ decision, not by this validator.
 Exit codes: **0** the supplied evidence validates (decision still
 `need_source`); **1** validation refusal (nothing was written, because nothing
 is ever written); **2** usage error, including a run without `--dry-run`.
+
+## FX source observations (read-only monitoring, migration `0038_billing_fx_source_observations.sql`)
+
+The FT pipeline above answers "is this candidate rate usable, and what would
+publishing it mean?". It deliberately does **not** answer "what has an approved
+publisher actually published lately?", because that requires reading an external
+source — and nothing in the pricing path may do that.
+
+This feature answers exactly that question, and nothing more:
+
+```bash
+# one live, read-only read of the approved publisher (writes nothing at all)
+npm run billing:fx:source:probe -- --dry-run
+
+# the same check inside the API, called by a scheduler (one shared secret)
+curl -X POST https://<api-host>/api/internal/billing/fx/source-check \
+  -H "x-veltrixeye-worker-token: $FX_SOURCE_WORKER_TOKEN"
+```
+
+**The observation is never the rate.** An observation is recorded in its own
+append-only table, `billing_fx_source_observations`, which has **no foreign key**
+to `billing_fx_rate_versions` in either direction. An observation cannot price a
+payment, cannot alter the rate in force, and cannot reprice anything already
+sold. Publishing an authoritative rate version stays the separate,
+operator-approved operation it already is (`billing:fx:validate` keeps every
+candidate at `need_source`), and every check result this feature returns carries
+`decision: 'need_source'`, `published: false` and `approved: false`.
+
+### The approved publisher is a constant, not a setting
+
+Exactly one publisher is recognised: the Bank of Ghana's published daily
+interbank FX rates page, pinned as a literal in `@veltrixeye/contracts`
+(`FX_SOURCE_BANK_OF_GHANA_URL`) and as a database `CHECK` on `source_url`. There
+is no base-URL setting, no host parameter and no environment variable for it, so
+no deployment can point the observation layer at a different host. Third-party
+mirrors and aggregators that re-publish Bank of Ghana figures are **not** this
+source; using one would be a separate source-approval decision.
+
+The reader (`@veltrixeye/provider-bank-of-ghana`) is READ-ONLY and deliberately
+narrow: one host, one URL, `GET`, exactly ONE attempt with no retry, no request
+body and no credential, redirects **refused** (a 3xx is a reported failure, not a
+followed document), and only a `200 text/html` response smaller than 512 KiB is
+considered. The published page is never stored: what is recorded is a SHA-256 of
+the bytes read plus the raw digits of the published row.
+
+### What is recorded, and how it is deduplicated
+
+Each observation records the publisher, the pair (pinned USD→GHS), the
+publisher's own date, the buying/selling/mid figures as **exact scaled integers**
+at one shared scale with the published decimals kept verbatim alongside them, the
+source URL, the content and row digests, the retrieval instant and a short
+retrieval label. Rows are append-only: `UPDATE` and `DELETE` are refused by
+trigger (SQLSTATE `27000`), so an observation can never be edited, re-dated or
+removed.
+
+Deduplication is by **content**, not by when we looked: the observation key is a
+SHA-256 over (publisher, pair, publication date, the three figures, the scale),
+unique per source. A scheduler that runs far more often than the publisher
+publishes therefore inserts nothing, while a **corrected republication** of the
+same date with different figures is a genuinely new row and is preserved.
+
+Incoherent or unrecognised pages are refused rather than interpreted: no single
+`USDGHS` row, two of them, a wrong cell count, a contradictory currency label,
+empty cells, a non-decimal figure, buying > mid, mid > selling, an unparseable
+publication date, a date after the retrieval instant, or an over-precise figure
+all produce a named issue and **no observation**.
+
+### Staleness, and the pricing bound this source cannot satisfy
+
+Every check reports staleness relative to the publisher's own cadence rather than
+to a preference: `never` (nothing observed yet — the truthful state before the
+first successful check), `fresh`, `warning` (≥ 2 days past the published date) and
+`stale` (≥ 4 days, covering a weekend plus a holiday). A failed or unrecognised
+retrieval writes **nothing** and is reported — a broken source must never look
+like an unchanged one — and the check also reports whether the mid rate **changed**
+since the previous observation, as an exact decimal difference (no float).
+
+**The pricing policy's freshness bound (900 s) cannot be satisfied by a
+business-daily publisher.** The report derives this rather than hardcoding it
+(`pricingPolicySatisfiable`, with the reason printed on every run), so nobody can
+mistake a daily bulletin for a rate that is fresh enough to price a payment.
+Reconciling that gap — if it is ever reconcilable — is an approved policy change
+and is not attempted here.
+
+### Scheduling, and what an operator must still do
+
+There are two invocation paths, exactly as for the other scheduled workers, and
+an unconditional PostgreSQL advisory lock (`FX_SOURCE_ADVISORY_LOCK_KEY`,
+`875421010`) means they are safe together:
+
+* an in-process ticker while the instance is awake —
+  `FX_SOURCE_CHECK_ENABLED=true` (default `false`), every
+  `FX_SOURCE_CHECK_INTERVAL_MS` (default 6 h);
+* a token-protected internal route for an external scheduler —
+  `POST /api/internal/billing/fx/source-check` with
+  `x-veltrixeye-worker-token: $FX_SOURCE_WORKER_TOKEN`. **Empty token ⇒ the route
+  does not exist (404)**, so an unconfigured deployment exposes no surface that
+  can cause an outbound read.
+
+An overlap does **not** fetch at all (two concurrent checks would spend the
+publisher's goodwill for no new information), and `GET /api/health` reports
+`workers.fxSource` without a credential, so an operator can tell a working
+scheduler from a green cron run that is actually being refused.
+
+**Not done by this change, and required before the schedule is enabled in
+production:** the publisher's page shape has not been verified live from the
+build environment. Run `npm run billing:fx:source:probe -- --dry-run` (or the
+internal route) from an environment with egress to `www.bog.gov.gh`, confirm the
+reported `publishedOn`/figures, and only then set `FX_SOURCE_CHECK_ENABLED=true`
+and/or create the Render Cron Job. Enabling a schedule that cannot parse the page
+would be recorded as a typed `unparseable` failure on every run — visible, but
+useless.
+
+### What this feature never does
+
+It never publishes or approves a rate; never bypasses the `need_source` approval
+boundary; never prices a payment; never modifies a price, a Paystack plan, a
+pricing epoch or the catalogue; never stores the publisher's page; never sends a
+credential; and never claims a publisher's figure is *correct* — a digest proves
+what was read and when, not that the number is right. Corroborating a published
+figure remains an operator decision, taken outside this tooling.

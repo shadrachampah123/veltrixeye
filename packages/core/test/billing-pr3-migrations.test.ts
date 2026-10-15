@@ -320,10 +320,11 @@ describe('Billing PR3 — 0032 file conventions and history integrity', () => {
     // are named here deliberately.
     assert.equal(files.filter((file) => file.startsWith('0036_')).length, 1, 'exactly one 0036 migration (non-commercial grants)');
     assert.equal(files.filter((file) => file.startsWith('0037_')).length, 1, 'exactly one 0037 migration (scheduled ingestion trigger)');
+    assert.equal(files.filter((file) => file.startsWith('0038_')).length, 1, 'exactly one 0038 migration (read-only FX source observations)');
     assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 37).length,
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 38).length,
       0,
-      'nothing is numbered after 0037',
+      'nothing is numbered after 0038',
     );
   });
 

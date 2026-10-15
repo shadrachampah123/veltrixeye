@@ -1,0 +1,20 @@
+{
+  "name": "@veltrixeye/provider-bank-of-ghana",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "VeltrixEye Bank of Ghana FX source reader (READ-ONLY: retrieves the published daily interbank USD→GHS rates page; never publishes a rate, never prices a payment)",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@veltrixeye/contracts": "*"
+  }
+}

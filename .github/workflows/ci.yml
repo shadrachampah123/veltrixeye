@@ -74,6 +74,13 @@ jobs:
           test -f packages/providers/paystack/package.json
           test -f packages/providers/paystack/src/index.ts
           echo "Paystack workspace present and resolvable"
+          echo "Checking Dockerfile for Bank of Ghana source-reader workspace packaging..."
+          grep -F "packages/providers/bank-of-ghana/package.json" Dockerfile
+          grep -F "packages/providers/bank-of-ghana/src" Dockerfile
+          node -e "const p = require.resolve('@veltrixeye/provider-bank-of-ghana'); console.log('resolved', p)"
+          test -f packages/providers/bank-of-ghana/package.json
+          test -f packages/providers/bank-of-ghana/src/index.ts
+          echo "Bank of Ghana source-reader workspace present and resolvable"
 
       - name: Test (all workspaces, including safety)
         id: test

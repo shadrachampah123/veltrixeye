@@ -481,12 +481,12 @@ describe('live plan registration — evidence assembly', () => {
 describe('live plan registration — fail-closed gates', () => {
   test('migration 0035 is present and applied (the live epoch schema)', async () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
-    assert.equal(status.expectedCount, 37);
-    assert.equal(status.appliedCount, 37);
+    assert.equal(status.expectedCount, 38);
+    assert.equal(status.appliedCount, 38);
     // 0035 is the newest migration OF THIS STEP; 0036 (non-commercial operator
-    // grants) and 0037 (scheduled ingestion trigger) legitimately follow it
-    // and are named here deliberately.
-    assert.equal(status.latestApplied, '0037_scheduled_ingestion_trigger.sql');
+    // grants), 0037 (scheduled ingestion trigger) and 0038 (read-only FX source
+    // observations) legitimately follow it and are named here deliberately.
+    assert.equal(status.latestApplied, '0038_billing_fx_source_observations.sql');
   });
 
   test('a service that is not explicitly live refuses before anything is read or written', async () => {
