@@ -24,7 +24,7 @@
  */
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FX_SOURCE_ADVISORY_LOCK_KEY } from '@veltrixeye/contracts';
@@ -376,6 +376,53 @@ describe('check 7 — downstream intent (D7)', () => {
     assert.equal(result.valid, true, JSON.stringify(result.issues));
     assert.equal(result.candidate!.registrant, 'operator-registrar');
     assert.equal(result.candidate!.epochRegistrationPlanned, true);
+  });
+});
+
+describe('the authority has exactly ONE application-level writer', () => {
+  const authority = (): string =>
+    readFileSync(path.join(REPO_ROOT, 'packages', 'core', 'src', 'billing', 'fx-rate-versions.ts'), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+
+  test('the unguarded legacy publish() method is GONE from the authority module', () => {
+    // The removed method accepted a nullable source_reference / created_by, ran no
+    // freshness, ordering, drift or plausibility check and wrote no audit event —
+    // a complete bypass of D1–D10. It must not come back.
+    assert.doesNotMatch(authority(), /\basync\s+publish\s*\(/, 'no publication method on the store');
+    assert.doesNotMatch(authority(), /PublishFxRateVersionInput/, 'its input contract was removed with it');
+  });
+
+  test('the authority module contains no INSERT at all', () => {
+    assert.doesNotMatch(
+      authority(),
+      /INSERT INTO\s+billing_fx_rate_versions/i,
+      'the only writer is FxPublicationService; this module reads',
+    );
+  });
+
+  test('the store is READ-ONLY: it resolves and reports usability, and writes nothing', () => {
+    const source = authority();
+    assert.match(source, /export class BillingFxRateVersionStore/, 'the read API stays');
+    assert.match(source, /\basync\s+resolve\s*\(/, 'resolution stays');
+    assert.match(source, /\basync\s+isUsable\s*\(/, 'usability stays');
+    assert.doesNotMatch(source, /\bUPDATE\s+billing_/i, 'no update path');
+    assert.doesNotMatch(source, /\bDELETE\s+FROM\b/i, 'no delete path');
+  });
+
+  test('across the whole package, only fx-publication.ts inserts the authority', () => {
+    const dir = path.join(REPO_ROOT, 'packages', 'core', 'src');
+    const inserters = readdirSync(dir, { recursive: true, encoding: 'utf8' })
+      .filter((entry) => entry.endsWith('.ts'))
+      .filter((entry) =>
+        /INSERT INTO\s+billing_fx_rate_versions/i.test(
+          readFileSync(path.join(dir, entry), 'utf8')
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/^\s*\/\/.*$/gm, ''),
+        ),
+      )
+      .map((entry) => entry.replaceAll('\\', '/'));
+    assert.deepEqual(inserters, ['billing/fx-publication.ts'], 'exactly one application-level writer');
   });
 });
 

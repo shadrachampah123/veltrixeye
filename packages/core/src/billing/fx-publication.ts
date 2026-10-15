@@ -57,9 +57,11 @@ import { parseFxRateDecimal } from './fx-validation.js';
  *  - it never fetches a rate: no network call, no provider import — the rate is
  *    operator-supplied evidence, exactly like a plan code;
  *  - it never reads or writes a price, a plan, an epoch or an entitlement;
- *  - it never calls `BillingFxRateVersionStore.publish()`: it opens its own
- *    transaction, because the version row and its audit event must commit or
- *    roll back together, which the pool-scoped `publish()` cannot express;
+ *  - it does not go through `BillingFxRateVersionStore`: that store is READ-ONLY
+ *    (it resolves and reports usability). The former `publish()` method on it was
+ *    removed, so this service is the ONLY application-level writer of the
+ *    authority. It opens its own transaction because the version row and its
+ *    audit event must commit or roll back together;
  *  - it never updates or deletes a version: the only new statements are one
  *    `INSERT` into the authority table and one audit `INSERT`.
  *

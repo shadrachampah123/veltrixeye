@@ -935,14 +935,18 @@ minimum subset, not the whole set. No gate was widened.
   has been provisioned (AC5 capability verified, four plan IDs pending — the
   Step 4 runbook below).
 - **FX publishing is an operator action, not a feature.** `billing_fx_rate_versions`
-  is append-only and written through `BillingFxRateVersionStore.publish()`, by
-  direct operator approval only; PR3 shipped the authority, the resolution
-  rules and the tests, not a rate feed and not an admin endpoint. The approved
-  policy (D1…D10) and its operator entry point —
-  `npm run billing:fx:publish`, which defaults to a dry run and writes only
-  through `FxPublicationService.publish()` inside one transaction with its
-  `billing.fx_rate_published` audit event — are specified in *FX publication
-  policy*. There is still **no HTTP route** that publishes an FX rate.
+  is append-only, and its **only** writer is `FxPublicationService.publish()`
+  (`packages/core/src/billing/fx-publication.ts`), reached through
+  `npm run billing:fx:publish` — which defaults to a dry run and writes the
+  version together with its `billing.fx_rate_published` audit event in ONE
+  transaction, by direct operator approval only. **There is no other
+  application-level route to the authority:** the former
+  `BillingFxRateVersionStore.publish()` method accepted a nullable
+  `source_reference` / `created_by`, ran no freshness or plausibility check and
+  recorded no audit event, so it was **removed** (the store is now read-only);
+  see *FX publication policy*. PR3 shipped the authority, the resolution rules
+  and the tests, not a rate feed and not an admin endpoint, and there is still
+  **no HTTP route** that publishes an FX rate.
 
 ## Later billing PRs
 
@@ -1939,10 +1943,18 @@ written), 2 usage/configuration error.
 2. **Confirm authorization and environment.** This run uses **test/sandbox
    mode only** (`sk_test_` elsewhere; this module reads no key at all). Live
    mode is refused by the code and forbidden here.
-3. **Publish the FX version first.** Insert the operator-approved USD→GHS rate
-   via `BillingFxRateVersionStore.publish({ fxRateScaled, fxRateScale, effectiveFrom, capturedAt, source: 'ops', … })`
-   with `effective_from = captured_at`. Registration must run within
-   **900 seconds** of `captured_at`.
+3. **Publish the FX version first — through the guarded publication flow.**
+   Run `npm run billing:fx:publish` (dry run first, then `--apply`), supplying
+   the exact decimal rate, the corroborating `--reference`, a `--reason`, the
+   executing operator (`--by`) and **two distinct approvers** (`--approver`
+   twice), with `--captured-at` set to the adoption instant and
+   `--effective-from` defaulting to it. There is **no other way to publish**: the
+   command runs the eight mandatory checks (D1–D10) and writes the version plus
+   its `billing.fx_rate_published` audit event in one transaction.
+   Registration must run within **900 seconds** of `captured_at`, taking the
+   published version's id from the command's output as `--fx-rate-version`.
+   *(Before this change the runbook instructed a raw
+   `BillingFxRateVersionStore.publish()` call; that method no longer exists.)*
 4. **Create the four plans in the Paystack Dashboard** (manual, test
    environment — the adapter never mutates plans): plan names for Pro/Elite ×
    monthly/annual, currency **GHS**, interval **monthly**/**annually**, **no
@@ -2384,11 +2396,19 @@ figure remains an operator decision, taken outside this tooling.
 
 Publishing an authoritative USD→GHS rate version is the step that used to have
 **no implementation**: PR3 shipped the authority, the resolution rules and the
-tests, and `BillingFxRateVersionStore.publish()` was reachable only out-of-band
-(see *Operational notes* → **FX publishing is an operator action, not a
-feature**). The approved policy below — **D1…D10** — is now enforced by
+tests, and the former `BillingFxRateVersionStore.publish()` was reachable only
+out-of-band (see *Operational notes* → **FX publishing is an operator action,
+not a feature**). The approved policy below — **D1…D10** — is enforced by
 `packages/core/src/billing/fx-publication.ts` (the boundary) and
 `scripts/billing/fx-publish.ts` (the operator entry point).
+
+**There is exactly one application-level writer.** `BillingFxRateVersionStore`
+is **read-only** (`resolve` / `isUsable`): its unguarded `publish()` method was
+**removed** so that no code path can write an authoritative version while
+skipping the policy — that method accepted a nullable `source_reference` and
+`created_by`, ran no freshness, ordering, drift or plausibility check, and wrote
+no audit event. A regression test pins that the authority's only writer is this
+service, and that the store exposes no write surface.
 
 **Source observation and authoritative publication are different acts.**
 `billing:fx:source:probe` and the observation layer *observe* what an approved

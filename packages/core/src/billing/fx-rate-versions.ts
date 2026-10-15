@@ -33,15 +33,20 @@ import { Errors } from '../errors.js';
  * WHAT THIS MODULE NEVER DOES
  *  - It makes NO network call, of any kind. Rates are never fetched from a
  *    market feed, a provider API, a browser or a client. The only I/O is
- *    Postgres, and only through the repository at the bottom of this file
- *    (`BillingFxRateVersionStore`), which is optional to use — the resolver
- *    itself is pure.
+ *    Postgres, and only through the READ-ONLY repository at the bottom of this
+ *    file (`BillingFxRateVersionStore`, which resolves and reports usability) —
+ *    the resolver itself is pure.
  *  - It never converts, rounds or computes a payable amount: that is
  *    `./pricing.ts`, which consumes a resolved version through the pure
  *    `toBillingFxSnapshot()` below.
- *  - It never accepts a rate supplied by a caller outside the platform's own
- *    durable authority. `BillingFxRateVersionStore.publish()` is the only
- *    writing path, and it writes a new immutable version (never an update).
+ *  - It never WRITES. This module holds no publication path at all: the only
+ *    approved writer of an authoritative version is
+ *    `FxPublicationService.publish()` (`./fx-publication.ts`), which requires
+ *    operator evidence and approval, runs the eight mandatory pre-publication
+ *    checks, and commits the version together with its
+ *    `billing.fx_rate_published` audit event. The former `publish()` method on
+ *    the store below was REMOVED so no unguarded application-level route to the
+ *    authority can exist.
  *
  * Callers inject the time they price at (`asOf`). Nothing in this file reads a
  * clock implicitly, so pricing is reproducible and testable.
@@ -354,57 +359,35 @@ export function fxRateVersionKey(params: {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Durable authority (the ONLY writer of rate versions)                       */
+/* Durable authority — READ access only (the only WRITER is fx-publication.ts) */
 /* -------------------------------------------------------------------------- */
 
-export interface PublishFxRateVersionInput {
-  fxRateScaled: bigint;
-  fxRateScale: number;
-  effectiveFrom: Date;
-  capturedAt?: Date;
-  source: BillingFxSource;
-  sourceReference?: string | null;
-  createdBy?: string | null;
-  roundingMode?: BillingRoundingMode;
-}
-
 /**
- * Postgres-backed authority for FX rate versions.
+ * Postgres-backed **read** access to the FX authority.
  *
- * `publish()` APPENDS a version (an immutable row). There is no update path and
- * no delete path, by construction here and by trigger in migration 0032: a
- * published rate can never be edited or re-dated, so a payment that was priced
- * at 09:00 can still be explained later.
+ * This store has NO writing path. It can resolve the version in force and answer
+ * whether a usable version exists; it cannot insert, update or delete.
+ *
+ * The ONLY approved writer is `FxPublicationService.publish()`
+ * (`./fx-publication.ts`), which requires operator evidence (a named executor,
+ * two distinct approvers, a source reference and a reason), runs the eight
+ * mandatory pre-publication checks, and writes the version row and its
+ * `billing.fx_rate_published` audit event in ONE transaction. Removing the
+ * former `publish()` method here deliberately closed the last application-level
+ * route that could write an authoritative rate WITHOUT those safeguards — a
+ * route that accepted a nullable `source_reference` / `created_by`, ran no
+ * freshness or plausibility check, and recorded no audit event.
+ *
+ * A published version is immutable regardless of the writing path: there is no
+ * update path and no delete path here, by construction, and by trigger in
+ * migration 0032, so a payment that was priced at 09:00 can still be explained
+ * later.
  */
 export class BillingFxRateVersionStore {
   constructor(
     private readonly db: Pool,
     private readonly policy: BillingFxPolicy = BILLING_FX_POLICY,
   ) {}
-
-  async publish(input: PublishFxRateVersionInput): Promise<BillingFxRateVersion> {
-    const capturedAt = input.capturedAt ?? new Date();
-    const { rows } = await this.db.query(
-      `INSERT INTO billing_fx_rate_versions
-         (base_currency, quote_currency, fx_rate_scaled, fx_rate_scale, rounding_mode,
-          source, source_reference, created_by, effective_from, captured_at, published_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
-       RETURNING *`,
-      [
-        this.policy.baseCurrency,
-        this.policy.quoteCurrency,
-        input.fxRateScaled.toString(),
-        input.fxRateScale,
-        input.roundingMode ?? this.policy.roundingMode,
-        input.source,
-        input.sourceReference ?? null,
-        input.createdBy ?? null,
-        input.effectiveFrom,
-        capturedAt,
-      ],
-    );
-    return parseFxRateVersion(rows[0]);
-  }
 
   /**
    * Resolve the version in force at `asOf`. Only versions already effective are

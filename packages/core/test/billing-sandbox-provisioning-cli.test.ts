@@ -55,14 +55,13 @@ import { fileURLToPath } from 'node:url';
 import type { Pool } from 'pg';
 import {
   BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION,
-  BillingFxRateVersionStore,
   BillingPlanProvisioningService,
   EXCLUDED_PROVIDER_PLAN_CODE,
   cataloguePriceMinor,
   computePaymentAmountMinor,
   providerIntervalForBillingInterval,
 } from '../src/index.js';
-import { retireActiveEpochs, startBillingTestDb } from './helpers/billing-checkout.js';
+import { insertFxVersion, retireActiveEpochs, startBillingTestDb } from './helpers/billing-checkout.js';
 
 // Unique per suite file (see the port ledger across packages/core/test/*.test.ts).
 const DB_PORT = 5549;
@@ -104,7 +103,8 @@ after(async () => {
 /* ========================================================================== */
 
 /**
- * Publish an operator FX version at a distinct anchor offset. Defaults are
+ * Insert an operator FX version FIXTURE at a distinct anchor offset. Defaults are
+ * fresh, so the guarded provisioning run under test accepts them. Defaults are
  * fresh (30 s + tick) for the real-clock child process; `capturedSecondsBefore
  * = 1000` models a version that has aged past the 900-second policy bound.
  */
@@ -113,8 +113,7 @@ async function publishFxNow(options: { rateScaled?: bigint; capturedSecondsBefor
   // Every version sits at a strictly distinct offset from the anchor, so the
   // durable uniqueness index can never collide within this suite.
   const capturedAt = new Date(FX_ANCHOR - ((options.capturedSecondsBefore ?? 30) + tick) * 1000);
-  const fxVersions = new BillingFxRateVersionStore(pool);
-  return fxVersions.publish({
+  return insertFxVersion(pool, {
     fxRateScaled: options.rateScaled ?? 12_500_000n,
     fxRateScale: 6,
     effectiveFrom: capturedAt,

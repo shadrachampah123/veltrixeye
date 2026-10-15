@@ -23,7 +23,6 @@ import path from 'node:path';
 import {
   BILLING_CATALOGUE_VERSION,
   BILLING_PRICING_POLICY_VERSION,
-  BillingFxRateVersionStore,
   BillingPlanProvisioningService,
   BillingProviderPlanStore,
   MIGRATIONS_DIR,
@@ -36,7 +35,7 @@ import {
   providerIntervalForBillingInterval,
   EXCLUDED_PROVIDER_PLAN_CODE,
 } from '../src/index.js';
-import { startBillingTestDb, retireActiveEpochs } from './helpers/billing-checkout.js';
+import { insertFxVersion, startBillingTestDb, retireActiveEpochs } from './helpers/billing-checkout.js';
 
 // Unique per suite file (see the port ledger in helpers/billing-checkout.ts).
 const DB_PORT = 5495;
@@ -62,7 +61,6 @@ after(async () => {
 /** An operator-driven registration for ONE instant (anchored to the real clock). */
 function provisioning() {
   const registeredAt = new Date();
-  const fxVersions = new BillingFxRateVersionStore(db.pool);
   let sequence = 0;
   return {
     service: new BillingPlanProvisioningService({ db: db.pool, now: () => registeredAt }),
@@ -71,7 +69,7 @@ function provisioning() {
       // A distinct effective instant per publication within one test (the
       // authority pins one version per pair per instant).
       const tick = sequence++;
-      return fxVersions.publish({
+      return insertFxVersion(db.pool, {
         fxRateScaled: rateScaled,
         fxRateScale: 6,
         effectiveFrom: effectiveFrom ?? new Date(registeredAt.getTime() - (capturedSecondsBefore + tick) * 1000),

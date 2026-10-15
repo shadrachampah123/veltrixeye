@@ -8,7 +8,8 @@ import {
   billingVerifiedTransactionEvidenceHash, billingVerifiedTransactionIdempotencyKey,
   createPool, runMigrations, MIGRATIONS_DIR, BILLING_CATALOGUE_VERSION,
   BILLING_PRICING_POLICY_VERSION, BillingPricingSnapshotStore,
-  cataloguePriceMinor, computePaymentAmountMinor, priceFromProviderPlanEpoch,
+  cataloguePriceMinor, computePaymentAmountMinor, parseFxRateVersion, priceFromProviderPlanEpoch,
+  type BillingFxRateVersion,
 } from '../../src/index.js';
 import { internalPlanForCommercialPlan } from '@veltrixeye/contracts';
 import type { BillingInterval, BillingProviderMode, CommercialPlanId } from '@veltrixeye/contracts';
@@ -43,6 +44,55 @@ export async function insertFx(pool: Pool, rateScaled = 12_500_000) {
      VALUES ($1,6,'ops',$2,$2) RETURNING *`, [rateScaled, captured],
   );
   return rows[0]!;
+}
+
+/**
+ * Insert ONE FX version row DIRECTLY, for fixtures that must model instants the
+ * approved publication path would — correctly — refuse: a version already aged
+ * past the 900-second bound, or one planted to collide with a later publication.
+ *
+ * WHY A DIRECT INSERT RATHER THAN THE PUBLICATION SERVICE. The application has
+ * exactly one approved writer (`FxPublicationService.publish()`, which requires
+ * operator evidence, two approvers, the eight checks and a transactional audit
+ * event). That path deliberately refuses a stale or colliding version, so a test
+ * that needs to *set up* such a state must write the row itself — the same
+ * fixture pattern `insertFx` above and `billing-pr3-migrations.test.ts` already
+ * use. This is a test fixture, never an application path.
+ *
+ * The row is read back through the authority's OWN parser, so a fixture can
+ * never drift from the shape production stores (scaled bigint, real `Date`s).
+ */
+export async function insertFxVersion(
+  pool: Pool,
+  input: {
+    fxRateScaled?: bigint;
+    fxRateScale?: number;
+    effectiveFrom: Date;
+    capturedAt?: Date;
+    source?: string;
+    sourceReference?: string | null;
+    createdBy?: string | null;
+    roundingMode?: string;
+  },
+): Promise<BillingFxRateVersion> {
+  const { rows } = await pool.query(
+    `INSERT INTO billing_fx_rate_versions
+       (base_currency, quote_currency, fx_rate_scaled, fx_rate_scale, rounding_mode,
+        source, source_reference, created_by, effective_from, captured_at, published_at)
+     VALUES ('USD', 'GHS', $1, $2, $3, $4, $5, $6, $7, $8, now())
+     RETURNING *`,
+    [
+      (input.fxRateScaled ?? 12_500_000n).toString(),
+      input.fxRateScale ?? 6,
+      input.roundingMode ?? 'half_up',
+      input.source ?? 'ops',
+      input.sourceReference ?? null,
+      input.createdBy ?? null,
+      input.effectiveFrom,
+      input.capturedAt ?? input.effectiveFrom,
+    ],
+  );
+  return parseFxRateVersion(rows[0]);
 }
 
 export async function insertEpoch(pool: Pool, options: {

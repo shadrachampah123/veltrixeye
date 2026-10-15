@@ -43,7 +43,6 @@ import {
   BILLING_CATALOGUE_VERSION,
   BILLING_PRICING_POLICY_VERSION,
   BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION,
-  BillingFxRateVersionStore,
   BillingLivePlanRegistrationService,
   BillingPlanProvisioningService,
   BillingProviderPlanStore,
@@ -64,7 +63,7 @@ import {
   buildLivePlanRegistrationEvidence,
   prepareSandboxProvisioningBatch,
 } from '../src/index.js';
-import { retireActiveEpochs, seedCommercialSubscription, startBillingTestDb, insertUser } from './helpers/billing-checkout.js';
+import { insertFxVersion, retireActiveEpochs, seedCommercialSubscription, startBillingTestDb, insertUser } from './helpers/billing-checkout.js';
 
 // Unique per suite file: every DB-backed core suite binds its own port.
 const DB_PORT = 5533;
@@ -110,9 +109,8 @@ let fxSequence = 0;
 
 /** Publish an operator FX version INSIDE the freshness window of the batch. */
 async function publishFx(rateScaled = 12_500_000n, capturedSecondsBefore = 120) {
-  const fxVersions = new BillingFxRateVersionStore(pool);
   const capturedAt = new Date(REGISTERED_AT.getTime() - (capturedSecondsBefore + fxSequence++) * 1000);
-  return fxVersions.publish({
+  return insertFxVersion(pool, {
     fxRateScaled: rateScaled,
     fxRateScale: 6,
     effectiveFrom: capturedAt,
@@ -129,9 +127,8 @@ async function publishFx(rateScaled = 12_500_000n, capturedSecondsBefore = 120) 
  * live freshness window at the moment it runs.
  */
 async function publishFxNow(capturedSecondsBefore = 30) {
-  const fxVersions = new BillingFxRateVersionStore(pool);
   const capturedAt = new Date(Date.now() - (capturedSecondsBefore + fxSequence++) * 1000);
-  return fxVersions.publish({
+  return insertFxVersion(pool, {
     fxRateScaled: 12_500_000n,
     fxRateScale: 6,
     effectiveFrom: capturedAt,

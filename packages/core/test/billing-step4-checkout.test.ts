@@ -28,7 +28,6 @@ import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import {
   BillingCheckoutService,
-  BillingFxRateVersionStore,
   BillingPlanProvisioningService,
   BillingPricingSnapshotStore,
   createBillingProviderRegistry,
@@ -45,6 +44,7 @@ import {
   startBillingTestDb,
   insertEpoch,
   insertFx,
+  insertFxVersion,
   insertUser,
   retireActiveEpochs,
   retireEpoch,
@@ -105,7 +105,7 @@ type Combo = 'pro/monthly' | 'pro/annual' | 'elite/monthly' | 'elite/annual';
 
 async function provisionSandboxEpochs(rateScaled = 12_500_000n) {
   const registeredAt = new Date();
-  const fx = await new BillingFxRateVersionStore(db.pool).publish({
+  const fx = await insertFxVersion(db.pool, {
     fxRateScaled: rateScaled,
     fxRateScale: 6,
     effectiveFrom: new Date(registeredAt.getTime() - 300_000),
