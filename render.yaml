@@ -141,6 +141,31 @@ services:
       # is not retried on every scanner tick.
       - key: INGESTION_MIN_INTERVAL_MS
         value: '900000'
+      # --- Billing FX source observations (read-only monitoring) ---
+      # Reads the Bank of Ghana's published daily interbank USD->GHS rates page
+      # and records what it published in an append-only table
+      # (billing_fx_source_observations). It NEVER publishes a billing rate,
+      # never prices a payment and cannot bypass the need_source approval
+      # boundary: the FX authority (billing_fx_rate_versions) is untouched.
+      #
+      # OFF by default, deliberately. The publisher's page has not been verified
+      # live from the build environment, so the schedule stays disabled until an
+      # operator runs the read-only probe against a networked environment and
+      # confirms the page parses:
+      #   npm run billing:fx:source:probe -- --dry-run
+      # (or calls the internal route with the token below). Turning it on before
+      # that would record a typed `unparseable` failure on every run.
+      - key: FX_SOURCE_CHECK_ENABLED
+        value: 'false'
+      - key: FX_SOURCE_CHECK_INTERVAL_MS
+        value: '21600000'
+      - key: FX_SOURCE_PROVIDER_TIMEOUT_MS
+        value: '15000'
+      # Shared secret for POST /api/internal/billing/fx/source-check, so an
+      # external scheduler (Render Cron Job) can run a sleep-safe observation
+      # check. Empty = that route returns 404 (no administrative surface).
+      - key: FX_SOURCE_WORKER_TOKEN
+        sync: false
       # --- M8.6 deployment-level global kill switch ---
       # 'true' pins the platform-wide emergency stop ON for every account
       # regardless of database state (new execution + paper simulation

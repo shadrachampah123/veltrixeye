@@ -12,8 +12,9 @@
 #
 # Notes
 #  - The API runs TypeScript directly through `tsx`: the workspace packages
-#    (@veltrixeye/core, @veltrixeye/contracts, @veltrixeye/provider-twelve-data)
-#    are consumed as TS sources, so there is no compile step
+#    (@veltrixeye/core, @veltrixeye/contracts, @veltrixeye/provider-twelve-data,
+#    @veltrixeye/provider-paystack, @veltrixeye/provider-bank-of-ghana) are
+#    consumed as TS sources, so there is no compile step
 #    (`npm run api:build` is a strict typecheck). `tsx` is therefore a
 #    *runtime* dependency of the API workspace.
 #  - No secrets are baked in. Every value comes from the environment, and the
@@ -35,6 +36,7 @@ COPY packages/contracts/package.json packages/contracts/
 COPY packages/core/package.json packages/core/
 COPY packages/providers/twelve-data/package.json packages/providers/twelve-data/
 COPY packages/providers/paystack/package.json packages/providers/paystack/
+COPY packages/providers/bank-of-ghana/package.json packages/providers/bank-of-ghana/
 COPY apps/api/package.json apps/api/
 COPY apps/web/package.json apps/web/
 RUN npm ci --omit=dev --workspace @veltrixeye/api
@@ -69,6 +71,10 @@ COPY --chown=node:node packages/providers/twelve-data/package.json packages/prov
 COPY --chown=node:node packages/providers/twelve-data/src packages/providers/twelve-data/src
 COPY --chown=node:node packages/providers/paystack/package.json packages/providers/paystack/package.json
 COPY --chown=node:node packages/providers/paystack/src packages/providers/paystack/src
+# Read-only Bank of Ghana FX source reader — the API composes it for the
+# read-only observation check. It publishes nothing and holds no credential.
+COPY --chown=node:node packages/providers/bank-of-ghana/package.json packages/providers/bank-of-ghana/package.json
+COPY --chown=node:node packages/providers/bank-of-ghana/src packages/providers/bank-of-ghana/src
 COPY --chown=node:node apps/api/package.json apps/api/package.json
 COPY --chown=node:node apps/api/tsconfig.json apps/api/tsconfig.json
 COPY --chown=node:node apps/api/src apps/api/src

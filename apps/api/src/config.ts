@@ -260,6 +260,42 @@ const baseEnvSchema = z.object({
   SCANNER_WORKER_TOKEN: z.string().max(256).default(''),
 
   /* ---------------------------------------------------------------------- */
+  /* Billing FX source observations (read-only monitoring)                   */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Run the read-only Bank of Ghana USD→GHS observation check inside the API
+   * process on an interval. DISABLED by default: the publisher's page shape has
+   * not been verified live from this environment, so enabling the schedule is a
+   * deliberate operator decision taken after a probe, not a default.
+   *
+   * This observes what an approved publisher published and records it in an
+   * append-only table. It never publishes a billing rate and never prices
+   * anything.
+   */
+  FX_SOURCE_CHECK_ENABLED: boolEnv(false),
+  /**
+   * Interval between in-process observation checks. Central-bank figures are
+   * published once per business day, so the default (6 hours) is already far
+   * more frequent than the data changes; the dedup key makes a too-frequent
+   * schedule harmless. Safe alongside an external scheduler: both paths
+   * serialize through the pinned FX observation advisory lock.
+   */
+  FX_SOURCE_CHECK_INTERVAL_MS: intEnv(300_000, 86_400_000, 21_600_000),
+  /**
+   * Per-request timeout for the single outbound read of the publisher's page.
+   * The read is ONE attempt with no retry; the next scheduled check is the
+   * retry.
+   */
+  FX_SOURCE_PROVIDER_TIMEOUT_MS: intEnv(1_000, 120_000, 15_000),
+  /**
+   * Shared secret for `POST /api/internal/billing/fx/source-check`.
+   * EMPTY = that route does not exist (404), so an unconfigured deployment
+   * exposes no administrative surface at all.
+   */
+  FX_SOURCE_WORKER_TOKEN: z.string().max(256).default(''),
+
+  /* ---------------------------------------------------------------------- */
   /* P1 — scheduled / pre-emptive candle ingestion                           */
   /* ---------------------------------------------------------------------- */
 
@@ -486,6 +522,26 @@ export interface ScannerConfig {
 }
 
 /**
+ * Billing FX **source observation** configuration (read-only monitoring).
+ *
+ * Note what is deliberately NOT here: no publisher URL, no host, no source id
+ * and no rate. The approved publisher and its URL are constants in
+ * `@veltrixeye/contracts`, the schema pins the URL as a CHECK, and no
+ * deployment may choose who the platform treats as an authority. What IS here
+ * is only how often an operator wants the check to run, how long the read may
+ * take, and whether a token-protected internal route exists.
+ */
+export interface FxSourceConfig {
+  /** Run the observation check on an interval inside this process. */
+  enabled: boolean;
+  intervalMs: number;
+  /** Timeout for the single outbound read of the publisher's page. */
+  timeoutMs: number;
+  /** Empty ⇒ the internal FX source route is not registered (404). */
+  workerToken: string;
+}
+
+/**
  * P1 — Scheduled/pre-emptive candle ingestion.
  *
  * When enabled, the scanner worker runs a cache-warm cycle before each scan,
@@ -517,6 +573,7 @@ export type AppConfig = z.infer<typeof envSchema> & {
   trustedProxies: string[];
   notification: NotificationConfig;
   scanner: ScannerConfig;
+  fxSource: FxSourceConfig;
   scheduledIngestion: ScheduledIngestionConfig;
   billing: BillingConfig;
 };
@@ -609,6 +666,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       leaseMs: values.SCANNER_LEASE_MS,
       runRetentionDays: values.SCANNER_RUN_RETENTION_DAYS,
       workerToken: values.SCANNER_WORKER_TOKEN,
+    },
+    fxSource: {
+      enabled: values.FX_SOURCE_CHECK_ENABLED,
+      intervalMs: values.FX_SOURCE_CHECK_INTERVAL_MS,
+      timeoutMs: values.FX_SOURCE_PROVIDER_TIMEOUT_MS,
+      workerToken: values.FX_SOURCE_WORKER_TOKEN,
     },
     scheduledIngestion: {
       enabled: values.INGESTION_SCHEDULE_ENABLED,

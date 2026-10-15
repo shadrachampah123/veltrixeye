@@ -8,6 +8,7 @@ import {
 } from './app.js';
 import { startDeliveryWorkerTicker, consoleDeliveryLogger } from './delivery-worker.js';
 import { startScannerWorkerTicker, consoleScannerLogger } from './scanner-worker.js';
+import { consoleFxSourceLogger, startFxSourceTicker } from './fx-source-runner.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 import { createTwelveDataProvider } from '@veltrixeye/provider-twelve-data';
 
@@ -176,8 +177,35 @@ async function main(): Promise<void> {
     );
   }
 
+  // Billing FX source observations (read-only). Disabled by default: the
+  // publisher's page has not been verified live from this environment, so
+  // enabling the schedule is a deliberate operator decision taken after a probe
+  // (`npm run billing:fx:source:probe`). Either path — this ticker or an
+  // external scheduler calling the token-protected internal route — is safe
+  // alongside the other, and both serialize through the pinned FX observation
+  // advisory lock.
+  let fxSourceTicker: ReturnType<typeof startFxSourceTicker> | null = null;
+  if (config.fxSource.enabled) {
+    fxSourceTicker = startFxSourceTicker(ctx.fxSource, {
+      intervalMs: config.fxSource.intervalMs,
+      initialDelayMs: 10_000,
+      logger: consoleFxSourceLogger('[fx-source]'),
+    });
+    console.info(
+      `[api] FX source observation check enabled (every ${config.fxSource.intervalMs}ms, ` +
+        'read-only, never publishes a rate)',
+    );
+  } else {
+    console.info(
+      '[api] FX source observation check is disabled — enable with FX_SOURCE_CHECK_ENABLED=true, ' +
+        'or invoke via POST /api/internal/billing/fx/source-check (FX_SOURCE_WORKER_TOKEN). ' +
+        'Either way it only observes: publishing a billing FX rate stays a separate approved operation.',
+    );
+  }
+
   const shutdown = async (signal: string) => {
         console.info(`[api] ${signal} received, shutting down`);
+    await fxSourceTicker?.stop().catch(() => {});
     await scannerTicker?.stop().catch(() => {});
     await workerTicker?.stop().catch(() => {});
     await ctx.scanner.waitForInFlight().catch(() => {});

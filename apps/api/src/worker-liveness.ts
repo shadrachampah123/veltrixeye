@@ -46,7 +46,7 @@
  *    cannot distinguish from success.
  */
 
-export type BackgroundWorker = 'scanner' | 'notifications';
+export type BackgroundWorker = 'scanner' | 'notifications' | 'fxSource';
 
 interface WorkerLivenessRecord {
   lastSuccessAtMs: number | null;
@@ -74,6 +74,16 @@ export interface WorkerLivenessEntry {
 export interface WorkerLivenessSnapshot {
   scanner: WorkerLivenessEntry;
   notifications: WorkerLivenessEntry;
+  /**
+   * The read-only billing FX source observation check. Recorded on BOTH
+   * invocation paths (the in-process ticker and the token-protected internal
+   * route), so a moving `lastSuccessAt` answers the question an operator
+   * actually has: "is the observation check running at all, and did the last
+   * run actually record something?" A check that is refused, misconfigured or
+   * pointed at the wrong route leaves `successes` at 0 — which a green cron run
+   * cannot otherwise be distinguished from success by.
+   */
+  fxSource: WorkerLivenessEntry;
 }
 
 function emptyRecord(): WorkerLivenessRecord {
@@ -97,6 +107,7 @@ function emptyRecord(): WorkerLivenessRecord {
 const records: Record<BackgroundWorker, WorkerLivenessRecord> = {
   scanner: emptyRecord(),
   notifications: emptyRecord(),
+  fxSource: emptyRecord(),
 };
 
 /** Mark an invocation as started (visible as `inFlight: 1`). */
@@ -162,6 +173,7 @@ export function workerLivenessSnapshot(nowMs: number = Date.now()): WorkerLivene
   return {
     scanner: toEntry(records.scanner, nowMs),
     notifications: toEntry(records.notifications, nowMs),
+    fxSource: toEntry(records.fxSource, nowMs),
   };
 }
 
@@ -169,4 +181,5 @@ export function workerLivenessSnapshot(nowMs: number = Date.now()): WorkerLivene
 export function resetWorkerLivenessForTests(): void {
   records.scanner = emptyRecord();
   records.notifications = emptyRecord();
+  records.fxSource = emptyRecord();
 }
