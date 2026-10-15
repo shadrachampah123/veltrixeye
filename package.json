@@ -21,6 +21,7 @@
     "billing:activate": "tsx scripts/billing/activate.ts",
     "billing:grant": "tsx scripts/billing/grant-entitlements.ts",
     "billing:provision:live": "tsx scripts/billing/provision-live.ts",
+    "billing:provision:sandbox": "tsx scripts/billing/provision-sandbox.ts",
     "billing:remediate:legacy-free-row": "tsx scripts/billing/remediate-legacy-free-row.ts",
     "api:dev": "npm run dev --workspace @veltrixeye/api",
     "api:build": "npm run build --workspace @veltrixeye/api",
