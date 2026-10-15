@@ -1,4 +1,4 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
 import {
   BILLING_CREDENTIAL_SHAPED_RE,
@@ -57,6 +57,14 @@ import {
  *      2. PERSISTENCE: the validated plan — and nothing else — flows into
  *         `BillingProviderPlanStore.register()`. No new price discovery happens
  *         at persistence time.
+ *  - TWO ENTRY POINTS, one preparation: `validateSandboxPlanEpochs` runs the
+ *    FX-row read plus the whole-batch admission rules and returns the
+ *    validated batch WITHOUT opening a write path (there is no BEGIN, no
+ *    INSERT and no audit event — the dry run behind
+ *    `npm run billing:provision:sandbox`), while `registerSandboxPlanEpochs`
+ *    runs the identical preparation and then persists. Both share one
+ *    preparation routine, so a dry run can never disagree with what the write
+ *    path would accept.
  *  - VALIDATE-BEFORE-WRITE: the complete batch is validated before the first
  *    INSERT, and registration runs inside ONE database transaction, so an
  *    entry-4 failure leaves zero new rows rather than a partial batch. This
@@ -860,93 +868,25 @@ export class BillingPlanProvisioningService {
    * write-time conflict rolls everything back.
    */
   async registerSandboxPlanEpochs(input: unknown): Promise<readonly BillingProviderPlan[]> {
-    const parsed = registerSandboxPlanEpochsInputSchema.safeParse(input);
-    if (!parsed.success) {
-      throw new BillingProvisioningError(
-        'invalid_evidence',
-        `The provisioning request is malformed: ${parsed.error.issues
-          .map((issue) => `${issue.path.join('.') || '<root>'}: ${issue.message}`)
-          .join('; ')}`,
-        { cause: parsed.error },
-      );
-    }
-
-    // LIVE registrations are auditable by construction: the operator identity
-    // and the reason are mandatory, and the audit event is written on the same
-    // transaction as the epochs. Refused here — before the connection, before
-    // the FX read, before the first INSERT.
-    if (this.mode === 'live' && parsed.data.audit === undefined) {
-      throw new BillingProvisioningError(
-        'audit_required',
-        'A live provider-plan registration requires the operator audit descriptor ' +
-          '(an operator id and a stated reason). A live epoch is a real-money charge target: it is never ' +
-          'registered anonymously or without a reason recorded in the same transaction. Nothing was registered.',
-      );
-    }
-    if (parsed.data.audit !== undefined) {
-      assertAuditTextIsNotCredentialShaped(parsed.data.audit);
-    }
-
+    const request = this.parseRunRequest(input);
     // ONE registration instant per batch: the freshness window is measured
     // against it and every epoch carries it as valid_from.
-    const registeredAt = this.nowFn();
-    if (!(registeredAt instanceof Date) || !Number.isFinite(registeredAt.getTime())) {
-      throw new BillingProvisioningError(
-        'invalid_instant',
-        'The provisioning clock did not produce a finite registration instant.',
-      );
-    }
+    const registeredAt = this.registrationInstant();
 
     const client = await this.db.connect();
     try {
       await client.query('BEGIN');
 
-      // The SELECTED authoritative version — by identity, never "latest". Read
-      // as the durable ROW (the seam checkout.ts uses too): the preparation
-      // phase re-validates that exact row contract, so the batch can only ever
-      // be prepared from what the authority actually stores.
-      const selected = await client.query(
-        `SELECT id, base_currency, quote_currency, fx_rate_scaled, fx_rate_scale, rounding_mode,
-                source, source_reference, created_by, effective_from, captured_at
-           FROM billing_fx_rate_versions
-          WHERE id = $1`,
-        [parsed.data.fxRateVersionId],
-      );
-      if (selected.rows[0] === undefined) {
-        throw new BillingFxError(
-          'missing',
-          `The selected FX rate version ${parsed.data.fxRateVersionId} does not exist in the durable ` +
-            'authority. Provisioning derives every amount from an existing published version: nothing ' +
-            'is constructed, imported or promoted locally, and no newer version is silently selected.',
-        );
-      }
-
-      // The WHOLE batch validates here — before the first INSERT.
-      const batch = prepareSandboxProvisioningBatch({
-        fxVersion: selected.rows[0],
-        evidence: parsed.data.evidence,
+      // The WHOLE batch — the selected authoritative FX row plus every Step 4
+      // admission rule — validates here, before the first INSERT. The SAME
+      // routine serves the read-only validateSandboxPlanEpochs dry run, so
+      // the two paths can never disagree about what is registrable.
+      const batch = await this.prepareSelectedBatch(
+        client,
+        request.fxRateVersionId,
+        request.evidence,
         registeredAt,
-        mode: this.mode,
-      });
-      if (batch.fxVersion.id !== parsed.data.fxRateVersionId) {
-        // Defensive: the selected id is the batch identity, retained verbatim.
-        throw new BillingProvisioningError(
-          'shared_fx_violation',
-          'The validated batch does not pin the operator-selected FX version. Nothing was registered.',
-        );
-      }
-
-      // One shared FX version id across all four registrations — the batch
-      // invariant is re-asserted over what will actually be written.
-      for (const registration of batch.registrations) {
-        if (registration.fxRateVersionId !== parsed.data.fxRateVersionId) {
-          throw new BillingProvisioningError(
-            'shared_fx_violation',
-            `Registration ${registration.cataloguePlan}/${registration.interval} does not pin the operator-selected ` +
-              'FX version. Nothing was registered.',
-          );
-        }
-      }
+      );
 
       const store = new BillingProviderPlanStore(client, undefined, this.mode);
       const registered: BillingProviderPlan[] = [];
@@ -974,7 +914,7 @@ export class BillingPlanProvisioningService {
       // The transactional audit event — on the SAME client/transaction as the
       // four epochs, and only after all four registered. A batch that cannot
       // record who authorized it does not exist.
-      const audit = parsed.data.audit;
+      const audit = request.audit;
       if (audit !== undefined) {
         try {
           await recordAuditEvent(client, {
@@ -982,12 +922,12 @@ export class BillingPlanProvisioningService {
             entityType: 'billing_provider_plan',
             // The batch identity is the ONE FX version all four epochs pin;
             // every epoch id is listed in the metadata below.
-            entityId: registered[0]?.fxRateVersionId ?? parsed.data.fxRateVersionId,
+            entityId: registered[0]?.fxRateVersionId ?? request.fxRateVersionId,
             metadata: {
               mode: this.mode,
               operatorId: audit.operatorId,
               reason: audit.reason,
-              fxRateVersionId: parsed.data.fxRateVersionId,
+              fxRateVersionId: request.fxRateVersionId,
               registeredAt: registeredAt.toISOString(),
               pricingPolicyVersion: registered[0]?.pricingPolicyVersion ?? null,
               catalogueVersion: registered[0]?.catalogueVersion ?? null,
@@ -1027,5 +967,153 @@ export class BillingPlanProvisioningService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * The DRY-RUN sibling of {@link registerSandboxPlanEpochs}: the identical
+   * input contract, the identical by-identity FX-row read and the identical
+   * whole-batch preparation — but this path NEVER opens a write. There is no
+   * BEGIN, no INSERT and no audit event: the method cannot persist anything,
+   * and it returns the fully validated batch — exactly what
+   * `registerSandboxPlanEpochs` would persist for the same request.
+   *
+   * Every refusal the write path surfaces is surfaced here first: a missing,
+   * malformed, wrong-pair, not-yet-effective or stale (>900 s) FX version; any
+   * shape, mapping, mode, currency, cap, code, exclusion or amount violation
+   * in the evidence; and — in LIVE mode — a missing or credential-shaped
+   * operator audit descriptor (`audit_required`), so a dry run can never
+   * report success for a request the write path would refuse.
+   */
+  async validateSandboxPlanEpochs(input: unknown): Promise<ValidatedSandboxProvisioningBatch> {
+    const request = this.parseRunRequest(input);
+    const registeredAt = this.registrationInstant();
+
+    const client = await this.db.connect();
+    try {
+      // Read-only: the shared preparation routine above a single SELECT — no
+      // transaction is opened, so nothing in this path can write.
+      return await this.prepareSelectedBatch(
+        client,
+        request.fxRateVersionId,
+        request.evidence,
+        registeredAt,
+      );
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Parse and gate one run request — shared byte-for-byte by the dry-run and
+   * the write path: the strict input schema, the LIVE-mode audit requirement
+   * and the credential-shape refusal all apply identically to both.
+   */
+  private parseRunRequest(input: unknown): {
+    fxRateVersionId: string;
+    evidence: readonly unknown[];
+    audit?: ProvisioningAuditDescriptor;
+  } {
+    const parsed = registerSandboxPlanEpochsInputSchema.safeParse(input);
+    if (!parsed.success) {
+      throw new BillingProvisioningError(
+        'invalid_evidence',
+        `The provisioning request is malformed: ${parsed.error.issues
+          .map((issue) => `${issue.path.join('.') || '<root>'}: ${issue.message}`)
+          .join('; ')}`,
+        { cause: parsed.error },
+      );
+    }
+
+    // LIVE registrations are auditable by construction: the operator identity
+    // and the reason are mandatory, and the audit event is written on the same
+    // transaction as the epochs. Refused here — before the connection, before
+    // the FX read, before the first INSERT. The dry-run path applies the SAME
+    // gate, so it can never report a live request as registrable.
+    if (this.mode === 'live' && parsed.data.audit === undefined) {
+      throw new BillingProvisioningError(
+        'audit_required',
+        'A live provider-plan registration requires the operator audit descriptor ' +
+          '(an operator id and a stated reason). A live epoch is a real-money charge target: it is never ' +
+          'registered anonymously or without a reason recorded in the same transaction. Nothing was registered.',
+      );
+    }
+    if (parsed.data.audit !== undefined) {
+      assertAuditTextIsNotCredentialShaped(parsed.data.audit);
+    }
+    return parsed.data;
+  }
+
+  /** ONE finite registration instant per run: the freshness anchor. */
+  private registrationInstant(): Date {
+    const registeredAt = this.nowFn();
+    if (!(registeredAt instanceof Date) || !Number.isFinite(registeredAt.getTime())) {
+      throw new BillingProvisioningError(
+        'invalid_instant',
+        'The provisioning clock did not produce a finite registration instant.',
+      );
+    }
+    return registeredAt;
+  }
+
+  /**
+   * Read the OPERATOR-SELECTED FX version row — by identity, never "latest" —
+   * and prepare + pin the whole batch against it. Runs on the caller's
+   * client: inside the write transaction for `registerSandboxPlanEpochs`, on
+   * a plain read-only client for `validateSandboxPlanEpochs`, so both paths
+   * see byte-identical validation.
+   *
+   * Read as the durable ROW (the seam checkout.ts uses too): the preparation
+   * phase re-validates that exact row contract, so the batch can only ever be
+   * prepared from what the authority actually stores.
+   */
+  private async prepareSelectedBatch(
+    runner: PoolClient,
+    fxRateVersionId: string,
+    evidence: readonly unknown[],
+    registeredAt: Date,
+  ): Promise<ValidatedSandboxProvisioningBatch> {
+    const selected = await runner.query(
+      `SELECT id, base_currency, quote_currency, fx_rate_scaled, fx_rate_scale, rounding_mode,
+              source, source_reference, created_by, effective_from, captured_at
+         FROM billing_fx_rate_versions
+        WHERE id = $1`,
+      [fxRateVersionId],
+    );
+    if (selected.rows[0] === undefined) {
+      throw new BillingFxError(
+        'missing',
+        `The selected FX rate version ${fxRateVersionId} does not exist in the durable ` +
+          'authority. Provisioning derives every amount from an existing published version: nothing ' +
+          'is constructed, imported or promoted locally, and no newer version is silently selected.',
+      );
+    }
+
+    // The WHOLE batch validates here — before the first INSERT.
+    const batch = prepareSandboxProvisioningBatch({
+      fxVersion: selected.rows[0],
+      evidence,
+      registeredAt,
+      mode: this.mode,
+    });
+    if (batch.fxVersion.id !== fxRateVersionId) {
+      // Defensive: the selected id is the batch identity, retained verbatim.
+      throw new BillingProvisioningError(
+        'shared_fx_violation',
+        'The validated batch does not pin the operator-selected FX version. Nothing was registered.',
+      );
+    }
+
+    // One shared FX version id across all four registrations — the batch
+    // invariant is re-asserted over what will actually be written.
+    for (const registration of batch.registrations) {
+      if (registration.fxRateVersionId !== fxRateVersionId) {
+        throw new BillingProvisioningError(
+          'shared_fx_violation',
+          `Registration ${registration.cataloguePlan}/${registration.interval} does not pin the operator-selected ` +
+            'FX version. Nothing was registered.',
+        );
+      }
+    }
+    return batch;
   }
 }

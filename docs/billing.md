@@ -1906,6 +1906,26 @@ clauses and the lookup `SELECT` project the explicit column list).
 
 **Runbook (operator, separately authorized — sandbox only)**
 
+The run is driven by the operator CLI — `npm run
+billing:provision:sandbox` — a thin wrapper over the service below. It is a
+**dry run by default** (validation only, zero writes), requires
+`PAYSTACK_MODE` to be exactly `test` (live or unreadable configuration is
+refused before any connection), takes ONE already-published `--fx-rate-version`
+id plus `--by` / `--reason` / `--evidence`, and has **no FX publication,
+approval, rate or mode option of any kind**: publication stays the separate
+approved operation from step 3 and the `need_source` source-approval gate is
+untouched. Only an explicit `--apply` registers, and it writes the four epochs
+plus ONE transactional `billing.provider_plans_registered` audit event
+naming the operator and the reason. The provider-domain pin is never treated
+as database isolation: **`--apply` additionally refuses any `DATABASE_URL`
+that is not a verified local loopback target** — a production or unverified
+database is refused *before the first connection*, and the refusal echoes no
+part of the configured target; a committed run against a deployed database
+is therefore a separate, explicitly approved change, not something this tool
+will do silently. Dry runs are read-only and unaffected by that gate. Exit
+codes: 0 clean dry run or registered batch, 1 typed refusal (nothing
+written), 2 usage/configuration error.
+
 1. **Agree the inputs before touching anything.** This run needs: (a) the four
    plan amounts, derived from the catalogue
    (`billing-catalogue.ts` — Pro $39/mo, Pro $390/yr, Elite $99/mo,
@@ -1930,11 +1950,17 @@ clauses and the lookup `SELECT` project the explicit column list).
    (real code), `paymentCurrency: 'GHS'`, `paymentAmountMinor` (the derived
    amount as an integer), `paymentAmountExponent: 2`, `mode: 'test'`,
    `paymentCountCap: 'uncapped'`, and an `evidenceReference` provenance label
-   (e.g. the dashboard/ticket reference — never a credential).
-7. **Register.** Call
-   `BillingPlanProvisioningService.registerSandboxPlanEpochs({ fxRateVersionId, evidence })`.
-   On success it returns the four epochs in matrix order, all `active`, all
-   pinning the same `fx_rate_version_id`.
+   (e.g. the dashboard/ticket reference — never a credential). These four
+   entries are passed verbatim to the CLI as `--evidence '<json array>'` —
+   the CLI assembles nothing and invents nothing.
+7. **Register.** Run
+   `npm run billing:provision:sandbox -- --fx-rate-version <uuid> --by <operator-id> --reason <text> --evidence '<json array>'`
+   once as the dry run (nothing is written; the printed plan is the exact
+   batch `--apply` would persist), then re-run with `--apply` to commit. On
+   success it reports the four epochs in matrix order, all `active`, all
+   pinning the same `fx_rate_version_id`, together with their audit event.
+   The underlying call is
+   `BillingPlanProvisioningService.registerSandboxPlanEpochs({ fxRateVersionId, evidence, audit })`.
 8. **On ANY refusal, stop.** A `BillingProvisioningError` reason
    (`invalid_evidence`, `plan_matrix`, `interval_mismatch`, `mode_mismatch`,
    `currency_mismatch`, `exponent_mismatch`, `cap_mismatch`, `amount_mismatch`,
