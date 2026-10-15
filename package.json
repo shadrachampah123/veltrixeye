@@ -19,6 +19,7 @@
     "db:migrate": "tsx scripts/db/migrate-cli.ts",
     "billing:fx:validate": "tsx scripts/billing/fx-validate.ts",
     "billing:fx:source:probe": "tsx scripts/billing/fx-source-probe.ts",
+    "billing:fx:publish": "tsx scripts/billing/fx-publish.ts",
     "billing:activate": "tsx scripts/billing/activate.ts",
     "billing:grant": "tsx scripts/billing/grant-entitlements.ts",
     "billing:provision:live": "tsx scripts/billing/provision-live.ts",

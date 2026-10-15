@@ -153,6 +153,7 @@
 | Recurring GHS amount | **Locked at subscription creation** (`subscriptions.locked_pricing_snapshot_id`, immutable by trigger). A rate or catalogue change never reprices an existing subscriber |
 | Refunds | Use the amount **actually charged**. A refund never re-rates |
 | Disclosure | USD price (prominent) + exact GHS amount + rate, version and time. GHS is shown before payment |
+| FX publication policy | **D1–D10 approved.** Freshness stays ≤ 15 minutes and is enforced when a new chargeable epoch is registered (never by substituting a newer rate at checkout); `captured_at` is the adoption/approval instant and is never back-dated; publication requires a named operator, two distinct named approvers, a source reference and a reason; the `billing.fx_rate_published` audit event rides the same transaction as the version; corrections are forward-only; a published rate never moves a customer-facing price. See *FX publication policy* |
 | Migration 0032 | **Created in PR3** — `0032_billing_fx_and_pricing.sql`; migrations 0001–0031 are byte-identical |
 | Migration 0033 | **Created in Step 7** — `0033_billing_payment_evidence.sql`; migrations 0001–0032 stay byte-identical — append-only `billing_verified_transactions` (durable payment evidence, Paystack sandbox only, integer minor units GHS exponent 2, unique provider ref + idempotency key, `evidence_hash`, no card/secrets, preserve redaction) |
 | Paystack API integration | **Seven of eight seam operations** (`findCustomer`, `createCustomer`, `initializeCheckout`, `findSubscription` (`GET /subscription/:id_or_code`), `cancelSubscription` (non-immediate only), `verifySubscription` (`GET /transaction/verify/:reference`) — provider calls — plus `normalizeEvent`, a pure local normalization of delivered events). `POST /api/billing/checkout` initializes sandbox checkouts through `initializeCheckout` (PR-C); the Step 5.2 receiver (`POST /api/billing/webhook`) verifies deliveries and records them in `billing_provider_events` — it confirms nothing; **Step 7 `POST /api/billing/verify` verifies the caller's own checkout reference through `verifySubscription` and reconciles it against the immutable pricing snapshot before recording durable evidence in `billing_verified_transactions` — it likewise confirms no payment to entitlements**. Aggregate `implemented` stays `false`; only adapter-level `synchronizeSubscription` is unimplemented (core owns synchronization). Adapter capability is not self-service authorization |
@@ -934,10 +935,14 @@ minimum subset, not the whole set. No gate was widened.
   has been provisioned (AC5 capability verified, four plan IDs pending — the
   Step 4 runbook below).
 - **FX publishing is an operator action, not a feature.** `billing_fx_rate_versions`
-  is append-only and written through `BillingFxRateVersionStore.publish()` —
-  called out-of-band by an operator (the Step 4 runbook includes the call), by
+  is append-only and written through `BillingFxRateVersionStore.publish()`, by
   direct operator approval only; PR3 shipped the authority, the resolution
-  rules and the tests, not a rate feed and not an admin endpoint.
+  rules and the tests, not a rate feed and not an admin endpoint. The approved
+  policy (D1…D10) and its operator entry point —
+  `npm run billing:fx:publish`, which defaults to a dry run and writes only
+  through `FxPublicationService.publish()` inside one transaction with its
+  `billing.fx_rate_published` audit event — are specified in *FX publication
+  policy*. There is still **no HTTP route** that publishes an FX rate.
 
 ## Later billing PRs
 
@@ -2374,3 +2379,203 @@ pricing epoch or the catalogue; never stores the publisher's page; never sends a
 credential; and never claims a publisher's figure is *correct* — a digest proves
 what was read and when, not that the number is right. Corroborating a published
 figure remains an operator decision, taken outside this tooling.
+
+## FX publication policy (`npm run billing:fx:publish`)
+
+Publishing an authoritative USD→GHS rate version is the step that used to have
+**no implementation**: PR3 shipped the authority, the resolution rules and the
+tests, and `BillingFxRateVersionStore.publish()` was reachable only out-of-band
+(see *Operational notes* → **FX publishing is an operator action, not a
+feature**). The approved policy below — **D1…D10** — is now enforced by
+`packages/core/src/billing/fx-publication.ts` (the boundary) and
+`scripts/billing/fx-publish.ts` (the operator entry point).
+
+**Source observation and authoritative publication are different acts.**
+`billing:fx:source:probe` and the observation layer *observe* what an approved
+publisher published: they record an immutable observation, carry no authority,
+are never read by the pricing path, and hold no path to `billing_fx_rate_versions`
+(migration `0038` creates no foreign key, in either direction). Publishing is
+the separate, operator-approved act described here. Observing a figure is not
+approving it, and nothing in this feature reads an observation.
+
+### D1 — the 900-second bound, and where it is enforced
+
+`BILLING_FX_POLICY.maxAgeSeconds = 900` is **unchanged**. The bound is checked
+when a **new** price is created, and it is deliberately *not* checked when an
+existing one is reused:
+
+| Act | Freshness checked? | Where |
+| --- | --- | --- |
+| Registering a **new chargeable pricing epoch** | **Yes** | `provisioning.ts` → `assertFxRateVersionFresh(fx, registeredAt)` |
+| Computing a **new one-off price** | **Yes** | `pricing.ts` → `assertFxSnapshotFresh(fx, asOf)` |
+| Publishing a **new rate version** | **Yes** | `fx-publication.ts` → check 6 (a rate that could not price anything is not published) |
+| Plan-bound **checkout** | **No — by design** | `checkout.ts` reads the epoch's FX version **by id**: `// Exact version, never latest and never freshness.` |
+| Verifying a **locked / already-quoted** amount | **No — by design** | `verifyPricingSnapshot()` (D-8) |
+
+**The bound is never satisfied by substituting a newer rate at checkout.** A
+plan-bound checkout derives its amount from the active epoch's frozen amount and
+the epoch's own pinned FX version; it never resolves "latest". A later rate
+therefore never silently reprices an existing epoch, a quoted checkout or a
+locked subscription. Consequently, publication is **time-critical**: a version
+must be consumed (registered into an epoch) within 900 seconds of `captured_at`,
+or it is inert for new-epoch registration and must be re-published.
+
+### D2 — `captured_at` and `effective_from`
+
+- **`captured_at` is the instant the named operator *adopted/approved* this
+  rate** — the moment the human decision was taken. It is **never** the
+  publisher's bulletin time and **never** back-dated.
+- **`effective_from` is the approved effective instant**, and **defaults to
+  `captured_at`** (`--effective-from` overrides it). Freshness is measured from
+  `captured_at`.
+- `published_at` is assigned by the database (`now()`); no operator supplies it.
+
+The database enforces `captured_at <= effective_from` and
+`published_at >= captured_at`, so a version can never be back-dated and a past
+payment can never be repriced by a later insertion.
+
+> **The mistake this prevents.** Setting `captured_at` to the bulletin's
+> publication time (e.g. midnight UTC) makes the version **instantly stale**:
+> freshness is computed from `captured_at`, so a rate "captured" at midnight is
+> already ~9 hours old by a 09:00 registration and is refused at
+> `assertFxRateVersionFresh`. The refusal is safe — nothing is mispriced — but it
+> consumes the approval and the publication. `captured_at` means *when we adopted
+> this rate*, not *when the number was printed*.
+
+### D3 — required evidence
+
+A publication is refused unless all of the following are present, supplied by
+the operator and validated before any write:
+
+| Evidence | Flag | Rule |
+| --- | --- | --- |
+| Named executing operator | `--by` | Recorded as `created_by`; credential-shaped text refused |
+| **Two** named approvers | `--approver <id>` ×2 | Must be **two different** people, and **neither may be the executor** |
+| Corroborating reference | `--reference` | The bulletin/document/ticket identifier — **never a URL**, never credential-shaped |
+| Reason | `--reason` | Recorded in the audit event; there is no `reason` column on the version, by design |
+| Capture instant | `--captured-at` | Timezone-bearing ISO 8601; the adoption instant (D2) |
+| Downstream intent | `--epoch-registration-planned` / `--registrant` | A planned registration must name who will perform it |
+| Exact decimal rate | `--rate` | No exponent, sign, separator or over-precision |
+
+`source` is pinned to `ops` — the authority's own vocabulary, never free text.
+
+### D4 — the audit event is transactional
+
+Every publication writes **one `audit_events` row** with the action
+**`billing.fx_rate_published`**, on the **same transaction** as the version row,
+naming the executor, both approvers, the reason, the reference, the new version
+id, the scaled rate/scale, both timestamps, the drift figure and the previous
+version. If the audit write fails, **the publication fails and the version is
+rolled back**: `recordAuditEvent()` propagates rather than swallows, and a
+published rate with no record of who approved it is unrepresentable. Both tables
+remain append-only.
+
+### D5 — two-person authorization, and its honest limit
+
+The authorization boundary is **two distinct named approvers plus one named
+executing operator, with written per-publication approval evidence**. It **fails
+closed**: an absent, single, duplicated or executor-equal approver is refused
+before the first INSERT.
+
+**This build has NO application role model.** A repository-wide search finds no
+administrative or operator role, and there is no publication route — the CLI
+deliberately has none, exactly like `billing:activate`, `billing:grant` and
+`billing:provision:*`. Consequences that must not be papered over:
+
+- the code verifies that the **recorded identities differ**; it cannot verify
+  that an approver is a different *person*, nor that an approver is *entitled*
+  to approve;
+- the ability to publish is therefore, today, **the ability to obtain a
+  publication-capable database credential** — a credential-custody control, not
+  an authorization control.
+
+**The residual control is procedural, and is stated here rather than implied:**
+
+1. **Two named humans** per publication: one proposer who validates the evidence,
+   one independent approver who re-checks the corroboration. Neither may execute.
+2. **A named credential roster**: publication-capable credentials are held by a
+   documented, named set of people — no shared or unattributed connection.
+3. **A written approval record per publication**, taken *before* the write and
+   retained with the audit event.
+
+None of the three is enforced by this code. Closing that gap requires a real
+authorization model, which is an explicit, separate decision.
+
+### D6 — forward-only correction
+
+A published version is **never edited and never deleted** (trigger, SQLSTATE
+`27000`), and there is **no unpublish**: this feature adds no update, no delete
+and no back-dating, and none may be added. A correction is a **new version with a
+later `effective_from`**, carrying the same evidence burden plus a reference to
+the version it corrects.
+
+**The consequence, stated plainly.** An incorrect publication is
+**uncorrectable for the window between its `effective_from` and the correction's
+`effective_from`**. If epochs were registered against it, **new subscribers are
+charged that amount until those epochs are retired and replaced** (retirement is
+one-way and part of a separately approved rotation). Subscribers locked before
+the mistake are unaffected — their price is immutable. The mitigation is
+procedural, not technical: publish late, register immediately, and treat the
+15-minute window as the exposure window.
+
+### D7 — the eight mandatory pre-publication checks
+
+Every check is implemented in `fx-publication.ts` and refused (never warned) on
+failure:
+
+| # | Check | Refuses when |
+| --- | --- | --- |
+| 1 | `rate_plausibility` | The rate is inverted or more than `10×` away from the last published version |
+| 2 | `rate_precision` | The rate is not an exact decimal within the authority's precision bound |
+| 3 | `corroboration` | No usable source reference, or a reference that is a URL |
+| 4 | `drift_explained` | The move exceeds the review threshold (500 bp) without a written justification |
+| 5 | `ordering` | `effective_from` is not strictly later than the last published version's |
+| 6 | `dry_run_validation` | The authority rejects the row, the capture is in the future, the rate is not yet effective, or it is **stale** beyond 900 s (D1) |
+| 7 | `downstream_intent` | A planned epoch registration names no registrant |
+| 8 | `two_person_authorization` | Fewer than two approvers, a duplicate approver, the executor used as an approver, or credential-shaped operator text |
+
+An assessment is **never an approval**: it reports `published: false` and
+`databaseWrites: 0`.
+
+### D8/D9 — published rates never move a customer-facing price
+
+A publication writes **exactly two rows** (the FX version and its audit event)
+and nothing else. `billing_provider_plans`, `billing_pricing_snapshots`,
+`subscriptions` (including every `locked_pricing_snapshot_id`) and every Paystack
+plan identifier are left **byte-identical**; epochs keep pinning their original
+FX version. This is pinned by regression tests, not asserted.
+
+**A customer-visible GHS price changes only through a separately approved epoch
+rotation** — retire the old epoch and register a new one bound to a new provider
+plan (`billing:provision:sandbox` / `billing:provision:live`, each with its own
+operator audit descriptor). Publishing a rate alone never moves a price.
+
+### D10 — the operator tooling
+
+`npm run billing:fx:publish`:
+
+```bash
+# Dry run (default): every check runs, NOTHING is written.
+npm run billing:fx:publish -- --rate 12.550000 \
+  --reference 'BoG daily interbank FX, 2026-10-15; ticket FX-1042' \
+  --reason 'Re-adopt the corroborated USD→GHS rate for this business day.' \
+  --by operator-executor --approver operator-approver-one --approver operator-approver-two \
+  --captured-at 2026-10-15T09:00:00Z
+
+# Publish (explicit, and only against a verified LOCAL loopback database).
+npm run billing:fx:publish -- … --apply
+```
+
+- **dry run by default**; `--apply` is the only commit path, and `--dry-run` and
+  `--apply` are mutually exclusive;
+- **the loopback gate runs before the pool is constructed**: a non-loopback,
+  unparseable or query-bearing `DATABASE_URL` is refused with no connection
+  opened, and the configured target is never echoed (the shared guard in
+  `scripts/billing/local-db-guard.ts`, also used by
+  `billing:provision:sandbox` — one implementation, never two);
+- **every refusal says plainly that nothing was published**;
+- exit codes: **0** clean dry run or published version · **1** typed refusal
+  (nothing written) · **2** usage or configuration error.
+
+The CLI has no epoch, price, provider or credential path: it cannot register or
+retire an epoch, cannot touch a Paystack plan, and never fetches a rate.
