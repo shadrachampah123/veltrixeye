@@ -274,9 +274,9 @@ Existing provider variable still required for production data:
 
 ## Failure / Retry Behavior
 
-- Provider timeout → retry with backoff (max 3, base 1s, max 10s, jitter)
-- Rate limit / unavailable → retry, then mark run partial/failed
-- Malformed response → fail loudly, no persistence
+- Scanner-owned fetch deadline → typed timeout, retry with backoff (max 3, base 1s, max 10s, jitter)
+- Ingestion-mapped `rate_limited` / `provider_unavailable` → retry, then mark run partial/failed; classification uses error codes, never message text
+- Invalid request, unknown instrument, malformed response or unrelated errors → no retry; fail closed, no alert
 - Missing symbol → 400 unsupported
 - Stale data → skip, count rejection, no alert
 - DB failure → rollback, run failed, no alert

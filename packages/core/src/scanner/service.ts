@@ -21,7 +21,7 @@ import {
   type AssetClass,
   timeframeMinutes,
 } from '@veltrixeye/contracts';
-import { Errors } from '../errors.js';
+import { DomainError, Errors } from '../errors.js';
 import type { ProviderRegistry } from '../market-data/registry.js';
 import type { CandleStore } from '../market-data/candles.js';
 import type { IngestionService } from '../market-data/ingestion.js';
@@ -982,7 +982,7 @@ export class ScannerService {
         const safeMsg = sanitizeScannerError(err, this.redact);
         // Don't fail whole strategy for one instrument failure
         metrics.errors.push(`instrument ${inst.assetClass}/${inst.symbol}: ${safeMsg}`);
-        if (isProviderFailure(err)) {
+        if (isRetryableScannerFetchFailure(err)) {
           metrics.providerFailures += 1;
         }
         this.logger.warn('instrument scan failed', {
@@ -1388,7 +1388,7 @@ export class ScannerService {
         return normalized;
       } catch (err) {
         lastError = err;
-        if (isProviderFailure(err) || isTimeoutError(err)) {
+        if (isRetryableScannerFetchFailure(err)) {
           if (attempt < this.maxRetries) {
             const delayMs = Math.min(this.retryBaseMs * 2 ** attempt + Math.random() * 500, this.retryMaxMs);
             this.logger.warn('provider fetch failed, retrying', {
@@ -1414,7 +1414,7 @@ export class ScannerService {
   private async withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
     let timeoutId: NodeJS.Timeout;
     const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error(`Provider timeout after ${timeoutMs}ms`)), timeoutMs);
+      timeoutId = setTimeout(() => reject(new ScannerFetchTimeoutError(timeoutMs)), timeoutMs);
     });
     try {
       const result = await Promise.race([promise, timeoutPromise]);
@@ -1745,17 +1745,16 @@ function toScannerRunDto(row: ScannerRunRow): ScannerRunDto {
   };
 }
 
-function isProviderFailure(err: unknown): boolean {
-  if (err instanceof Error) {
-    const msg = err.message.toLowerCase();
-    return msg.includes('provider') || msg.includes('rate limit') || msg.includes('unavailable') || msg.includes('timeout');
+/** Only the scanner's own deadline and ingestion's mapped transient provider errors are retryable.
+ * No message text (including provider-controlled text in a cause) is trusted for classification. */
+class ScannerFetchTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Provider timeout after ${timeoutMs}ms`);
+    this.name = 'ScannerFetchTimeoutError';
   }
-  return false;
 }
 
-function isTimeoutError(err: unknown): boolean {
-  if (err instanceof Error) {
-    return err.message.toLowerCase().includes('timeout');
-  }
-  return false;
+export function isRetryableScannerFetchFailure(err: unknown): boolean {
+  return err instanceof ScannerFetchTimeoutError ||
+    (err instanceof DomainError && (err.code === 'provider_unavailable' || err.code === 'rate_limited'));
 }

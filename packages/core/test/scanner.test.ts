@@ -6,6 +6,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 
+import { isRetryableScannerFetchFailure } from '../src/scanner/service.js';
+
 import {
   ProviderError,
   type Candle,
@@ -34,6 +36,7 @@ import {
   StubAlertSender,
   NotificationOutbox,
   ScannerService,
+  Errors,
   normalizeSymbol,
   normalizeTimeframe,
   normalizeCandle,
@@ -74,6 +77,21 @@ let providerRegistry: ReturnType<typeof createProviderRegistry>;
 
 const uniqueEmail = () => `scanner_${randomBytes(6).toString('hex')}@example.com`;
 const PASSWORD = 'correct-horse-42';
+
+test('scanner retries only typed transient failures, never message-shaped failures', () => {
+  assert.equal(isRetryableScannerFetchFailure(Errors.providerUnavailable('upstream failed')), true);
+  assert.equal(isRetryableScannerFetchFailure(Errors.rateLimited('try again')), true);
+  for (const err of [
+    Errors.invalidInput('provider timeout unavailable'),
+    Errors.notFound('provider rate limit'),
+    Errors.internal('provider unavailable'),
+    new Error('provider timeout rate limit unavailable'),
+    new ProviderError('invalid_request', 'provider unavailable'),
+    null,
+  ]) {
+    assert.equal(isRetryableScannerFetchFailure(err), false);
+  }
+});
 
 function makeCandle(time: number, open = 100, high = 105, low = 95, close = 102, volume: number | null = 1000): Candle {
   return { time, open, high, low, close, volume, state: 'closed' };
@@ -1625,6 +1643,40 @@ describe('F3: External scheduler invocation, sleep-resume recovery & graceful sh
     }
   });
 
+  test('scanner fetch retries typed unavailable errors even without message keywords; rejects misleading invalid input', async () => {
+    for (const [failure, expectedAttempts] of [
+      [Errors.providerUnavailable('upstream broke'), 2],
+      [Errors.invalidInput('provider timeout unavailable'), 1],
+    ] as const) {
+      let attempts = 0;
+      const failingIngestion = {
+        getCandles: async () => { attempts++; throw failure; },
+      } as unknown as IngestionService;
+      const testScanner = new ScannerService(
+        pool, providerRegistry, candleStore, failingIngestion, evaluation, setups, scoring, alerts,
+        { maxRetries: 1, retryBaseMs: 1, retryMaxMs: 1, providerTimeoutMs: 500,
+          logger: { info: () => {}, warn: () => {}, error: () => {} } },
+      );
+      // Use the same private fetch path as a normal scan, without relying on
+      // whether the shared candle store already has coverage for this fixture.
+      await assert.rejects(() => (testScanner as unknown as {
+        fetchValidatedCandles(args: Record<string, unknown>): Promise<unknown>;
+      }).fetchValidatedCandles({
+        assetClass: 'forex', symbol: 'EURUSD', timeframe: '1m',
+        nowMs: Date.now(), instrumentId: '00000000-0000-4000-8000-000000000000',
+        minimumCandles: 100, metrics: { candlesFetched: 0 },
+      }), (err: unknown) => err === failure);
+      assert.equal(attempts, expectedAttempts);
+    }
+  });
+
+  test('scanner-owned deadline has a typed retryable failure', async () => {
+    const never = new Promise<never>(() => {});
+    await assert.rejects(() => (scanner as unknown as {
+      withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T>;
+    }).withTimeout(never, 5), (err: unknown) => isRetryableScannerFetchFailure(err));
+  });
+
   test('retry/fail-closed + redaction: provider failure with secret/UUID in error fails closed and persists sanitized error', async () => {
     const rawSecret = 'td-super-secret-token-777';
     const leakedUuid = 'd4d4d4d4-4444-4444-8444-444444444444';
@@ -1633,8 +1685,7 @@ describe('F3: External scheduler invocation, sleep-resume recovery & graceful sh
     const failingIngestion = {
       getCandles: async () => {
         attempts += 1;
-        throw new ProviderError(
-          'unavailable',
+        throw Errors.providerUnavailable(
           `provider upstream https://admin:${rawSecret}@api.twelvedata.com/time_series unavailable for ${leakedUuid} apikey=${rawSecret}`,
         );
       },
