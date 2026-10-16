@@ -366,7 +366,7 @@ describe('focused dry-run — test-mode enforcement (fail closed)', () => {
     // after reading the FX row. The mode gate is therefore two layers: env gate + evidence gate.
     const here = path.dirname(fileURLToPath(import.meta.url));
     const src = readFileSync(path.resolve(here, '..', '..', '..', 'scripts', 'billing', 'provision-sandbox.ts'), 'utf8');
-    assert.match(src, /PAYSTACK_MODE.*must be exactly \"test\"/, 'env gate exists');
+    assert.match(src, /PAYSTACK_MODE.*must be exactly "test"/, 'env gate exists');
     assert.match(src, /mode: 'test'/, 'service is pinned to test');
   });
 });
