@@ -99,6 +99,80 @@ test('missing, retired-only and ambiguous epochs fail closed without provider ca
   assert.equal(calls.length, 0);
 });
 
+test('an epoch retired after the active lookup but before the lock refuses the sale and persists nothing', async () => {
+  const facts = await insertEpoch(db.pool);
+  const user = await insertUser(db.pool);
+  const snapshotsBefore = await snapshotCount();
+  const orphansBefore = await orphanSnapshotCount();
+  // Deterministic interleaving of the documented race: the active-epoch
+  // lookup resolves epoch A, then A is retired (a committed rotation on a
+  // separate connection) before the pricing-lock transaction re-reads it.
+  // Without the in-transaction revalidation this checkout would create a
+  // lock from the stale active read.
+  const original = BillingProviderPlanStore.prototype.findActive;
+  const findActive = mock.method(BillingProviderPlanStore.prototype, 'findActive', async function (
+    this: BillingProviderPlanStore, ...args: Parameters<typeof original>
+  ) {
+    const epoch = await original.apply(this, args);
+    await retireEpoch(db.pool, facts.epoch.id);
+    return epoch;
+  });
+  try {
+    await assert.rejects(service.checkout(user.id, PRO_MONTHLY), reason('retired'));
+  } finally { findActive.mock.restore(); }
+  assert.equal(
+    (await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id])).rowCount, 0,
+    'no sold subscription is created from a retired epoch',
+  );
+  assert.equal(await snapshotCount(), snapshotsBefore, 'no pricing snapshot survives the refusal');
+  assert.equal(await orphanSnapshotCount(), orphansBefore, 'and no unlinked snapshot is left behind');
+  assert.equal(calls.length, 0, 'the provider is never called for a retired epoch');
+});
+
+test('a rotation between lookup and lock is refused, never silently repriced onto the replacement epoch', async () => {
+  const a = await insertEpoch(db.pool);
+  const user = await insertUser(db.pool);
+  const snapshotsBefore = await snapshotCount();
+  // Same race, with the full rotation: A is retired AND its replacement B is
+  // registered active before the lock transaction runs. The checkout priced
+  // from A must fail closed — it may neither sell the retired A nor switch
+  // the customer onto B, whose amount they were never quoted.
+  const original = BillingProviderPlanStore.prototype.findActive;
+  const findActive = mock.method(BillingProviderPlanStore.prototype, 'findActive', async function (
+    this: BillingProviderPlanStore, ...args: Parameters<typeof original>
+  ) {
+    const epoch = await original.apply(this, args);
+    await retireEpoch(db.pool, a.epoch.id);
+    await insertEpoch(db.pool, { rateScaled: 20_000_000 });
+    return epoch;
+  });
+  try {
+    await assert.rejects(service.checkout(user.id, PRO_MONTHLY), reason('retired'));
+  } finally { findActive.mock.restore(); }
+  assert.equal(
+    (await db.pool.query('SELECT * FROM subscriptions WHERE user_id=$1', [user.id])).rowCount, 0,
+    'no subscription is sold under either the retired or the replacement epoch',
+  );
+  assert.equal(await snapshotCount(), snapshotsBefore, 'no snapshot is persisted for the refused sale');
+  assert.equal(calls.length, 0);
+});
+
+test('epoch revalidation runs inside the lock transaction, under FOR SHARE, before any persistence', () => {
+  const source = readFileSync(new URL('../src/billing/checkout.ts', import.meta.url), 'utf8');
+  // By-id re-read of the candidate epoch on the transaction client, holding
+  // FOR SHARE so a concurrent retirement serializes against the lock.
+  assert.match(source, /FROM billing_provider_plans\s+WHERE id = \$1 FOR SHARE/);
+  assert.match(source, /assertCandidateEpochStillActive\(client, candidateEpoch, candidate\)/);
+  assert.match(source, /parseProviderPlan\(rows\[0\], \{ allowedMode: candidateEpoch\.mode \}\)/);
+  assert.match(source, /assertProviderPlanMatches\(/);
+  // The revalidation precedes the snapshot INSERT it guards.
+  assert.ok(
+    source.indexOf('assertCandidateEpochStillActive(client, candidateEpoch, candidate)')
+      < source.indexOf('new BillingPricingSnapshotStore(client).create(candidate)'),
+    'the epoch is re-validated before the candidate snapshot is persisted',
+  );
+});
+
 test('MODEL C: registration creates no subscription row; the free fallback is the missing row', async () => {
   const before = await db.pool.query('SELECT count(*)::int AS c FROM billing_pricing_snapshots');
   const user = await new UserService(db.pool).create({
