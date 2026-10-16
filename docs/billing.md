@@ -614,14 +614,29 @@ one named account. See *Legacy free placeholder remediation* below.
   and the lock grants none of them. Nothing in Model C may be used as a
   substitute for that authority: the lock is a pricing fact, and only the
   out-of-band activation fact authorizes a paid entitlement.
-- **Known follow-up (not fixed here):** an active epoch can be *retired*
-  between the active-epoch lookup and the pricing-lock creation, because the
-  epoch read is not taken under `FOR SHARE` and no active re-check is performed
-  inside the lock transaction. The outcome is fail-closed rather than unsafe —
-  the lock is created from what was active at lookup time, and the Paystack
-  adapter independently refuses a retired/mismatched epoch, so no charge is
-  initialized — but it is a race worth fixing deliberately in its own change.
-  No scope expansion was made for it here.
+- **Epoch-retirement race — FIXED in its own change.** An active epoch could
+  previously be *retired* between the active-epoch lookup and the
+  pricing-lock creation, because the epoch read was not taken under
+  `FOR SHARE` and no active re-check was performed inside the lock
+  transaction (the outcome was fail-closed rather than unsafe — the lock was
+  created from what was active at lookup time, and the Paystack adapter
+  independently refuses a retired/mismatched epoch, so no charge was
+  initialized — but the stale lock persisted). `BillingCheckoutService` now
+  re-validates the candidate epoch **by id, on the lock transaction's own
+  client, under `FOR SHARE`**, before the snapshot INSERT: the row is parsed
+  through the canonical epoch contract in the configured provider domain,
+  must still be `active`, and must match the candidate snapshot exactly
+  (`assertProviderPlanMatches` — the adapter's own comparison). `FOR SHARE`
+  serializes against the retirement `UPDATE`: a retirement that committed
+  first is seen and refused (`retired`); one that arrives second waits for
+  the lock to commit, so the sale was authorized by an epoch active at its
+  lock instant. A refusal rolls the whole transaction back — no snapshot, no
+  subscription, no lock, no provider call — and never selects or reprices
+  onto a replacement epoch. Existing locked rows never enter this path:
+  retirement after a sale neither rewrites nor re-validates that sale's lock.
+  Pinned by the deterministic interleaving tests in
+  `packages/core/test/billing-checkout.test.ts` (retirement and full rotation
+  injected between the active lookup and the lock).
 
 ### 6. The sandbox adapter and its composition
 

@@ -1,10 +1,22 @@
 import { createHash } from 'node:crypto';
 import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
-import { internalPlanForCommercialPlan, type BillingPricingSnapshot } from '@veltrixeye/contracts';
+import {
+  internalPlanForCommercialPlan,
+  type BillingPricingSnapshot,
+  type BillingProviderMode,
+} from '@veltrixeye/contracts';
 import { BillingFxError, parseFxRateVersion } from './fx-rate-versions.js';
 import { priceFromProviderPlanEpoch, verifyPricingSnapshot } from './pricing.js';
-import { BillingProviderPlanStore, isBillingProviderPlanError, providerPlanKey } from './provider-plans.js';
+import {
+  BillingProviderPlanError,
+  BillingProviderPlanStore,
+  assertProviderPlanMatches,
+  isBillingProviderPlanError,
+  parseProviderPlan,
+  providerPlanExpectationFromSnapshot,
+  providerPlanKey,
+} from './provider-plans.js';
 import {
   billingCheckoutRequestSchema,
   type BillingCheckoutSession,
@@ -92,6 +104,12 @@ export class BillingCheckoutService {
     // the snapshot, the sold subscription and the immutable pricing lock are
     // one atomic unit of work.
     let candidate: BillingPricingSnapshot | null = null;
+    // The epoch the candidate was priced from. The active-epoch lookup in
+    // this branch is NOT the sale's authorization by itself: the epoch can be
+    // retired after this lookup and before the pricing lock commits, so
+    // `obtainLock` re-validates THIS epoch, by id, inside the lock
+    // transaction (below).
+    let candidateEpoch: { id: string; mode: BillingProviderMode } | null = null;
     if (rows.length === 0) {
       // The configured provider domain travels with the REGISTERED adapter
       // (composition injects it): the store, the directory key and the epoch
@@ -132,9 +150,10 @@ export class BillingCheckoutService {
       // Pure decision, no write: `obtainLock` persists it inside the
       // subscription/lock transaction it belongs to.
       candidate = snapshot;
+      candidateEpoch = { id: epoch.id, mode: provider.mode };
     }
 
-    const locked = await this.obtainLock(userId, candidate);
+    const locked = await this.obtainLock(userId, candidate, candidateEpoch);
     await this.options.requireExistingCustomer(userId);
     const reference = billingCheckoutReference(userId, locked.idempotencyKey);
     const request = billingCheckoutRequestSchema.parse({
@@ -161,13 +180,33 @@ export class BillingCheckoutService {
    * therefore committed together or discarded together — a failure after the
    * snapshot INSERT leaves no snapshot, no subscription and no lock behind.
    */
-  private async obtainLock(userId: string, candidate: BillingPricingSnapshot | null): Promise<StoredBillingPricingSnapshot> {
+  private async obtainLock(
+    userId: string,
+    candidate: BillingPricingSnapshot | null,
+    candidateEpoch: { id: string; mode: BillingProviderMode } | null,
+  ): Promise<StoredBillingPricingSnapshot> {
     const client = await this.options.db.connect();
     try {
       await client.query('BEGIN');
       let row = await this.selectLock(client, userId);
       if (row === undefined) {
-        if (candidate === null) throw new BillingCheckoutError('pricing_lock_required');
+        if (candidate === null || candidateEpoch === null) {
+          throw new BillingCheckoutError('pricing_lock_required');
+        }
+        // EPOCH RETIREMENT RACE (the deliberate fix for the follow-up recorded
+        // in docs/billing.md): the epoch was read as active OUTSIDE this
+        // transaction, so it may have been retired since. Re-read THAT epoch,
+        // by id, on this transaction's client and under FOR SHARE — which
+        // serializes against the retirement UPDATE: either the retirement
+        // committed first and this re-read sees `retired` and refuses, or
+        // this lock commits first and the retirement waits, so the sale was
+        // authorized by an epoch that was active at its lock instant. The
+        // re-read epoch must still match the candidate snapshot EXACTLY;
+        // nothing is repriced, no replacement epoch is selected and no
+        // snapshot, subscription or lock survives a refusal (the transaction
+        // rolls back). Existing locked rows never enter this path: retirement
+        // after a sale does not rewrite or re-validate that sale's lock.
+        await this.assertCandidateEpochStillActive(client, candidateEpoch, candidate);
         // ATOMICITY SEAM: the snapshot INSERT rides this client/transaction.
         // The subscription INSERT needs the snapshot id (the lock is a FK and
         // migration 0032 makes it immutable at creation), so the snapshot is
@@ -217,6 +256,46 @@ export class BillingCheckoutService {
     } finally {
       client.release();
     }
+  }
+
+  /**
+   * Re-validate, inside the lock transaction, the epoch a row-less candidate
+   * was priced from. The row is locked `FOR SHARE` on the transaction's own
+   * client, parsed through the canonical epoch contract in the configured
+   * provider domain, required to still be `active`, and required to match the
+   * candidate snapshot exactly (plan, interval, currency, amount, provider
+   * plan, FX version and pricing policy — the same comparison the adapter
+   * performs before a charge). Any divergence fails closed; the caller's
+   * rollback discards the whole sale.
+   */
+  private async assertCandidateEpochStillActive(
+    client: PoolClient,
+    candidateEpoch: { id: string; mode: BillingProviderMode },
+    candidate: BillingPricingSnapshot,
+  ): Promise<void> {
+    const { rows } = await client.query(
+      `SELECT id, provider, mode, catalogue_plan, billing_interval, payment_currency,
+              payment_amount_minor, payment_amount_exponent, provider_plan_id,
+              provider_plan_reference, fx_rate_version_id, pricing_policy_version,
+              catalogue_version, status, valid_from, retired_at, retired_reason
+         FROM billing_provider_plans
+        WHERE id = $1 FOR SHARE`,
+      [candidateEpoch.id],
+    );
+    if (rows[0] === undefined) throw new BillingCheckoutError('plan_not_registered');
+    const epoch = parseProviderPlan(rows[0], { allowedMode: candidateEpoch.mode });
+    if (epoch.status !== 'active') {
+      throw new BillingProviderPlanError(
+        'retired',
+        `Provider-plan epoch ${epoch.id} was retired after it was selected for this checkout. ` +
+          'A retired epoch is history and is never used for a new charge.',
+      );
+    }
+    if (candidate.providerPlanId === null) throw new BillingCheckoutError('unauthorized_amount');
+    assertProviderPlanMatches(
+      epoch,
+      providerPlanExpectationFromSnapshot(candidate, candidate.providerPlanId, { mode: candidateEpoch.mode }),
+    );
   }
 
   private async selectLock(client: PoolClient, userId: string): Promise<SubscriptionLock | undefined> {
