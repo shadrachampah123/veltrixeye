@@ -196,6 +196,73 @@ Guard rails (in `apps/web/next.config.mjs`):
 The API origin stays server-side: it is read from `next.config.mjs` (not a
 `NEXT_PUBLIC_*` variable), so it is never shipped to the browser.
 
+### Vercel Preview deployments — intended policy (paper-only, not yet empirically verified)
+
+> **Status:** This section documents the *intended* Vercel Preview deployment
+> policy for `apps/web` as a paper description only. This commit/PR makes **no**
+> change to `vercel.json`, application code, workflows, secrets, environment
+> variables, or Vercel project settings, and **does not claim** that the policy
+> has been empirically verified. Verification remains pending (see evidence
+> checklist below). Until live evidence is attached, treat this as intent, not
+> proof.
+>
+> Isolation: branch `ci/verify-vercel-policy` is documentation-only, created
+> from `main` at `338829b8d9582f9bd4c6c37f09289077cf569a29` for policy verification;
+> it does not modify `main`, PRs #103/#104, outbox/roadmap files, or Gold v8
+> (remains paused, automation OFF, paper-only).
+
+**Intended preview behavior:**
+
+- **Project scope:** Vercel project serving `apps/web` (Root Directory
+  `apps/web`, framework `nextjs`). Build wiring is pinned in
+  `apps/web/vercel.json` (`installCommand: cd ../.. && npm ci`,
+  `buildCommand: next build`) and in `apps/web/next.config.mjs` (same-origin
+  `/api/*` rewrite to `API_INTERNAL_BASE`). This documentation PR does **not**
+  modify `apps/web/vercel.json`, `apps/web/next.config.mjs`,
+  `.github/workflows/ci.yml`, or any Vercel dashboard setting.
+- **Automatic previews:** Pull requests targeting `main` are *intended* to
+  trigger an automatic, ephemeral **Preview** deployment per PR, each with a
+  unique preview URL (e.g. `https://veltrixeye-xxxx-shadrachampah123s-projects.vercel.app`),
+  separate from the **Production** deployment. The preview is not promoted to
+  Production and is torn down/replaced on subsequent pushes to the PR branch.
+- **Preview environment variable:** `API_INTERNAL_BASE` for the **Preview**
+  environment (Vercel → Settings → Environment Variables → Preview) is intended
+  to be set to the same production API origin (`https://<your-api-host>`) or a
+  staging API, so PR previews have a backend to proxy to (see table in Step 4).
+  Production `API_INTERNAL_BASE` remains **required** — a Vercel production
+  build without it (or with a non-`https://` value) fails loudly via
+  `apps/web/next.config.mjs`; Preview may share the Production API during
+  initial verification — no new secrets are introduced by this PR.
+- **No promotion, no mutation:** Previews are intended to be read-only
+  deployments that do not mutate Production data, secrets, or deployments.
+  Manual “Promote to Production” is not part of the intended flow.
+- **Monorepo wiring:** The Vercel project is expected to build `apps/web` only
+  (Root Directory `apps/web`, monorepo install from repo root per
+  `apps/web/vercel.json`); the API remains a container (Render/Docker) and is
+  never built as a Vercel Function.
+
+**Evidence required before claiming “verified” (all pending, none claimed here):**
+
+To move from *intended* to *empirically verified*, the following live
+evidence must be collected and linked from the verification PR — **do not claim
+a Vercel deployment outcome until collected**:
+
+1. **Vercel dashboard record** showing a Preview deployment for branch
+   `ci/verify-vercel-policy` (or its draft PR), with deployment URL, commit
+   SHA, and status `Ready`.
+2. **GitHub Deployments API** response for that SHA + `environment: Preview`
+   (e.g. `GET /repos/shadrachampah123/veltrixeye/deployments?environment=Preview`
+   and `…/deployments/:id/statuses`) showing `state: success` and a
+   `target_url` matching the Preview URL.
+3. **Live preview probe (optional, low-risk)** — `curl -sS $PREVIEW_URL/api/health`
+   and `curl -sS $PREVIEW_URL/api/health/ready` through the preview’s
+   same-origin rewrite (no auth, no credential, no write). A `200` proves the
+   preview’s rewrite reaches the API; a `503` with `database: down` is still a
+   meaningful health signal.
+
+Until all three are attached, this policy is **paper-only — intended, not
+verified** — and the verification branch/PR must remain draft and unmerged.
+
 ## Step 5 — Verify the deployment
 
 ```bash
