@@ -233,9 +233,14 @@ The API origin stays server-side: it is read from `next.config.mjs` (not a
   build without it (or with a non-`https://` value) fails loudly via
   `apps/web/next.config.mjs`; Preview may share the Production API during
   initial verification — no new secrets are introduced by this PR.
-- **No promotion, no mutation:** Previews are intended to be read-only
-  deployments that do not mutate Production data, secrets, or deployments.
-  Manual “Promote to Production” is not part of the intended flow.
+- **No automatic promotion; backend isolation matters:** a Preview is not
+  automatically promoted to Production. This does **not** make it read-only:
+  if Preview `API_INTERNAL_BASE` points at the Production API, authenticated
+  actions through the Preview can mutate Production data. Prefer a staging API
+  for Preview. If only Production is configured, treat the Preview as
+  production-connected and do not use write-capable flows for verification.
+  Never put Production secrets in Preview or use Preview to change deployment
+  settings.
 - **Monorepo wiring:** The Vercel project is expected to build `apps/web` only
   (Root Directory `apps/web`, monorepo install from repo root per
   `apps/web/vercel.json`); the API remains a container (Render/Docker) and is
