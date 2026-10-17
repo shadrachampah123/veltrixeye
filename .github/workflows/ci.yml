@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   test:
@@ -17,6 +16,8 @@ jobs:
     # migration; validate Ubuntu 26.04 separately before changing this pin.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      test-outcome: ${{ steps.test.outcome }}
 
     steps:
       - name: Checkout repository
@@ -123,16 +124,37 @@ jobs:
             /tmp/test-tail.log
           retention-days: 7
 
-      - name: Post failure details as PR comment (if failed)
-        if: failure() && github.event_name == 'pull_request'
+  report-test-failure:
+    name: report test failure
+    needs: [test]
+    if: >-
+      ${{
+        failure() &&
+        needs.test.outputs.test-outcome == 'failure' &&
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Download test log artifact
+        uses: actions/download-artifact@v8.0.2
+        with:
+          name: test-log
+          path: /tmp/test-log
+
+      - name: Post failure details as PR comment
         uses: actions/github-script@v9.0.0
         with:
           script: |
             const fs = require('fs');
             let fail = '';
             let tail = '';
-            try { fail = fs.readFileSync('/tmp/fail.log', 'utf8'); } catch (e) { fail = `no fail.log: ${e.message}`; }
-            try { tail = fs.readFileSync('/tmp/test-tail.log', 'utf8'); } catch (e) { tail = `no tail: ${e.message}`; }
+            try { fail = fs.readFileSync('/tmp/test-log/fail.log', 'utf8'); } catch (e) { fail = `no fail.log: ${e.message}`; }
+            try { tail = fs.readFileSync('/tmp/test-log/test-tail.log', 'utf8'); } catch (e) { tail = `no tail: ${e.message}`; }
             const body = `❌ CI test step failed on \`${{ github.head_ref || github.ref_name }}\` @ \`${{ github.sha }}\` (single authoritative run, no retries)\n\n**Failing tests (grep not ok):**\n\`\`\`\n${fail.slice(0, 20000)}\n\`\`\`\n\n**Tail (last 500 lines):**\n\`\`\`\n${tail.slice(0, 20000)}\n\`\`\`\n`;
             github.rest.issues.createComment({
               owner: context.repo.owner,
