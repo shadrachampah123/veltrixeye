@@ -1,5 +1,100 @@
 # Milestone Boundaries
 
+## Current roadmap and release-status reconciliation (2026-10-17)
+
+This is the canonical roadmap/status record. The milestone sections below describe
+implemented scope; **implementation/merge is not the same as production
+verification or release approval**. Evidence checked against `main`
+`0e8c684d530889f4f226245f8f64ff1424343240`, current PRs, CI checks and recorded
+deployment/status data. This checkpoint does not authorize production changes.
+
+### Current delivery and gates
+
+- **Merged, repository/CI verified:** M1–M9.2 and M10.0/Gate 9/B1/B2 are present
+  on `main`; latest merges include #122 (sandbox provisioning dry-run tests),
+  #123 (checkout epoch revalidation), and #124 (typed scanner transient
+  failures). Their reported required CI jobs passed. This is code/test evidence,
+  not proof that every feature is operational or production-verified.
+- **M9.2 outbox symbol-collision patch:** unresolved as a roadmap item. The
+  current code contains M9.2 outbox tests, but the checked-in milestone history,
+  open PR list, and issue/PR search contain no specific collision remediation
+  or closure evidence. Do not treat the broad “M9.2 delivered” heading as proof
+  that this separately identified patch is done; track and verify its exact
+  failing case before closing it.
+- **Execution safety:** automation remains OFF; live execution remains
+  unavailable/impossible by the enforced boundary. M10/Gate 9 is a non-live
+  foundation only. Trading remains paper-only. No broker orders, live/demo
+  connectivity, or Gold v8 work is authorized by this roadmap.
+- **Release readiness:** not release-ready by assertion. Required gates include
+  externally validated execution transport (still absent), end-to-end release
+  evidence, production configuration/health verification for the deployed
+  schema, approved legal copy, and closure of remaining reliability and
+  commercial gates below.
+- **Billing / Paystack:** sandbox/test only. #119 merged the provisioning CLI
+  with dry-run default, and #122 added a focused dry-run preparation suite; these
+  do not prove that sandbox plans were provisioned. Provisioning remains an
+  explicit operator gate. Production credentials and live Paystack remain
+  prohibited/deferred. No surprise plan rotation is authorized.
+- **FX:** #120 added read-only Bank of Ghana source observations; #116 added a
+  dry-run-only evidence validator. No FX rate publication is evidenced here.
+  Publishing an authoritative FX version remains a deliberate operator action
+  and a prerequisite for dependent provider-plan provisioning; do not publish
+  as part of this work.
+- **Retention / monitoring:** scanner-run retention and unauthenticated
+  retention-sweep observability were merged (#107/#111); the M9.1 deployment
+  health note records schema 0027 at the time of that check. Current `main`
+  includes later migrations through 0036, and this checkpoint has no fresh
+  production readiness observation for that current schema. Treat current
+  production migration/health status as unverified. CI's test retry loop was
+  removed (#112); latest inspected CI runs pass, but reliability is monitored
+  through actual authoritative runs, not retries or a single green badge.
+- **Legal / commercial polish:** customer-facing legal/risk copy from #106 is
+  explicitly draft and awaits legal approval. Billing portal v1 is read-only;
+  cancellation and verified-payment-history UI remain scoped/deferred as
+  documented. Starter is not sold; production billing credentials, provider
+  provisioning, FX publication, and any unapproved pricing/plan changes remain
+  gates. Do not represent the product as legally or commercially launch-ready.
+- **AI / ChatGPT Strategy Builder:** intentionally the final roadmap feature,
+  after operational safety, production validation, legal, commercial and
+  release-readiness gates. It is not implemented or approved to displace those
+  prerequisites.
+
+### PR #121 / Vercel Preview status
+
+PR #121 is open and Draft. Its current observed head is
+`e0ce6473b0e00324b30dc3279503e95e8b999f48`. GitHub's Vercel status for that SHA
+says “Canceled by Ignored Build Step”; no GitHub Preview deployment record for
+that SHA was found. The owner reports that Root Directory is `apps/web`, the
+root-directory-change skip filter has now been disabled, and the Production
+Override is left untouched. No post-change Preview attempt is evidenced yet;
+therefore the effect of the saved project-level change and a Ready Preview
+remain unverified. The exact Production Override command must not be changed
+without evidence and approval. Do not merge #121 until a Ready Preview, deployed
+SHA/URL, corresponding GitHub Preview record and reviewed CI evidence are
+attached. The repository's `apps/web/vercel.json` configures Next.js and the
+workspace install/build commands; it cannot prove live dashboard or Preview
+environment-variable values.
+
+### Paused investigation and preserved evidence
+
+Gold Break & Retest v8 remains **PAUSED**. Preserve its existing evidence and
+versions as-is; do not run, resume, amend, or reopen that investigation here.
+Open PRs #103/#104 concern the read-only diagnostic and are not authorization to
+resume the paused work. Automation stays OFF and execution stays paper-only.
+
+### Remaining validation sequence (gates, not completion claims)
+
+1. Resolve the M9.2 outbox symbol-collision item with a reproducible test and
+   focused review; update its status only when that evidence exists.
+2. Verify current production schema/health and operational monitoring without
+   changing production configuration; keep billing sandbox and FX publication
+   behind their explicit owner approvals.
+3. Close legal approval, commercial policy, retention/monitoring, CI reliability
+   and release-readiness gaps with evidence.
+4. Obtain and record PR #121's actual Vercel Preview deployment evidence before
+   changing its Draft/unmerged disposition.
+5. Consider the AI/ChatGPT Strategy Builder only after the preceding gates.
+
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
 M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2, M8.3, M8.4, M8.5,
 M8.6, M8.7, M9.1, M9.2, the M10.0 / Gate 9 execution-transport program
