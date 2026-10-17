@@ -52,7 +52,10 @@ async function makeAlert(userId: string): Promise<string> {
   const alert = await pool.query<{ id: string }>(`INSERT INTO alerts (user_id, setup_id, strategy_id, strategy_version_id, instrument_id, direction, trigger_state, quality_score, min_quality_score, title, body) VALUES ($1,$2,$3,$4,$5,'long','confirmed',80,65,'m92','{}') RETURNING id`, [userId, setup.rows[0]!.id, strategy.rows[0]!.id, version.rows[0]!.id, instrument.rows[0]!.id]);
   return alert.rows[0]!.id;
 }
-function payloadFor(alertId: string) {
+function payloadFor(
+  alertId: string,
+  instrument: { assetClass: string; symbol: string } = { assetClass: 'forex', symbol: 'EURUSD' },
+) {
   return renderAlertNotification({
     alertId,
     setupId: '33333333-3333-4333-8333-333333333333',
@@ -64,9 +67,9 @@ function payloadFor(alertId: string) {
     qualityScore: 80,
     minQualityScore: 65,
     createdAt: new Date(1_800_000_000_000).toISOString(),
-    body: { instrument: { assetClass: 'forex', symbol: 'EURUSD' }, direction: 'long', triggerState: 'confirmed', qualityScore: 80, qualityGrade: 'B', minQualityScore: 65, entryPrice: 1.1, stopLossPrice: 1.0, tp1Price: 1.2, tp2Price: 1.3, tp3Price: 1.4, detectedAt: new Date(1_799_900_000_000).toISOString() },
-    symbol: 'EURUSD',
-    assetClass: 'forex',
+    body: { instrument, direction: 'long', triggerState: 'confirmed', qualityScore: 80, qualityGrade: 'B', minQualityScore: 65, entryPrice: 1.1, stopLossPrice: 1.0, tp1Price: 1.2, tp2Price: 1.3, tp3Price: 1.4, detectedAt: new Date(1_799_900_000_000).toISOString() },
+    symbol: instrument.symbol,
+    assetClass: instrument.assetClass,
     timeframe: '1h',
   });
 }
@@ -89,6 +92,18 @@ async function enqueueChannel(alertId: string, userId: string, channel: 'email' 
 }
 
 describe('M9.2 outbox — push channel + 3-way fairness', () => {
+  test('same ticker in different asset classes has distinct notification subjects', () => {
+    const alertId = '11111111-1111-4111-8111-111111111111';
+    const forex = payloadFor(alertId, { assetClass: 'forex', symbol: 'SAME' });
+    const crypto = payloadFor(alertId, { assetClass: 'crypto', symbol: 'SAME' });
+
+    assert.equal(forex.data.instrument.symbol, crypto.data.instrument.symbol);
+    assert.notEqual(forex.data.instrument.assetClass, crypto.data.instrument.assetClass);
+    assert.notEqual(forex.subject, crypto.subject, 'asset class disambiguates equal ticker symbols');
+    assert.ok(forex.subject.includes('SAME (forex)'));
+    assert.ok(crypto.subject.includes('SAME (crypto)'));
+  });
+
   test('push enqueue creates row in push table, idempotent per alert', async () => {
     const user = await makeUser();
     const alertId = await makeAlert(user.id);

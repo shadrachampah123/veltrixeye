@@ -144,12 +144,16 @@ export function renderAlertNotification(args: RenderAlertNotificationArgs): Aler
 /* -------------------------------------------------------------------------- */
 
 /**
- * `EURUSD long setup confirmed - quality 80/100 (B)`, capped at 200 chars.
+ * `EURUSD (forex) long setup confirmed - quality 80/100 (B)`, capped at 200 chars.
  * Plain ASCII on purpose: a non-ASCII subject forces an encoded-word header,
  * which some filters and inboxes render badly.
  */
 function buildSubject(data: AlertNotificationData): string {
-  const subject = `${data.instrument.symbol} ${data.direction} setup ${data.triggerState} - quality ${data.qualityScore}/100 (${data.qualityGrade})`;
+  // A canonical symbol is only unique within its asset class. Include that
+  // namespace in the subject so same-ticker forex/crypto/equity alerts do not
+  // collapse to visually identical messages in an inbox.
+  const instrument = `${data.instrument.symbol} (${data.instrument.assetClass})`;
+  const subject = `${instrument} ${data.direction} setup ${data.triggerState} - quality ${data.qualityScore}/100 (${data.qualityGrade})`;
   return subject.slice(0, 200);
 }
 

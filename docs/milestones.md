@@ -4,17 +4,21 @@
 
 This is the canonical roadmap/status record. The milestone sections below describe
 implemented scope; **implementation/merge is not the same as production
-verification or release approval**. Evidence checked against `main`
-`0e8c684d530889f4f226245f8f64ff1424343240`, current PRs, CI checks and recorded
-deployment/status data. This checkpoint does not authorize production changes.
+verification or release approval**. This checkpoint uses baseline `main`
+`96305ea07f5244764b1e62d7eb9848a3a1d7401a` (merge PR #129), current PR
+metadata, CI checks and recorded deployment/status data. It does not authorize
+production changes. No overall completion percentage is stated: the roadmap
+mixes delivered milestones, deferred product decisions, external validations
+and blocking gates without a stable, non-overlapping denominator.
 
 - **Production database and health verification: BLOCKED (2026-10-17 UTC).**
   Neon production compute is exhausted. Do not use the production
   `DATABASE_URL`, run migration/status queries, call production `/api/health`
   or `/api/health/ready`, or report worker/retention health until compute is
   restored and an authorized owner explicitly permits a read-only check. This
-  block was recorded while reviewing latest `main` at
-  `f9e660d66fe56af2ea4f1d2031759210af497d67`; no production probe was attempted.
+  underlying compute-exhaustion report was recorded while reviewing `main` at
+  `f9e660d66fe56af2ea4f1d2031759210af497d67` and is carried forward from that
+  owner evidence; this task did not access production or revalidate compute.
   Local embedded-Postgres tests and deployment records are not production
   evidence; no production configuration, data, migration or infrastructure may
   be changed to clear this block.
@@ -26,12 +30,16 @@ deployment/status data. This checkpoint does not authorize production changes.
   #123 (checkout epoch revalidation), and #124 (typed scanner transient
   failures). Their reported required CI jobs passed. This is code/test evidence,
   not proof that every feature is operational or production-verified.
-- **M9.2 outbox symbol-collision patch:** unresolved as a roadmap item. The
-  current code contains M9.2 outbox tests, but the checked-in milestone history,
-  open PR list, and issue/PR search contain no specific collision remediation
-  or closure evidence. Do not treat the broad “M9.2 delivered” heading as proof
-  that this separately identified patch is done; track and verify its exact
-  failing case before closing it.
+- **M9.2 outbox symbol collision — reproduced; fix proposed on this branch.**
+  The exact user-visible failure is a subject collision: rendering otherwise
+  identical alerts for the same canonical ticker under `forex` and `crypto`
+  produced the same email subject because the subject omitted `assetClass`, even
+  though the structured payload retained it. This is presentation ambiguity,
+  not an outbox-row or idempotency-key collision. The fix includes the asset class
+  in the subject; `packages/core/test/m92-outbox.test.ts` now reproduces and
+  guards the distinction. This PR is not merged, so mainline closure remains
+  pending review and required CI gates; do not infer that the item is closed on
+  `main` yet.
 - **Execution safety:** automation remains OFF; live execution remains
   unavailable/impossible by the enforced boundary. M10/Gate 9 is a non-live
   foundation only. Trading remains paper-only. No broker orders, live/demo
@@ -104,8 +112,8 @@ resume the paused work. Automation stays OFF and execution stays paper-only.
 
 ### Remaining validation sequence (gates, not completion claims)
 
-1. Resolve the M9.2 outbox symbol-collision item with a reproducible test and
-   focused review; update its status only when that evidence exists.
+1. Review and merge the focused M9.2 subject-disambiguation PR only after its
+   tests and required gates pass; keep the mainline roadmap item open until then.
 2. **BLOCKED — production verification:** after Neon compute is restored and an
    authorized owner permits a read-only check, verify the current production
    schema/health and operational monitoring without changing production
