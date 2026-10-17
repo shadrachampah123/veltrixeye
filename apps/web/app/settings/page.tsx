@@ -6,10 +6,16 @@ import { RequireAuth, useAuth } from '@/components/auth-context';
 import { api, ApiError } from '@/lib/api';
 import { Alert, Badge, Button, Card, CardHeader, Field, Input, Spinner } from '@/components/ui';
 import { formatDateTime } from '@/lib/formats';
-import type { SessionDto, BillingPortalSummaryDto, BillingStateDto } from '@veltrixeye/contracts';
+import type {
+  SessionDto,
+  BillingPortalSummaryDto,
+  BillingStateDto,
+  BillingVerifiedPaymentRecordsDto,
+} from '@veltrixeye/contracts';
 import { SubscriptionPanel, PlanComparison } from '@/components/subscription-panel';
 import { BillingCheckoutPanel } from '@/components/billing-checkout';
 import { BillingPortalPanel } from '@/components/billing-portal';
+import { BillingPaymentRecordsPanel } from '@/components/billing-payment-records';
 import { WatchlistPanel } from '@/components/watchlist';
 import { NotificationPreferencesPanel } from '@/components/notification-preferences';
 import { BRAND } from '@/lib/brand';
@@ -38,6 +44,9 @@ function SettingsContent() {
    */
   const [portal, setPortal] = React.useState<BillingPortalSummaryDto | null>(null);
   const [portalUnavailable, setPortalUnavailable] = React.useState(false);
+  /** Billing Step 9b-R1 — the separate, bounded verified-payment read. */
+  const [paymentRecords, setPaymentRecords] = React.useState<BillingVerifiedPaymentRecordsDto | null>(null);
+  const [paymentRecordsUnavailable, setPaymentRecordsUnavailable] = React.useState(false);
   const [name, setName] = React.useState(user?.name ?? '');
   const [profileMsg, setProfileMsg] = React.useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
   const [cur, setCur] = React.useState('');
@@ -78,6 +87,19 @@ function SettingsContent() {
       });
   }, []);
 
+  const loadPaymentRecords = React.useCallback(() => {
+    api
+      .getBillingVerifiedPaymentRecords()
+      .then((summary) => {
+        setPaymentRecords(summary);
+        setPaymentRecordsUnavailable(false);
+      })
+      .catch(() => {
+        setPaymentRecords(null);
+        setPaymentRecordsUnavailable(true);
+      });
+  }, []);
+
   /**
    * BOTH server-derived billing surfaces are re-read together. The checkout
    * panel asks for this after a checkout attempt: the first checkout writes the
@@ -107,13 +129,15 @@ function SettingsContent() {
   const handleEvidenceRecorded = React.useCallback(() => {
     setEvidenceRecorded(true);
     loadPortal();
-  }, [loadPortal]);
+    loadPaymentRecords();
+  }, [loadPaymentRecords, loadPortal]);
 
   React.useEffect(() => {
     loadSessions();
     loadBilling();
     loadPortal();
-  }, [loadSessions, loadBilling, loadPortal]);
+    loadPaymentRecords();
+  }, [loadSessions, loadBilling, loadPortal, loadPaymentRecords]);
 
   if (!user) return <Spinner />;
 
@@ -207,11 +231,13 @@ function SettingsContent() {
             (free / awaiting verification / evidence awaiting activation /
             activated / unknown / unavailable), the server-derived plan and
             interval, the trusted persisted period end and the authoritative
-            cancellation state. Display only — no cancellation, no invoices, no
-            payment method and no plan editing (there is no endpoint for any of
-            them, and this page calls none).
+            cancellation state. Display only — no cancellation, invoice,
+            payment-method or plan-editing action is available.
           */}
           <BillingPortalPanel portal={portal} unavailable={portalUnavailable} />
+
+          {/* Billing Step 9b-R1 — bounded evidence records; no provider action or authority. */}
+          <BillingPaymentRecordsPanel records={paymentRecords} unavailable={paymentRecordsUnavailable} />
 
           {/* Subscription & Entitlement Foundations */}
           <SubscriptionPanel

@@ -75,29 +75,31 @@
 > could be sold are inventoried under *Starter disposition* below. Step 10a is
 > documentation and display copy only: **no route, no service, no migration, no
 > schema change, no provider operation and no authority.**
-> **Billing Step 9b remains documentation-only; its C-1 and R-1 decisions are
-> now recorded.** C-1 defers customer-facing in-app cancellation: the existing
-> non-immediate Paystack adapter capability remains, but no cancellation route
-> or button is authorized. Reconsider only after paid-through-period entitlement
-> behavior, durable cancellation status, provider uncertainty/retry behavior,
-> and customer support/terms implications are addressed. This decision does not
-> imply that a provider-hosted cancellation portal exists.
-> R-1 approves a future read-only Settings view labelled **Verified payment
-> records**, sourced only from `billing_verified_transactions`; it is not an
-> invoice feature and is not implemented. It must be authenticated-user and
-> provider-mode scoped, use a strict minimal DTO, bounded newest-first results,
-> and stored verified amounts. It must disclose that it includes only
-> transactions verified through VeltrixEye, not complete invoice, renewal,
-> failure, or refund history. It must not create provider invoices/receipts,
-> call Paystack, recalculate FX, or change cancellation or entitlement behavior.
+> **Billing Step 9b is partially delivered.** C-1 still defers customer-facing
+> in-app cancellation: the existing non-immediate Paystack adapter capability
+> remains, but there is no cancellation route or button. Reconsider only after
+> paid-through-period entitlement behavior, durable cancellation status,
+> provider uncertainty/retry behavior, and customer support/terms implications
+> are addressed. This does not imply that a provider-hosted cancellation portal
+> exists.
+> R-1's bounded, read-only Settings view labelled **Verified Payment Records**
+> is implemented at `GET /api/billing/verified-payment-records`, using only
+> `billing_verified_transactions`. This implementation was explicitly
+> authorized for the current task. The query is authenticated-user and
+> server-configured provider-mode scoped; its strict DTO exposes only stored
+> GHS minor-unit amounts and persisted paid/verified instants, capped at the 25
+> newest records. The view discloses that it includes only transactions
+> verified through VeltrixEye, not complete invoice, renewal, failure, or refund
+> history. It creates no provider invoices/receipts, makes no Paystack calls,
+> recalculates no FX, and changes no cancellation or entitlement behavior.
 > Payment-method management and plan changes remain outside 9b; refunds /
 > proration / dunning / production go-live remain out. Subscription lookup and
 > non-immediate cancellation are adapter capabilities, not customer-facing
-> authorization. This decision update performs no provisioning or provider
-> calls. There is still no saved payment method, in-app cancellation, invoice or
-> Verified payment records view, refund/proration/dunning execution,
-> notification, live payment, production credential, production activation, or
-> Starter selling (Step 10a records that as a decision, not as a pending gap).
+> authorization. This implementation performs no provisioning or provider
+> calls. There is still no saved payment method, in-app cancellation, provider
+> invoice or receipt history, refund/proration/dunning execution, notification,
+> live payment, production credential, production activation, or Starter selling
+> (Step 10a records that as a decision, not as a pending gap).
 > **Receipt is still not confirmation**: the webhook receiver records deliveries; `POST /api/billing/sync` applies the canonical status mapping without confirming payment; `POST /api/billing/verify` records verified-transaction evidence after reconciliation — none of them changes subscription plan or grants execution. The only payment-confirmation authority is the out-of-band activation fact, written by a named operator with a stated reason.
 >
 > **A non-commercial operator grant exists, and it is deliberately NOT a payment.** `npm run billing:grant` (`scripts/billing/grant-entitlements.ts` → `BillingEntitlementGrantService`, migration `0036_billing_entitlement_grants.sql`) records one immutable, append-only **non-commercial grant** for a named account — a standing operator authorization of a commercial entitlement tier for an account that made no purchase. It exists because the payment path is *correctly* closed to any account that has not paid: `BillingActivationService` refuses without verified payment evidence, and that evidence is only ever produced by a **real** provider read. The grant is therefore a **separate authority beside the payment path, not a shortcut through it**: it calls no provider, reads no key, consults no `PAYSTACK_MODE`, writes no subscription/evidence/activation/epoch/FX row, and has **no HTTP surface** (no route, no admin role, no token — `DATABASE_URL` is the whole trust boundary). `paymentConfirmed` remains derived from the 0034 activation fact alone and stays **`false`** for a granted account; `canAccessAutomation` stays `false` and automation/live/broker execution stay OFF. `GET /api/billing/me` discloses it read-only as `entitlementGrant: { plan }` (the tier, nothing else — no operator, no reason, no id, no payment field). See *Non-commercial operator grant*.
@@ -159,7 +161,7 @@
 | Provider plan mutation | **Never.** `PUT /plan` is never called; a price change is a NEW epoch + a NEW provider plan, and the previous epoch is retired locally |
 | Entitlements / execution | **Unchanged.** `canAccessAutomation` stays `false` for every plan |
 | Billing Step 9b — C-1 (cancellation) | **Defer customer-facing in-app cancellation.** Keep the existing adapter capability, but add no route or button. Reconsider only after paid-through-period entitlement behavior, durable cancellation status, provider uncertainty/retry behavior, and customer support/terms implications are addressed. No provider-hosted portal is asserted to exist. |
-| Billing Step 9b — R-1 (payment history) | Approve a future read-only view labelled **Verified payment records**, from existing `billing_verified_transactions` only. Require authenticated-user/provider-mode scoping, a strict minimal DTO, bounded newest-first results, stored verified amounts, and disclosure that coverage is limited to VeltrixEye-verified transactions—not complete invoice, renewal, failure, or refund history. No provider invoice/receipt creation, Paystack call, FX recalculation, cancellation, or entitlement behavior. |
+| Billing Step 9b — R-1 (payment history) | **Delivered:** read-only **Verified Payment Records** view from existing `billing_verified_transactions` only. The authenticated-user and server-mode scoped `GET /api/billing/verified-payment-records` returns at most 25 newest records in a strict DTO with stored GHS minor amounts and persisted paid/verified times. It discloses that coverage is limited to transactions verified through VeltrixEye—not complete invoice, renewal, failure, or refund history. No provider invoice/receipt creation, Paystack call, FX recalculation, cancellation, or entitlement behavior. |
 
 ## Pricing decisions (D-1 … D-9)
 
@@ -858,18 +860,19 @@ ledger write — receipt only) — while everything below remains true at the
   `billing_customers` now has exactly one writer — the Billing Step 6 customer
   provisioning flow (`POST /api/billing/customer`, see below) — which records
   provider customer identity only and grants nothing.
-- **No customer-facing billing management beyond checkout, verification, and the
-  read-only overview.** There is no cancellation route or button, invoice
-  endpoint, or Verified payment records view; payment-method management, plan
-  changes and refunds are also absent. The Paystack adapter contains a
-  non-immediate cancellation operation, but approved C-1 keeps it unexposed.
-  **Billing Portal v1 provides a READ-ONLY overview**
-  (`GET /api/billing/portal` plus the `/settings` card), and the Step 9 surface
-  initiates a sandbox checkout and verifies it. Together those are the current
-  customer-facing billing UI. Step 9b now records deferred cancellation and a
-  future, read-only Verified payment records view; neither feature is
-  implemented. No provider-hosted cancellation portal is claimed. See
-  *Self-serve billing management scope (Billing Step 9b)*.
+- **No customer-facing billing management beyond checkout, verification, and
+  the two read-only views.** There is no cancellation route or button, provider
+  invoice endpoint, payment-method management, plan mutation or refund action.
+  The Paystack adapter contains a non-immediate cancellation operation, but
+  approved C-1 keeps it unexposed. **Billing Portal v1 provides the READ-ONLY
+  overview** (`GET /api/billing/portal` plus the `/settings` card), while
+  **Billing Step 9b-R1 provides the bounded Verified Payment Records view**
+  (`GET /api/billing/verified-payment-records` plus its `/settings` card),
+  sourced solely from existing verified evidence. Together with Step 9 checkout
+  and explicit verification, these are the current customer-facing billing
+  surfaces. C-1 remains deferred; R-1 is delivered. No provider-hosted
+  cancellation portal or invoice history is claimed. See *Self-serve billing
+  management scope (Billing Step 9b)*.
 - **No webhook-driven state change.** The receiver writes
   `billing_provider_events` rows (`received`) and never touches
   `subscriptions`, entitlements or any execution gate. A recorded
@@ -1076,9 +1079,9 @@ Roughly in order; each is its own PR and may be re-scoped.
      only)**; see *Customer provisioning (Billing Step 6)* below.
    - 8b. ~~**Billing portal — read-only v1**~~ — **delivered by Billing Portal
      v1** (the overview only; see *Read-only billing overview (Billing Portal
-     v1)* below). Customer-facing cancellation remains deferred; a future
-     Verified payment records view is approved but not started. No provider-
-     hosted cancellation portal is asserted to exist.
+     v1)* below). Customer-facing cancellation remains deferred; the separate
+     Verified Payment Records view is now delivered under Step 9b-R1. No
+     provider-hosted cancellation portal is asserted to exist.
 9. **Web UI** — checkout and portal surfaces in `apps/web`.
    - **9a. Sandbox checkout surface — delivered by Billing Step 9 (sandbox
      only)**; see *Sandbox checkout surface (Billing Step 9)* below. Four
@@ -1086,21 +1089,21 @@ Roughly in order; each is its own PR and may be re-scoped.
      authorization URL used verbatim, an explicit verification action, no
      polling, and a disclosed response projection that carries no checkout
      reference, provider identifier, idempotency key or pricing snapshot.
-   - 9b. Billing portal and self-serve management — **DECISIONS RECORDED,
-     IMPLEMENTATION NOT STARTED (Billing Step 9b, this document only)**. The
-     READ-ONLY overview card shipped with Billing Portal v1 and offers no
-     action. C-1 defers an in-app cancellation route/button, retaining the
+   - 9b. Billing portal and self-serve management — **PARTIALLY DELIVERED**.
+     The READ-ONLY overview card shipped with Billing Portal v1 and offers no
+     action. C-1 still defers an in-app cancellation route/button, retaining the
      adapter capability without exposing it; provider-hosted management is not
-     claimed. R-1 approves only a future read-only **Verified payment records**
-     view sourced from `billing_verified_transactions`; it is not an invoice
-     feature and is not built. Its requirements are authenticated-user and
-     provider-mode scoping, a strict minimal DTO, bounded newest-first results,
-     stored verified amounts, and clear disclosure that the list is limited to
-     transactions verified through VeltrixEye rather than complete invoice,
+     claimed. R-1's read-only **Verified Payment Records** view is delivered at
+     `GET /api/billing/verified-payment-records`, sourced only from
+     `billing_verified_transactions`. It is authenticated-user and
+     server-mode scoped, uses a strict minimal DTO, returns the 25 newest
+     records in descending paid-time order, preserves stored integer GHS minor
+     amounts and persisted timestamps, and discloses that the list is limited
+     to transactions verified through VeltrixEye rather than complete invoice,
      renewal, failure, or refund history. Payment-method management and plan
      changes remain out; refunds / proration / dunning / go-live remain out.
-     See *Self-serve billing management scope (Billing Step 9b)*. This decision
-     update adds no route, migration, provider call, or authority.
+     See *Self-serve billing management scope (Billing Step 9b)*. The view adds
+     no migration, provider call, invoice/receipt creation, or authority change.
 10. **Starter sellability decision — decided: NOT sold in this build (Billing
     Step 10a).** Starter keeps its catalogue entry as a documented future
     concept and the plan comparison marks it "Not available yet"; nothing was
@@ -1607,28 +1610,30 @@ decision starts from the real constraints instead of from a price row.
 
 ## Self-serve billing management scope (Billing Step 9b)
 
-**Status: C-1 AND R-1 DECISIONS RECORDED — IMPLEMENTATION NOT STARTED.**
-This section records the approved Billing Step 9b scope and what remains
-outside it. This update is **documentation only**: it adds **no route, service,
-migration, schema change, column, provider operation or call, credential, API
-endpoint, or authority change**. The existing adapter capability is unchanged.
+**Status: C-1 DEFERRED; R-1 DELIVERED (2026-10-17).** This section records
+the approved Billing Step 9b scope and what remains outside it. R-1 is
+implemented as the bounded, read-only **Verified Payment Records** API and
+Settings card, using existing verified evidence. The implementation adds no
+migration, schema change, provider operation or call, credential, payment
+confirmation, entitlement, or execution authority. The existing adapter
+capability is unchanged.
 
-9b remains the earliest unfinished item under *Later billing PRs* (#9), but its
-product decisions are no longer unresolved. The only approved future
-customer-facing surface is a read-only **Verified payment records** view;
-in-app cancellation is deferred, and provider-issued invoices are not approved.
-No 9b feature is implemented by this decision update.
+9b is partially complete under *Later billing PRs* (#9): the read-only R-1
+surface is delivered; in-app cancellation remains deferred, and provider-issued
+invoices are not approved. No other customer-facing billing management is
+included.
 
 **C-1** and **R-1** are operator-approved and recorded in *Decisions
 (operator-confirmed)* above. The detailed dispositions and implementation
-boundaries follow; this documentation update does not authorize feature work.
+boundaries follow. The R-1 implementation is limited to the read-only evidence
+view described below; it does not authorize any other billing feature.
 
 ### 1. The 9b boundary
 
 | Capability | In 9b? | Disposition |
 | --- | --- | --- |
 | **Customer-facing cancellation** | **DEFERRED / out of the current 9b implementation** | Retain the existing adapter capability, but expose no cancellation route or button. Reconsider only after paid-through-period entitlement behavior, durable cancellation status, provider uncertainty/retry behavior, and customer support/terms implications are addressed. Do not imply a provider-hosted portal exists. |
-| **Verified payment records** | **Approved future read-only scope; not implemented** | Use only existing `billing_verified_transactions` evidence. Require authenticated-user and provider-mode scoping, a strict minimal DTO, bounded newest-first results, stored verified amounts, and disclosure that records cover only transactions verified through VeltrixEye—not complete invoice, renewal, failure, or refund history. No provider invoices/receipts, Paystack calls, FX recalculation, cancellation, or entitlement behavior. |
+| **Verified payment records** | **DELIVERED — read-only R-1 scope** | Uses only existing `billing_verified_transactions` evidence. The authenticated-user and server-mode scoped route returns at most 25 newest records in a strict minimal DTO with stored integer GHS minor amounts and persisted paid/verified times. It discloses that records cover only transactions verified through VeltrixEye—not complete invoice, renewal, failure, or refund history. No provider invoices/receipts, Paystack calls, FX recalculation, cancellation, or entitlement behavior. |
 | **Provider-issued invoices** | **Not approved / out of 9b** | Subscription lookup is not an invoice source. Local verified payment evidence must not be labelled as invoices or provider receipts. |
 | **Payment-method management** | **OUT of 9b** | This build persists no card, authorization or bank detail and reads none. The provider's `authorizations[]` on a customer fetch is credential-shaped material the adapter never reads, and a management surface over it would have to display reusable payment credentials. That is a separate decision with its own security review, not a 9b capability. |
 | **Plan changes** (upgrade / downgrade) | **OUT of 9b** | Provider plan-change semantics are documented as **unknown** (in-place change vs new subscription, re-authorization, timing — *paystack-provider-contract.md* §1), `PUT /plan` is forbidden by the provider-mutation decision, and a change would move the entitlement identity, which no billing surface may do (`planChanged` / `entitlementsChanged` are pinned `z.literal(false)`). A plan change is a NEW checkout against a NEW epoch (D-9) — a purchase path the Step 9 surface already provides — not a self-serve mutation of an existing subscription. |
@@ -1637,13 +1642,13 @@ boundaries follow; this documentation update does not authorize feature work.
 | **Dunning** | OUT | Later billing work (#11), its own PR. The provider documents that "subscriptions aren't retried", so a local dunning policy would be new product behaviour rather than a passthrough. |
 | **Production go-live** | OUT | Later billing work (#12), gated on everything above. |
 
-9b's approved future customer-facing scope is limited to one read-only
-**Verified payment records** view; it is not implemented. Customer-facing
-cancellation remains deferred, provider-issued invoices are not approved, and
-payment-method management, plan changes, refunds, proration, dunning and
-go-live remain out. The existing non-immediate cancellation adapter is a
-provider capability, not authorization for a self-service feature. There is
-currently no cancellation route/button or payment-records view.
+9b's approved customer-facing scope includes one read-only **Verified Payment
+Records** view, now implemented at `GET /api/billing/verified-payment-records`.
+Customer-facing cancellation remains deferred, provider-issued invoices are
+not approved, and payment-method management, plan changes, refunds, proration,
+dunning and go-live remain out. The existing non-immediate cancellation
+adapter is a provider capability, not authorization for a self-service
+feature. There is still no cancellation route or button.
 
 ### 2. Decision C-1 — defer customer-facing in-app cancellation (APPROVED)
 
@@ -1687,7 +1692,7 @@ for a documented payload or an authorized action record.
 The existing `GET /api/billing/portal` and `/settings` overview remain
 read-only. Adapter availability does not authorize exposing cancellation.
 
-### 3. Decision R-1 — future read-only Verified payment records (APPROVED; NOT IMPLEMENTED)
+### 3. Decision R-1 — read-only Verified Payment Records (APPROVED; IMPLEMENTED)
 
 The provider-read behavior below is unchanged context only; neither subscription
 lookup nor synchronization is a source for this view. R-1 uses only
@@ -1728,26 +1733,28 @@ because core owns synchronization. Neither lookup nor sync grants payment
 activation. The portal reads persisted local facts and activation authority;
 it does not call the provider or calculate renewal dates from an interval.
 
-**Approved R-1 disposition.** A future customer-facing view may show only
-**Verified payment records** from the existing `billing_verified_transactions`
-evidence. It is a read-only local evidence view—not an invoice feature or a
-provider-issued receipt. A future implementation must:
+**Verified implementation (2026-10-17).** The Settings surface reads
+`GET /api/billing/verified-payment-records`, backed only by the existing
+`billing_verified_transactions` evidence table. The route derives the subject
+from the authenticated session and the provider domain from server
+configuration; neither is request-selectable. The query returns at most the 25
+newest records for that user and mode. The strict DTO contains only the stored
+GHS amount in integer minor units, its currency/exponent, and persisted paid and
+verified timestamps; row/user/subscription ids, provider references/status,
+hashes, idempotency keys, pricing snapshots and raw payloads are not selected
+or disclosed. Malformed data and read failures return the fixed unavailable
+answer rather than a partial list.
 
-- scope every query to the authenticated user and configured provider mode;
-- expose a strict minimal DTO, with no raw provider payload or credential-shaped
-  data;
-- return a bounded, newest-first result set;
-- display the stored verified amount rather than recalculating FX; and
-- clearly disclose that it includes only transactions verified through
-  VeltrixEye and is not a complete invoice, renewal, failure, or refund history.
-
-It must not create provider invoices or receipts, call Paystack, recalculate FX,
-or add cancellation or entitlement behavior. Subscription lookup is not an
-invoice source; the receipt-only `billing_provider_events` ledger is not
-verified payment evidence or an invoice list. Normalizing `invoice.update` /
-`invoice.payment_failed` does not implement invoice retrieval or customer
-invoice delivery. No Verified payment records view exists today; this is a
-product-scope decision, not implementation authorization.
+The Settings card clearly limits coverage to transactions verified through
+VeltrixEye and states that the view is not a complete invoice, renewal, failed-
+payment, refund or provider-issued receipt history. It must not create provider
+invoices or receipts, call Paystack, recalculate FX, or add cancellation or
+entitlement behavior. Subscription lookup is not an invoice source; the
+receipt-only `billing_provider_events` ledger is not verified payment evidence
+or an invoice list. Normalizing `invoice.update` / `invoice.payment_failed`
+does not implement invoice retrieval or customer invoice delivery. This change
+adds no migration, provider operation or billing authority and was tested only
+against local embedded PostgreSQL fixtures; it is not production verification.
 
 Any future lifecycle/cancellation display must retain the authoritative,
 guarded persistence boundary and state `null` / `unknown` where facts are not
@@ -1763,10 +1770,10 @@ The Step 4 provisioning workflow exists
 stub-transport tests do not establish current deployed FX/plan records or a
 real sandbox subscription. Without a registered plan epoch, checkout fails
 closed with `plan_not_registered`. C-1 defers customer-facing cancellation;
-R-1's future read-only payment-records view uses existing verified evidence and
-does not require a provider management call or sandbox provisioning. Any
-separately authorized sandbox management exercise still requires separately
-verified provisioning and subscription evidence.
+the delivered R-1 view reads only existing verified evidence and requires no
+provider management call or sandbox provisioning. Any separately authorized
+sandbox management exercise still requires separately verified provisioning
+and subscription evidence.
 
 **This reconciliation does not perform that operator run or clear AC5.** It
 publishes no FX rate, creates no provider plan, registers no epoch, and
