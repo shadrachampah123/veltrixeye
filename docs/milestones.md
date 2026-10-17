@@ -31,11 +31,15 @@ configuration, billing, FX, broker or execution change.
   **503/503**, focused liveness and ticker tests **14/14**, API typecheck, lint
   and diff checks. Additional safety audit runs passed: Gate 9/B1/B2 focused
   core tests **106/106**, and health, retention, notification ticker and
-  worker-liveness API tests **78/78**. Those checks cover source/workflow head
-  `9b83989`; any later PR push (including this documentation update) must have
-  green checks on its exact latest SHA before merge. No PR approval was observed (`reviewDecision`
-  empty, no reviews); repository protection settings could not be queried, so
-  whether a mandatory approval applies is unknown. PR #128 is not merged.
+  worker-liveness API tests **78/78**. CI passed on source/workflow head
+  `9b83989`; after the documentation update at head
+  `57af1632208443c2a7178f4c0ead4a7c31182714`, push CI `39059834338` and PR CI
+  `39059839158` both passed, as did Vercel Preview. The conditional failure
+  reporter jobs were skipped because the tests succeeded. Any later push still
+  requires green checks on its exact latest SHA before merge. No PR approval was
+  observed (`reviewDecision` empty, no reviews); repository protection settings
+  could not be queried, so whether a mandatory approval applies is unknown. PR
+  #128 is not merged.
 - **CI reliability:** the workflow now pins `ubuntu-24.04` (retaining the
   existing required-check display name) and audited action releases
   `checkout@v7.0.1`, `setup-node@v7.1.0`, `upload-artifact@v7.0.2`,
