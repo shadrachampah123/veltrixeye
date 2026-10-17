@@ -5,6 +5,30 @@ wiring that lets the production web app talk to it. Nothing here contains a
 credential: every secret is supplied by the operator at deploy time
 (see [security.md](./security.md)).
 
+## Current production verification gate (2026-10-17 UTC)
+
+**Status: BLOCKED.** Neon production compute is exhausted. Until the
+authorized owner confirms that compute has recovered and explicitly authorizes
+a read-only observation, do not run or report production database or health
+checks. This is an operational blocker, not evidence that production is
+healthy or unhealthy. This status applies to latest `main` at
+`f9e660d66fe56af2ea4f1d2031759210af497d67`; no production probe was attempted.
+
+The following production checks are blocked:
+
+- `GET /api/health` and `GET /api/health/ready`, including worker and retention
+  observations;
+- `npm run db:migrate -- --status` or any other direct use of the production
+  `DATABASE_URL`;
+- production diagnostic workflows, including the paused Gold diagnostic
+  workflows in PRs #103/#104.
+
+Local embedded-Postgres tests, type checks and builds remain allowed; they are
+not production verification. Do not change the production `DATABASE_URL`,
+production migrations, configuration or infrastructure to clear this block.
+After compute is restored, record sanitized HTTP status/JSON and schema/checksum
+evidence here before changing the status.
+
 ## Topology
 
 ```
@@ -157,6 +181,12 @@ npm run db:migrate -- --status # read-only: list applied migrations
 docker run --rm -e DATABASE_URL='postgres://…' veltrixeye-api npm run db:migrate -- --status
 ```
 
+> **Current production status: BLOCKED.** The commands above describe the
+> eventual read-only procedure; do not point them at Neon production while
+> compute is exhausted. No production migration status, connection check or
+> schema observation is authorized until the owner confirms recovery and
+> authorizes it.
+
 Optional: on a **paid** Render instance type you can also add
 
 ```yaml
@@ -283,6 +313,11 @@ unauthenticated health response were inaccessible due deployment protection;
 see the evidence record above. Production was not probed.
 
 ## Step 5 — Verify the deployment
+
+> **Current status: BLOCKED.** The read-only health and readiness commands
+> below are preserved as the post-recovery procedure only. Do not execute them
+> against production while Neon compute is exhausted, and do not treat local
+> tests or deployment records as a substitute for the blocked observation.
 
 ```bash
 API_BASE='https://<your-api-host>'   # the URL you copied in Step 2

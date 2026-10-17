@@ -8,6 +8,17 @@ verification or release approval**. Evidence checked against `main`
 `0e8c684d530889f4f226245f8f64ff1424343240`, current PRs, CI checks and recorded
 deployment/status data. This checkpoint does not authorize production changes.
 
+- **Production database and health verification: BLOCKED (2026-10-17 UTC).**
+  Neon production compute is exhausted. Do not use the production
+  `DATABASE_URL`, run migration/status queries, call production `/api/health`
+  or `/api/health/ready`, or report worker/retention health until compute is
+  restored and an authorized owner explicitly permits a read-only check. This
+  block was recorded while reviewing latest `main` at
+  `f9e660d66fe56af2ea4f1d2031759210af497d67`; no production probe was attempted.
+  Local embedded-Postgres tests and deployment records are not production
+  evidence; no production configuration, data, migration or infrastructure may
+  be changed to clear this block.
+
 ### Current delivery and gates
 
 - **Merged, repository/CI verified:** M1–M9.2 and M10.0/Gate 9/B1/B2 are present
@@ -95,9 +106,12 @@ resume the paused work. Automation stays OFF and execution stays paper-only.
 
 1. Resolve the M9.2 outbox symbol-collision item with a reproducible test and
    focused review; update its status only when that evidence exists.
-2. Verify current production schema/health and operational monitoring without
-   changing production configuration; keep billing sandbox and FX publication
-   behind their explicit owner approvals.
+2. **BLOCKED — production verification:** after Neon compute is restored and an
+   authorized owner permits a read-only check, verify the current production
+   schema/health and operational monitoring without changing production
+   configuration. Until then, keep all production database/health checks
+   blocked; keep billing sandbox and FX publication behind their explicit owner
+   approvals.
 3. Close legal approval, commercial policy, retention/monitoring, CI reliability
    and release-readiness gaps with evidence.
 4. Obtain and record PR #121's actual Vercel Preview deployment evidence before
@@ -833,7 +847,11 @@ Completes the second notification channel and preference system, plus durable fa
 - **Durable fairness (remediation):** `notification_delivery_fairness` singleton table `0026` with `last_channel`, advisory lock `611_231_008` + `FOR UPDATE` + `FOR UPDATE SKIP LOCKED` claim, lifetime counters `email_claims, webhook_claims` added in `0027_notification_fairness_ledger.sql` (additive ALTER TABLE). Counters only grow inside claiming transaction, rollback-safe, immune to cleanup/cascade/retries/stale recovery/restart. Single-row and batch claims both use durable ledger, not `sum(attempts)`.
 - **API:** `GET/PUT /api/notifications/preferences`, `GET/PUT /api/notifications/preferences/strategies/:strategyId`, owner-scoped, rate-limited 30/min, audit logged, DTOs never contain secrets.
 - **Tests:** 1407-line `notification-outbox.test.ts` covering ledger byte-identical across cleanup/cascade, batch fairness durable, 5-round balanced, worker-id bias, retries/stale no disturb, 4-way concurrent, invalid limits, rollback, plus `m91-migrations.test.ts` fresh 27 and upgrade 0022→0027.
-- **Production:** verified `https://veltrixeye-api.onrender.com/api/health/ready` → `applied 27 expected 27 latest 0027_notification_fairness_ledger.sql pending [] checksumsMatch true`.
+- **Historical production observation (not current verification):** a prior
+  check recorded `https://veltrixeye-api.onrender.com/api/health/ready` →
+  `applied 27 expected 27 latest 0027_notification_fairness_ledger.sql pending [] checksumsMatch true`.
+  It is superseded by the current **BLOCKED** production database/health gate;
+  it does not prove the current schema, readiness or operational health.
 
 ## M9.2 — delivered (Push Channel + Preferences UI + Secret Hardening + 3-Way Fairness)
 
