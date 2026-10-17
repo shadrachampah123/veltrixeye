@@ -1,128 +1,189 @@
 # Milestone Boundaries
 
-## Current roadmap and release-status reconciliation (2026-10-17)
+## Current release-readiness audit (2026-10-17 UTC)
 
-This is the canonical roadmap/status record. The milestone sections below describe
-implemented scope; **implementation/merge is not the same as production
-verification or release approval**. Evidence checked against `main`
-`0e8c684d530889f4f226245f8f64ff1424343240`, current PRs, CI checks and recorded
-deployment/status data. This checkpoint does not authorize production changes.
+This is the canonical, evidence-qualified roadmap checkpoint. The audit started
+from `main` SHA `7d70efc81a5814b214c2759243c46e4de8a4c6c7`. Current `main` is
+`f9e660d66fe56af2ea4f1d2031759210af497d67` after M9.2 PR #127. The active
+session branch has the notification-liveness and CI-hardening work in open PR
+#128; PR checks are not production-health evidence. Merged, tested, deployed and
+production-verified are distinct states. This record authorizes no production
+configuration, billing, FX, broker or execution change.
 
-### Current delivery and gates
+### Delivery and verification state
 
-- **Merged, repository/CI verified:** M1–M9.2 and M10.0/Gate 9/B1/B2 are present
-  on `main`; latest merges include #122 (sandbox provisioning dry-run tests),
-  #123 (checkout epoch revalidation), and #124 (typed scanner transient
-  failures). Their reported required CI jobs passed. This is code/test evidence,
-  not proof that every feature is operational or production-verified.
-- **M9.2 outbox symbol-collision patch:** unresolved as a roadmap item. The
-  current code contains M9.2 outbox tests, but the checked-in milestone history,
-  open PR list, and issue/PR search contain no specific collision remediation
-  or closure evidence. Do not treat the broad “M9.2 delivered” heading as proof
-  that this separately identified patch is done; track and verify its exact
-  failing case before closing it.
-- **Execution safety:** automation remains OFF; live execution remains
-  unavailable/impossible by the enforced boundary. M10/Gate 9 is a non-live
-  foundation only. Trading remains paper-only. No broker orders, live/demo
-  connectivity, or Gold v8 work is authorized by this roadmap.
-- **Release readiness:** not release-ready by assertion. Required gates include
-  externally validated execution transport (still absent), end-to-end release
-  evidence, production configuration/health verification for the deployed
-  schema, approved legal copy, and closure of remaining reliability and
-  commercial gates below.
-- **Billing / Paystack:** sandbox/test only. #119 merged the provisioning CLI
-  with dry-run default, and #122 added a focused dry-run preparation suite; these
-  do not prove that sandbox plans were provisioned. Provisioning remains an
-  explicit operator gate. Production credentials and live Paystack remain
-  prohibited/deferred. No surprise plan rotation is authorized.
-- **FX:** #120 added read-only Bank of Ghana source observations; #116 added a
-  dry-run-only evidence validator. No FX rate publication is evidenced here.
-  Publishing an authoritative FX version remains a deliberate operator action
-  and a prerequisite for dependent provider-plan provisioning; do not publish
-  as part of this work.
-- **Retention / monitoring:** scanner-run retention and unauthenticated
-  retention-sweep observability were merged (#107/#111); the M9.1 deployment
-  health note records schema 0027 at the time of that check. Current `main`
-  includes later migrations through 0036, and this checkpoint has no fresh
-  production readiness observation for that current schema. Treat current
-  production migration/health status as unverified. CI's test retry loop was
-  removed (#112); latest inspected CI runs pass, but reliability is monitored
-  through actual authoritative runs, not retries or a single green badge.
-- **Legal / commercial polish:** customer-facing legal/risk copy from #106 is
-  explicitly draft and awaits legal approval. Billing portal v1 is read-only;
-  cancellation and verified-payment-history UI remain scoped/deferred as
-  documented. Starter is not sold; production billing credentials, provider
-  provisioning, FX publication, and any unapproved pricing/plan changes remain
-  gates. Do not represent the product as legally or commercially launch-ready.
-- **AI / ChatGPT Strategy Builder:** intentionally the final roadmap feature,
-  after operational safety, production validation, legal, commercial and
-  release-readiness gates. It is not implemented or approved to displace those
-  prerequisites.
+- **M9.2 — merged and repository/CI verified:** PR #127 merged at
+  `f9e660d66fe56af2ea4f1d2031759210af497d67`; its PR checks and post-merge CI
+  run `39056164366` passed. The collision-hardening change is confined to the
+  M9.2 test helper in `packages/core/test/m92-outbox.test.ts`: its generated
+  instrument-symbol suffix uses `randomBytes(8)`. Password and strategy-name
+  generators were not changed. This is test/code evidence, not deployment or
+  production health evidence.
+- **Notification ticker liveness + CI reliability — implemented, tested, open
+  PR:** #128 is open. Runtime fix commit `e6618461e366f608c2bb9fa5e86ca195fa488ba1`
+  records liveness before maintenance and records failures when maintenance or
+  delivery work throws. CI-hardening commits
+  `4e17e763a433e102d8c2a73fa50933d90b848ebc` and
+  `9b83989442f83d1e764288fccf8ebaf290db757e` update the workflow. On the latter
+  head, pull-request CI `39058918727` and push CI `39058915025` passed; Vercel
+  Preview passed. The conditional failure-reporter jobs were skipped as expected
+  because the test jobs succeeded. Local evidence includes the API suite
+  **503/503**, focused liveness and ticker tests **14/14**, API typecheck, lint
+  and diff checks. Additional safety audit runs passed: Gate 9/B1/B2 focused
+  core tests **106/106**, and health, retention, notification ticker and
+  worker-liveness API tests **78/78**. Those checks cover source/workflow head
+  `9b83989`; any later PR push (including this documentation update) must have
+  green checks on its exact latest SHA before merge. No PR approval was observed (`reviewDecision`
+  empty, no reviews); repository protection settings could not be queried, so
+  whether a mandatory approval applies is unknown. PR #128 is not merged.
+- **CI reliability:** the workflow now pins `ubuntu-24.04` (retaining the
+  existing required-check display name) and audited action releases
+  `checkout@v7.0.1`, `setup-node@v7.1.0`, `upload-artifact@v7.0.2`,
+  `download-artifact@v8.0.2`, and `github-script@v9.0.0`. This addresses the
+  observed warning that Node-20 action versions were being forced to Node 24;
+  audited action metadata now declares Node 24. The `ubuntu-latest`→Ubuntu 26.04
+  transition begins `2026-10-19`, so the pin preserves the known runner; the
+  new action/runner combination passed CI on PR head `9b83989`. Workflow-level permissions are
+  read-only; only the isolated failure reporter receives `actions: read` and
+  `pull-requests: write`, runs for same-repository PR test failures, and does
+  not check out or execute PR code. Ubuntu 26.04 compatibility for the
+  embedded-PostgreSQL suite remains untested.
+- **Execution safety / M10 / Gate 9:** M10.0, Gate 9 protocol and durable
+  submit-mutation persistence, B1 and B2 are implemented and covered by
+  repository tests, but remain a non-live foundation. Gate 9 persistence is for
+  submit mutations only; M10 transport adapters remain unwired and disabled,
+  and no broker/MT5/Exness connection, demo session or order is verified. The
+  **106/106** focused safety tests cover identity/binding mismatch, one-use
+  barrier consumption, duplicate/replay refusal, retry lineage and restart
+  recovery; unknown outcomes remain uncertain, not accepted/rejected. M10's
+  adapter idempotency is process-local; durable Gate 9 submit identity/replay
+  controls do not themselves create a production transport or authorization
+  resolver. Automation remains **OFF** for all plans; no live order or execution
+  is authorized or claimed.
+- **Retention and health:** scanner-run retention and health observability are
+  implemented and locally tested (core scanner-run retention **16/16**; API health/
+  retention/liveness subset **78/78**), including zero-delete sweep evidence and
+  sanitized failures. The source inventory now has **38 migrations**, through
+  `0038_billing_fx_source_observations.sql`; production's applied count,
+  readiness, notification liveness, scanner liveness and retention-sweep state
+  are all **unverified**.
+- **Paystack / pricing / FX:** Paystack remains sandbox/test-only; no sandbox
+  plan provisioning is evidenced by this audit, and live credentials/operations
+  are not authorized. Do not rotate plan codes or alter the user-approved prices:
+  Pro GH₵451.62/month and GH₵4,516.20/year; Elite GH₵1,146.42/month and
+  GH₵11,464.20/year. FX source observations are not published rates. Preserve
+  stale-rate/fail-closed behavior; publication and any plan provisioning require
+  the relevant explicit operator approval.
+- **Legal / commercial readiness:** the customer-facing legal/risk copy from
+  #106 remains draft and awaits qualified legal review. Billing portal v1 is
+  read-only; approved future payment-history scope is not implemented. Starter
+  is not sold. No claim of legal, commercial or release readiness is made.
+- **AI / ChatGPT Strategy Builder:** intentionally the final product feature,
+  after operational safety, production validation, legal and commercial gates.
+  It is not implemented or approved to displace those prerequisites.
 
-### PR #121 / Vercel Preview status
+### Production deployment records (not health checks)
+
+- GitHub records Vercel Production deployment **7143558642** for main SHA
+  `f9e660d66fe56af2ea4f1d2031759210af497d67` as `success` / `Deployment has
+  completed` at `2026-10-17T18:00:44Z`. This verifies the deployment record
+  only. No live application health/readiness response or Vercel dashboard Ready
+  label was independently observed.
+- GitHub records Render API deployment **7143549231** for the same SHA as
+  `failure` at `2026-10-17T18:01:34Z`. Its cause and logs are unknown from the
+  evidence available here. The authorized owner must inspect Render Dashboard →
+  `veltrixeye-api` → Deploys → `7143549231`, identify the failing stage and
+  sanitized cause, and report whether the prior service instance remains
+  available. Do not share secrets or environment-variable values. No production
+  configuration was changed.
+- Because the Render failure is unexplained, PR #128's runtime API change is
+  being held from merge. A successful Vercel status does not cancel or explain
+  the Render failure, and neither deployment record proves `/api/health`,
+  `/api/health/ready`, database connectivity or applied migrations.
+
+### Historical Vercel Preview status (PR #121 / #125)
 
 PR #121's original head was
 `e0ce6473b0e00324b30dc3279503e95e8b999f48`. GitHub's Vercel status for that SHA
 said “Canceled by Ignored Build Step”; there is no Preview deployment record for
 that SHA. The owner reported Root Directory `apps/web` and disabling/saving the
 project root-directory-change skip filter. The replacement PR #125 carried
-forward #121's documentation-only policy, reconciled this roadmap, and produced
-a successful Preview on final PR head
-`78088b96c0ae2e25bc0ca5997a104b8936a46575`: GitHub deployment 7142752223,
-environment `Preview`, status `success`, URL
-`https://veltrixeye-mcdomur37-shadrachampah123s-projects.vercel.app`. The
-reported filter change plus earlier “Canceled by Ignored Build Step” statuses
-and subsequent completed Preview supports the root-directory skip filter as
-the blocker; the exact setting-change timestamp remains unverified because the
-Vercel activity log was not accessible. The Production Override was left
-untouched. A read-only health probe was blocked by Vercel deployment protection;
-the dashboard's literal “Ready” label and Preview `API_INTERNAL_BASE` presence
-were not independently observed. PR #125 passed CI and was merged as
+forward #121's documentation-only policy and produced a successful Preview on
+final PR head `78088b96c0ae2e25bc0ca5997a104b8936a46575`: GitHub deployment
+7142752223, environment `Preview`, status `success`. The reported filter change
+plus earlier “Canceled by Ignored Build Step” statuses and subsequent completed
+Preview supports the root-directory skip filter as the blocker; the exact
+setting-change timestamp remains unverified. The Production Override was left
+untouched. A read-only health probe was blocked by deployment protection; the
+Vercel dashboard's literal “Ready” label and Preview `API_INTERNAL_BASE`
+presence were not independently observed. PR #125 passed CI and merged as
 `a931167ed6bf43ce4b3fd7809a3298431db20ccb`; PR #121 was closed as superseded,
-not merged. Post-merge CI passed; GitHub recorded Vercel deployment 7142851056
-for the merge SHA as `Production` / `Deployment has completed`. No Production
-health probe was performed. `apps/web/vercel.json` specifies framework/build
-wiring but cannot prove live dashboard or environment-variable values.
+not merged. Post-merge CI passed and GitHub recorded Vercel deployment 7142851056
+for that merge SHA as `Production` / `Deployment has completed`; Production was
+not probed.
 
 ### Paused investigation and preserved evidence
 
-Gold Break & Retest v8 remains **PAUSED**. Preserve its existing evidence and
-versions as-is; do not run, resume, amend, or reopen that investigation here.
+Gold Break & Retest Test Pro VI v8 remains **PAUSED**. Preserve its evidence and
+versions; do not run, resume, amend, reopen, change versions or discard evidence.
 Open PRs #103/#104 concern the read-only diagnostic and are not authorization to
-resume the paused work. Automation stays OFF and execution stays paper-only.
+resume that work. Automation stays OFF.
 
-### Remaining validation sequence (gates, not completion claims)
+### Ordered readiness gates (incomplete gates, not completion claims)
 
-1. Resolve the M9.2 outbox symbol-collision item with a reproducible test and
-   focused review; update its status only when that evidence exists.
-2. Verify current production schema/health and operational monitoring without
-   changing production configuration; keep billing sandbox and FX publication
-   behind their explicit owner approvals.
-3. Close legal approval, commercial policy, retention/monitoring, CI reliability
-   and release-readiness gaps with evidence.
-4. Obtain and record PR #121's actual Vercel Preview deployment evidence before
-   changing its Draft/unmerged disposition.
-5. Consider the AI/ChatGPT Strategy Builder only after the preceding gates.
+1. **Resolve the deployment blocker before merging runtime API code.** The
+   authorized owner inspects Render deployment `7143549231` in the dashboard,
+   reports the failing stage/cause without secrets, and confirms whether the
+   previous service instance is serving. If a code/config correction is needed,
+   propose it for review; do not change production configuration or trigger a
+   protected deployment without explicit authorization.
+2. **Verify production health read-only after the owner confirms a safe
+   deployment state.** Record HTTP status and sanitized JSON from
+   `/api/health` and `/api/health/ready`, including worker and retention blocks.
+   The current source expects 38 migrations and latest
+   `0038_billing_fx_source_observations.sql`; do not say production is 38/38
+   until the endpoint proves it with no pending migrations and matching
+   checksums. No protected Vercel probe bypass.
+3. **Merge PR #128 only when safe.** Recheck required CI on its final head and
+   any mandatory review approval; current repository settings did not expose
+   branch-protection requirements to this audit. The unexplained Render failure
+   must be diagnosed first. After a normal merge/deploy, independently verify
+   the resulting API health/readiness before calling it production-verified.
+4. **Keep M10/Gate 9 non-live.** Any future broker/bridge or demo integration
+   needs a separately approved scope, vendor protocol and test environment,
+   a production-grade secret-manager/credential binding, authoritative
+   server-side authorization, durable identity/replay and reconciliation/audit
+   evidence, and an independent safety review. No such integration or order is
+   authorized by this audit.
+5. **Close commercial/FX gates only with their own explicit approvals.** Keep
+   Paystack test-only; preserve plan codes and prices. Any sandbox plan action
+   requires explicit operator authorization and a reviewed FX authority. FX
+   observations are monitoring evidence, not publishable rates; publish no
+   version without explicit approval. Retain stale-rate and billing fail-closed
+   invariants.
+6. **Obtain legal/commercial sign-off.** Qualified counsel must review the
+   draft customer-facing legal/risk language; commercial owners must confirm the
+   catalogue/launch policy. Do not turn draft language into approved copy or
+   claim unsupported trading performance.
+7. **Only after the preceding gates**, consider the AI/ChatGPT Strategy Builder.
 
-This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
-M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2, M8.3, M8.4, M8.5,
-M8.6, M8.7, M9.1, M9.2, the M10.0 / Gate 9 execution-transport program
-(transport foundation, Gate 9 protocol + persistence, B1, B2), and the start of
-billing (PR1 — authoritative commercial catalogue; **no payment flow**). The
-boundaries below are deliberate and enforced: M1 shipped foundations and
-contracts; M2 added real historical
-market data; M3 added deterministic strategy evaluation; M4 added
-deterministic setup detection and lifecycle management; M5 added
-deterministic setup quality scoring; M6 Phases 1–3 add the backtest
-engine/service and explicit setup alerts with a **stub-only** delivery
-ledger; M6 Phase 4 adds the backtest and alert surfaces in the web app; M7.1
-adds the core browser trading workflow (evaluate → detect → score →
-transition → alert → acknowledge); M7.2 hardens the whole surface for
-commercial readiness (reference-data protection, audit attribution,
-credential-endpoint limiting, session hygiene). M8.3 adds an **internal,
-deterministic paper execution simulator** — simulated fills and positions
-only, no broker, no demo account, no live execution. Still, nothing that
-schedules, streams, sends real notifications, or executes a real trade.
+The repository contains **Milestones M1–M9.2**, the **M10.0 / Gate 9
+execution-transport foundation** (protocol, durable provider-submit mutation
+persistence, B1 and B2), and the evolving billing program through sandbox
+checkout, verified-payment evidence, out-of-band activation, a read-only billing
+portal and non-commercial grants. These are implementation boundaries, not
+production-operation or release-approval claims. M1–M5 establish the product,
+market-data, deterministic evaluation, setup detection/lifecycle and
+quality-scoring foundations. M6 adds backtests, alerts and web surfaces; M7 adds
+the browser trading workflow, security hardening, scanner and notification
+delivery; M8 adds paper execution and safety controls; M9 adds notification
+delivery/preferences/push and secret hardening. M10/Gate 9 adds non-live
+execution authorization and durable submit identity/replay safeguards. None of
+those layers authorizes a broker trade: automation remains **OFF**, live
+execution is unavailable, and the paper simulator is internal and deterministic
+only. Scheduled workers and notification transports exist in source, but their
+current production operation is not verified by this audit. Billing remains
+fail-closed and sandbox/test-only; it grants no execution capability.
 
 ## M1 — delivered (Product Foundation & Architecture)
 
@@ -850,6 +911,7 @@ Extends M9.1 with third channel, UI, and application-level secret encryption at 
 - **Configuration/Render:** `render.yaml` adds `WEBHOOK_SECRET_ENCRYPTION_KEY sync:false`, `VAPID_PUBLIC_KEY sync:false`, `VAPID_PRIVATE_KEY sync:false`, `VAPID_SUBJECT sync:false`, `PUSH_ENABLED true`, `PUSH_PROVIDER_TIMEOUT_MS 15000`. Docs updated, no secrets in repo. Production config requires encryption key when secret encryption enabled, VAPID private server-only.
 - **Tests:** contracts push accepted/invalid, channel max 3, invalid HTTP rejected, secrets excluded; migrations fresh through 0028 and upgrade 0027→0028, data preserved, constraints correct, push_claims 0, checksumsMatch; secret manager encryption/decryption, random IV, wrong key fails, key version, malformed fails, production missing-key fail-closed, redaction; preferences push ownership, encrypted persistence, webhook encrypted, no leakage, routing, quiet hours; push provider configured/unconfigured, success 201, 404/410 permanent, 429 retryable, 5xx retryable, timeout retryable, private-key redaction; outbox push enqueue/claim, 3-way fairness balanced, one empty queue fills capacity, cleanup durability, retries/stale, cascade, concurrent, rollback, invalid limits; API auth, owner scoping, rate limits, no secret leakage; web rendering, permission denied, subscribe/unsubscribe, SW behaviour, no hard-coded branding; regression all workspaces.
 - **M8.7 unchanged, M9.1 fairness preserved, automation OFF, live execution impossible, VAPID private server-only, secrets encrypted at rest, production fails closed.**
+- **M9.2 collision-test helper (PR #127):** merged at `f9e660d66fe56af2ea4f1d2031759210af497d67`; only the generated instrument-symbol suffix in `packages/core/test/m92-outbox.test.ts` changed from `randomBytes(2)` to `randomBytes(8)`. Focused test ran 5 times at 8/8 each, core suite 1,943/1,943, and repository suite 3,348/3,348 passed before merge; PR checks and post-merge CI run `39056164366` passed. No production password or strategy-name generator was modified. This is merge/test evidence, not a production deployment or health check.
 
 ## M10.0 / Gate 9 — non-live execution transport foundation + durable provider mutation persistence
 
