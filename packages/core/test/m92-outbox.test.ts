@@ -45,7 +45,7 @@ async function makeUser() {
   return user;
 }
 async function makeAlert(userId: string): Promise<string> {
-  const instrument = await pool.query<{ id: string }>('INSERT INTO instruments (asset_class, symbol) VALUES ($1,$2) RETURNING id', ['forex', `P${randomBytes(2).toString('hex').toUpperCase()}`]);
+  const instrument = await pool.query<{ id: string }>('INSERT INTO instruments (asset_class, symbol) VALUES ($1,$2) RETURNING id', ['forex', `P${randomBytes(8).toString('hex').toUpperCase()}`]);
   const strategy = await pool.query<{ id: string }>('INSERT INTO strategies (user_id, name) VALUES ($1,$2) RETURNING id', [userId, `m92-${randomBytes(3).toString('hex')}`]);
   const version = await pool.query<{ id: string }>('INSERT INTO strategy_versions (strategy_id, version_number) VALUES ($1,1) RETURNING id', [strategy.rows[0]!.id]);
   const setup = await pool.query<{ id: string }>(`INSERT INTO setups (strategy_version_id, instrument_id, state, direction, detected_at, as_of_ms) VALUES ($1,$2,'confirmed','long',now(),1800000000000) RETURNING id`, [version.rows[0]!.id, instrument.rows[0]!.id]);
