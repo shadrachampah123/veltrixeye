@@ -61,18 +61,29 @@ deployment/status data. This checkpoint does not authorize production changes.
 
 ### PR #121 / Vercel Preview status
 
-PR #121 is open and Draft. Its current observed head is
+PR #121 is open and Draft at head
 `e0ce6473b0e00324b30dc3279503e95e8b999f48`. GitHub's Vercel status for that SHA
-says “Canceled by Ignored Build Step”; no GitHub Preview deployment record for
-that SHA was found. The owner reports that Root Directory is `apps/web`, the
-root-directory-change skip filter has now been disabled, and the Production
-Override is left untouched. No post-change Preview attempt is evidenced yet;
-therefore the effect of the saved project-level change and a Ready Preview
-remain unverified. The exact Production Override command must not be changed
-without evidence and approval. Do not merge #121 until a Ready Preview, deployed
-SHA/URL, corresponding GitHub Preview record and reviewed CI evidence are
-attached. The repository's `apps/web/vercel.json` configures Next.js and the
-workspace install/build commands; it cannot prove live dashboard or Preview
+says “Canceled by Ignored Build Step”; there is no Preview deployment record for
+that SHA. The owner reports Root Directory `apps/web`, and that the project
+root-directory-change skip filter was disabled and saved. A fresh automatic
+Preview subsequently succeeded on verification/replacement PR #125 at
+`eb8acfd5ba8243821a334b258d5228896c5680db` (GitHub deployment 7142594072,
+environment `Preview`, status `success`, URL
+`https://veltrixeye-clecyk96f-shadrachampah123s-projects.vercel.app`). This is
+evidence that Preview builds can complete with the Production Override left
+untouched; it is not a deployment for #121's original SHA. PR #125 supersedes
+#121's documentation-only verification change and includes this roadmap
+reconciliation. The reported root-filter change plus before/after
+cancellation/completion evidence supports the root-directory skip filter as the
+blocker; exact setting change time is not independently verified because the
+Vercel activity log is not accessible. Do not alter the Production Override.
+The GitHub deployment is successful/completed; the deployment page is
+Vercel-protected, so this environment could not independently see a dashboard
+“Ready” label or pass the unauthenticated health probe. Preview
+`API_INTERNAL_BASE` presence is also unverified. Keep #125 Draft and unmerged
+until its final CI/deployment evidence is reviewed; keep #121 open/unmerged for
+supersession disposition. The repository `apps/web/vercel.json` configures
+Next.js and workspace install/build commands; it cannot prove live dashboard or
 environment-variable values.
 
 ### Paused investigation and preserved evidence
