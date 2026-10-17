@@ -6,7 +6,7 @@ import {
   getBillingState, BillingCheckoutError, Errors, isBillingProviderPlanError,
   isBillingPricingError, isBillingFxError, isBillingSubscriptionSyncError,
   isBillingCustomerProvisioningError, type BillingCustomerProvisioningErrorReason,
-  isBillingPaymentConfirmationError, readBillingPortalFacts,
+  isBillingPaymentConfirmationError, readBillingPortalFacts, readBillingVerifiedPaymentRecords,
 } from '@veltrixeye/core';
 import { isPaystackAdapterError } from '@veltrixeye/provider-paystack';
 import { composeBillingCheckout, composeBillingCustomers, composeBillingSync, composeBillingVerify } from '../billing-composition.js';
@@ -16,6 +16,7 @@ import {
   projectBillingCheckoutSession,
   projectBillingPortalSummary,
   UNAVAILABLE_BILLING_PORTAL_SUMMARY,
+  UNAVAILABLE_BILLING_VERIFIED_PAYMENT_RECORDS,
   type BillingStateDto,
 } from '@veltrixeye/contracts';
 
@@ -39,6 +40,9 @@ export const BILLING_CUSTOMER_RATE_LIMIT_MAX = 10;
  * One documented provider read per call, so it is low.
  */
 export const BILLING_VERIFY_RATE_LIMIT_MAX = 10;
+
+/** Billing Step 9b-R1: bound the session-authenticated records read per IP. */
+export const BILLING_PAYMENT_RECORDS_RATE_LIMIT_MAX = 30;
 
 /**
  * Provisioning refusals that are about LOCAL state needing operator review
@@ -234,6 +238,35 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
     } catch (error) {
       req.log.error({ err: error }, 'billing portal summary unavailable');
       return reply.send(UNAVAILABLE_BILLING_PORTAL_SUMMARY);
+    }
+  });
+
+  /**
+   * Billing Step 9b-R1 — the read-only Verified Payment Records view.
+   *
+   * The account id is always the authenticated session user and the provider
+   * mode is always server configuration; neither can be supplied by query,
+   * body or header. The reader selects only the newest bounded set of stored
+   * `billing_verified_transactions` facts for that user and mode. It makes no
+   * provider call, does not recalculate FX, and cannot create an invoice or
+   * receipt. The strict DTO contains only the stored GHS minor-unit amount and
+   * the paid/verified instants — no identifiers, references, hashes, provider
+   * status, pricing snapshot or credential-shaped material.
+   *
+   * A read or row-validation failure fails closed to an empty `unavailable`
+   * answer. Nothing in this route writes a billing fact or changes
+   * entitlements, payment confirmation, automation or execution.
+   */
+  app.get('/api/billing/verified-payment-records', {
+    config: { rateLimit: { max: BILLING_PAYMENT_RECORDS_RATE_LIMIT_MAX, timeWindow: '1 minute' } },
+  }, async (req, reply) => {
+    if (!await requireAuth(req, reply)) return;
+    const { user } = req as AuthenticatedRequest;
+    try {
+      return reply.send(await readBillingVerifiedPaymentRecords(ctx.pool, user.id, config.billing.mode));
+    } catch (error) {
+      req.log.error({ err: error }, 'verified payment records unavailable');
+      return reply.send(UNAVAILABLE_BILLING_VERIFIED_PAYMENT_RECORDS);
     }
   });
 

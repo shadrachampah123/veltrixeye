@@ -171,3 +171,55 @@ test('market-data failures surface as ApiError with code/status/message', async 
     },
   );
 });
+
+test('api.getBillingVerifiedPaymentRecords() — strict, body-less session GET', async () => {
+  const payload = {
+    state: 'available',
+    mode: 'test',
+    records: [{
+      amountMinor: 12_345,
+      currency: 'GHS',
+      exponent: 2,
+      paidAt: '2026-10-16T10:00:00.000Z',
+      verifiedAt: '2026-10-16T10:01:00.000Z',
+    }],
+    hasMore: false,
+  };
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof globalThis.fetch;
+
+  const result = await api.getBillingVerifiedPaymentRecords();
+  assert.deepEqual(result, payload);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.url, '/api/billing/verified-payment-records');
+  assert.equal(calls[0]!.init?.method, undefined, 'GET is the default');
+  assert.equal(calls[0]!.init?.body, undefined, 'no user, mode or provider input is sent');
+  assert.equal(contentTypeOf(calls[0]!), null);
+});
+
+test('api.getBillingVerifiedPaymentRecords() — rejects provider/row identifiers', async () => {
+  const payload = {
+    state: 'available',
+    mode: 'test',
+    records: [{
+      amountMinor: 12_345,
+      currency: 'GHS',
+      exponent: 2,
+      paidAt: '2026-10-16T10:00:00.000Z',
+      verifiedAt: '2026-10-16T10:01:00.000Z',
+      providerReference: 've-chk-must-not-be-disclosed',
+    }],
+    hasMore: false,
+  };
+  globalThis.fetch = (async () => new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })) as typeof globalThis.fetch;
+
+  await assert.rejects(() => api.getBillingVerifiedPaymentRecords());
+});
