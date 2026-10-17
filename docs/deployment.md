@@ -5,6 +5,33 @@ wiring that lets the production web app talk to it. Nothing here contains a
 credential: every secret is supplied by the operator at deploy time
 (see [security.md](./security.md)).
 
+## Current observed deployment state (2026-10-17 UTC)
+
+This is a read-only evidence snapshot for main SHA
+`f9e660d66fe56af2ea4f1d2031759210af497d67` (M9.2 PR #127). The post-merge
+GitHub CI run `39056164366` passed.
+
+- GitHub records Vercel Production deployment **7143558642** for this SHA as
+  `success` / `Deployment has completed` at `2026-10-17T18:00:44Z`. This is a
+  deployment-record result only. No live application health/readiness response
+  or Vercel dashboard Ready label was independently observed.
+- GitHub records Render API deployment **7143549231** for this SHA as
+  `failure` at `2026-10-17T18:01:34Z`. The failure cause is unknown from the
+  available GitHub record; no Render build/deploy log was inspected. The
+  authorized owner must open Render Dashboard → `veltrixeye-api` → Deploys →
+  `7143549231`, identify the failing stage and sanitized cause, and report
+  whether the previous service instance remains available. Do not share
+  secrets or environment-variable values.
+- **Production API health, database connectivity and applied migration state
+  remain unverified.** The repository currently contains 38 migrations through
+  `0038_billing_fx_source_observations.sql`; that is the source's expected
+  schema, not evidence that production has applied it. The Vercel success does
+  not explain the Render failure. PR #128's notification-liveness/CI work is
+  open and is not deployed.
+- No production configuration was changed and no deployment protection was
+  bypassed. Do not infer that the service is either healthy or unavailable from
+  the deployment records alone.
+
 ## Topology
 
 ```
@@ -35,7 +62,7 @@ browser ──https──> Vercel (Next.js web app, apps/web)
 | `Dockerfile` | Production image for `apps/api` (multi-stage, non-root, no dev deps, no secrets). Host-agnostic: Render, Fly, Railway, Cloud Run, ECS, a plain VM. |
 | `.dockerignore` | Keeps `.env*`, `.git`, `node_modules`, tests and docs out of the image. |
 | `render.yaml` | Render **Blueprint**: one Docker web service, health check `/api/health/ready`, env vars wired, `DATABASE_URL` prompted as a secret (`sync: false`). |
-| `apps/api` | The existing API (routes, sessions, rate limits, helmet, owner scoping) is unchanged apart from the readiness payload. It runs TypeScript through `tsx` because the workspace packages are TS sources, so the image has no compile step — which is why `tsx` is a runtime dependency of the API workspace. |
+| `apps/api` | The long-running Fastify API (routes, sessions, rate limits, owner scoping, liveness/readiness and worker health). Runtime behavior is determined by the deployed SHA; a deployment record or readiness route definition is not proof of current production health. It runs TypeScript through `tsx` because workspace packages are TS sources, so the image has no compile step — which is why `tsx` is a runtime dependency of the API workspace. |
 | `scripts/db/migrate-cli.ts` | Existing migration CLI (`npm run db:migrate`), also usable inside the image. |
 | `apps/web/next.config.mjs` | Same-origin `/api/*` rewrite driven by `API_INTERNAL_BASE`, with build-time fail-fast in production. |
 
@@ -196,20 +223,20 @@ Guard rails (in `apps/web/next.config.mjs`):
 The API origin stays server-side: it is read from `next.config.mjs` (not a
 `NEXT_PUBLIC_*` variable), so it is never shipped to the browser.
 
-### Vercel Preview deployments — intended policy (paper-only, not yet empirically verified)
+### Vercel Preview deployments — intended policy and partial evidence
 
-> **Status:** This section documents the *intended* Vercel Preview deployment
-> policy for `apps/web` as a paper description only. This commit/PR makes **no**
-> change to `vercel.json`, application code, workflows, secrets, environment
-> variables, or Vercel project settings, and **does not claim** that the policy
-> has been empirically verified. Verification remains pending (see evidence
-> checklist below). Until live evidence is attached, treat this as intent, not
-> proof.
+> **Status:** This section records the *intended* Vercel Preview policy for
+> `apps/web`, plus historical evidence from PR #125. That PR was documentation-
+> only and made no change to `vercel.json`, application code, workflows, secrets,
+> environment variables or Vercel project settings. A successful Preview record
+> exists, but the complete policy is not empirically verified: the Vercel
+> dashboard Ready label, Preview API health and exact settings history remain
+> unobserved (see evidence below). Treat the rest as intent, not proof.
 >
-> Isolation: branch `ci/verify-vercel-policy` is documentation-only, created
-> from `main` at `338829b8d9582f9bd4c6c37f09289077cf569a29` for policy verification;
-> it does not modify `main`, PRs #103/#104, outbox/roadmap files, or Gold v8
-> (remains paused, automation OFF, paper-only).
+> Historical scope: branch `ci/verify-vercel-policy` was documentation-only,
+> created from `main` at `338829b8d9582f9bd4c6c37f09289077cf569a29` for policy
+> verification. It did not modify `main`, PRs #103/#104, outbox/roadmap files or
+> the paused Gold Break & Retest investigation; automation remained OFF.
 
 **Intended preview behavior:**
 
@@ -217,7 +244,7 @@ The API origin stays server-side: it is read from `next.config.mjs` (not a
   `apps/web`, framework `nextjs`). Build wiring is pinned in
   `apps/web/vercel.json` (`installCommand: cd ../.. && npm ci`,
   `buildCommand: next build`) and in `apps/web/next.config.mjs` (same-origin
-  `/api/*` rewrite to `API_INTERNAL_BASE`). This documentation PR does **not**
+  `/api/*` rewrite to `API_INTERNAL_BASE`). Historical PR #125 did **not**
   modify `apps/web/vercel.json`, `apps/web/next.config.mjs`,
   `.github/workflows/ci.yml`, or any Vercel dashboard setting.
 - **Automatic previews:** Pull requests targeting `main` are *intended* to
@@ -232,7 +259,7 @@ The API origin stays server-side: it is read from `next.config.mjs` (not a
   Production `API_INTERNAL_BASE` remains **required** — a Vercel production
   build without it (or with a non-`https://` value) fails loudly via
   `apps/web/next.config.mjs`; Preview may share the Production API during
-  initial verification — no new secrets are introduced by this PR.
+  initial verification — PR #125 introduced no secrets.
 - **No automatic promotion; backend isolation matters:** a Preview is not
   automatically promoted to Production. This does **not** make it read-only:
   if Preview `API_INTERNAL_BASE` points at the Production API, authenticated
@@ -246,7 +273,7 @@ The API origin stays server-side: it is read from `next.config.mjs` (not a
   `apps/web/vercel.json`); the API remains a container (Render/Docker) and is
   never built as a Vercel Function.
 
-**Evidence checklist and current verification record:**
+**Historical PR #125 evidence record (partial verification):**
 
 The following evidence distinguishes a completed GitHub Preview deployment from
 an independently inspected Vercel dashboard Ready state and an application
@@ -293,8 +320,10 @@ curl -sS "$API_BASE/api/health"            # {"status":"ok",...}
 
 # readiness: database + migration/schema state
 curl -sS "$API_BASE/api/health/ready"
-# {"status":"ready","database":"up","schema":{"applied":8,"expected":8,
-#   "latest":"0008_market_candles.sql","pending":[],"checksumsMatch":true}}
+# Illustrative success shape for the current source inventory only — NOT a
+# recorded production response. Production applied migrations are unverified.
+# {"status":"ready","database":"up","schema":{"applied":38,"expected":38,
+#   "latest":"0038_billing_fx_source_observations.sql","pending":[],"checksumsMatch":true}}
 
 # security headers + no CORS
 curl -sSI "$API_BASE/api/health" | grep -Ei 'strict-transport|x-frame|content-security|access-control'
