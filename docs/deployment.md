@@ -253,15 +253,16 @@ an independently inspected Vercel dashboard Ready state and an application
 health probe. Do not conflate a green status with a deployment; the status must
 be read together with the deployment record and its environment URL.
 
-1. **Preview deployment completed (verified on the observed commit):** draft
-   PR #125, commit
-   `eb8acfd5ba8243821a334b258d5228896c5680db`. GitHub deployment **7142594072**
-   records `environment: Preview`, `state: success`, description
+1. **Preview deployment completed (verified on final PR head):** PR #125,
+   commit `78088b96c0ae2e25bc0ca5997a104b8936a46575`. GitHub deployment
+   **7142752223** records `environment: Preview`, `state: success`, description
    `Deployment has completed`, and target/environment URL
-   `https://veltrixeye-clecyk96f-shadrachampah123s-projects.vercel.app`.
+   `https://veltrixeye-mcdomur37-shadrachampah123s-projects.vercel.app`.
    GitHub's Vercel commit status is `success` with description
    `Deployment has completed`. This is a verified successful Preview deployment
-   for that SHA, not for PR #121's original SHA.
+   for that SHA, not for PR #121's original SHA. PR #125 passed CI and merged as
+   `a931167ed6bf43ce4b3fd7809a3298431db20ccb`; PR #121 was closed as superseded
+   without merging.
 2. **Dashboard Ready label:** not independently observed. The Vercel deployment
    details and Preview URL require Vercel authentication/deployment access; the
    available public fetch redirected to Vercel login. Do not state that the
@@ -276,9 +277,10 @@ be read together with the deployment record and its environment URL.
    supports that filter as the cause. The Vercel activity log and setting-change
    timestamp remain unavailable here. The Production Override was not changed.
 
-Keep PR #125 Draft and unmerged pending CI completion and review of the exact
-head deployment. Keep PR #121 open and Draft until its supersession disposition
-is recorded; no deployment for its original commit is claimed.
+PR #125 is merged; PR #121 is closed as superseded, not merged. No deployment
+for PR #121's original commit is claimed. The Vercel dashboard Ready label and
+unauthenticated health response were inaccessible due deployment protection;
+see the evidence record above. Production was not probed.
 
 ## Step 5 — Verify the deployment
 
