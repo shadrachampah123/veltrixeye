@@ -24,6 +24,7 @@
     "billing:provision:live": "tsx scripts/billing/provision-live.ts",
     "billing:provision:sandbox": "tsx scripts/billing/provision-sandbox.ts",
     "billing:remediate:legacy-free-row": "tsx scripts/billing/remediate-legacy-free-row.ts",
+    "diagnostics:gold-v8": "tsx scripts/diagnostics/gold-v8-production-evidence.ts",
     "api:dev": "npm run dev --workspace @veltrixeye/api",
     "api:build": "npm run build --workspace @veltrixeye/api",
     "api:start": "npm run start --workspace @veltrixeye/api",
