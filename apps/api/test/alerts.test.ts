@@ -144,6 +144,13 @@ function engulfConfig(symbol: string, risk: typeof RISK_LOW = RISK_LOW) {
   };
 }
 
+async function grantProFixtureEntitlement(userId: string): Promise<void> {
+  await pool.query(
+    "INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'active')",
+    [userId],
+  );
+}
+
 async function registerUser(): Promise<{ cookie: string; userId: string }> {
   const res = await app.inject({
     method: 'POST',
@@ -623,6 +630,7 @@ describe('m6 alerts api (phase 3)', () => {
 
   test('terminal states (invalidated, expired, completed) are refused and never alerted', async () => {
     const owner = await registerUser();
+    await grantProFixtureEntitlement(owner.userId);
     const cases: Array<{ exit: string; symbol: string; offset: number; via?: 'triggered' }> = [
       { exit: 'invalidated', symbol: 'EURUSD', offset: 12 },
       { exit: 'expired', symbol: 'GBPUSD', offset: 14 },
@@ -712,6 +720,7 @@ describe('m6 alerts api (phase 3)', () => {
 
   test('minQualityScore gate: score == gate generates, score < gate is silent with skippedReason', async () => {
     const owner = await registerUser();
+    await grantProFixtureEntitlement(owner.userId);
 
     // Learn the engine's deterministic total for this configuration.
     const probe = await createPublishedVersion(owner.cookie, engulfConfig('EURUSD'));
@@ -971,6 +980,7 @@ describe('m6 alerts api (phase 3)', () => {
 
   test('different trigger states do not collapse: confirmed and triggered are separate logical alerts', async () => {
     const owner = await registerUser();
+    await grantProFixtureEntitlement(owner.userId);
     const { strategyId, versionId } = await createPublishedVersion(owner.cookie, engulfConfig('EURUSD'));
     const anchor = AS_OF + 60 * HOUR;
     await seedCandles('EURUSD', BULLISH_SHAPES, anchor);
@@ -1021,6 +1031,7 @@ describe('m6 alerts api (phase 3)', () => {
 
   test('different setups and strategies do not collapse, even when the rendered title is identical', async () => {
     const owner = await registerUser();
+    await grantProFixtureEntitlement(owner.userId);
     const first = await createPublishedVersion(owner.cookie, engulfConfig('EURUSD'));
     const second = await createPublishedVersion(owner.cookie, engulfConfig('EURUSD'));
     const third = await createPublishedVersion(owner.cookie, engulfConfig('GBPUSD'));

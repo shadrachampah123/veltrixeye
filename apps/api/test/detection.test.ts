@@ -133,6 +133,13 @@ const NEWS_FILTER_CONFIG: StrategyVersionConfig = {
   ],
 };
 
+async function grantProFixtureEntitlement(userId: string): Promise<void> {
+  await pool.query(
+    "INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'active')",
+    [userId],
+  );
+}
+
 async function registerUser(): Promise<{ cookie: string; userId: string }> {
   const res = await app.inject({
     method: 'POST',
@@ -804,6 +811,7 @@ describe('m4 setup detection api', () => {
 
   test('setup list supports owner-scoped filters and limits', async () => {
     const owner = await registerUser();
+    await grantProFixtureEntitlement(owner.userId);
     const v1 = await createPublishedVersion(owner.cookie, engulfConfig('EURUSD', 'bullish'));
     const v2 = await createPublishedVersion(owner.cookie, engulfConfig('GBPUSD', 'bearish'));
     await seedCandles('GBPUSD', BEARISH_SHAPES, AS_OF);

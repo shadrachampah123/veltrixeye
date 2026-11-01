@@ -196,6 +196,17 @@ export class StrategyService {
     try {
       await client.query('BEGIN');
 
+      // Serialize strategy creation per account before reading entitlement or
+      // counts. A missing subscription row (the normal Free state) cannot be
+      // locked by SELECT ... FOR UPDATE, so that row lock alone permits two
+      // concurrent transactions to both observe a count below the limit.
+      // The transaction-scoped advisory lock covers the absent-row case too;
+      // hash collisions only cause harmless extra serialization.
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('strategy-create:' || $1::text, 0))",
+        [actorUserId],
+      );
+
       // M7.4 Atomic entitlement enforcement
       // `provider` and the durable activation fact are read for the
       // fail-closed entitlement gate: a provider-backed row is an unconfirmed
@@ -233,7 +244,7 @@ export class StrategyService {
       const countRes = await client.query('SELECT count(*)::int AS c FROM strategies WHERE user_id = $1', [actorUserId]);
       const currentCount = countRes.rows[0].c;
       
-      if (currentCount >= maxStrategies) {
+      if (maxStrategies !== null && currentCount >= maxStrategies) {
         throw Errors.forbidden(`Strategy limit reached. Your plan allows up to ${maxStrategies} strategies.`);
       }
 

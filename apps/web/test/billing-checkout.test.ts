@@ -54,7 +54,7 @@ const IDEMPOTENCY_KEY = 'b'.repeat(64);
 const PROVIDER_PLAN_ID = 'PLN_5a1f0c9e2b7d4bad9bdd2b0d7b3dcb6d';
 
 const FREE_ENTITLEMENTS = {
-  maxStrategies: 100,
+  maxStrategies: 1,
   maxBacktestsPerMonth: 100,
   maxAlertsPerMonth: 1000,
   maxSavedSetups: 1000,

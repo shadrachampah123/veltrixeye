@@ -86,7 +86,7 @@ export function stubAutomation(script: ScriptedAutomationState | ScriptedAutomat
       state.calls += 1;
       return {
         entitlements: {
-          maxStrategies: 100,
+          maxStrategies: 1,
           maxBacktestsPerMonth: 100,
           maxAlertsPerMonth: 1000,
           maxSavedSetups: 1000,

@@ -101,6 +101,13 @@ const BULLISH_ENGULF_CONFIG: StrategyVersionConfig = {
   ],
 };
 
+async function grantProFixtureEntitlement(userId: string): Promise<void> {
+  await pool.query(
+    "INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'active')",
+    [userId],
+  );
+}
+
 async function registerUser(): Promise<{ cookie: string; userId: string }> {
   const res = await app.inject({
     method: 'POST',
@@ -491,6 +498,7 @@ describe('m3 evaluation api', () => {
 
   test('evaluation never triggers provider fetch-through (no key, empty registry, unseeded timeframe → 200 with insufficient data)', async () => {
     const owner = await registerUser();
+    await grantProFixtureEntitlement(owner.userId);
     const { strategyId, versionId } = await createPublishedVersion(owner.cookie, BULLISH_ENGULF_CONFIG);
     // No candles exist for GBPUSD at all — a fetch-through would throw 502
     // (no provider registered); evaluation must answer 200 instead.

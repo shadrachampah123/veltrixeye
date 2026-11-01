@@ -385,7 +385,7 @@ describe('billing PR2 — entitlement safety', () => {
     }
     assert.deepEqual(
       USER_PLANS.map((plan) => getEntitlements(plan as UserPlan, 'active').maxStrategies),
-      [100, 500, 1000],
+      [1, 5, null],
       'the enforced limits are unchanged',
     );
     // A provider-backed Elite subscription is still just `premium` to the enforcer.
@@ -393,7 +393,7 @@ describe('billing PR2 — entitlement safety', () => {
     assert.equal(elite.canAccessAutomation, false);
     assert.equal(elite.canAccessScanner, true);
     const cancelledElite = getEntitlements('premium', 'canceled');
-    assert.equal(cancelledElite.maxStrategies, 100, 'a cancelled subscription falls back to free');
+    assert.equal(cancelledElite.maxStrategies, 1, 'a cancelled subscription falls back to Starter-sized free');
     assert.equal(cancelledElite.canAccessAutomation, false);
   });
 

@@ -160,8 +160,8 @@ describe('resolveEntitlements — provider IS NULL preserves the existing matrix
         assert.deepEqual(entitlements, getEntitlements(plan, status));
       }
     }
-    assert.equal(resolveEntitlements('pro', 'active', null, false, null).maxStrategies, 500);
-    assert.equal(resolveEntitlements('premium', 'active', null, false, null).maxStrategies, 1000);
+    assert.equal(resolveEntitlements('pro', 'active', null, false, null).maxStrategies, 5);
+    assert.equal(resolveEntitlements('premium', 'active', null, false, null).maxStrategies, null);
   });
 
   it('keeps the existing free fallback for lapsed historical subscriptions', () => {
@@ -205,7 +205,7 @@ describe('resolveEntitlements — provider IS NOT NULL is fail-closed until acti
           assert.equal(entitlements.canAccessAdvancedStrategies, false);
           assert.equal(entitlements.canAccessAdvancedAlerts, false);
           assert.equal(entitlements.canAccessAutomation, false);
-          assert.equal(entitlements.maxStrategies, 100);
+          assert.equal(entitlements.maxStrategies, 1);
           assert.equal(entitlements.maxBacktestsPerMonth, 100);
           assert.equal(entitlements.maxAlertsPerMonth, 1000);
           assert.equal(entitlements.maxSavedSetups, 1000);
@@ -314,7 +314,7 @@ describe('getBillingState — historical (provider IS NULL) subscriptions are pr
       }
     }
     const premium = await getBillingState(pool, await seededUser({ plan: 'premium', status: 'active' }));
-    assert.equal(premium.entitlements.maxStrategies, 1000);
+    assert.equal(premium.entitlements.maxStrategies, null);
     assert.equal(premium.entitlements.maxBacktestsPerMonth, 5000);
     assert.equal(premium.entitlements.maxAlertsPerMonth, 10000);
     assert.equal(premium.entitlements.maxSavedSetups, 10000);
@@ -610,53 +610,82 @@ describe('AutomationService.readState — the execution gate reads the same reso
 /* 4. A real transactional limit reader                                       */
 /* -------------------------------------------------------------------------- */
 
-describe('StrategyService.createStrategy — the atomic limit read is gated too', () => {
+describe('StrategyService.createStrategy — commercial strategy ceilings', () => {
   const strategies = (): StrategyService => new StrategyService(pool, new AuditService(pool));
 
-  async function fillToFreeLimit(userId: string): Promise<void> {
+  async function seedStrategyCount(userId: string, count: number): Promise<void> {
+    if (count === 0) return;
     await pool.query(
       `INSERT INTO strategies (user_id, name, description)
-       SELECT $1, 'Seeded ' || i, 'fixture' FROM generate_series(1, 100) i`,
-      [userId],
+       SELECT $1, 'Seeded ' || i, 'fixture' FROM generate_series(1, $2) i`,
+      [userId, count],
     );
   }
 
-  it('lets a historical pro row past the free limit', async () => {
-    const userId = await seededUser({ plan: 'pro', status: 'active' });
-    await fillToFreeLimit(userId);
-    const created = await strategies().createStrategy(userId, { name: 'Historical pro strategy' });
-    assert.equal(created.name, 'Historical pro strategy');
-    const count = await pool.query('SELECT count(*)::int AS c FROM strategies WHERE user_id=$1', [userId]);
-    assert.equal(count.rows[0]!.c, 101);
+  async function strategyCount(userId: string): Promise<number> {
+    const result = await pool.query<{ c: number }>(
+      'SELECT count(*)::int AS c FROM strategies WHERE user_id=$1', [userId],
+    );
+    return result.rows[0]!.c;
+  }
+
+  it('Starter/free: allows one strategy, refuses the next, and retains existing rows', async () => {
+    const userId = await seededUser({ plan: 'free', status: 'active' });
+    await strategies().createStrategy(userId, { name: 'Starter strategy' });
+    await assert.rejects(
+      strategies().createStrategy(userId, { name: 'Over Starter limit' }),
+      /up to 1 strategies/,
+    );
+    assert.equal(await strategyCount(userId), 1);
   });
 
-  it('stops a provider-backed pro row at the free limit', async () => {
+  it('serializes concurrent Free creations when the account has no subscription row', async () => {
+    const user = await insertUser(pool, false);
+    const subscription = await pool.query(
+      'SELECT 1 FROM subscriptions WHERE user_id = $1', [user.id],
+    );
+    assert.equal(subscription.rowCount, 0, 'the ordinary Free account has no subscription row');
+
+    const results = await Promise.allSettled([
+      strategies().createStrategy(user.id, { name: 'Concurrent Free A' }),
+      strategies().createStrategy(user.id, { name: 'Concurrent Free B' }),
+    ]);
+    const created = results.filter((result) => result.status === 'fulfilled');
+    const rejected = results.filter((result) => result.status === 'rejected');
+    assert.equal(created.length, 1, 'only one concurrent request may use the Free allowance');
+    assert.equal(rejected.length, 1);
+    assert.match(String((rejected[0] as PromiseRejectedResult).reason), /up to 1 strategies/);
+    assert.equal(await strategyCount(user.id), 1, 'the persisted count must not exceed Free');
+  });
+
+  it('pending provider-backed Pro checkout remains Starter-sized until activation', async () => {
     const userId = await seededUser({
       plan: 'pro', status: 'active', provider: 'paystack', providerState: 'pending',
     });
-    await fillToFreeLimit(userId);
+    await seedStrategyCount(userId, 1);
     await assert.rejects(
       strategies().createStrategy(userId, { name: 'Unpaid checkout strategy' }),
-      (error: unknown) => {
-        const message = (error as Error).message;
-        assert.match(message, /Strategy limit reached/);
-        assert.match(message, /up to 100 strategies/, 'the FREE limit is quoted, not the pro limit of 500');
-        return true;
-      },
+      /up to 1 strategies/,
     );
-    const count = await pool.query('SELECT count(*)::int AS c FROM strategies WHERE user_id=$1', [userId]);
-    assert.equal(count.rows[0]!.c, 100, 'nothing was created');
+    assert.equal(await strategyCount(userId), 1);
   });
 
-  it('stops a provider-backed premium row at the free limit even with provider_state=active', async () => {
-    const userId = await seededUser({
-      plan: 'premium', status: 'active', provider: 'paystack', providerState: 'active',
-    });
-    await fillToFreeLimit(userId);
+  it('activated/historical Pro: allows the fifth strategy and refuses a sixth', async () => {
+    const userId = await seededUser({ plan: 'pro', status: 'active' });
+    await seedStrategyCount(userId, 4);
+    await strategies().createStrategy(userId, { name: 'Pro strategy five' });
     await assert.rejects(
-      strategies().createStrategy(userId, { name: 'Unpaid elite strategy' }),
-      /up to 100 strategies/,
+      strategies().createStrategy(userId, { name: 'Over Pro limit' }),
+      /up to 5 strategies/,
     );
+    assert.equal(await strategyCount(userId), 5);
+  });
+
+  it('Elite: does not retain the old 1,000-strategy cap', async () => {
+    const userId = await seededUser({ plan: 'premium', status: 'active' });
+    await seedStrategyCount(userId, 1_000);
+    await strategies().createStrategy(userId, { name: 'Elite strategy 1001' });
+    assert.equal(await strategyCount(userId), 1_001);
   });
 });
 
