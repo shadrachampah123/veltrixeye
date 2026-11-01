@@ -639,6 +639,25 @@ describe('StrategyService.createStrategy — commercial strategy ceilings', () =
     assert.equal(await strategyCount(userId), 1);
   });
 
+  it('serializes concurrent Free creations when the account has no subscription row', async () => {
+    const user = await insertUser(pool, false);
+    const subscription = await pool.query(
+      'SELECT 1 FROM subscriptions WHERE user_id = $1', [user.id],
+    );
+    assert.equal(subscription.rowCount, 0, 'the ordinary Free account has no subscription row');
+
+    const results = await Promise.allSettled([
+      strategies().createStrategy(user.id, { name: 'Concurrent Free A' }),
+      strategies().createStrategy(user.id, { name: 'Concurrent Free B' }),
+    ]);
+    const created = results.filter((result) => result.status === 'fulfilled');
+    const rejected = results.filter((result) => result.status === 'rejected');
+    assert.equal(created.length, 1, 'only one concurrent request may use the Free allowance');
+    assert.equal(rejected.length, 1);
+    assert.match(String((rejected[0] as PromiseRejectedResult).reason), /up to 1 strategies/);
+    assert.equal(await strategyCount(user.id), 1, 'the persisted count must not exceed Free');
+  });
+
   it('pending provider-backed Pro checkout remains Starter-sized until activation', async () => {
     const userId = await seededUser({
       plan: 'pro', status: 'active', provider: 'paystack', providerState: 'pending',
