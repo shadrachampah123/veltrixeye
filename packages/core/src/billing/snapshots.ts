@@ -14,7 +14,7 @@ const integer = z.union([z.number(), z.string().regex(/^\d+$/)])
 const timestamp = z.union([z.date(), z.string().datetime()])
   .transform((value) => new Date(value).toISOString());
 const rowSchema = z.object({
-  id: z.string().uuid(),
+  id: z.string().guid(),
   commercial_currency: z.literal('USD'),
   commercial_amount_minor: integer,
   catalogue_plan: z.string(),
@@ -25,7 +25,7 @@ const rowSchema = z.object({
   payment_amount_exponent: integer,
   fx_rate_scaled: integer,
   fx_rate_scale: integer,
-  fx_rate_version_id: z.string().uuid(),
+  fx_rate_version_id: z.string().guid(),
   fx_rate_effective_from: timestamp,
   fx_rate_captured_at: timestamp,
   fx_rate_source: z.string(),

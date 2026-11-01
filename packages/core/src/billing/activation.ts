@@ -203,7 +203,7 @@ export const BILLING_ACTIVATION_AUDIT_ACTION = 'billing.subscription_activated';
 /* -------------------------------------------------------------------------- */
 
 const isoDateTime = z.string().datetime();
-const uuid = z.string().uuid();
+const uuid = z.string().guid();
 const integer = z.union([z.number(), z.string().regex(/^\d+$/)]).transform(Number).pipe(z.number().int().safe());
 
 const activationRowSchema = z
@@ -309,7 +309,7 @@ const activationInputSchema = z
     /** Why the operator authorized it. Required, never inferred. */
     reason: z.string().trim(),
     /** Optional explicit evidence row to activate. */
-    evidenceId: z.string().uuid().nullable().optional(),
+    evidenceId: z.string().guid().nullable().optional(),
     /** Optional explicit activation instant (tests/backfills only). */
     activatedAt: isoDateTime.optional(),
   })
@@ -680,7 +680,7 @@ export class BillingActivationService {
     client: PoolClient,
     reference: string,
   ): Promise<{ id: string; email: string } | null> {
-    const asUuid = z.string().uuid().safeParse(reference);
+    const asUuid = z.string().guid().safeParse(reference);
     const { rows } = asUuid.success
       ? await client.query<{ id: string; email: string }>(
           'SELECT id, email FROM users WHERE id = $1',

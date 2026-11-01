@@ -50,7 +50,7 @@ import { billingPaymentEvidenceIdempotencyCanonicalString } from '@veltrixeye/co
  */
 
 const isoDateTime = z.string().datetime();
-const uuid = z.string().uuid();
+const uuid = z.string().guid();
 
 export class BillingVerifiedTransactionError extends Error {
   readonly code = 'billing_verified_transaction_failed' as const;

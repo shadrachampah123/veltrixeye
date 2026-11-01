@@ -48,7 +48,7 @@ export const providerEventReferenceSchema = z
 export const billingIsoDateTimeSchema = z.string().datetime();
 
 /** UUID identifier. */
-export const billingUuidSchema = z.string().uuid();
+export const billingUuidSchema = z.string().guid();
 
 /**
  * The explicit provider-domain (Paystack mode) vocabulary: `test` (sandbox)

@@ -182,7 +182,7 @@ export class BillingSubscriptionSyncService {
    * provider view.
    */
   async synchronize(userId: string): Promise<SubscriptionSyncResult> {
-    const user = z.string().uuid().parse(userId);
+    const user = z.string().guid().parse(userId);
     const provider = this.options.providers.get(BILLING_PROVIDER);
     if (provider === undefined) throw new BillingSubscriptionSyncError('provider_not_registered');
 

@@ -474,7 +474,7 @@ function planFromBatch(
 
 const registerLivePlanEpochsInputSchema = z
   .object({
-    fxRateVersionId: z.string().uuid(),
+    fxRateVersionId: z.string().guid(),
     planCodes: z.unknown(),
     operatorId: z.string(),
     reason: z.string(),

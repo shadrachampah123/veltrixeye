@@ -170,8 +170,8 @@ export type InstrumentEvaluation = z.infer<typeof instrumentEvaluationSchema>;
 
 export const evaluationResultSchema = z
   .object({
-    strategyId: z.string().uuid(),
-    versionId: z.string().uuid(),
+    strategyId: z.string().guid(),
+    versionId: z.string().guid(),
     versionNumber: z.number().int().positive(),
     engineVersion: z.string().min(1),
     /** The anchor the evaluation was pinned to (epoch-ms, UTC). */

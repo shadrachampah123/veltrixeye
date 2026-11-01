@@ -375,9 +375,9 @@ const epochMsSchema = z.number().int().positive().max(9_999_999_999_999);
  */
 export const executionDecisionSchema = z
   .object({
-    strategyId: z.string().uuid(),
-    strategyVersionId: z.string().uuid(),
-    setupId: z.string().uuid(),
+    strategyId: z.string().guid(),
+    strategyVersionId: z.string().guid(),
+    setupId: z.string().guid(),
     action: z.enum(EXECUTION_ACTIONS),
     assetClass: z.enum(ASSET_CLASSES),
     symbol: instrumentSymbolSchema,
@@ -456,7 +456,7 @@ export type ExecutionDecisionInput = z.infer<typeof executionDecisionSchema>;
 /* DTO schemas                                                                 */
 /* -------------------------------------------------------------------------- */
 
-const uuidSchema = z.string().uuid();
+const uuidSchema = z.string().guid();
 const isoDateTimeSchema = z.string();
 
 export const BROKER_CONNECTION_STATUSES = ['unconfigured', 'disabled', 'unavailable', 'connected', 'degraded'] as const;
@@ -589,7 +589,7 @@ export const executionAuditEventDtoSchema = z
     fromStatus: z.string().max(32).nullable(),
     toStatus: z.string().max(32).nullable(),
     reason: z.string().nullable(),
-    metadata: z.record(z.unknown()),
+    metadata: z.record(z.string(), z.unknown()),
     createdAt: isoDateTimeSchema,
   })
   .strict();

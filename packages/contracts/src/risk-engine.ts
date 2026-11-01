@@ -246,7 +246,7 @@ const moneySchema = z.number().positive().finite().max(PLATFORM_RISK_CEILINGS.ma
 
 export const riskPolicyDtoSchema = z
   .object({
-    id: z.string().uuid(),
+    id: z.string().guid(),
     enabled: z.boolean(),
     policyVersion: z.number().int().positive(),
     riskPctPerTrade: z.number(),
@@ -414,7 +414,7 @@ export type RiskExposureSnapshot = z.infer<typeof riskExposureSnapshotSchema>;
 
 export const riskDecisionDtoSchema = z
   .object({
-    id: z.string().uuid(),
+    id: z.string().guid(),
     outcome: z.enum(RISK_DECISION_OUTCOMES),
     rejectionCode: z.enum(RISK_REJECTION_CODES).nullable(),
     reason: z.string().min(1).max(500),

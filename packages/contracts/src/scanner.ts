@@ -32,7 +32,7 @@ export const scannerRunStatusSchema = z.enum(SCANNER_RUN_STATUSES);
 /** One row of scanner_runs. */
 export const scannerRunDtoSchema = z
   .object({
-    id: z.string().uuid(),
+    id: z.string().guid(),
     status: scannerRunStatusSchema,
     providerSlug: z.string().min(1).max(64),
     startedAt: z.string().datetime(),
@@ -58,8 +58,8 @@ export type ScannerRunDto = z.infer<typeof scannerRunDtoSchema>;
 /** Per-cursor state (last processed candle). */
 export const scannerCursorDtoSchema = z
   .object({
-    strategyVersionId: z.string().uuid(),
-    instrumentId: z.string().uuid(),
+    strategyVersionId: z.string().guid(),
+    instrumentId: z.string().guid(),
     timeframe: z.string().min(1).max(8),
     lastCandleTime: z.number().int().positive(),
     lastScanAt: z.string().datetime(),
@@ -104,7 +104,7 @@ export type ScannerRunListQuery = z.infer<typeof scannerRunListQuerySchema>;
 export const scannerTriggerRequestSchema = z
   .object({
     /** Optional: scan only this strategy (must be owned + active + published). */
-    strategyId: z.string().uuid().optional(),
+    strategyId: z.string().guid().optional(),
     /** Optional: scan only these instruments (must be within market universe). */
     instruments: z
       .array(

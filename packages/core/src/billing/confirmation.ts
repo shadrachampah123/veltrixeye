@@ -78,7 +78,7 @@ export class BillingPaymentConfirmationService {
   }
 
   async confirm(userId: string): Promise<BillingPaymentVerificationResult> {
-    const user = z.string().uuid().parse(userId);
+    const user = z.string().guid().parse(userId);
     const provider = this.options.providers.get(BILLING_PROVIDER);
     if (provider === undefined) {
       throw new BillingPaymentConfirmationError(

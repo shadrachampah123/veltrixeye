@@ -980,7 +980,7 @@ function FilterParamsEditor({
   );
 }
 
-function flattenIssues(error: { issues: { path: (string | number)[]; message: string }[] }): Record<string, string[]> {
+function flattenIssues(error: { issues: { path: readonly PropertyKey[]; message: string }[] }): Record<string, string[]> {
   const fields: Record<string, string[]> = {};
   for (const issue of error.issues) {
     const key = issue.path.join('.') || '(body)';

@@ -171,8 +171,8 @@ const billingProviderEventInsertSchema = z
     providerEventId: providerEventReferenceSchema.nullable(),
     idempotencyKey: sha256HexSchema,
     payloadHash: sha256HexSchema,
-    subscriptionId: z.string().uuid().nullable(),
-    userId: z.string().uuid().nullable(),
+    subscriptionId: z.string().guid().nullable(),
+    userId: z.string().guid().nullable(),
     providerCustomerId: providerReferenceSchema.nullable(),
     providerSubscriptionId: providerReferenceSchema.nullable(),
     providerReference: providerEventReferenceSchema.nullable(),
@@ -311,8 +311,8 @@ export async function claimReceivedBillingProviderEvents(
   client: PoolClient,
   subject: { subscriptionId: string; userId: string },
 ): Promise<ClaimedBillingProviderEvent[]> {
-  const subscriptionId = z.string().uuid().parse(subject.subscriptionId);
-  const userId = z.string().uuid().parse(subject.userId);
+  const subscriptionId = z.string().guid().parse(subject.subscriptionId);
+  const userId = z.string().guid().parse(subject.userId);
   const { rows } = await client.query<{ id: string; idempotency_key: string; event_type: string }>(
     `SELECT id, idempotency_key, event_type
        FROM billing_provider_events
@@ -345,7 +345,7 @@ export async function settleBillingProviderEvents(
   },
 ): Promise<number> {
   if (input.ids.length === 0) return 0;
-  const ids = z.array(z.string().uuid()).max(BILLING_PROVIDER_EVENT_CLAIM_LIMIT).parse(input.ids);
+  const ids = z.array(z.string().guid()).max(BILLING_PROVIDER_EVENT_CLAIM_LIMIT).parse(input.ids);
   const state = z.enum(['processed', 'ignored', 'failed']).parse(input.state);
   const processedAt = isoDateTime.parse(input.processedAt);
   const reason = input.failureReason === null ? null : sanitizeBillingWebhookFailureReason(input.failureReason);
@@ -587,8 +587,8 @@ export async function bindProviderSubscriptionCode(
   db: Pool,
   input: { subscriptionId: string; userId: string; providerSubscriptionCode: string },
 ): Promise<BillingSubscriptionCodeBinding> {
-  const subscriptionId = z.string().uuid().parse(input.subscriptionId);
-  const userId = z.string().uuid().parse(input.userId);
+  const subscriptionId = z.string().guid().parse(input.subscriptionId);
+  const userId = z.string().guid().parse(input.userId);
   // The canonical reference rule: an identifier, never credential-shaped
   // material, never wider than the column (0031's CHECK).
   const code = providerReferenceSchema.parse(input.providerSubscriptionCode);

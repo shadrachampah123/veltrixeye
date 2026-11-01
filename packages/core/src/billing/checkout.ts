@@ -80,7 +80,7 @@ export class BillingCheckoutService {
   constructor(private readonly options: BillingCheckoutOptions) {}
 
   async checkout(userId: string, input: unknown): Promise<BillingCheckoutSession> {
-    z.string().uuid().parse(userId);
+    z.string().guid().parse(userId);
     const requested = billingCheckoutInputSchema.parse(input);
     const { db, providers, callbackUrl } = this.options;
     if (callbackUrl === null || !z.string().url().safeParse(callbackUrl).success ||

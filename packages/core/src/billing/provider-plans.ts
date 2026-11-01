@@ -63,7 +63,7 @@ const scaledInteger = z.union([
 
 export const billingProviderPlanRowSchema = z
   .object({
-    id: z.string().uuid(),
+    id: z.string().guid(),
     provider: z.string(),
     mode: z.string(),
     catalogue_plan: z.string(),
@@ -73,7 +73,7 @@ export const billingProviderPlanRowSchema = z
     payment_amount_exponent: z.number().int(),
     provider_plan_id: z.string(),
     provider_plan_reference: z.string().nullable().optional(),
-    fx_rate_version_id: z.string().uuid(),
+    fx_rate_version_id: z.string().guid(),
     pricing_policy_version: z.string(),
     catalogue_version: z.string(),
     status: z.string(),

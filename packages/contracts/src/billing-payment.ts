@@ -136,7 +136,7 @@ export const billingFxSnapshotSchema = z
     /** Power of ten `fxRateScaled` is expressed in (never zero). */
     fxRateScale: z.number().int().min(1).max(18),
     /** Identity of the immutable rate version this snapshot came from. */
-    fxRateVersionId: z.string().uuid(),
+    fxRateVersionId: z.string().guid(),
     fxRateEffectiveFrom: z.string().datetime(),
     fxRateCapturedAt: z.string().datetime(),
     fxRateSource: billingFxSourceSchema,

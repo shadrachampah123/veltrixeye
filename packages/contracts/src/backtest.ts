@@ -170,8 +170,8 @@ export const backtestRequestSchema = z
     direction: backtestDirectionSchema.default('both'),
     from: z.number().int().positive().max(9_999_999_999_999),
     to: z.number().int().positive().max(9_999_999_999_999),
-    exitPolicy: backtestExitPolicySchema.default({}),
-    costPolicy: backtestCostPolicySchema.default({}),
+    exitPolicy: backtestExitPolicySchema.prefault({}),
+    costPolicy: backtestCostPolicySchema.prefault({}),
   })
   .strict()
   .superRefine((b, ctx) => {
@@ -286,9 +286,9 @@ export type BacktestMetrics = z.infer<typeof backtestMetricsSchema>;
 /** One row of `backtest_runs` (Phase 2 persistence). */
 export const backtestRunDtoSchema = z
   .object({
-    id: z.string().uuid(),
-    strategyId: z.string().uuid(),
-    strategyVersionId: z.string().uuid(),
+    id: z.string().guid(),
+    strategyId: z.string().guid(),
+    strategyVersionId: z.string().guid(),
     versionNumber: z.number().int().positive(),
     instrument: backtestInstrumentSchema,
     direction: backtestDirectionSchema,
@@ -322,8 +322,8 @@ export type BacktestRunDetailDto = z.infer<typeof backtestRunDetailDtoSchema>;
 /** GET /api/backtests query (Phase 2; values arrive as strings over HTTP). */
 export const backtestListQuerySchema = z
   .object({
-    strategyId: z.string().uuid().optional(),
-    versionId: z.string().uuid().optional(),
+    strategyId: z.string().guid().optional(),
+    versionId: z.string().guid().optional(),
     limit: z.coerce.number().int().min(1).max(MAX_BACKTESTS_LIMIT).default(DEFAULT_BACKTESTS_LIMIT),
   })
   .strict();
