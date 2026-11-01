@@ -15,7 +15,7 @@ export const subscriptionDtoSchema = z.object({
 export type SubscriptionDto = z.infer<typeof subscriptionDtoSchema>;
 
 export const entitlementsDtoSchema = z.object({
-  maxStrategies: z.number(),
+  maxStrategies: z.number().int().positive().nullable(),
   maxBacktestsPerMonth: z.number(),
   maxAlertsPerMonth: z.number(),
   maxSavedSetups: z.number(),

@@ -140,7 +140,7 @@ describe('M7.4: Billing and Entitlements API', () => {
     const data = res.json();
     assert.equal(data.subscription.plan, 'free');
     assert.equal(data.subscription.status, 'active');
-    assert.equal(data.entitlements.maxStrategies, 100);
+    assert.equal(data.entitlements.maxStrategies, 1);
     // Model C: the free state IS the absent row — no provider, nothing confirmed,
     // no commercial entitlement and no scanner access.
     assert.deepEqual(data.providerStatus, { provider: null, providerState: null, paymentConfirmed: false });
@@ -194,7 +194,7 @@ describe('M7.4: Billing and Entitlements API', () => {
     });
     const billing = resBilling.json();
     assert.equal(billing.subscription.plan, 'premium');
-    assert.equal(billing.entitlements.maxStrategies, 1000); 
+    assert.equal(billing.entitlements.maxStrategies, null);
 
     // Test that the premium user can create more than free limit
     await pool.query(

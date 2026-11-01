@@ -233,7 +233,7 @@ export class StrategyService {
       const countRes = await client.query('SELECT count(*)::int AS c FROM strategies WHERE user_id = $1', [actorUserId]);
       const currentCount = countRes.rows[0].c;
       
-      if (currentCount >= maxStrategies) {
+      if (maxStrategies !== null && currentCount >= maxStrategies) {
         throw Errors.forbidden(`Strategy limit reached. Your plan allows up to ${maxStrategies} strategies.`);
       }
 

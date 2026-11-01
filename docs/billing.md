@@ -1103,13 +1103,11 @@ Roughly in order; each is its own PR and may be re-scoped.
      update adds no route, migration, provider call, or authority.
 10. **Starter sellability decision — decided: NOT sold in this build (Billing
     Step 10a).** Starter keeps its catalogue entry as a documented future
-    concept and the plan comparison marks it "Not available yet"; nothing was
-    added for it — no internal plan value, no entitlement definition, no
-    provider plan — and no gate was widened. Making it sellable remains a
-    future decision that would require **all twelve** gates listed under
-    *Starter disposition* to be widened together, plus the two unresolved
-    product decisions recorded there (Starter's advertised limits sit below the
-    free tier's enforced limits, and the free-tier disposition is undecided).
+    concept and the plan comparison marks it "Not available yet". M8.8 aligns
+    the existing free fallback to Starter's one-strategy ceiling, but does not
+    create a dedicated `starter` internal plan, provider plan, or checkout path.
+    Making Starter sellable remains a future decision that would require **all
+    twelve** gates listed under *Starter disposition* to be widened together.
 11. **Refunds / proration / dunning execution** — each its own PR, each using
     the amount actually charged (never a re-rate).
 12. **Production credentials + go-live** only after all of the above, and only
@@ -1584,26 +1582,23 @@ database constraint together with the service check it mirrors. **No gate was
 widened by Step 10a**: this list is the checklist a future change must walk, and
 it is deliberately the only place the enumeration is stated.
 
-### Two unresolved product decisions (deliberately not decided here)
+### M8.8 strategy-ceiling alignment; Starter sale remains deferred
 
-1. **Starter's advertised limits sit below the free tier's enforced limits.**
-   The catalogue advertises Starter as *1 active strategy · 1 market category ·
-   delayed/limited*, while the **enforced** free tier is wider:
-   `maxStrategies: 100`, `maxBacktestsPerMonth: 100`, `maxAlertsPerMonth: 1000`,
-   `maxSavedSetups: 1000` (`FREE_ENTITLEMENTS`, `entitlements.ts`). Selling
-   Starter as advertised would hand a paying customer *fewer* strategies than
-   they have for free, so either the advertised allowance or the enforced tier
-   would have to change — an entitlement decision, not a catalogue edit.
-2. **Free-tier disposition.** `free` has no catalogue row and is not a sold
-   tier: since Model C a free user typically has **no `subscriptions` row at
-   all**, and the missing row is what resolves to free. Introducing a $15 entry
-   tier therefore needs a product decision about whether free survives, with
-   which limits, and how existing free users are treated (retained, migrated or
-   grandfathered). Step 10a does not decide it and changes nothing for free
-   users.
+M8.8 aligns the **strategy-creation ceiling** with the published catalogue:
+`free` (the existing no-subscription fallback) is limited to 1 strategy,
+internal `pro` to 5, and internal `premium` (commercial Elite) is unlimited.
+The other free quotas and feature flags are unchanged. The server does not
+rewrite subscription rows or delete/disable existing strategies; strategy
+creation is refused at the ceiling. Operator grants still resolve through the
+same internal tier matrix, and a pending provider checkout still receives only
+the free fallback until the existing activation authority exists.
 
-Both decisions stay **open**, and they are recorded here so a future Starter
-decision starts from the real constraints instead of from a price row.
+This is not a decision to sell Starter or to change pricing. Starter remains
+non-sellable and has no dedicated internal `UserPlan`; whether a separate
+commercial Starter subscription should exist, and whether free should remain a
+distinct product, are still open product decisions. No prices, provider-plan
+epochs, subscription/customer records, or migrations are changed by this code
+change.
 
 ## Self-serve billing management scope (Billing Step 9b)
 

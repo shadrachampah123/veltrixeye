@@ -103,6 +103,13 @@ function alwaysPassConfig(symbol: string) {
   };
 }
 
+async function grantProFixtureEntitlement(userId: string): Promise<void> {
+  await pool.query(
+    "INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'active')",
+    [userId],
+  );
+}
+
 async function registerUser(): Promise<{ cookie: string; userId: string; email: string }> {
   const email = uniqueEmail();
   const res = await app.inject({
@@ -354,6 +361,7 @@ describe('m6 backtests api', () => {
 
   test('minQualityScore gate: setups below the published version threshold are not counted', async () => {
     const owner = await registerUser();
+    await grantProFixtureEntitlement(owner.userId);
     // The PUBLISHED version config is the gate's source: its only qualifying
     // setups score 60 (a satisfied required filter plus an unsatisfied
     // confirmation ⇒ 0 of 15 confirmation points) against minQualityScore 65 —

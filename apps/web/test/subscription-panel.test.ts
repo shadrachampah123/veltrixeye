@@ -21,8 +21,9 @@
  *    is SOLD from what merely exists in the catalogue — every catalogue entry
  *    renders, sellability is DERIVED from `BILLING_CHECKOUT_SELLABLE_PLANS`
  *    (never restated), Starter is the one non-sellable entry and is marked
- *    "Not available yet" and explained as a catalogue concept with no enforced
- *    entitlement tier, no card offers any action, and the current-plan badge
+ *    "Not available yet" and explained as a non-sellable, non-dedicated internal
+ *    tier whose one-strategy allowance matches the free fallback; no card offers
+ *    any action, and the current-plan badge
  *    behaves exactly as before (Starter can never be current).
  */
 import { test } from 'node:test';
@@ -43,7 +44,7 @@ import { PlanComparison, SubscriptionPanel } from '../components/subscription-pa
 const SUBSCRIPTION_ID = '9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d';
 
 const FREE_ENTITLEMENTS = {
-  maxStrategies: 100,
+  maxStrategies: 1,
   maxBacktestsPerMonth: 100,
   maxAlertsPerMonth: 1000,
   maxSavedSetups: 1000,
@@ -54,7 +55,7 @@ const FREE_ENTITLEMENTS = {
 };
 
 const PRO_ENTITLEMENTS = {
-  maxStrategies: 500,
+  maxStrategies: 5,
   maxBacktestsPerMonth: 1000,
   maxAlertsPerMonth: 5000,
   maxSavedSetups: 5000,
@@ -65,7 +66,7 @@ const PRO_ENTITLEMENTS = {
 };
 
 const PREMIUM_ENTITLEMENTS = {
-  maxStrategies: 1000,
+  maxStrategies: null,
   maxBacktestsPerMonth: 5000,
   maxAlertsPerMonth: 10000,
   maxSavedSetups: 10000,
@@ -78,7 +79,7 @@ const PREMIUM_ENTITLEMENTS = {
 function billingState(args: {
   plan: 'free' | 'pro' | 'premium';
   status: BillingStateDto['subscription']['status'];
-  entitlements: typeof FREE_ENTITLEMENTS;
+  entitlements: BillingStateDto['entitlements'];
   provider?: string | null;
   providerState?: string | null;
   /** Whether the durable activation FACT confirms the payment (Step 8). */
@@ -131,7 +132,7 @@ test('a provider-backed pending checkout is labelled awaiting verification and s
   assert.doesNotMatch(markup, /Payment evidence recorded/, 'no evidence has been recorded yet');
   assert.doesNotMatch(markup, /awaiting operator activation/);
   // The FREE limits the server actually enforced, not the pro ones.
-  assert.match(markup, />100</, 'strategies limit is the free limit');
+  assert.match(markup, />1</, 'strategies limit is the Starter-sized free limit');
   assert.match(markup, />1000</, 'alerts limit is the free limit');
   assert.doesNotMatch(markup, />500</, 'the pro limit is never displayed');
   assert.match(markup, /Not included/, 'the scanner is shown as unavailable');
@@ -155,8 +156,8 @@ test('an activated provider-backed checkout renders its paid limits and no warni
   // and the panel renders it exactly like any other paid row — with the
   // limits the server actually enforced, and still no payment affordance.
   for (const [entitlements, strategyLimit, alertLimit] of [
-    [PRO_ENTITLEMENTS, '500', '5000'],
-    [PREMIUM_ENTITLEMENTS, '1000', '10000'],
+    [PRO_ENTITLEMENTS, '5', '5000'],
+    [PREMIUM_ENTITLEMENTS, 'Unlimited', '10000'],
   ] as const) {
     const markup = render(billingState({
       plan: entitlements === PRO_ENTITLEMENTS ? 'pro' : 'premium',
@@ -186,7 +187,7 @@ test('a historical paid subscription still renders its paid limits with no warni
   }));
   assert.doesNotMatch(markup, /Payment not confirmed/);
   assert.doesNotMatch(markup, /unconfirmed/i);
-  assert.match(markup, />1000</, 'premium strategy limit');
+  assert.match(markup, />Unlimited</, 'premium strategy limit is unlimited');
   assert.match(markup, />10000</, 'premium alert limit');
   assert.match(markup, />active</, 'the authoritative status badge is unchanged');
 });
@@ -391,12 +392,13 @@ test('every catalogue entry renders, and exactly the non-sellable entry is marke
   assert.doesNotMatch(grid, />\s*Available\s*</i, 'no Available badge exists');
 });
 
-test('Starter is described as a catalogue concept only, with no enforced entitlement tier', () => {
+test('Starter is not separately sellable, and its one-strategy ceiling matches the free fallback', () => {
   const markup = renderComparison('pro');
   assert.match(markup, /Starter is a catalogue concept only\./);
   assert.match(markup, /Not offered and not purchasable in this build/);
-  assert.match(markup, /no enforced entitlement tier/);
-  assert.match(markup, /not a plan the server sells, prices, provisions or activates/);
+  assert.match(markup, /no separate Starter entitlement tier/);
+  assert.match(markup, /server does not sell, price, provision or activate Starter/);
+  assert.match(renderComparison('free'), /one-strategy free allowance/);
   // The catalogue price is still shown — as catalogue information, not as an offer.
   assert.ok(cardFor(catalogueGrid(markup), 'Starter').includes('$15'));
   // And nothing claims Starter is purchasable or included.
@@ -533,7 +535,7 @@ test('a granted account is told WHY it holds paid limits, and that no payment wa
   assert.match(markup, /paymentConfirmed: false/, 'the server still confirms no payment');
   assert.match(markup, /Elite/, 'the commercial name of the granted tier is shown');
   // The limits shown really are the granted ones, not the free ones.
-  assert.match(markup, />1000</, 'the elite strategy limit is rendered');
+  assert.match(markup, />Unlimited</, 'the elite strategy limit is rendered as unlimited');
   assert.doesNotMatch(markup, />100</, 'the free strategy limit is not');
   // It offers nothing and changes nothing: the block is prose, not a control.
   assert.doesNotMatch(markup, /<button/i, 'the grant notice is not an action');

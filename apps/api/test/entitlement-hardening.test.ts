@@ -61,7 +61,7 @@ const HOUR = 3_600_000;
 const DETECT_AS_OF = 1_700_000_000_000;
 const SYMBOL = 'EURUSD';
 const FREE_LIMITS = {
-  maxStrategies: 100,
+  maxStrategies: 1,
   maxBacktestsPerMonth: 100,
   maxAlertsPerMonth: 1000,
   maxSavedSetups: 1000,
@@ -354,7 +354,7 @@ describe('GET /api/billing/me — historical subscriptions are preserved', () =>
         assert.equal(state.entitlements.canAccessAdvancedStrategies, true);
         assert.equal(state.entitlements.canAccessAdvancedAlerts, true);
         assert.equal(
-          state.entitlements.maxStrategies, plan === 'pro' ? 500 : 1000, `${plan}/${status}`,
+          state.entitlements.maxStrategies, plan === 'pro' ? 5 : null, `${plan}/${status}`,
         );
         assert.equal(state.entitlements.canAccessAutomation, false, 'automation stays off for everyone');
         assert.deepEqual(state.providerStatus, { provider: null, providerState: null, paymentConfirmed: false });
@@ -414,7 +414,7 @@ describe('GET /api/billing/me — provider-backed rows are never a confirmed sub
       assert.equal(state.providerStatus.paymentConfirmed, false);
       assert.deepEqual(state.entitlements, FREE_LIMITS);
       assert.notDeepEqual(state.entitlements, {
-        ...FREE_LIMITS, canAccessScanner: true, maxStrategies: 1000,
+        ...FREE_LIMITS, canAccessScanner: true, maxStrategies: null,
       });
     }
   });
@@ -794,15 +794,15 @@ describe('scanner gates — a provider-backed checkout cannot reach the scanner'
 
 describe('limits — a provider-backed checkout gets the existing FREE limits', () => {
   test('strategies: refused at the free limit, allowed for a historical pro row', async () => {
-    for (const [plan, prepare, expected] of [
-      ['provider-backed pro', async (id: string) => makeProviderBacked(id, 'pro', 'active', 'pending'), 403],
-      ['provider-backed premium', async (id: string) => makeProviderBacked(id, 'premium', 'active', 'active'), 403],
-      ['historical pro', async (id: string) => makeHistorical(id, 'pro', 'active'), 201],
-    ] as [string, (userId: string) => Promise<void>, number][]) {
+    for (const [plan, prepare, strategyCount, expected] of [
+      ['provider-backed pro', async (id: string) => makeProviderBacked(id, 'pro', 'active', 'pending'), 1, 403],
+      ['provider-backed premium', async (id: string) => makeProviderBacked(id, 'premium', 'active', 'active'), 1, 403],
+      ['historical pro', async (id: string) => makeHistorical(id, 'pro', 'active'), 4, 201],
+    ] as [string, (userId: string) => Promise<void>, number, number][]) {
       const { cookie, userId } = await register();
       await db.pool.query(
         `INSERT INTO strategies (user_id, name, description)
-         SELECT $1, 'Seeded ' || i, 'fixture' FROM generate_series(1, 100) i`, [userId],
+         SELECT $1, 'Seeded ' || i, 'fixture' FROM generate_series(1, $2) i`, [userId, strategyCount],
       );
       await prepare(userId);
       const res = await app.inject({
@@ -811,7 +811,7 @@ describe('limits — a provider-backed checkout gets the existing FREE limits', 
       });
       assert.equal(res.statusCode, expected, `${plan}: ${res.body}`);
       if (expected === 403) {
-        assert.match(res.json().error.message, /up to 100 strategies/, plan);
+        assert.match(res.json().error.message, /up to 1 strategies/, plan);
       }
     }
   });
@@ -960,7 +960,7 @@ describe('a non-commercial operator grant, over HTTP', () => {
     await grant(userId, 'premium');
 
     const after = await billingMe(cookie);
-    assert.equal(after.entitlements.maxStrategies, 1000, 'the elite limit is the one enforced');
+    assert.equal(after.entitlements.maxStrategies, null, 'the elite limit is the one enforced');
     assert.equal(after.entitlements.canAccessScanner, true);
     assert.equal(after.entitlements.canAccessAutomation, false, 'a grant never grants execution');
     assert.deepEqual(after.entitlementGrant, { plan: 'premium' }, 'and the tier is disclosed');
@@ -1024,7 +1024,7 @@ describe('a non-commercial operator grant, over HTTP', () => {
 
     await grant(userId, 'pro');
     const state = await billingMe(cookie);
-    assert.equal(state.entitlements.maxStrategies, 500, 'the GRANT is the authority, and only for its own tier');
+    assert.equal(state.entitlements.maxStrategies, 5, 'the GRANT is the authority, and only for its own tier');
     assert.equal(state.providerStatus.paymentConfirmed, false, 'and it still confirms no payment');
     assert.equal(state.providerStatus.providerState, 'pending', 'the provider state is untouched');
   });

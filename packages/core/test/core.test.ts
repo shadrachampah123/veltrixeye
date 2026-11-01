@@ -303,6 +303,15 @@ async function makeUser(): Promise<string> {
   return u.id;
 }
 
+async function makeProUser(): Promise<string> {
+  const id = await makeUser();
+  await pool.query(
+    "INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'active')",
+    [id],
+  );
+  return id;
+}
+
 describe('strategies', () => {
   test('create strategy with full config and read it back (round-trip)', async () => {
     const owner = await makeUser();
@@ -402,7 +411,7 @@ describe('strategies', () => {
   });
 
   test('enforces unique strategy name per user (case-insensitive)', async () => {
-    const owner = await makeUser();
+    const owner = await makeProUser();
     await strategies.createStrategy(owner, { name: 'Unique Name Test' });
     await assert.rejects(
       () => strategies.createStrategy(owner, { name: 'unique name test' }),
@@ -456,7 +465,7 @@ describe('strategies', () => {
   });
 
   test('publish gate: incomplete config cannot be published', async () => {
-    const owner = await makeUser();
+    const owner = await makeProUser();
     // empty draft
     const empty = await strategies.createStrategy(owner, { name: 'Incomplete' });
     await assert.rejects(

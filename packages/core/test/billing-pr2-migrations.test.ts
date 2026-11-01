@@ -510,9 +510,9 @@ describe('Billing PR2 — upgrade 0030 → 0031', () => {
       assert.equal(getEntitlements(plan, 'active').canAccessAutomation, false, `${plan}: automation is not granted`);
       assert.equal(getEntitlements(plan, 'canceled').canAccessAutomation, false);
     }
-    assert.equal(getEntitlements('premium', 'active').maxStrategies, 1000);
-    assert.equal(getEntitlements('pro', 'active').maxStrategies, 500);
-    assert.equal(getEntitlements('free', 'active').maxStrategies, 100);
+    assert.equal(getEntitlements('premium', 'active').maxStrategies, null);
+    assert.equal(getEntitlements('pro', 'active').maxStrategies, 5);
+    assert.equal(getEntitlements('free', 'active').maxStrategies, 1);
     assert.equal(seeded.length, 3);
   });
 

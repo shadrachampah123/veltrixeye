@@ -6,9 +6,9 @@
  *     (Starter / Pro / Elite, USD monthly + annual);
  *  2. the compatibility boundary with the existing internal plan values
  *     (`free` / `pro` / `premium`) — nothing is renamed, no user is migrated;
- *  3. **entitlement enforcement is unchanged by the catalogue**: limits and
- *     `canAccessAutomation` come from `getEntitlements()` exactly as before,
- *     and no catalogue entry grants live/broker/automation execution.
+ *  3. active-strategy enforcement aligns with Starter / Pro / Elite allowances,
+ *     while all other limits remain internal plan policy and no catalogue entry
+ *     grants live/broker/automation execution.
  *
  * No database, provider call, checkout or webhook is involved.
  */
@@ -64,10 +64,10 @@ describe('compatibility boundary — no rename, no user migration', () => {
     assert.equal(catalogueEntryForPlan('premium')?.id, 'elite');
   });
 
-  it('does not change the limits any existing user is enforced against', () => {
+  it('preserves non-strategy quotas and pins the approved strategy ceilings', () => {
     const expected: Record<UserPlan, ReturnType<typeof getEntitlements>> = {
       free: {
-        maxStrategies: 100,
+        maxStrategies: 1,
         maxBacktestsPerMonth: 100,
         maxAlertsPerMonth: 1000,
         maxSavedSetups: 1000,
@@ -77,7 +77,7 @@ describe('compatibility boundary — no rename, no user migration', () => {
         canAccessAutomation: false,
       },
       pro: {
-        maxStrategies: 500,
+        maxStrategies: 5,
         maxBacktestsPerMonth: 1000,
         maxAlertsPerMonth: 5000,
         maxSavedSetups: 5000,
@@ -87,7 +87,7 @@ describe('compatibility boundary — no rename, no user migration', () => {
         canAccessAutomation: false,
       },
       premium: {
-        maxStrategies: 1000,
+        maxStrategies: null,
         maxBacktestsPerMonth: 5000,
         maxAlertsPerMonth: 10000,
         maxSavedSetups: 10000,
@@ -98,8 +98,15 @@ describe('compatibility boundary — no rename, no user migration', () => {
       },
     };
     for (const plan of USER_PLANS) {
-      assert.deepEqual(getEntitlements(plan, 'active'), expected[plan], `entitlements for ${plan} must be unchanged`);
+      assert.deepEqual(getEntitlements(plan, 'active'), expected[plan], `non-strategy entitlements for ${plan} stay pinned`);
     }
+    assert.equal(getEntitlements('free', 'active').maxStrategies,
+      getCommercialPlan('starter').activeStrategies.limit, 'free/Starter enforces one strategy');
+    assert.equal(getEntitlements('pro', 'active').maxStrategies,
+      getCommercialPlan('pro').activeStrategies.limit, 'Pro enforces five strategies');
+    assert.equal(getCommercialPlan('elite').activeStrategies.limit, null, 'Elite advertises unlimited');
+    assert.equal(getEntitlements('premium', 'active').maxStrategies, null,
+      'Elite uses the unlimited sentinel in the entitlement contract');
   });
 
   it('keeps automation OFF for every plan, including the commercial Elite tier', () => {

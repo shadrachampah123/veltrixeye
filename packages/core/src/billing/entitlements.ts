@@ -5,10 +5,10 @@ import type { UserPlan } from '@veltrixeye/contracts';
  *
  * Keyed on the **internal** plan values (`free` / `pro` / `premium`, stored in
  * `users.plan` and `subscriptions.plan`), never on the commercial catalogue
- * (`starter` / `pro` / `elite`). PR1 introduces the commercial catalogue in
- * `./catalogue.ts`; it changes nothing here. Renaming the stored values or
- * migrating existing users requires a migration (0031) and is out of scope for
- * PR1 — see docs/billing.md "Compatibility boundary".
+ * (`starter` / `pro` / `elite`). The active-strategy ceilings below align those
+ * internal values with Starter / Pro / Elite without renaming stored values or
+ * rewriting any customer's subscription or strategy records. Starter remains
+ * unavailable as a checkout plan until its internal-plan mapping is resolved.
  *
  * `canAccessAutomation` is `false` for every plan and must stay that way: the
  * commercial catalogue cannot grant execution capability.
@@ -20,7 +20,7 @@ import type { UserPlan } from '@veltrixeye/contracts';
  */
 
 export interface Entitlements {
-  maxStrategies: number;
+  maxStrategies: number | null;
   maxBacktestsPerMonth: number;
   maxAlertsPerMonth: number;
   maxSavedSetups: number;
@@ -36,7 +36,8 @@ export interface Entitlements {
  * second matrix. There is exactly one definition of every tier.
  */
 export const FREE_ENTITLEMENTS: Entitlements = {
-  maxStrategies: 100,
+  // The existing no-subscription tier receives Starter's advertised allowance.
+  maxStrategies: 1,
   maxBacktestsPerMonth: 100,
   maxAlertsPerMonth: 1000,
   maxSavedSetups: 1000,
@@ -47,7 +48,7 @@ export const FREE_ENTITLEMENTS: Entitlements = {
 };
 
 const PRO_ENTITLEMENTS: Entitlements = {
-  maxStrategies: 500,
+  maxStrategies: 5,
   maxBacktestsPerMonth: 1000,
   maxAlertsPerMonth: 5000,
   maxSavedSetups: 5000,
@@ -57,8 +58,9 @@ const PRO_ENTITLEMENTS: Entitlements = {
   canAccessAutomation: false, // M8 future, off for everyone for now
 };
 
+// `null` is the explicit unlimited sentinel in the public entitlement DTO.
 const PREMIUM_ENTITLEMENTS: Entitlements = {
-  maxStrategies: 1000,
+  maxStrategies: null,
   maxBacktestsPerMonth: 5000,
   maxAlertsPerMonth: 10000,
   maxSavedSetups: 10000,

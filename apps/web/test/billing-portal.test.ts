@@ -332,7 +332,7 @@ describe('Billing Portal v1 — the API client', () => {
       { emailToken: 'eyJhbGciOi' },
       { providerError: 'Charge attempted failed' },
       { pricingSnapshot: { commercialAmountMinor: 3900 } },
-      { entitlements: { maxStrategies: 500 } },
+      { entitlements: { maxStrategies: 5 } },
     ]) {
       respond = () => json({ ...activated(), ...leak });
       await assert.rejects(

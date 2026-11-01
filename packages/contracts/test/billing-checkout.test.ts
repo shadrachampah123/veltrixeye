@@ -71,7 +71,7 @@ const INITIALIZED_AT = '2026-09-22T12:00:00.000Z';
 const COMPUTED_AT = '2026-09-22T11:59:31.000Z';
 
 const FREE_ENTITLEMENTS = {
-  maxStrategies: 100,
+  maxStrategies: 1,
   maxBacktestsPerMonth: 100,
   maxAlertsPerMonth: 1000,
   maxSavedSetups: 1000,

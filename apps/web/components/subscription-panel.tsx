@@ -144,7 +144,7 @@ export function SubscriptionPanel({
         </div>
 
         <div className="grid gap-3 sm:grid-cols-2">
-          <EntitlementRow label="Strategies" value={`${ent.maxStrategies}`} hint="Max saved strategies" />
+          <EntitlementRow label="Strategies" value={ent.maxStrategies === null ? 'Unlimited' : `${ent.maxStrategies}`} hint="Max saved strategies" />
           <EntitlementRow label="Backtests / month" value={`${ent.maxBacktestsPerMonth}`} hint="Historical replay limit" />
           <EntitlementRow label="Alerts / month" value={`${ent.maxAlertsPerMonth}`} hint="Scored alerts" />
           <EntitlementRow label="Saved setups" value={`${ent.maxSavedSetups}`} hint="Persisted setups" />
@@ -250,9 +250,9 @@ function FeatureRow({ label, enabled, note }: { label: string; enabled: boolean;
  * Billing Step 10a: the cards distinguish what is SOLD from what merely exists
  * in the catalogue. Sellability comes from `BILLING_CHECKOUT_SELLABLE_PLANS`
  * and nothing else; a catalogue entry without a sellable plan (today: Starter)
- * is marked "Not available yet" and explained as a catalogue concept with no
- * enforced entitlement tier. Pro/Elite rendering and the current-plan badge are
- * unchanged, and no card offers any action.
+ * is marked "Not available yet" and explained as not having a separate
+ * sellable internal tier. The free fallback enforces the same one-strategy
+ * ceiling but cannot be purchased as Starter. No card offers any action.
  */
 export function PlanComparison({
   currentPlan,
@@ -272,9 +272,9 @@ export function PlanComparison({
   // plans are exactly `BILLING_CHECKOUT_SELLABLE_PLANS` (Pro + Elite), and every
   // other catalogue entry is a catalogue CONCEPT only. Starter is therefore
   // rendered as "Not available yet" and nothing about it is offered, priced for
-  // payment, provisioned or activatable: no internal plan value, no entitlement
-  // definition and no provider plan exists for it, and the server refuses it at
-  // every gate. This is a display distinction and it grants nothing.
+  // payment, provisioned or activatable: there is no dedicated internal plan
+  // value or provider plan, and checkout refuses it. The free fallback shares
+  // its one-strategy ceiling; that is not a purchasable Starter entitlement.
   const sellablePlans: readonly string[] = BILLING_CHECKOUT_SELLABLE_PLANS;
   const unavailableCataloguePlans = COMMERCIAL_PLAN_CATALOGUE.filter(
     (plan) => !sellablePlans.includes(plan.id),
@@ -315,8 +315,8 @@ export function PlanComparison({
       <div className="border-t border-ink-700 px-5 py-3 text-[11px] leading-snug text-ink-400">
         Prices are {BILLING_CURRENCY} and come from the server-side catalogue.{' '}
         {currentCommercialPlan === null
-          ? `Your account is on the internal "${currentPlan}" plan, which has no commercial catalogue counterpart — nothing changes for you.`
-          : 'Enforced limits are unchanged and continue to come from the API.'}{' '}
+          ? `Your account is on the internal "${currentPlan}" plan, which has no commercial catalogue counterpart. It uses the one-strategy free allowance; Starter itself is not purchasable.`
+          : 'Strategy allowances are enforced by the API; other quotas remain as configured there.'}{' '}
         {unavailableCataloguePlans.length > 0 ? (
           <p className="mt-2">
             <strong className="text-ink-300">
@@ -327,9 +327,10 @@ export function PlanComparison({
               }`}
             </strong>{' '}
             <span>
-              Not offered and not purchasable in this build, with no enforced entitlement tier: the prices and
-              allowances on its card are the commercial concept, not a plan the server sells, prices, provisions or
-              activates. Every catalogue entry that is not a sellable plan is marked &ldquo;Not available yet&rdquo;.
+              Not offered and not purchasable in this build, with no separate Starter entitlement tier. Its
+              one-strategy allowance is also used by the free fallback, but the card&rsquo;s prices and remaining
+              allowances are catalogue information only; the server does not sell, price, provision or activate
+              Starter. Every non-sellable catalogue entry is marked &ldquo;Not available yet&rdquo;.
             </span>
           </p>
         ) : null}

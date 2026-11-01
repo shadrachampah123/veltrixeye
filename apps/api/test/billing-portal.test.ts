@@ -330,7 +330,7 @@ test('a stored status of active alone never produces a paid state', async () => 
   const me = billingStateDtoSchema.parse((await billingMe(owner.cookie)).json());
   assert.equal(me.providerStatus.paymentConfirmed, false);
   assert.equal(me.subscription.plan, 'pro', 'the row records what was checked out…');
-  assert.equal(me.entitlements.maxStrategies, 100, '…and the server still enforces the free tier');
+  assert.equal(me.entitlements.maxStrategies, 1, '…and the server still enforces the free tier');
   assert.equal(me.entitlements.canAccessAutomation, false);
   assert.equal(commercial.amountMinor > 0, true);
 });
@@ -373,7 +373,7 @@ test('verified evidence without an activation stays free-entitled', async () => 
   assert.equal(state.canAccessAutomation, false);
 
   const me = billingStateDtoSchema.parse((await billingMe(owner.cookie)).json());
-  assert.equal(me.entitlements.maxStrategies, 100, 'evidence is a receipt, never an entitlement');
+  assert.equal(me.entitlements.maxStrategies, 1, 'evidence is a receipt, never an entitlement');
   assert.equal(me.providerStatus.paymentConfirmed, false);
   assert.equal(me.entitlements.canAccessAutomation, false);
 
@@ -408,7 +408,7 @@ test('an activated subscription reflects the server-side activation fact', async
   // provider-backed row resolves the PAID tier, and automation stays OFF.
   const me = billingStateDtoSchema.parse((await billingMe(owner.cookie)).json());
   assert.equal(me.providerStatus.paymentConfirmed, true);
-  assert.equal(me.entitlements.maxStrategies, 1000, 'elite (internal premium) limits');
+  assert.equal(me.entitlements.maxStrategies, null, 'elite (internal premium) is effectively unlimited');
   assert.equal(me.entitlements.canAccessAutomation, false);
 });
 

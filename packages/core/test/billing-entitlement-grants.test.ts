@@ -784,18 +784,18 @@ describe('the production readers — a granted account with no subscription row'
     const strategies = new StrategyService(pool, new AuditService(pool));
     await pool.query(
       `INSERT INTO strategies (user_id, name, description)
-       SELECT $1, 'Seeded ' || i, 'fixture' FROM generate_series(1, 100) i`, [user.id],
+       SELECT $1, 'Seeded ' || i, 'fixture' FROM generate_series(1, 1) i`, [user.id],
     );
     // Free limit reached, with no grant.
     await assert.rejects(
       strategies.createStrategy(user.id, { name: 'Before the grant' }),
-      /up to 100 strategies/,
+      /up to 1 strategies/,
     );
     await grants().grant({ ...request({ user: user.email }) });
     const created = await strategies.createStrategy(user.id, { name: 'After the grant' });
     assert.equal(created.name, 'After the grant', 'the granted tier is the one enforced');
     const count = await pool.query('SELECT count(*)::int AS c FROM strategies WHERE user_id=$1', [user.id]);
-    assert.equal(count.rows[0]!.c, 101);
+    assert.equal(count.rows[0]!.c, 2);
   });
 
   it('AutomationService.readState reports the granted tier and still no automation', async () => {
