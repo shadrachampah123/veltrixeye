@@ -115,7 +115,7 @@ export type ReconciliationResolutionAction = (typeof RECONCILIATION_RESOLUTION_A
 /* Snapshot interfaces (provider-neutral)                                      */
 /* -------------------------------------------------------------------------- */
 
-const uuidSchema = z.string().uuid();
+const uuidSchema = z.string().guid();
 const isoDateTimeSchema = z.string();
 
 export const reconciliationProviderOrderSchema = z

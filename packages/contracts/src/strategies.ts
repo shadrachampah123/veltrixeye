@@ -40,7 +40,7 @@ export const strategyFilterSchema = z
     type: z.enum(STRATEGY_FILTER_TYPES),
     enabled: z.boolean().default(true),
     /** Type-specific parameters, validated by the strategy service. */
-    params: z.record(z.string(), z.unknown()).default({}),
+    params: z.record(z.string(), z.unknown()).prefault({}),
   })
   .strict();
 export type StrategyFilter = z.infer<typeof strategyFilterSchema>;
@@ -99,7 +99,7 @@ export type StrategyVersionUpdateInput = z.input<typeof strategyVersionUpdateSch
 /** Create a new draft version, optionally cloned from an existing one. */
 export const strategyVersionCreateSchema = z
   .object({
-    fromVersionId: z.string().uuid().optional(),
+    fromVersionId: z.string().guid().optional(),
     changelog: z.string().trim().max(500).optional(),
   })
   .strict();

@@ -524,7 +524,7 @@ export class BillingLegacyFreeRowRemediationService {
   private async readUser(
     reference: string,
   ): Promise<{ id: string; email: string } | null> {
-    const asUuid = z.string().uuid().safeParse(reference);
+    const asUuid = z.string().guid().safeParse(reference);
     const { rows } = asUuid.success
       ? await this.options.db.query<{ id: string; email: string }>(
           'SELECT id, email FROM users WHERE id = $1',

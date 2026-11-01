@@ -128,7 +128,7 @@ export type PaperSimulationGateId = (typeof PAPER_SIMULATION_GATE_IDS)[number];
 /* DTOs                                                                        */
 /* -------------------------------------------------------------------------- */
 
-const uuidSchema = z.string().uuid();
+const uuidSchema = z.string().guid();
 const isoDateTimeSchema = z.string();
 
 /**

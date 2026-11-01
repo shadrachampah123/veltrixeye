@@ -29,8 +29,8 @@ import { Errors, getBillingState } from '@veltrixeye/core';
 
 const createBacktestBodySchema = z
   .object({
-    strategyId: z.string().uuid(),
-    versionId: z.string().uuid(),
+    strategyId: z.string().guid(),
+    versionId: z.string().guid(),
     instrument: backtestInstrumentSchema,
     direction: backtestDirectionSchema.optional(),
     from: z.number().int().positive().max(9_999_999_999_999),

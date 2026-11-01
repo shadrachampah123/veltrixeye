@@ -792,7 +792,7 @@ export interface RegisterSandboxPlanEpochsInput {
 
 const registerSandboxPlanEpochsInputSchema = z
   .object({
-    fxRateVersionId: z.string().uuid(),
+    fxRateVersionId: z.string().guid(),
     evidence: z.array(z.unknown()).min(1),
     audit: provisioningAuditDescriptorSchema.optional(),
   })

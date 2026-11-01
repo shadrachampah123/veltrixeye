@@ -92,7 +92,7 @@ export type AlertAcknowledgeRequest = z.infer<typeof alertAcknowledgeRequestSche
 /** GET /api/alerts query (Phase 3; values arrive as strings over HTTP). */
 export const alertListQuerySchema = z
   .object({
-    strategyId: z.string().uuid().optional(),
+    strategyId: z.string().guid().optional(),
     status: alertStatusSchema.optional(),
     limit: z.coerce.number().int().min(1).max(MAX_ALERTS_LIMIT).default(DEFAULT_ALERTS_LIMIT),
   })
@@ -102,10 +102,10 @@ export type AlertListQuery = z.infer<typeof alertListQuerySchema>;
 /** One row of `alerts`. */
 export const alertDtoSchema = z
   .object({
-    id: z.string().uuid(),
-    setupId: z.string().uuid(),
-    strategyId: z.string().uuid(),
-    strategyVersionId: z.string().uuid(),
+    id: z.string().guid(),
+    setupId: z.string().guid(),
+    strategyId: z.string().guid(),
+    strategyVersionId: z.string().guid(),
     versionNumber: z.number().int().positive(),
     instrument: detectionInstrumentSchema,
     direction: setupDirectionSchema,
@@ -130,7 +130,7 @@ export type AlertDto = z.infer<typeof alertDtoSchema>;
 export const alertDeliveryDtoSchema = z
   .object({
     id: z.number().int().positive(),
-    alertId: z.string().uuid(),
+    alertId: z.string().guid(),
     channel: alertChannelSchema,
     status: alertDeliveryStatusSchema,
     attempt: z.number().int().min(1),

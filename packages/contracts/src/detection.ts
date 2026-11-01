@@ -107,8 +107,8 @@ export type SetupTransitionRequest = z.infer<typeof setupTransitionRequestSchema
 /** GET /api/setups query (all values arrive as strings over HTTP). */
 export const setupListQuerySchema = z
   .object({
-    strategyId: z.string().uuid().optional(),
-    versionId: z.string().uuid().optional(),
+    strategyId: z.string().guid().optional(),
+    versionId: z.string().guid().optional(),
     state: setupStateSchema.optional(),
     direction: setupDirectionSchema.optional(),
     limit: z.coerce.number().int().min(1).max(MAX_SETUPS_LIMIT).default(DEFAULT_SETUPS_LIMIT),
@@ -119,9 +119,9 @@ export type SetupListQuery = z.infer<typeof setupListQuerySchema>;
 /** One row of `setups`, joined with its strategy/version/instrument identity. */
 export const setupDtoSchema = z
   .object({
-    id: z.string().uuid(),
-    strategyId: z.string().uuid(),
-    strategyVersionId: z.string().uuid(),
+    id: z.string().guid(),
+    strategyId: z.string().guid(),
+    strategyVersionId: z.string().guid(),
     versionNumber: z.number().int().positive(),
     instrument: detectionInstrumentSchema,
     state: setupStateSchema,
@@ -147,7 +147,7 @@ export type SetupDto = z.infer<typeof setupDtoSchema>;
 export const setupStateEventDtoSchema = z
   .object({
     id: z.number().int().positive(),
-    setupId: z.string().uuid(),
+    setupId: z.string().guid(),
     fromState: setupStateSchema.nullable(),
     toState: setupStateSchema,
     reason: z.string().nullable(),
@@ -201,8 +201,8 @@ export type DetectionItemDto = z.infer<typeof detectionItemDtoSchema>;
 /** POST …/detect response. */
 export const detectionResponseDtoSchema = z
   .object({
-    strategyId: z.string().uuid(),
-    versionId: z.string().uuid(),
+    strategyId: z.string().guid(),
+    versionId: z.string().guid(),
     versionNumber: z.number().int().positive(),
     instrument: detectionInstrumentSchema,
     asOfMs: z.number().int().positive(),

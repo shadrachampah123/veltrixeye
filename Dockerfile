@@ -54,11 +54,14 @@ ENV NODE_ENV=production \
     PORT=4000
 
 COPY --from=deps --chown=node:node /app/node_modules ./node_modules
-# npm may keep production dependencies used by a single workspace nested under
-# that workspace instead of hoisting them (Nodemailer 10 is one such package).
-# The API consumes these workspace sources directly, so preserve their local
-# dependency directories in the runtime image as well.
+# npm may keep dependencies nested under individual workspaces instead of
+# hoisting them (Zod 4 is one such dependency). The API consumes these workspace
+# sources directly, so preserve each runtime workspace's local dependency tree.
+COPY --from=deps --chown=node:node /app/apps/api/node_modules ./apps/api/node_modules
+COPY --from=deps --chown=node:node /app/packages/contracts/node_modules ./packages/contracts/node_modules
 COPY --from=deps --chown=node:node /app/packages/core/node_modules ./packages/core/node_modules
+COPY --from=deps --chown=node:node /app/packages/providers/twelve-data/node_modules ./packages/providers/twelve-data/node_modules
+COPY --from=deps --chown=node:node /app/packages/providers/paystack/node_modules ./packages/providers/paystack/node_modules
 
 # Sources needed at runtime: the API entrypoint plus the two workspace
 # packages it imports (they resolve to .ts sources — see the note above).

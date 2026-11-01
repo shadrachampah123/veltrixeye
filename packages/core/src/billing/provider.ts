@@ -94,7 +94,7 @@ if (SERVER_BILLING_CATALOGUE.provider !== BILLING_PROVIDER) {
 /* Seam request/result schemas (canonical, provider-neutral, strict)          */
 /* -------------------------------------------------------------------------- */
 
-const uuid = z.string().uuid();
+const uuid = z.string().guid();
 const isoDateTime = z.string().datetime();
 
 /** Lookup a provider customer by local user (and optionally by email). */

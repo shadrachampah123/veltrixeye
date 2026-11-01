@@ -100,7 +100,7 @@ const timestamp = z.union([z.date(), z.string().datetime()]).transform((value) =
 
 export const billingFxRateVersionRowSchema = z
   .object({
-    id: z.string().uuid(),
+    id: z.string().guid(),
     base_currency: z.string(),
     quote_currency: z.string(),
     fx_rate_scaled: scaledInteger.transform((value) => BigInt(value)),

@@ -116,10 +116,10 @@ export const notificationFailureCategorySchema = z.enum(NOTIFICATION_FAILURE_CAT
  */
 export const alertNotificationDataSchema = z
   .object({
-    alertId: z.string().uuid(),
-    setupId: z.string().uuid(),
-    strategyId: z.string().uuid(),
-    strategyVersionId: z.string().uuid(),
+    alertId: z.string().guid(),
+    setupId: z.string().guid(),
+    strategyId: z.string().guid(),
+    strategyVersionId: z.string().guid(),
     versionNumber: z.number().int().positive(),
     instrument: detectionInstrumentSchema,
     /** Setup timeframe of the strategy version that produced the alert. */
@@ -163,8 +163,8 @@ export type AlertNotificationPayload = z.infer<typeof alertNotificationPayloadSc
  */
 export const notificationDtoSchema = z
   .object({
-    id: z.string().uuid(),
-    alertId: z.string().uuid(),
+    id: z.string().guid(),
+    alertId: z.string().guid(),
     channel: notificationChannelSchema,
     status: notificationStatusSchema,
     attempts: z.number().int().min(0).max(100),
@@ -243,7 +243,7 @@ export type NotificationMaintenanceResponse = z.infer<typeof notificationMainten
 
 /** M9.1 owner preference DTO. Secrets are intentionally never returned. */
 export const notificationPreferenceSchema = z.object({
-  id: z.string().uuid(),
+  id: z.string().guid(),
   channel: notificationChannelSchema,
   enabled: z.boolean(),
   endpointUrl: z.string().url().nullable(),
@@ -287,7 +287,7 @@ export const notificationPreferencesRequestSchema = z.object({
 export type NotificationPreferencesRequest = z.input<typeof notificationPreferencesRequestSchema>;
 
 export const strategyNotificationPreferenceSchema = z.object({
-  strategyId: z.string().uuid(),
+  strategyId: z.string().guid(),
   muted: z.boolean(),
   channels: z.array(notificationChannelSchema).max(3).nullable(),
 }).strict();

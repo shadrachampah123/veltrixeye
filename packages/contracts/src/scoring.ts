@@ -180,7 +180,7 @@ export type ScoreHistoryQuery = z.infer<typeof scoreHistoryQuerySchema>;
 export const setupScoreDtoSchema = z
   .object({
     id: z.number().int().positive(),
-    setupId: z.string().uuid(),
+    setupId: z.string().guid(),
     /** The scoring engine version that produced this row (e.g. M5_SCORE_ENGINE_VERSION). */
     engineVersion: z.string().min(1).max(120),
     /** The deterministic M3 evaluation anchor this score was computed from. */
@@ -210,7 +210,7 @@ export type SetupScoreResponseDto = z.infer<typeof setupScoreResponseDtoSchema>;
 /** GET /api/setups/:setupId/scores response (newest first). */
 export const setupScoreHistoryResponseDtoSchema = z
   .object({
-    setupId: z.string().uuid(),
+    setupId: z.string().guid(),
     scores: z.array(setupScoreDtoSchema).max(MAX_SCORE_HISTORY_LIMIT),
   })
   .strict();

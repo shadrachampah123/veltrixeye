@@ -16,9 +16,9 @@ export interface SanitizedTransportError {
 }
 
 export const transportContextSchema = z.object({
-  requestId: z.string().uuid().transform((value) => value.toLowerCase()),
-  executionId: z.string().uuid().transform((value) => value.toLowerCase()),
-  correlationId: z.string().uuid().transform((value) => value.toLowerCase()),
+  requestId: z.string().guid().transform((value) => value.toLowerCase()),
+  executionId: z.string().guid().transform((value) => value.toLowerCase()),
+  correlationId: z.string().guid().transform((value) => value.toLowerCase()),
   timestamp: z.string().datetime(),
 }).strict();
 export type TransportContext = z.infer<typeof transportContextSchema>;

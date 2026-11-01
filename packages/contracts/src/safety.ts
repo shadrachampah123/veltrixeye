@@ -80,7 +80,7 @@ export const killSwitchReasonSchema = z
   // the length bound; colons/spaces pass naturally for notes like "incident: X".
   .regex(/^[A-Za-z0-9 .,;:!?'()@#%+=/[\]{}_-]+$/, 'Reason contains unsupported characters');
 
-const uuidSchema = z.string().uuid();
+const uuidSchema = z.string().guid();
 const isoDateTimeSchema = z.string();
 
 /**

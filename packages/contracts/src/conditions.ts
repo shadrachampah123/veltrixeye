@@ -120,7 +120,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   choch: {
     type: 'choch',
@@ -136,7 +136,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   bos: {
     type: 'bos',
@@ -151,7 +151,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   break_retest: {
     type: 'break_retest',
@@ -168,7 +168,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   order_block: {
     type: 'order_block',
@@ -185,7 +185,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   fvg: {
     type: 'fvg',
@@ -201,7 +201,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   support: {
     type: 'support',
@@ -216,7 +216,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   resistance: {
     type: 'resistance',
@@ -231,7 +231,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   supply: {
     type: 'supply',
@@ -246,7 +246,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   demand: {
     type: 'demand',
@@ -261,7 +261,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   rejection_candle: {
     type: 'rejection_candle',
@@ -276,7 +276,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   engulfing_candle: {
     type: 'engulfing_candle',
@@ -291,7 +291,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   displacement: {
     type: 'displacement',
@@ -307,7 +307,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   rr_requirement: {
     type: 'rr_requirement',
@@ -321,7 +321,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   session_requirement: {
     type: 'session_requirement',
@@ -337,7 +337,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   news_filter: {
     type: 'news_filter',
@@ -353,7 +353,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
   volatility_filter: {
     type: 'volatility_filter',
@@ -370,7 +370,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({})
+      .prefault({})
       .superRefine((v, ctx) => {
         if (v.max !== undefined && v.max <= v.min) {
           ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['max'], message: 'max must be greater than min' });
@@ -404,7 +404,7 @@ export const CONDITION_TYPE_REGISTRY: Readonly<Record<string, ConditionTypeDefin
         anchorOffsetCandles: anchorOffsetCandlesSchema,
       })
       .strict()
-      .default({}),
+      .prefault({}),
   },
 };
 
@@ -431,7 +431,7 @@ export const strategyConditionSchema = z
     conditionType: z.string().min(1).max(64),
     classification: conditionClassificationSchema,
     timeframeRole: conditionTimeframeRoleSchema,
-    params: z.record(z.string(), z.unknown()).default({}),
+    params: z.record(z.string(), z.unknown()).prefault({}),
     description: z.string().trim().max(280).optional(),
     position: z.number().int().min(0).max(10000).default(0),
   })
@@ -468,7 +468,7 @@ export const strategyRuleGroupSchema = z
     logic: z.enum(['AND', 'OR']),
     position: z.number().int().min(0).max(10000).default(0),
     conditions: z.array(strategyConditionSchema).max(100).default([]),
-    parentGroupId: z.string().uuid().optional(),
+    parentGroupId: z.string().guid().optional(),
   })
   .strict();
 export type StrategyRuleGroup = z.infer<typeof strategyRuleGroupSchema>;

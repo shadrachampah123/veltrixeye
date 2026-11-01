@@ -798,7 +798,7 @@ const publishedOnDate = z
 
 export const fxSourceObservationRowSchema = z
   .object({
-    id: z.string().uuid(),
+    id: z.string().guid(),
     source_id: z.string(),
     observation_key: z.string().regex(HEX_64),
     base_currency: z.string(),

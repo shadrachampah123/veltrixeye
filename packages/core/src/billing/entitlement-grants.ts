@@ -244,7 +244,7 @@ export const BILLING_ENTITLEMENT_GRANT_AUDIT_ACTION = 'billing.entitlement_grant
 /* -------------------------------------------------------------------------- */
 
 const isoDateTime = z.string().datetime();
-const uuid = z.string().uuid();
+const uuid = z.string().guid();
 
 const grantRowSchema = z
   .object({
@@ -703,7 +703,7 @@ export class BillingEntitlementGrantService {
     client: PoolClient,
     reference: string,
   ): Promise<{ id: string; email: string } | null> {
-    const asUuid = z.string().uuid().safeParse(reference);
+    const asUuid = z.string().guid().safeParse(reference);
     const { rows } = asUuid.success
       ? await client.query<{ id: string; email: string }>(
           'SELECT id, email FROM users WHERE id = $1',

@@ -291,7 +291,7 @@ export class BillingCustomerService {
    * refusal. `userId` must be the authenticated caller's own id.
    */
   ensureCustomer(userId: string): Promise<BillingCustomerProvisioningResult> {
-    const user = z.string().uuid().parse(userId);
+    const user = z.string().guid().parse(userId);
     const existing = this.inflight.get(user);
     if (existing !== undefined) return existing;
     const pending = this.provision(user).finally(() => {
@@ -303,7 +303,7 @@ export class BillingCustomerService {
 
   /** The user's local billing customer row, or null. Read-only. */
   async findLocalCustomer(userId: string): Promise<BillingCustomerRow | null> {
-    const user = z.string().uuid().parse(userId);
+    const user = z.string().guid().parse(userId);
     const { rows } = await this.options.db.query<BillingCustomerRow>(
       `SELECT ${CUSTOMER_COLUMNS}
          FROM billing_customers
