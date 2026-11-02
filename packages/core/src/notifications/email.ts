@@ -74,7 +74,11 @@ export function createSmtpEmailProvider(config: SmtpEmailConfig): SmtpEmailProvi
   const configured = isSmtpConfigured(config);
   // Everything an operator may see. `pass` is deliberately absent, and it is
   // also redacted out of any provider error text.
-  const secrets: string[] = [config.pass, config.user].filter((v) => v.length > 3);
+  // Keep even short credentials for the SMTP-specific echo check below. The
+  // shared redactor intentionally ignores short strings to avoid shredding
+  // ordinary diagnostics; if Nodemailer echoes one verbatim, suppress the whole
+  // provider message instead of risking a credential leak.
+  const secrets: string[] = [config.pass, config.user].filter((v) => v.length > 0);
 
   return {
     channel: 'email',
@@ -186,7 +190,17 @@ export function classifySmtpError(
   const shape = (err !== null && typeof err === 'object' ? err : {}) as SmtpErrorShape;
   const code = typeof shape.code === 'string' ? shape.code : '';
   const responseCode = responseCodeOf(shape.responseCode ?? shape.response);
-  const message = describeError(err, secrets);
+  const rawErrorText = err instanceof Error
+    ? `${err.name}: ${err.message}`
+    : typeof err === 'string'
+      ? err
+      : '';
+  const echoedShortSecret = secrets.some(
+    (secret) => secret.length > 0 && secret.length <= 3 && rawErrorText.includes(secret),
+  );
+  const message = echoedShortSecret
+    ? 'SMTP provider error omitted because it echoed configured credential material'
+    : describeError(err, secrets);
 
   // Authentication/configuration: retrying cannot fix it.
   if (code === 'EAUTH' || (responseCode !== null && ['530', '534', '535', '538'].includes(responseCode))) {
@@ -200,7 +214,7 @@ export function classifySmtpError(
 
   // Timeouts (socket/greeting/connection) — the provider may still have
   // accepted it, hence the stable Message-Id rather than a blind re-send.
-  if (code === 'ETIMEDOUT' || (code === 'ESOCKET' && /timeout/i.test(message))) {
+  if (code === 'ETIMEDOUT' || (code === 'ESOCKET' && /timeout/i.test(rawErrorText))) {
     return { outcome: 'timeout', failureCategory: 'timeout', responseCode, error: message };
   }
 
