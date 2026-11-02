@@ -46,19 +46,38 @@ A later GitHub deployment record exists for the service: **7481011027**, ref
 `main`, SHA `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`, created
 `2026-11-01T23:51:14Z` by `shadrachampah123`. Its GitHub status history later
 reported `success` at `2026-11-01T23:52:15Z` and links to the Render deploy log
-for `veltrixeye-api`. This establishes a later successful *deployment record*,
-not service health, automatic-vs-manual trigger mode, or whether a rollback
-occurred. The Render connector is unavailable in this review environment, so
-those details were not independently verified.
+for `veltrixeye-api`. The preceding GitHub deployment record **7475005597** for
+SHA `743c89a8c164b3324f3ff276196e42c37af8f7f8` also reports `success`
+(`2026-11-01T15:25:26Z`) and links to Render deployment `dep-dbjlj8uq1p3s73asmdig`.
+The code diff between those two SHAs contains no migration/SQL files. These
+records establish prior successful deployment records, not current service
+health or a guaranteed safe rollback.
 
-The authorized owner must inspect the sanitized Render event/build/deploy log
-for `7143549231` and `7481011027`, confirm current service state and the
-`autoDeploy`/deployment-hold setting, and establish a safe merge procedure and
-rollback path. Include the failure stage, exit code and redacted error context
-for `7143549231`; include relevant root-directory/build/start-command metadata
+**Owner-provided read-only Render dashboard snapshot (2026-11-02; not
+independently accessed in this environment):** service `veltrixeye-api`
+(`srv-dajhclm7bikc73c3a5pg`), production branch `main`, `autoDeploy: yes`,
+`autoDeployTrigger: commit`, pull-request previews disabled, maintenance mode
+disabled. The owner reports current live deployment
+`dep-dbjt0sbm8hqs7386rnmg` at SHA `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`,
+previous deployment `dep-dbjlj8uq1p3s73asmdig` now deactivated, and historical
+failed deployment `dep-db9rf7e7bikc73e1m51g` (SHA
+`f9e660d66fe56af2ea4f1d2031759210af497d67`) with status `update_failed`. GitHub
+metadata independently corroborates the current-main and previous-successful
+deployment records, but not the owner-reported dashboard state or failure
+cause. With `autoDeploy: yes` and trigger `commit`, merging to `main` is expected
+to start a Render production deployment; no hold or safe merge-without-deploy
+procedure has been established. Do not change this setting without explicit
+authorization.
+
+The authorized owner must provide sanitized Render event/build/deploy logs for
+`7143549231`, current deployment `7481011027`, and the successful candidate
+`7475005597`, establish whether the
+deactivated previous deploy is a viable rollback target, and state the required
+schema/data compatibility checks. Include the failure stage, exit code and
+redacted error context for `7143549231`; include relevant build/start metadata
 if logs point to configuration. Provide no secret values or customer data. No
-Render settings, environment variables or deployments were changed or triggered
-by this review.
+Render settings, environment variables, database, migrations, or deployments
+were changed or triggered by this review.
 
 ## Topology
 
