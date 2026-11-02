@@ -155,7 +155,9 @@ jobs:
             let tail = '';
             try { fail = fs.readFileSync('/tmp/test-log/fail.log', 'utf8'); } catch (e) { fail = `no fail.log: ${e.message}`; }
             try { tail = fs.readFileSync('/tmp/test-log/test-tail.log', 'utf8'); } catch (e) { tail = `no tail: ${e.message}`; }
-            const body = `❌ CI test step failed on \`${{ github.head_ref || github.ref_name }}\` @ \`${{ github.sha }}\` (single authoritative run, no retries)\n\n**Failing tests (grep not ok):**\n\`\`\`\n${fail.slice(0, 20000)}\n\`\`\`\n\n**Tail (last 500 lines):**\n\`\`\`\n${tail.slice(0, 20000)}\n\`\`\`\n`;
+            // Read GitHub context as data; never interpolate the untrusted branch name into this JavaScript source.
+            const refName = context.payload.pull_request?.head?.ref ?? context.ref;
+            const body = `❌ CI test step failed on \`${refName}\` @ \`${context.sha}\` (single authoritative run, no retries)\n\n**Failing tests (grep not ok):**\n\`\`\`\n${fail.slice(0, 20000)}\n\`\`\`\n\n**Tail (last 500 lines):**\n\`\`\`\n${tail.slice(0, 20000)}\n\`\`\`\n`;
             github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,

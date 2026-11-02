@@ -1,5 +1,5 @@
 import type { DeliveryWorker, DeliveryWorkerLogger } from '@veltrixeye/core';
-import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from './worker-liveness.js';
+import { failureCode, recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from './worker-liveness.js';
 
 /**
  * In-process invocation of the M7.3 delivery worker.
@@ -88,8 +88,11 @@ export function startDeliveryWorkerTicker(
       } catch (err) {
         recordWorkerFailure('notifications', err);
         // A maintenance or batch failure must never kill the timer (or process).
+        // Do not log exception messages here: maintenance/DB failures can carry
+        // connection details. The public liveness record and log retain only a
+        // bounded machine code.
         logger.error('notification worker batch failed', {
-          error: err instanceof Error ? `${err.name}: ${err.message}` : 'unknown error',
+          failureCode: failureCode(err),
         });
       }
     })().finally(() => {
