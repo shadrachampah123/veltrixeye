@@ -101,3 +101,114 @@ test('malformed or unsafe stored values fail closed without exposing the row', a
     },
   );
 });
+
+/**
+ * Regression: the minor-unit magnitude check must be TOTAL.
+ *
+ * `payment_amount_minor` reaches the reader as whatever the driver returned,
+ * so it can be any string. Zod keeps evaluating later checks after an earlier
+ * one fails (to collect every issue), so a refinement that called
+ * `BigInt(value)` directly was reached by values that had already failed the
+ * digit-only regex — `"abc"` and `"1.2"` made `BigInt()` throw a `SyntaxError`
+ * that escaped `safeParse()` instead of producing a validation failure.
+ *
+ * The reader throws its own fail-closed error ONLY on
+ * `paymentRecordRowSchema.safeParse(raw) === { success: false }`. Reaching
+ * exactly that error therefore proves `safeParse` returned `success: false`;
+ * any other error name (`SyntaxError`, `RangeError`, …) would mean validation
+ * threw instead.
+ */
+test('a malformed minor-unit string fails closed instead of escaping validation', async () => {
+  const malformed: readonly unknown[] = [
+    'abc', '1.2', '', '0', '-5', '01', ' 12 ', '1e3', '+7', 'NaN', 'Infinity',
+    '0x10', '1_000', 'sk_test_0123456789abcdef0123456789abcdef01234567',
+  ];
+
+  for (const amount of malformed) {
+    const { pool } = stubPool([row({ payment_amount_minor: amount })]);
+    await assert.rejects(
+      readBillingVerifiedPaymentRecords(pool, USER_ID, 'test'),
+      (error: unknown) => {
+        assert.ok(error instanceof Error, 'a failed validation is reported as an Error');
+        assert.equal(
+          error.name,
+          'Error',
+          `payment_amount_minor=${JSON.stringify(amount)} escaped validation as ${error.name} ` +
+            'instead of returning success: false',
+        );
+        assert.match(
+          error.message,
+          /not usable by the read-only view/,
+          'the reader fails closed with its own message',
+        );
+        assert.doesNotMatch(error.message, /BigInt|Cannot convert/i, 'no conversion error leaks');
+        return true;
+      },
+      `payment_amount_minor=${JSON.stringify(amount)} must fail closed`,
+    );
+  }
+});
+
+test('the accepted-amount rules are unchanged: valid amounts accepted, zero/negative/unsafe refused', async () => {
+  const accepted: readonly [label: string, amount: unknown, expected: number][] = [
+    ['a driver-returned BIGINT string', '12345', 12_345],
+    ['an integer number', 12_345, 12_345],
+    ['a bigint', 12_345n, 12_345],
+    ['the smallest positive amount', '1', 1],
+    ['Number.MAX_SAFE_INTEGER', '9007199254740991', 9_007_199_254_740_991],
+  ];
+
+  for (const [label, amount, expected] of accepted) {
+    const { pool } = stubPool([row({ payment_amount_minor: amount })]);
+    const result = await readBillingVerifiedPaymentRecords(pool, USER_ID, 'test');
+    assert.equal(result.state, 'available', `${label} stays accepted`);
+    if (result.state !== 'available') assert.fail(`expected ${label} to be accepted`);
+    assert.equal(result.records[0]?.amountMinor, expected, `${label} keeps its exact value`);
+  }
+
+  // Zero, negatives and anything above the safe-integer projection are still refused.
+  const refused: readonly [label: string, amount: unknown][] = [
+    ['zero number', 0],
+    ['zero string', '0'],
+    ['negative number', -1],
+    ['negative string', '-1'],
+    ['negative bigint', -1n],
+    ['MAX_SAFE_INTEGER + 1 as a number', 9_007_199_254_740_992],
+    ['MAX_SAFE_INTEGER + 1 as a string', '9007199254740992'],
+    ['MAX_SAFE_INTEGER + 1 as a bigint', 9_007_199_254_740_992n],
+    ['a fractional number', 1.2],
+    ['a non-integer number', 12_345.5],
+  ];
+
+  for (const [label, amount] of refused) {
+    const { pool } = stubPool([row({ payment_amount_minor: amount })]);
+    await assert.rejects(
+      readBillingVerifiedPaymentRecords(pool, USER_ID, 'test'),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.name, 'Error', `${label} must fail closed, not throw ${error.name}`);
+        assert.match(error.message, /not usable by the read-only view/);
+        return true;
+      },
+      `${label} stays refused`,
+    );
+  }
+});
+
+test('a refused row is never echoed back, whatever its amount looked like', async () => {
+  const { pool } = stubPool([row({
+    payment_amount_minor: 'sk_test_0123456789abcdef0123456789abcdef01234567',
+    provider_reference: 'sensitive-checkout-reference',
+  })]);
+
+  await assert.rejects(
+    readBillingVerifiedPaymentRecords(pool, USER_ID, 'test'),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.name, 'Error');
+      const message = error.message + JSON.stringify((error as { cause?: unknown }).cause ?? '');
+      assert.doesNotMatch(message, /sk_test_|sensitive-checkout-reference/i);
+      return true;
+    },
+  );
+});

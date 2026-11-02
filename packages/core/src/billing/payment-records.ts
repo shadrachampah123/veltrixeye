@@ -28,14 +28,47 @@ import {
 /* Selected-row boundary                                                      */
 /* -------------------------------------------------------------------------- */
 
+/** A positive decimal integer with no leading zeros (the stored BIGINT shape). */
+const MINOR_UNITS_PATTERN = /^[1-9][0-9]*$/;
+/** Largest minor-unit amount that survives the `Number()` projection below. */
+const MAX_SAFE_MINOR_UNITS = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * Magnitude check for the string branch, written to be TOTAL: it returns a
+ * boolean for every input and can never throw.
+ *
+ * The previous form called `BigInt(value)` directly inside the refinement.
+ * Zod keeps evaluating later checks after an earlier one fails (to collect
+ * every issue), so a value that failed the regex — `"abc"`, `"1.2"`,
+ * `"sk_test_…"` — still reached the conversion, and `BigInt()` threw a
+ * `SyntaxError` that escaped `safeParse()` instead of producing a normal
+ * validation failure. A stored row could therefore turn a read into an
+ * unexpected exception type rather than the fail-closed error this reader is
+ * designed to raise.
+ *
+ * The shape test runs first and the conversion is guarded, so any malformed
+ * value FAILS CLOSED. The accepted set is unchanged: a positive integer with
+ * no leading zeroes, at most `Number.MAX_SAFE_INTEGER`.
+ */
+function isSafePositiveMinorUnits(value: string): boolean {
+  if (!MINOR_UNITS_PATTERN.test(value)) return false;
+  try {
+    return BigInt(value) <= MAX_SAFE_MINOR_UNITS;
+  } catch {
+    // Unreachable for a string that matched the pattern; kept so no future
+    // conversion error can ever escape `safeParse`.
+    return false;
+  }
+}
+
 const safePositiveMinorUnitsSchema = z
   .union([
     z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     z.bigint().positive().max(BigInt(Number.MAX_SAFE_INTEGER)),
     z
       .string()
-      .regex(/^[1-9][0-9]*$/)
-      .refine((value) => BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER), {
+      .regex(MINOR_UNITS_PATTERN)
+      .refine(isSafePositiveMinorUnits, {
         message: 'a minor-unit amount must be a safe integer',
       }),
   ])
