@@ -11,8 +11,10 @@ credential: every secret is supplied by the operator at deploy time
 authorized owner confirms that compute has recovered and explicitly authorizes
 a read-only observation, do not run or report production database or health
 checks. This is an operational blocker, not evidence that production is
-healthy or unhealthy. This status applies to latest `main` at
-`f9e660d66fe56af2ea4f1d2031759210af497d67`; no production probe was attempted.
+healthy or unhealthy. The compute-exhaustion report was recorded against `main` at
+`f9e660d66fe56af2ea4f1d2031759210af497d67`. Latest repository `main` is
+`085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`; compute status has not been
+revalidated here and no production probe was attempted.
 
 The following production checks are blocked:
 
@@ -28,6 +30,24 @@ not production verification. Do not change the production `DATABASE_URL`,
 production migrations, configuration or infrastructure to clear this block.
 After compute is restored, record sanitized HTTP status/JSON and schema/checksum
 evidence here before changing the status.
+
+### Historical Render deployment evidence (read-only)
+
+GitHub records Render deployment **7143549231** for SHA
+`f9e660d66fe56af2ea4f1d2031759210af497d67` as failed at
+`2026-10-17T18:01:34Z`. Its status points to the Render dashboard deployment
+log for service `veltrixeye-api`; that dashboard log is not accessible from this
+review environment, so the failing stage/cause and whether the previous service
+instance remained available are **unknown**. The GitHub deployment record is
+not the Render build/deploy log and does not establish current service health.
+
+The authorized owner must provide the sanitized Render event/build/deploy log
+for deployment `7143549231`, including the failure stage, exit code and
+redacted error context, plus the service's subsequent deployment/rollback
+state and whether the prior instance served requests. Include relevant
+root-directory/build/start-command metadata if the log points to configuration,
+but no secret values or customer data. No Render settings, environment
+variables or deployments were changed or triggered by this review.
 
 ## Topology
 

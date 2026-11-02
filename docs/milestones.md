@@ -1,12 +1,12 @@
 # Milestone Boundaries
 
-## Current roadmap and release-status reconciliation (2026-10-17)
+## Current roadmap and release-status reconciliation (2026-11-02)
 
 This is the canonical roadmap/status record. The milestone sections below describe
 implemented scope; **implementation/merge is not the same as production
-verification or release approval**. This checkpoint uses baseline `main`
-`96305ea07f5244764b1e62d7eb9848a3a1d7401a` (merge PR #129), current PR
-metadata, CI checks and recorded deployment/status data. It does not authorize
+verification or release approval**. This checkpoint uses latest `main`
+`085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`, current PR metadata, CI checks
+and recorded deployment/status data. It does not authorize
 production changes. No overall completion percentage is stated: the roadmap
 mixes delivered milestones, deferred product decisions, external validations
 and blocking gates without a stable, non-overlapping denominator.
@@ -15,13 +15,14 @@ and blocking gates without a stable, non-overlapping denominator.
   Neon production compute is exhausted. Do not use the production
   `DATABASE_URL`, run migration/status queries, call production `/api/health`
   or `/api/health/ready`, or report worker/retention health until compute is
-  restored and an authorized owner explicitly permits a read-only check. This
-  underlying compute-exhaustion report was recorded while reviewing `main` at
+  restored and an authorized owner explicitly permits a read-only check. The
+  last compute-exhaustion report was recorded while reviewing `main` at
   `f9e660d66fe56af2ea4f1d2031759210af497d67` and is carried forward from that
   owner evidence; this task did not access production or revalidate compute.
   Local embedded-Postgres tests and deployment records are not production
-  evidence; no production configuration, data, migration or infrastructure may
-  be changed to clear this block.
+  evidence. The latest main SHA is `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`;
+  compute status has not been revalidated. No production configuration, data,
+  migration or infrastructure may be changed to clear this block.
 
 ### Current delivery and gates
 
@@ -30,16 +31,20 @@ and blocking gates without a stable, non-overlapping denominator.
   #123 (checkout epoch revalidation), and #124 (typed scanner transient
   failures). Their reported required CI jobs passed. This is code/test evidence,
   not proof that every feature is operational or production-verified.
-- **M9.2 outbox symbol collision — reproduced; fix proposed on this branch.**
-  The exact user-visible failure is a subject collision: rendering otherwise
-  identical alerts for the same canonical ticker under `forex` and `crypto`
-  produced the same email subject because the subject omitted `assetClass`, even
-  though the structured payload retained it. This is presentation ambiguity,
-  not an outbox-row or idempotency-key collision. The fix includes the asset class
-  in the subject; `packages/core/test/m92-outbox.test.ts` now reproduces and
-  guards the distinction. This PR is not merged, so mainline closure remains
-  pending review and required CI gates; do not infer that the item is closed on
-  `main` yet.
+- **M9.2 outbox subject symbol collision — resolved on main:** PR #130 merged
+  at `a5a36fd` and includes `assetClass` in alert subjects; this was presentation
+  ambiguity, not an outbox-row or idempotency-key collision.
+- **Notification ticker liveness + CI reliability — open, stale PR #128.** Its
+  head is `5e9df827c40a5352d1c95f7ea16367102f8fcf1c`, based on
+  `f9e660d66fe56af2ea4f1d2031759210af497d67`; latest main is
+  `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`. GitHub reports the PR conflicting
+  and no review approval is recorded. On the old head, CI runs `39061039804` and
+  `39061035891` and Vercel Preview passed. These results do not validate a
+  reconciled head. The PR changes the ticker liveness window, adds maintenance
+  failure coverage, pins CI runner/actions and revises readiness documentation.
+  A new/reconciled PR head must pass its own CI and Preview checks before review
+  is complete. The Render deployment failure remains separately unresolved;
+  see [deployment.md](./deployment.md).
 - **Execution safety:** automation remains OFF; live execution remains
   unavailable/impossible by the enforced boundary. M10/Gate 9 is a non-live
   foundation only. Trading remains paper-only. No broker orders, live/demo
@@ -112,8 +117,9 @@ resume the paused work. Automation stays OFF and execution stays paper-only.
 
 ### Remaining validation sequence (gates, not completion claims)
 
-1. Review and merge the focused M9.2 subject-disambiguation PR only after its
-   tests and required gates pass; keep the mainline roadmap item open until then.
+1. Reconcile and independently review notification-liveness PR #128; keep it
+   unmerged until the final head has green checks, review approval, and the Render
+   deployment failure is diagnosed by the authorized owner.
 2. **BLOCKED — production verification:** after Neon compute is restored and an
    authorized owner permits a read-only check, verify the current production
    schema/health and operational monitoring without changing production
