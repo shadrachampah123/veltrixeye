@@ -34,17 +34,7 @@ and blocking gates without a stable, non-overlapping denominator.
 - **M9.2 outbox subject symbol collision — resolved on main:** PR #130 merged
   at `a5a36fd` and includes `assetClass` in alert subjects; this was presentation
   ambiguity, not an outbox-row or idempotency-key collision.
-- **Notification ticker liveness + CI reliability — open, stale PR #128.** Its
-  head is `5e9df827c40a5352d1c95f7ea16367102f8fcf1c`, based on
-  `f9e660d66fe56af2ea4f1d2031759210af497d67`; latest main is
-  `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`. GitHub reports the PR conflicting
-  and no review approval is recorded. On the old head, CI runs `39061039804` and
-  `39061035891` and Vercel Preview passed. These results do not validate a
-  reconciled head. The PR changes the ticker liveness window, adds maintenance
-  failure coverage, pins CI runner/actions and revises readiness documentation.
-  A new/reconciled PR head must pass its own CI and Preview checks before review
-  is complete. The Render deployment failure remains separately unresolved;
-  see [deployment.md](./deployment.md).
+- **Notification ticker liveness + CI reliability — PR #128 stale; reconciled review PR #134 open (Draft).** PR #128 remains at head `5e9df827c40a5352d1c95f7ea16367102f8fcf1c`, based on `f9e660d66fe56af2ea4f1d2031759210af497d67`; GitHub reports it conflicting with current `main` and no approval is recorded. PR #134 preserves its commits in a merge commit whose first parent is latest main `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`, with current head `85eb4d7ea9452be1e8d0f21cd9f78dd18c7d820b`. Its CI runs `41371472037` and `41371466576` and Vercel Preview passed on that exact head. This validates the PR code, not production delivery. The liveness fixes, CI hardening and SMTP short-credential redaction are tested. A documented claimed-batch/lease mismatch remains unresolved and can cause reclaims/duplicate sends under overlapping workers; SMTP also cannot guarantee exactly-once delivery. Production email remains unverified. The historical Render deployment failure remains unresolved; see [deployment.md](./deployment.md). Keep PR #134 in review and do not treat it as production-ready.
 - **Execution safety:** automation remains OFF; live execution remains
   unavailable/impossible by the enforced boundary. M10/Gate 9 is a non-live
   foundation only. Trading remains paper-only. No broker orders, live/demo
@@ -117,9 +107,10 @@ resume the paused work. Automation stays OFF and execution stays paper-only.
 
 ### Remaining validation sequence (gates, not completion claims)
 
-1. Reconcile and independently review notification-liveness PR #128; keep it
-   unmerged until the final head has green checks, review approval, and the Render
-   deployment failure is diagnosed by the authorized owner.
+1. Independently review reconciled notification-liveness PR #134 (PR #128 remains
+   stale/conflicting); keep #134 unmerged until review approval and the outstanding
+   lease/overlap reliability risk and historical Render failure have been addressed
+   or explicitly accepted by the authorized owner.
 2. **BLOCKED — production verification:** after Neon compute is restored and an
    authorized owner permits a read-only check, verify the current production
    schema/health and operational monitoring without changing production
