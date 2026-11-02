@@ -34,7 +34,7 @@ and blocking gates without a stable, non-overlapping denominator.
 - **M9.2 outbox subject symbol collision — resolved on main:** PR #130 merged
   at `a5a36fd` and includes `assetClass` in alert subjects; this was presentation
   ambiguity, not an outbox-row or idempotency-key collision.
-- **Notification ticker liveness + CI reliability — PR #128 stale; reconciled review PR #134 open (Draft).** PR #128 remains at head `5e9df827c40a5352d1c95f7ea16367102f8fcf1c`, based on `f9e660d66fe56af2ea4f1d2031759210af497d67`; GitHub reports it conflicting with current `main` and no approval is recorded. PR #134 preserves its commits in a merge commit whose first parent is latest main `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`, with current head `85eb4d7ea9452be1e8d0f21cd9f78dd18c7d820b`. Its CI runs `41371472037` and `41371466576` and Vercel Preview passed on that exact head. This validates the PR code, not production delivery. The liveness fixes, CI hardening and SMTP short-credential redaction are tested. A documented claimed-batch/lease mismatch remains unresolved and can cause reclaims/duplicate sends under overlapping workers; SMTP also cannot guarantee exactly-once delivery. Production email remains unverified. The historical Render deployment failure remains unresolved; see [deployment.md](./deployment.md). Keep PR #134 in review and do not treat it as production-ready.
+- **Notification reliability reconciliation — PR #128 remains stale/conflicting; PR #134 remains open (Draft).** PR #128 is unchanged at `5e9df827c40a5352d1c95f7ea16367102f8fcf1c`. PR #134 preserves its work on latest main `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`; the lease-fencing implementation commit is `df7bc4900a7328717de190b4b13a7d0b49ef4248`. It claims one job at a time, renews each active lease, writes a unique owner token, and requires the live token for renewal and every delivery outcome transition. Tests against real embedded PostgreSQL cover an attempt longer than the initial lease, concurrent recovery while sending, current/stale token behavior, failed renewal, old-owner acknowledgement after reclaim, crash recovery, and duplicate prevention. Local verification on that implementation commit: focused notification/outbox + SMTP tests **49/49 passed**; full `npm test` **3,359/3,359 passed**; `npm run typecheck`, `npm run lint`, `npm run build`, and `git diff --check` passed. GitHub CI runs `41401257442` and `41401251795` and Vercel Preview [CZfdKataZmtS1ma1NMpxfigEJhTR](https://vercel.com/shadrachampah123s-projects/veltrixeye/CZfdKataZmtS1ma1NMpxfigEJhTR) passed on that exact implementation commit. These are code/test evidence, not production email evidence. At-least-once delivery remains: if a provider has accepted a message before lease ownership is lost, a later retry can duplicate it; no exactly-once SMTP claim is made. Production email and the historical Render failure remain unverified; see [deployment.md](./deployment.md). Keep PR #134 in Draft for independent review.
 - **Execution safety:** automation remains OFF; live execution remains
   unavailable/impossible by the enforced boundary. M10/Gate 9 is a non-live
   foundation only. Trading remains paper-only. No broker orders, live/demo
@@ -107,10 +107,11 @@ resume the paused work. Automation stays OFF and execution stays paper-only.
 
 ### Remaining validation sequence (gates, not completion claims)
 
-1. Independently review reconciled notification-liveness PR #134 (PR #128 remains
-   stale/conflicting); keep #134 unmerged until review approval and the outstanding
-   lease/overlap reliability risk and historical Render failure have been addressed
-   or explicitly accepted by the authorized owner.
+1. Independently review reconciled notification PR #134 (PR #128 remains
+   stale/conflicting). The active-job lease-expiry risk is addressed with
+   per-job claims, renewal and owner fencing. Keep #134 unmerged pending review
+   approval; SMTP acceptance/deduplication and historical Render diagnosis remain
+   separate, unverified operational evidence gates.
 2. **BLOCKED — production verification:** after Neon compute is restored and an
    authorized owner permits a read-only check, verify the current production
    schema/health and operational monitoring without changing production
