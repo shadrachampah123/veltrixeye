@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify';
 import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -601,12 +601,53 @@ export async function runStartupScannerRecovery(
 }
 
 /**
+ * Optional overrides for {@link buildApp}.
+ *
+ * `logger` exists so tests can capture what the API actually writes to a log
+ * sink (a pino destination) and assert on it — without it, logging is off
+ * outside production and a logging regression is invisible. Production never
+ * passes it and keeps deriving the level from configuration.
+ */
+export interface BuildAppOptions {
+  logger?: FastifyServerOptions['logger'];
+}
+
+/**
+ * Pino-level redaction: last line of defence for anything that reaches a log
+ * sink. Every handler is expected to build its own safe, allow-listed payload
+ * (see `safe-error-log.ts`), but a future `req.log.error({ err })` must not be
+ * able to write a stack trace, an `Authorization`/`Cookie` header or a field
+ * named like a credential. Censoring is structural, so the field survives with
+ * `[redacted]` and the line stays useful.
+ */
+const LOGGER_REDACT_PATHS = [
+  // A serialized exception: the stack is never worth the risk it carries.
+  'err.stack', '*.err.stack', 'error.stack', '*.error.stack',
+  'err.headers.authorization', '*.err.headers.authorization',
+  'req.headers.authorization', '*.req.headers.authorization',
+  'req.headers.cookie', '*.req.headers.cookie',
+  'req.headers["set-cookie"]', '*.req.headers["set-cookie"]',
+  // Fields named like a credential, at the top level and one level down.
+  ...['password', 'passwd', 'secret', 'token', 'authorization', 'apiKey', 'api_key',
+    'accessToken', 'refreshToken', 'connectionString', 'databaseUrl', 'DATABASE_URL']
+    .flatMap((field) => [field, `*.${field}`]),
+];
+
+/**
  * Build the Fastify app WITHOUT listening.
  * Tests use `app.inject()` against this factory.
  */
-export async function buildApp(config: AppConfig, ctx: AppContext): Promise<FastifyInstance> {
+export async function buildApp(
+  config: AppConfig,
+  ctx: AppContext,
+  options: BuildAppOptions = {},
+): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: config.NODE_ENV === 'production' ? { level: config.LOG_LEVEL } : false,
+    logger:
+      options.logger ??
+      (config.NODE_ENV === 'production'
+        ? { level: config.LOG_LEVEL, redact: { paths: LOGGER_REDACT_PATHS, censor: '[redacted]' } }
+        : false),
     /**
      * Client-IP resolution — pinned to the proxies that actually front this
      * service, never `true`.

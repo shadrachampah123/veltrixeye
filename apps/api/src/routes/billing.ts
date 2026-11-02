@@ -10,6 +10,7 @@ import {
 } from '@veltrixeye/core';
 import { isPaystackAdapterError } from '@veltrixeye/provider-paystack';
 import { composeBillingCheckout, composeBillingCustomers, composeBillingSync, composeBillingVerify } from '../billing-composition.js';
+import { configuredSecrets, logErrorSafely } from '../safe-error-log.js';
 import { registerBillingWebhookRoutes } from '../billing-webhook.js';
 import {
   isBillingCheckoutProjectionError,
@@ -65,6 +66,13 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
   const sync = composeBillingSync(ctx.pool, ctx.billingProviders);
   const customers = composeBillingCustomers(ctx.pool, ctx.billingProviders);
   const verify = composeBillingVerify(ctx.pool, ctx.billingProviders, config);
+  /**
+   * Credentials this deployment was configured with, resolved once at
+   * registration time. They are matched by exact value in addition to the
+   * shape-based scrubber, so a key that does not look like anything known is
+   * still removed from anything this route logs.
+   */
+  const logSecrets = configuredSecrets(config);
 
   // Billing Step 5.2 — the secure webhook receiver route. Signature-verified,
   // never session-authenticated; registered only when a billing provider
@@ -265,7 +273,28 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
     try {
       return reply.send(await readBillingVerifiedPaymentRecords(ctx.pool, user.id, config.billing.mode));
     } catch (error) {
-      req.log.error({ err: error }, 'verified payment records unavailable');
+      /**
+       * SECURITY: the thrown object is NEVER handed to the logger. A database
+       * or row-validation failure can carry a connection string, an
+       * authorization header, a provider key or an authorization code, and a
+       * raw pino `err` serialisation would also write the stack. `logErrorSafely`
+       * logs only an allow-listed projection (type, redacted message, short
+       * driver code) plus scrubbed context, so the diagnostic survives and the
+       * credential does not. The response is the fixed unavailable DTO either
+       * way: no reason, message or row value reaches the browser.
+       */
+      logErrorSafely(
+        req.log,
+        error,
+        'verified payment records unavailable',
+        {
+          route: '/api/billing/verified-payment-records',
+          method: 'GET',
+          requestId: req.id,
+          billingMode: config.billing.mode,
+        },
+        logSecrets,
+      );
       return reply.send(UNAVAILABLE_BILLING_VERIFIED_PAYMENT_RECORDS);
     }
   });
