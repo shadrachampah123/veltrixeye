@@ -5,16 +5,17 @@ wiring that lets the production web app talk to it. Nothing here contains a
 credential: every secret is supplied by the operator at deploy time
 (see [security.md](./security.md)).
 
-## Current production verification gate (2026-10-17 UTC)
+## Current production verification gate (2026-11-02 UTC)
 
-**Status: BLOCKED.** Neon production compute is exhausted. Until the
-authorized owner confirms that compute has recovered and explicitly authorizes
-a read-only observation, do not run or report production database or health
-checks. This is an operational blocker, not evidence that production is
-healthy or unhealthy. The compute-exhaustion report was recorded against `main` at
-`f9e660d66fe56af2ea4f1d2031759210af497d67`. Latest repository `main` is
-`085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`; compute status has not been
-revalidated here and no production probe was attempted.
+**Status: BLOCKED / not revalidated.** The last owner-reported evidence says
+Neon production compute was exhausted on `main` at
+`f9e660d66fe56af2ea4f1d2031759210af497d67` (2026-10-17). This review did not
+access production or verify whether compute has recovered. Until an authorized
+owner confirms recovery and explicitly authorizes a read-only observation, do
+not run or report production database or health checks. This is an operational
+blocker, not evidence that production is healthy or unhealthy. Latest
+repository `main` is `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`; no production
+probe was attempted.
 
 The following production checks are blocked:
 
@@ -41,13 +42,23 @@ review environment, so the failing stage/cause and whether the previous service
 instance remained available are **unknown**. The GitHub deployment record is
 not the Render build/deploy log and does not establish current service health.
 
-The authorized owner must provide the sanitized Render event/build/deploy log
-for deployment `7143549231`, including the failure stage, exit code and
-redacted error context, plus the service's subsequent deployment/rollback
-state and whether the prior instance served requests. Include relevant
-root-directory/build/start-command metadata if the log points to configuration,
-but no secret values or customer data. No Render settings, environment
-variables or deployments were changed or triggered by this review.
+A later GitHub deployment record exists for the service: **7481011027**, ref
+`main`, SHA `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`, created
+`2026-11-01T23:51:14Z` by `shadrachampah123`. Its GitHub status history later
+reported `success` at `2026-11-01T23:52:15Z` and links to the Render deploy log
+for `veltrixeye-api`. This establishes a later successful *deployment record*,
+not service health, automatic-vs-manual trigger mode, or whether a rollback
+occurred. The Render connector is unavailable in this review environment, so
+those details were not independently verified.
+
+The authorized owner must inspect the sanitized Render event/build/deploy log
+for `7143549231` and `7481011027`, confirm current service state and the
+`autoDeploy`/deployment-hold setting, and establish a safe merge procedure and
+rollback path. Include the failure stage, exit code and redacted error context
+for `7143549231`; include relevant root-directory/build/start-command metadata
+if logs point to configuration. Provide no secret values or customer data. No
+Render settings, environment variables or deployments were changed or triggered
+by this review.
 
 ## Topology
 
