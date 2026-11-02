@@ -123,16 +123,25 @@ The API is a container that a platform may stop at any time (the Render free
 tier spins down), so stale recovery makes interrupted work eligible for another
 attempt. This is **at-least-once**, not exactly-once delivery: after a provider
 accepts a message but its response is lost, a retry can send a duplicate, and
-SMTP does not provide a portable idempotency guarantee. In addition, a batch is
-claimed up front and sent sequentially; the default batch size (25) multiplied
-by the default provider timeout (15 s) exceeds the 120 s lease. The worker does
-not renew leases during a batch, so a second process invoking recovery while a
-long batch is still active can reclaim an unstarted or slow job. Treat this as
-a reliability risk to resolve before relying on overlapping scheduled workers;
-configure a single active drain as a mitigation, not as an exactly-once
-guarantee. The scanner heartbeat route is the one external trigger reachable
-with the scanner's own secret, which is why it drains a batch too — see *Alert
-delivery operations* in [deployment.md](./deployment.md).
+SMTP does not provide a portable idempotency guarantee. The worker now claims
+one job immediately before each send (unstarted siblings stay pending) and
+renews the active job's lease every third of the lease interval. Each claim
+writes a fresh opaque fencing token in `locked_by`; renewal and every outcome
+transition require that token and a still-unexpired lease. Recovery and renew/
+ack updates serialize on the row, so whichever state transition wins prevents
+the former owner from acknowledging a reclaimed job. Retry/backoff and the
+attempt/dead-letter budget are unchanged.
+
+A database renewal failure is fail-closed: the worker logs a bounded event,
+waits for the provider call to settle, and does not acknowledge that result. A
+later recovery can retry it. If a provider accepted a message before the worker
+lost database ownership, a later attempt may duplicate it; no portable SMTP
+idempotency or exactly-once guarantee exists. As with any lease, a process pause
+longer than the lease or prolonged database unavailability can outlast renewal;
+owner fencing prevents stale database writes but cannot retract an external
+side effect already in flight. The scanner heartbeat route remains an external
+trigger reachable with the scanner's own secret — see *Alert delivery
+operations* in [deployment.md](./deployment.md).
 
 Whether this process is invoking delivery is observable WITHOUT a worker token:
 `GET /api/health` reports `workers.notifications` / `workers.scanner` with the

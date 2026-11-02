@@ -423,7 +423,7 @@ describe('outbox — claiming', () => {
     assert.equal(claimed.length, 1);
     assert.equal(claimed[0]?.id, row.id);
     assert.equal(claimed[0]?.attempts, 1);
-    assert.equal(claimed[0]?.locked_by, 'worker-A');
+    assert.ok(claimed[0]?.locked_by?.startsWith('worker-A:'), 'lease token is scoped to the worker and unique to the claim');
 
     const after = await getJob(row.id);
     assert.equal(after.status, 'processing');
@@ -616,7 +616,7 @@ describe('outbox — claiming', () => {
     const second = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(4, 'batch-worker-2');
     assert.equal(first.length, 4);
     assert.equal(second.length, 4);
-    for (const job of [...first, ...second]) await outbox.markDelivered(job.id, { failureCategory: 'none' }, job.channel as 'email' | 'webhook');
+    for (const job of [...first, ...second]) await outbox.markDelivered(job.id, job.locked_by!, TEST_POLICY.leaseMs, { failureCategory: 'none' }, job.channel as 'email' | 'webhook');
     // Retention wipes the email queue's history while the webhook queue's
     // fresh delivered rows stay: the reviewed sum(attempts) score would reset
     // email to zero and treat it as starved-then-light forever after.
@@ -645,7 +645,7 @@ describe('outbox — claiming', () => {
       const claimed = await new NotificationOutbox(pool, { maxAttempts: TEST_POLICY.maxAttempts }).claimBatch(4, `balanced-worker-${round}`);
       assert.equal(claimed.length, 4);
       assert.equal(claimed.filter((job) => job.channel === 'email').length, 2, `round ${round}: each queue keeps its reserved half`);
-      for (const job of claimed) await outbox.markDelivered(job.id, { failureCategory: 'none' }, job.channel as 'email' | 'webhook');
+      for (const job of claimed) await outbox.markDelivered(job.id, job.locked_by!, TEST_POLICY.leaseMs, { failureCategory: 'none' }, job.channel as 'email' | 'webhook');
       // Continuous availability THROUGH retention: cleanup between rounds
       // (age-based, so these fresh rows survive) must not skew the ledger.
       await outbox.cleanup({ deliveredRetentionDays: 1, failedRetentionDays: 1 });
@@ -690,7 +690,7 @@ describe('outbox — claiming', () => {
     // The email job fails and is retried (this INFLATES its attempts column —
     // exactly what the reviewed sum(attempts) score was made of), and the
     // webhook job's worker dies inside the lease so stale recovery requeues it.
-    await outbox.markRetry(first[0]!.id, 0, { failureCategory: 'transient', error: 'smtp timeout' }, 'email');
+    await outbox.markRetry(first[0]!.id, first[0]!.locked_by!, TEST_POLICY.leaseMs, 0, { failureCategory: 'transient', error: 'smtp timeout' }, 'email');
     await pool.query(`UPDATE notification_webhook_deliveries SET locked_at = now() - interval '1 hour' WHERE id = $1`, [second[0]!.id]);
     assert.deepEqual(await outbox.recoverStale(60_000), { recovered: 1, deadLettered: 0 });
 
@@ -1034,6 +1034,111 @@ describe('worker — timeout, crash and concurrency safety', () => {
     const after = await getJob(row.id);
     assert.equal(after.status, 'delivered');
     assert.equal(after.attempts, 1);
+  });
+
+  test('one-at-a-time claims plus lease renewal prevent reclaims and duplicate concurrent delivery after the original lease', async () => {
+    const owner = await makeUser();
+    const alertA = await makeAlert(owner.id);
+    const alertB = await makeAlert(owner.id);
+    const first = (await enqueueAlert(alertA, owner.id)).row;
+    const second = (await enqueueAlert(alertB, owner.id)).row;
+    await pool.query(`UPDATE notification_deliveries SET next_attempt_at = now() - interval '1 second' WHERE id = $1`, [first.id]);
+
+    const policy = { ...TEST_POLICY, leaseMs: 600, timeoutMs: 100, batchSize: 10 };
+    let releaseFirst!: () => void;
+    const activeSend = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let firstStarted!: () => void;
+    const firstStartedPromise = new Promise<void>((resolve) => { firstStarted = resolve; });
+    let workerOneCalls = 0;
+    const providerOne = fakeProvider(async (request) => {
+      workerOneCalls += 1;
+      assert.equal(request.jobId, first.id);
+      firstStarted();
+      await activeSend; // deliberately exceeds the original 600 ms lease
+      return { outcome: 'delivered', providerMessageId: '<long-send@provider>' };
+    });
+    const w1Promise = worker(registryWith(providerOne), policy).runOnce();
+    await firstStartedPromise;
+    await new Promise((resolve) => setTimeout(resolve, 750));
+
+    let workerTwoCalls = 0;
+    const providerTwo = fakeProvider(async (request) => {
+      workerTwoCalls += 1;
+      assert.equal(request.jobId, second.id, 'the unattempted sibling remains pending and independently claimable');
+      return { outcome: 'delivered', providerMessageId: '<other@provider>' };
+    });
+    const resultTwo = await worker(registryWith(providerTwo), policy).runOnce();
+    assert.equal(resultTwo.delivered, 1);
+    assert.equal(workerTwoCalls, 1);
+    assert.equal((await getJob(first.id)).status, 'processing', 'active first job was not recovered');
+
+    releaseFirst();
+    const resultOne = await w1Promise;
+    assert.equal(resultOne.delivered, 1);
+    assert.equal(workerOneCalls, 1);
+    assert.equal((await getJob(first.id)).status, 'delivered');
+    assert.equal((await getJob(second.id)).status, 'delivered');
+    assert.equal(providerOne.calls.length + providerTwo.calls.length, 2, 'no job was delivered concurrently twice');
+  });
+
+  test('only the current unexpired token can renew or acknowledge a reclaimed job', async () => {
+    const owner = await makeUser();
+    const alertId = await makeAlert(owner.id);
+    const { row } = await enqueueAlert(alertId, owner.id);
+    const policy = { ...TEST_POLICY, leaseMs: 500 };
+    const first = (await outbox.claimBatch(1, 'first-worker'))[0]!;
+    const firstToken = first.locked_by!;
+
+    await pool.query(`UPDATE notification_deliveries SET locked_at = now() - interval '200 milliseconds' WHERE id = $1`, [row.id]);
+    assert.equal(await outbox.renewLease(row.id, firstToken, policy.leaseMs), true, 'current owner can renew before expiry');
+    assert.equal(await outbox.renewLease(row.id, 'not-the-owner', policy.leaseMs), false, 'different owner cannot renew');
+
+    await pool.query(`UPDATE notification_deliveries SET locked_at = now() - interval '2 seconds' WHERE id = $1`, [row.id]);
+    assert.deepEqual(await outbox.recoverStale(policy.leaseMs), { recovered: 1, deadLettered: 0 });
+    assert.equal(await outbox.renewLease(row.id, firstToken, policy.leaseMs), false, 'expired/reclaimed owner cannot renew');
+    const secondOwner = (await outbox.claimBatch(1, 'second-worker'))[0]!;
+    assert.ok(secondOwner.locked_by);
+    assert.notEqual(secondOwner.locked_by, firstToken, 'each claim has a new fencing token');
+    assert.equal(await outbox.markDelivered(row.id, firstToken, policy.leaseMs, { failureCategory: 'none' }), false,
+      'old owner cannot acknowledge a reclaimed job');
+    assert.equal((await getJob(row.id)).locked_by, secondOwner.locked_by, 'stale acknowledgement did not alter new ownership');
+    assert.equal(await outbox.markDelivered(row.id, secondOwner.locked_by!, policy.leaseMs, { failureCategory: 'none' }), true);
+    assert.equal((await getJob(row.id)).status, 'delivered');
+  });
+
+  test('database failure during renewal fails closed and leaves the job for lease recovery', async () => {
+    const owner = await makeUser();
+    const alertId = await makeAlert(owner.id);
+    const { row } = await enqueueAlert(alertId, owner.id);
+    let failNextRenewal = false;
+    const failingPool = {
+      query: (sql: string, values?: unknown[]) => {
+        if (failNextRenewal && /SET locked_at = now\(\)/i.test(sql)) {
+          failNextRenewal = false;
+          return Promise.reject(Object.assign(new Error('synthetic renewal outage'), { code: 'ECONNRESET' }));
+        }
+        return pool.query(sql, values as never);
+      },
+      connect: () => pool.connect(),
+    } as unknown as typeof pool;
+    const policy = { ...TEST_POLICY, leaseMs: 240, timeoutMs: 50, batchSize: 1 };
+    const provider = fakeProvider(async () => {
+      failNextRenewal = true; // initial ownership confirmation has already completed
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return { outcome: 'delivered', providerMessageId: '<maybe-accepted@provider>' };
+    });
+    const w = new DeliveryWorker(failingPool, registryWith(provider), policy);
+    const result = await w.runOnce();
+    assert.equal(result.claimed, 1);
+    assert.equal(result.delivered, 0, 'uncertain ownership cannot be acknowledged');
+    assert.equal(provider.calls.length, 1);
+    const unacknowledged = await getJob(row.id);
+    assert.equal(unacknowledged.status, 'processing');
+    assert.equal(unacknowledged.attempts, 1);
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.deepEqual(await outbox.recoverStale(policy.leaseMs), { recovered: 1, deadLettered: 0 });
+    assert.equal((await getJob(row.id)).status, 'pending');
   });
 
   test('worker restarts are safe: re-running a finished drain changes nothing', async () => {
