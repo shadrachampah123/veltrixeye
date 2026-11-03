@@ -5,7 +5,7 @@ wiring that lets the production web app talk to it. Nothing here contains a
 credential: every secret is supplied by the operator at deploy time
 (see [security.md](./security.md)).
 
-## Current production verification gate (2026-11-02 UTC)
+## Current production verification gate (2026-11-03 UTC)
 
 **Status: BLOCKED / not revalidated.** The last owner-reported evidence says
 Neon production compute was exhausted on `main` at
@@ -14,8 +14,11 @@ access production or verify whether compute has recovered. Until an authorized
 owner confirms recovery and explicitly authorizes a read-only observation, do
 not run or report production database or health checks. This is an operational
 blocker, not evidence that production is healthy or unhealthy. Latest
-repository `main` is `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`; no production
-probe was attempted.
+repository `main` is `d5e4d68073018d5f082116a55635d28b9d4c5aa3` (PR #131,
+read-only verified payment records), and the notification branch behind PR #134
+was merged with that mainline on 2026-11-03; no production probe was attempted.
+No Render, Vercel, Neon, secret or environment-variable value was read or
+changed during that reconciliation, and no deployment was triggered or observed.
 
 The following production checks are blocked:
 

@@ -2,6 +2,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { ZodError } from 'zod';
 import { ERROR_CODES, type ErrorCode } from '@veltrixeye/contracts';
 import { isDomainError } from '@veltrixeye/core';
+import { logErrorSafely } from './safe-error-log.js';
 
 export interface ApiErrorBody {
   error: {
@@ -48,8 +49,20 @@ export function sendZodError(reply: FastifyReply, err: ZodError, body: string): 
   } satisfies ApiErrorBody);
 }
 
-/** Central error handler: maps domain/zod errors to safe HTTP responses. */
-export function errorHandler(err: Error, req: FastifyRequest, reply: FastifyReply): void {
+/**
+ * Central error handler: maps domain/zod errors to safe HTTP responses.
+ *
+ * `secrets` are the deployment credentials the safe logger substitutes before
+ * an unhandled error is written. It defaults to an empty list so the handler
+ * stays usable in isolation (and in tests) without configuration, but the
+ * server always passes `configuredSecrets(config)` — see `buildApp`.
+ */
+export function errorHandler(
+  err: Error,
+  req: FastifyRequest,
+  reply: FastifyReply,
+  secrets: readonly string[] = [],
+): void {
   if (isDomainError(err)) {
     sendDomainError(reply, err);
     return;
@@ -87,7 +100,27 @@ export function errorHandler(err: Error, req: FastifyRequest, reply: FastifyRepl
     } satisfies ApiErrorBody);
     return;
   }
-  req.log.error({ err }, 'unhandled error');
+  // The error object is NEVER handed to the logger. An unhandled failure can
+  // carry a database password, a provider key or a connection URL inside
+  // `err.message`, and Pino's redaction list (see `LOGGER_REDACT_PATHS` in
+  // app.ts) censors `err.stack` but not `err.message` — a raw pass would write
+  // those credentials to the production sink. `logErrorSafely` projects the
+  // error to { type, message, code } after substituting every configured
+  // secret and truncating, so the diagnostic survives without the payload.
+  //
+  // Only the ROUTE PATTERN is logged, never `req.url`: the concrete URL can
+  // carry a token or an identifier in its query string.
+  logErrorSafely(
+    req.log,
+    err,
+    'unhandled error',
+    {
+      route: typeof req.routeOptions?.url === 'string' ? req.routeOptions.url : undefined,
+      method: req.method,
+      requestId: req.id,
+    },
+    secrets,
+  );
   void reply.code(500).send({
     error: {
       code: ERROR_CODES.INTERNAL,

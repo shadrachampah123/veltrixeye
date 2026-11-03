@@ -1,12 +1,20 @@
 # Milestone Boundaries
 
-## Current roadmap and release-status reconciliation (2026-11-02)
+## Current roadmap and release-status reconciliation (2026-11-03)
 
 This is the canonical roadmap/status record. The milestone sections below describe
 implemented scope; **implementation/merge is not the same as production
-verification or release approval**. This checkpoint uses latest `main`
-`085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`, current PR metadata, CI checks
-and recorded deployment/status data. It does not authorize
+verification or release approval**. This checkpoint starts from latest `main`
+SHA `d5e4d68073018d5f082116a55635d28b9d4c5aa3`, which merged PR #131
+(read-only verified payment records); the notification branch behind PR #134
+was merged with that mainline on 2026-11-03. PR #130 (M9.2 notification subject
+disambiguation), #132 (runtime dependency-advisory patch) and #133 (strategy
+entitlements aligned with the subscription catalogue) are also merged on that
+mainline; the asset-class-aware notification subject in
+`packages/core/src/notifications/render.ts` and its regression in
+`packages/core/test/m92-outbox.test.ts` are present in the fetched tree. PR #134
+remains open, unmerged and in Draft. This checkpoint reconciles current PR
+metadata, CI checks and recorded deployment/status data; it does not authorize
 production changes. No overall completion percentage is stated: the roadmap
 mixes delivered milestones, deferred product decisions, external validations
 and blocking gates without a stable, non-overlapping denominator.
@@ -20,20 +28,40 @@ and blocking gates without a stable, non-overlapping denominator.
   `f9e660d66fe56af2ea4f1d2031759210af497d67` and is carried forward from that
   owner evidence; this task did not access production or revalidate compute.
   Local embedded-Postgres tests and deployment records are not production
-  evidence. The latest main SHA is `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`;
-  compute status has not been revalidated. No production configuration, data,
+  evidence. The latest main SHA is `d5e4d68073018d5f082116a55635d28b9d4c5aa3`
+  (PR #131 merged); compute status has not been revalidated. No production configuration, data,
   migration or infrastructure may be changed to clear this block.
 
 ### Current delivery and gates
 
 - **Merged, repository/CI verified:** M1–M9.2 and M10.0/Gate 9/B1/B2 are present
   on `main`; latest merges include #122 (sandbox provisioning dry-run tests),
-  #123 (checkout epoch revalidation), and #124 (typed scanner transient
-  failures). Their reported required CI jobs passed. This is code/test evidence,
-  not proof that every feature is operational or production-verified.
-- **M9.2 outbox subject symbol collision — resolved on main:** PR #130 merged
-  at `a5a36fd` and includes `assetClass` in alert subjects; this was presentation
-  ambiguity, not an outbox-row or idempotency-key collision.
+  #123 (checkout epoch revalidation), #124 (typed scanner transient failures),
+  #130 (M9.2 notification subject disambiguation), #131 (read-only verified
+  payment records), #132 (runtime dependency-advisory patch) and #133 (strategy
+  entitlements aligned with the subscription catalogue). Their reported required
+  CI jobs passed. This is code/test evidence, not proof that every feature is
+  operational or production-verified.
+- **M9.2 outbox symbol collision — closed on `main` by PR #130.**
+  Rendering otherwise identical alerts for the same canonical ticker under
+  `forex` and `crypto` previously produced the same email subject because the
+  subject omitted `assetClass`, even though the structured payload retained it.
+  This was presentation ambiguity, not an outbox-row or idempotency-key
+  collision. The merged fix includes the asset class in the subject;
+  `packages/core/test/m92-outbox.test.ts` guards the distinction. PR #130 merged
+  as `a5a36fd4e9df53056e991311d1ccbbfbf91ddd22`; the exact current mainline tree
+  contains both the renderer change and regression test.
+- **Latest main deployment metadata (not a health check):** for main SHA
+  `a5a36fd4e9df53056e991311d1ccbbfbf91ddd22`, GitHub records Vercel deployment
+  `7146343163` as `success` (`Deployment has completed`) and Render deployment
+  `7146335883` as `failure`. The Render deployment cause is not available in
+  the GitHub deployment record. No production API health probe, database query,
+  or migration check was performed; these deployment states do not establish
+  production readiness. [deployment.md](./deployment.md) carries the later
+  read-only deployment evidence, including the owner-provided Render dashboard
+  snapshot for `085d3b6`; none of it was revalidated while reconciling this
+  branch, and `main` has since advanced to `d5e4d68` with no new deployment or
+  health observation recorded here.
 - **Notification reliability reconciliation — PR #128 closed as superseded; PR #134 remains open (Draft), awaiting an authorized independent review and deployment-safety confirmation.** PR #128 (`5e9df827c40a5352d1c95f7ea16367102f8fcf1c`) was closed without merge on 2026-11-02; its notification ticker liveness, CI hardening, tests, and docs were carried forward in PR #134. PR #134's implementation commit is `df7bc4900a7328717de190b4b13a7d0b49ef4248`; later PR commits are documentation-only. The live PR head, exact-head verification, review requests, and deployment gate are maintained in the [PR description](https://github.com/shadrachampah123/veltrixeye/pull/134), not duplicated here as a stale current-head claim. The implementation claims one job at a time, renews each active lease, writes a unique owner token, and requires the live token for renewal and every delivery outcome transition. Tests against real embedded PostgreSQL cover an attempt longer than the initial lease, concurrent recovery while sending, current/stale token behavior, failed renewal, old-owner acknowledgement after reclaim, crash recovery, and duplicate prevention. At review checkpoint `667aff4`, focused outbox/worker + SMTP + delivery-ticker tests **53/53 passed**; full `npm test` **3,359/3,359 passed**; `npm run typecheck`, `npm run lint`, `npm run build`, and `git diff --check` passed. Exact-head CI and Preview evidence for that checkpoint is recorded in the PR conversation. These are code/test evidence, not production email evidence. At-least-once delivery remains: if a provider has accepted a message before lease ownership is lost, a later retry can duplicate it; no exactly-once SMTP claim is made. Production email and the historical Render failure remain unverified; see [deployment.md](./deployment.md).
 - **Execution safety:** automation remains OFF; live execution remains
   unavailable/impossible by the enforced boundary. M10/Gate 9 is a non-live
@@ -57,17 +85,18 @@ and blocking gates without a stable, non-overlapping denominator.
 - **Retention / monitoring:** scanner-run retention and unauthenticated
   retention-sweep observability were merged (#107/#111); the M9.1 deployment
   health note records schema 0027 at the time of that check. Current `main`
-  includes later migrations through 0036, and this checkpoint has no fresh
+  includes later migrations through 0038, and this checkpoint has no fresh
   production readiness observation for that current schema. Treat current
   production migration/health status as unverified. CI's test retry loop was
   removed (#112); latest inspected CI runs pass, but reliability is monitored
   through actual authoritative runs, not retries or a single green badge.
 - **Legal / commercial polish:** customer-facing legal/risk copy from #106 is
-  explicitly draft and awaits legal approval. Billing portal v1 is read-only;
-  cancellation and verified-payment-history UI remain scoped/deferred as
-  documented. Starter is not sold; production billing credentials, provider
-  provisioning, FX publication, and any unapproved pricing/plan changes remain
-  gates. Do not represent the product as legally or commercially launch-ready.
+  explicitly draft and awaits legal approval. Billing Portal v1 and the R-1
+  Verified Payment Records view are read-only; customer-facing cancellation
+  remains deferred under C-1. Starter is not sold; production billing
+  credentials, provider provisioning, FX publication, and any unapproved
+  pricing/plan changes remain gates. Do not represent the product as legally
+  or commercially launch-ready.
 - **AI / ChatGPT Strategy Builder:** intentionally the final roadmap feature,
   after operational safety, production validation, legal, commercial and
   release-readiness gates. It is not implemented or approved to displace those
@@ -112,23 +141,32 @@ resume the paused work. Automation stays OFF and execution stays paper-only.
    is addressed with per-job claims, renewal and owner fencing. Keep #134
    unmerged pending approval and deployment safety; SMTP acceptance/deduplication
    and historical Render diagnosis remain separate, unverified evidence gates.
-2. **BLOCKED — production verification:** after Neon compute is restored and an
+2. **BLOCKED — Render deployment diagnosis.** GitHub reports main deployment
+   `7146335883` for `a5a36fd4e9df53056e991311d1ccbbfbf91ddd22` as failed,
+   without a cause in the deployment record. The later read-only deployment
+   evidence recorded in [deployment.md](./deployment.md) (including the
+   owner-provided Render dashboard snapshot) was not revalidated by this
+   reconciliation. An authorized owner must provide sanitized Render
+   build/deploy logs for the failed and current deployments before any
+   deployment remediation; no Render setting, environment variable, deployment
+   or database may be changed to clear this block.
+3. **BLOCKED — production verification:** after compute is restored and an
    authorized owner permits a read-only check, verify the current production
    schema/health and operational monitoring without changing production
    configuration. Until then, keep all production database/health checks
    blocked; keep billing sandbox and FX publication behind their explicit owner
-   approvals.
-3. Close legal approval, commercial policy, retention/monitoring, CI reliability
-   and release-readiness gaps with evidence.
-4. Obtain and record PR #121's actual Vercel Preview deployment evidence before
-   changing its Draft/unmerged disposition.
+   approvals. No such check was performed for this checkpoint.
+4. Close legal approval, commercial policy, retention/monitoring, CI reliability
+   and release-readiness gaps with evidence. Billing Step 9b-R1 is delivered as
+   a local, read-only verified-payment view; C-1 cancellation remains deferred.
 5. Consider the AI/ChatGPT Strategy Builder only after the preceding gates.
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
 M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2, M8.3, M8.4, M8.5,
 M8.6, M8.7, M9.1, M9.2, the M10.0 / Gate 9 execution-transport program
-(transport foundation, Gate 9 protocol + persistence, B1, B2), and the start of
-billing (PR1 — authoritative commercial catalogue; **no payment flow**). The
+(transport foundation, Gate 9 protocol + persistence, B1, B2), and billing's
+sandbox/test payment flow plus read-only portal and verified-payment records.
+Production billing and any change to prices or authority remain gated. The
 boundaries below are deliberate and enforced: M1 shipped foundations and
 contracts; M2 added real historical
 market data; M3 added deterministic strategy evaluation; M4 added
@@ -1028,24 +1066,29 @@ canonical billing contracts and the Paystack provider seam — see
   owner case is unaffected — an account with no subscription row, which is the
   normal state since Model C, resolves to free and is never refused. See
   [billing.md](./billing.md#non-commercial-operator-grant-npm-run-billinggrant).
-- **Deferred billing management (Billing Step 9b):** the decisions are recorded,
-  but 9b remains documentation-only. C-1 defers customer-facing in-app
-  cancellation; the existing subscription lookup and non-immediate cancellation
-  are adapter capabilities, not customer-facing authorization. R-1 approves
-  only a future read-only **Verified payment records** view sourced from
-  `billing_verified_transactions`; it is not an invoice feature, is not
-  implemented, and the scope decision does not authorize implementation.
-  Provider-issued invoices are not approved. Payment-method management and plan
-  changes are **out** of 9b. See
-  [billing.md](./billing.md#self-serve-billing-management-scope-billing-step-9b);
-  no customer-facing endpoint, migration, provider call or authority change was
-  made. Refunds/proration/dunning execution, the Starter
-  **sellability** decision (Billing Step 10a decided Starter is **not sold** in
-  this build; making it sellable would require widening all twelve gates
-  documented in
-  [billing.md](./billing.md#starter-disposition-billing-step-10a) together, plus
-  the two unresolved Starter product decisions recorded there), and production
-  credentials also remain deferred as before.
+- **Billing Step 9b — R-1 delivered; C-1 remains deferred.** The read-only
+  **Verified Payment Records** view uses only `billing_verified_transactions`
+  and is scoped by the authenticated user and server-configured provider mode.
+  `GET /api/billing/verified-payment-records` returns at most the 25 newest
+  stored GHS minor-unit amounts and paid/verified instants in a strict DTO; it
+  does not create invoices/receipts, call Paystack, recalculate FX or alter
+  confirmation, entitlements or execution. It discloses that it is not complete
+  invoice, renewal, failure or refund history. C-1 still defers customer-facing
+  cancellation; adapter lookup/cancellation are not customer-facing
+  authorization. Payment-method management, plan changes, provider-issued
+  invoices, refunds/proration/dunning, production credentials and go-live stay
+  out. This change adds no migration, provider operation or billing authority.
+  See [billing.md](./billing.md#self-serve-billing-management-scope-billing-step-9b).
+  The Starter **sellability** decision (Billing Step 10a: Starter is **not
+  sold**) still requires all twelve gates and two unresolved product decisions
+  documented in [billing.md](./billing.md#starter-disposition-billing-step-10a)
+  before any future reconsideration.
+- **Billing Step 9b-R1 local verification (2026-10-17):** `npm test` passed all
+  3,370 tests across contracts, core, providers, API and web; full workspace
+  `npm run typecheck`, `npm run lint` and `npm run build` passed. Database tests
+  used local embedded PostgreSQL and synthetic evidence only; no provider was
+  contacted. `git diff --check` is recorded after the patch was staged. No
+  production database, health endpoint or migration status was accessed.
 - **Not started / not planned in the billing stream:** broker or MT5/Exness
   connectivity, live execution, automation, and any change to Gate 9, B1, B2 or
   paper-execution behaviour.
@@ -1053,5 +1096,5 @@ canonical billing contracts and the Paystack provider seam — see
 ## After M9.2 (later work, outline only)
 
 1. **Operational broker transport** — validate a concrete MT5 bridge and an approved external secret manager on demo infrastructure. M8.4 deliberately ships neither and makes no connectivity claim. M8.5/M8.6/M8.7/M9.1/M9.2 prepare reconciliation, safety plumbing, drawdown protection, notification fairness and secret hardening for it; the transport itself is gated on external validation.
-2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path now runs end to end through verified payment evidence and the out-of-band activation authority (Steps 6–8, migrations 0033–0034), with a checkout UI and a read-only overview delivered by Billing Step 9 and Billing Portal v1. Billing Step 9b remains scoped but documentation-only: C-1 defers customer-facing cancellation; R-1 approves future scope for a read-only **Verified payment records** view from existing `billing_verified_transactions`, not an invoice feature. The view is not implemented, and the scope decision does not authorize implementation; provider-issued invoices are not approved, while payment-method management and plan changes are out of 9b. Refunds/proration/dunning execution, production credentials, and the Starter sellability decision (Billing Step 10a records that Starter is **not sold** and shows it as "Not available yet"; see [the Starter disposition](./billing.md#starter-disposition-billing-step-10a)) — are listed in [billing.md](./billing.md#later-billing-prs) and in the section above.
+2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path runs through verified evidence and out-of-band activation (Steps 6–8, migrations 0033–0034), with checkout and read-only portal surfaces delivered. Billing Step 9b-R1 now adds a bounded, authenticated-user/provider-mode-scoped **Verified Payment Records** view from `billing_verified_transactions`; it is not an invoice feature and does not call Paystack, recalculate FX or change authority. C-1 continues to defer customer-facing cancellation; provider-issued invoices are not approved; payment-method management and plan changes are out of scope. Refunds/proration/dunning execution, production credentials and Starter sellability (Step 10a records Starter as **not sold** and "Not available yet"; see [the Starter disposition](./billing.md#starter-disposition-billing-step-10a)) remain deferred; see [billing.md](./billing.md#later-billing-prs).
 3. **More channels** (SMS/Telegram) behind same registry if needed.
