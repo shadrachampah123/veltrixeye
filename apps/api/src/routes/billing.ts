@@ -244,7 +244,17 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
     try {
       return reply.send(projectBillingPortalSummary(await readBillingPortalFacts(ctx.pool, user.id)));
     } catch (error) {
-      req.log.error({ err: error }, 'billing portal summary unavailable');
+      // Same reasoning as the verified-payment-records route: the thrown value
+      // is projected, never logged. `readBillingPortalFacts` is a driver read
+      // that can fail with a connection-string error (password included), and
+      // its schema-refusal message quotes stored field paths. 500-level detail
+      // stays server-side; the browser gets nothing but the fail-closed DTO.
+      logErrorSafely(req.log, error, 'billing portal summary unavailable', {
+        route: '/api/billing/portal',
+        method: 'GET',
+        requestId: req.id,
+        billingMode: config.billing.mode,
+      }, logSecrets);
       return reply.send(UNAVAILABLE_BILLING_PORTAL_SUMMARY);
     }
   });

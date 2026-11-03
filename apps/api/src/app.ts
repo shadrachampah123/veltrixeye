@@ -6,6 +6,7 @@ import type pg from 'pg';
 import type { AppConfig } from './config.js';
 import { isProduction } from './config.js';
 import { errorHandler } from './errors.js';
+import { configuredSecrets } from './safe-error-log.js';
 import {
   redactSecrets,
   UserService,
@@ -619,10 +620,21 @@ export interface BuildAppOptions {
  * able to write a stack trace, an `Authorization`/`Cookie` header or a field
  * named like a credential. Censoring is structural, so the field survives with
  * `[redacted]` and the line stays useful.
+ *
+ * Exported so tests can drive a capture sink with the EXACT production
+ * configuration instead of a lookalike.
  */
-const LOGGER_REDACT_PATHS = [
+export const LOGGER_REDACT_PATHS = [
   // A serialized exception: the stack is never worth the risk it carries.
   'err.stack', '*.err.stack', 'error.stack', '*.error.stack',
+  // The message is the highest-risk part of a serialized exception: a driver
+  // error quotes the connection string (password included) and a provider
+  // error echoes the submitted key. Any call site that still passes a raw
+  // exception under `err` therefore loses the message too — the type and the
+  // code stay, and the routes that need a readable reason use `logErrorSafely`
+  // (which writes a *scrubbed, truncated* message under `error`, untouched by
+  // these paths). This is the backstop, not the primary control.
+  'err.message', '*.err.message',
   'err.headers.authorization', '*.err.headers.authorization',
   'req.headers.authorization', '*.req.headers.authorization',
   'req.headers.cookie', '*.req.headers.cookie',
@@ -682,7 +694,16 @@ export async function buildApp(
     bodyLimit: 256 * 1024, // 256 KB — strategy configs are small; reject fat payloads
   });
 
-  app.setErrorHandler(errorHandler);
+  // The central handler logs unhandled exceptions, so it needs the deployment
+  // credentials to substitute before writing them. Computed once per app, not
+  // per error.
+  const errorLogSecrets = configuredSecrets(config);
+  app.setErrorHandler((err, req, reply) => {
+    // Fastify hands the handler an unknown thrown value; a non-Error is still
+    // answered generically, so normalising here keeps the contract honest.
+    const asError = err instanceof Error ? err : new Error(String(err));
+    errorHandler(asError, req, reply, errorLogSecrets);
+  });
   app.setNotFoundHandler((_req, reply) => {
     void reply.code(404).send({
       error: { code: 'not_found', message: 'Route not found' },

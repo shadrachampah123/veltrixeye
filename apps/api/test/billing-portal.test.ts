@@ -26,7 +26,7 @@ import {
   UNAVAILABLE_BILLING_PORTAL_SUMMARY, billingPortalSummaryDtoSchema,
   billingStateDtoSchema, type BillingPortalSummaryDto,
 } from '@veltrixeye/contracts';
-import { buildApp, createAppContext } from '../src/app.js';
+import { LOGGER_REDACT_PATHS, buildApp, createAppContext } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import {
   insertUser, retireActiveEpochs, seedActivatedSubscription, seedCommercialSubscription,
@@ -36,8 +36,16 @@ import {
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
 let ctx: ReturnType<typeof createAppContext>;
 let app: Awaited<ReturnType<typeof buildApp>>;
-/** A second app whose `subscriptions` read throws a provider-shaped error. */
+/**
+ * A second app whose `subscriptions` read throws a provider-shaped error.
+ *
+ * It is built with a CAPTURE sink at the production redaction configuration:
+ * logging is disabled outside production, so without capturing what the logger
+ * actually emits, a credential leaking into the production log would be
+ * invisible to this suite.
+ */
 let failingApp: Awaited<ReturnType<typeof buildApp>>;
+const portalLogLines: string[] = [];
 
 const SESSION_COOKIE = 've_session';
 
@@ -83,7 +91,13 @@ before(async () => {
   app = await buildApp(cfg, ctx);
   await app.ready();
   const failingCfg = config();
-  failingApp = await buildApp(failingCfg, createAppContext(failingPool(db.pool), failingCfg));
+  failingApp = await buildApp(failingCfg, createAppContext(failingPool(db.pool), failingCfg), {
+    logger: {
+      level: 'error',
+      stream: { write: (line: string) => { portalLogLines.push(String(line)); return true; } },
+      redact: { paths: LOGGER_REDACT_PATHS, censor: '[redacted]' },
+    },
+  });
   await failingApp.ready();
 }, { timeout: 180_000 });
 
@@ -624,4 +638,73 @@ test('a row without a statable commercial identity is unknown, never a guess', a
     "INSERT INTO subscriptions (user_id, plan, status) VALUES ($1, 'pro', 'trialing')", [historical.id],
   );
   assert.equal((await summary(historical.cookie)).state, 'unknown');
+});
+
+test('a failed portal read is logged WITHOUT the credential it carried', async () => {
+  /**
+   * The injected failure throws a message carrying both a Paystack-shaped key
+   * and a provider authorization code. The browser is already pinned to see
+   * none of it (`a failure neither leaks the error...`); this pins the other
+   * half — the LOG SINK, which is where a raw `req.log.error({ err })` used to
+   * write the whole exception, message included, in production.
+   */
+  const owner = await user(true);
+  await seedActivatedSubscription(db.pool, owner.id);
+  const session = await ctx.sessions.create(owner.id, {});
+  const cookie = `${SESSION_COOKIE}=${session.token}`;
+
+  portalLogLines.length = 0;
+  const res = await failingApp.inject({
+    method: 'GET', url: '/api/billing/portal',
+    headers: { cookie, 'x-forwarded-for': nextIp() },
+  });
+  assert.equal(res.statusCode, 200, res.body);
+  assert.equal(res.json().state, 'unavailable', 'the read still fails closed');
+
+  const errorLines = portalLogLines
+    .map((line) => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return null; } })
+    .filter((entry): entry is Record<string, unknown> => entry !== null && entry.level === 50);
+  assert.equal(errorLines.length, 1, `expected exactly one error log line, got ${errorLines.length}`);
+  const line = errorLines[0] as Record<string, unknown>;
+  const serialized = JSON.stringify(line);
+
+  // The credential carried by the injected driver error is not in the sink.
+  for (const secret of [
+    'sk_test_0123456789abcdef0123456789abcdef01234567',
+    'AUTH_9f8e7d6c5b4a39281706f5e4d3c2b1a0',
+  ]) {
+    assert.ok(!serialized.includes(secret), `a credential reached the log sink: ${secret}`);
+  }
+
+  // The raw exception is not the logged payload at all: no raw `err`, no stack.
+  assert.equal(line.err, undefined, 'a raw `err` key must never be written');
+  assert.ok(!('stack' in line), 'a stack trace must never be written');
+
+  // ...but the failure is still diagnosable.
+  assert.equal(line.msg, 'billing portal summary unavailable');
+  const error = line.error as Record<string, unknown> | undefined;
+  assert.ok(error, 'a projected `error` object must be written');
+  assert.equal(error.type, 'Error');
+  assert.ok(String(error.message ?? '').length > 0, 'a redacted reason must survive');
+  assert.ok(String(error.message ?? '').length <= 300, 'the message must be truncated');
+  assert.ok(String(error.message ?? '').includes('[redacted]'), 'the secret must be substituted');
+  assert.equal(line.route, '/api/billing/portal');
+  assert.equal(line.method, 'GET');
+  assert.equal(line.billingMode, 'test');
+  assert.ok(typeof line.requestId === 'string' && line.requestId.length > 0);
+});
+
+test('the production logger redaction list still censors err.message', async () => {
+  // A guard, not a behaviour test: removing `err.message` from
+  // LOGGER_REDACT_PATHS silently reopens the leak on every call site that has
+  // not been migrated to `logErrorSafely`. The behavioural proof that the
+  // censor works lives in `error-log-safety.test.ts`.
+  assert.ok(
+    LOGGER_REDACT_PATHS.includes('err.message'),
+    'err.message must stay in the Pino redaction list',
+  );
+  assert.ok(
+    LOGGER_REDACT_PATHS.includes('err.stack'),
+    'err.stack must stay in the Pino redaction list',
+  );
 });
