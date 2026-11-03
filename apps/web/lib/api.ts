@@ -49,6 +49,8 @@ import type {
   BillingPaymentVerificationResult,
   // Billing Portal v1 — the read-only billing overview
   BillingPortalSummaryDto,
+  // Billing Step 9b-R1 — the bounded verified-payment records view
+  BillingVerifiedPaymentRecordsDto,
   // M7.5 — live scanner
   ScannerHealthDto,
   ScannerRunDto,
@@ -98,6 +100,7 @@ import {
   billingCheckoutRequestDtoSchema,
   billingCheckoutSessionDtoSchema,
   billingPortalSummaryDtoSchema,
+  billingVerifiedPaymentRecordsDtoSchema,
   MAX_ALERTS_LIMIT,
   MAX_BACKTESTS_LIMIT,
   MAX_BACKTEST_TRADES,
@@ -793,6 +796,16 @@ export const api = {
   getBillingPortalSummary: async (): Promise<BillingPortalSummaryDto> =>
     billingPortalSummaryDtoSchema.parse(
       await request<BillingPortalSummaryDto>('/billing/portal'),
+    ),
+
+  /**
+   * Billing Step 9b-R1 — bounded, session-scoped verified payment evidence.
+   * The strict response contains only stored minor-unit amounts and persisted
+   * instants; identifiers, provider references and pricing data cannot render.
+   */
+  getBillingVerifiedPaymentRecords: async (): Promise<BillingVerifiedPaymentRecordsDto> =>
+    billingVerifiedPaymentRecordsDtoSchema.parse(
+      await request<BillingVerifiedPaymentRecordsDto>('/billing/verified-payment-records'),
     ),
 };
 

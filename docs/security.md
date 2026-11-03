@@ -411,6 +411,41 @@ Webhook signing secrets and push subscription keys are now encrypted at rest via
   generic 500 with a message that leaks nothing about internals.
 - 404s for unknown *routes* return JSON (consistent client handling).
 
+### Error logging (server side)
+
+The response body is not the only place an error can leak. A raw exception
+handed to the logger writes its **message** to the production log sink, and a
+driver or provider error can carry a database password, a connection string or
+a submitted API key inside that message.
+
+- **No call site logs a raw exception.** Every failure path in `apps/api/src`
+  goes through `logErrorSafely` (`apps/api/src/safe-error-log.ts`), which
+  projects the thrown value to `{ type, message, code }`, substitutes every
+  configured secret (`configuredSecrets(config)`), and truncates. This covers
+  the central error handler in `errors.ts` — i.e. every unhandled exception
+  API-wide — as well as the billing routes.
+- **Only the route *pattern* is logged, never `req.url`.** The concrete URL can
+  carry a token or an identifier in its query string.
+- **Pino-level redaction is the backstop, not the primary control.**
+  `LOGGER_REDACT_PATHS` (`apps/api/src/app.ts`) censors `err.stack`,
+  `err.message`, `Authorization`/`Cookie` headers and any field named like a
+  credential. So a future `req.log.error({ err })` is censored rather than
+  leaked — but that path loses the message entirely, which is why routes log a
+  scrubbed, truncated `error.message` instead.
+- **Diagnostics are preserved, not suppressed.** An operator still gets the
+  error type, the driver code, a redacted reason, the route pattern, the method
+  and the request id.
+- **Logging is off outside production**, so a logging regression is invisible to
+  a normal test run. `apps/api/test/error-log-safety.test.ts` and the logging
+  cases in `billing-portal.test.ts` assert on what a real Pino logger emits
+  through a capture sink, and were proven by negative control.
+
+Known limits: redaction is pattern- and known-value-based, so it cannot catch
+an unknown secret embedded in an unmigrated call site's message; and Fastify
+writes its own `incoming request` line at INFO level carrying the full URL —
+safe today because no route reads a credential from the query string, which
+`apps/api/test/request-url-logging.test.ts` enforces.
+
 ## Known remaining items (post-M1)
 
 - No account email verification or password reset flow (intentionally
@@ -427,8 +462,14 @@ Webhook signing secrets and push subscription keys are now encrypted at rest via
   email/webhook/push needs an outbox + worker and provider credentials, and is
   deliberately deferred — see [alerts.md](./alerts.md#10-future-channelprovider-architecture).
 - Production deployment hardening (TLS termination, WAF, secret manager,
-  least-privilege DB roles, log redaction) is an operational task for
-  deployment time — see [milestones.md](./milestones.md).
+  least-privilege DB roles) is an operational task for deployment time — see
+  [milestones.md](./milestones.md). Note that **server-side error-log redaction
+  is now implemented** — see
+  [Error logging (server side)](#error-logging-server-side). The scheduled
+  ingestion path (`packages/core/src/market-data/scheduled.ts`) still logs
+  unredacted `err.message` through a `console.*` worker logger; `pg` was
+  confirmed not to echo the connection password in the connection-error cases
+  tested, so this is low severity, but it is unhardened and tracked here.
 
 ## Risk engine (M8.2)
 

@@ -6,16 +6,18 @@ import {
   getBillingState, BillingCheckoutError, Errors, isBillingProviderPlanError,
   isBillingPricingError, isBillingFxError, isBillingSubscriptionSyncError,
   isBillingCustomerProvisioningError, type BillingCustomerProvisioningErrorReason,
-  isBillingPaymentConfirmationError, readBillingPortalFacts,
+  isBillingPaymentConfirmationError, readBillingPortalFacts, readBillingVerifiedPaymentRecords,
 } from '@veltrixeye/core';
 import { isPaystackAdapterError } from '@veltrixeye/provider-paystack';
 import { composeBillingCheckout, composeBillingCustomers, composeBillingSync, composeBillingVerify } from '../billing-composition.js';
+import { configuredSecrets, logErrorSafely } from '../safe-error-log.js';
 import { registerBillingWebhookRoutes } from '../billing-webhook.js';
 import {
   isBillingCheckoutProjectionError,
   projectBillingCheckoutSession,
   projectBillingPortalSummary,
   UNAVAILABLE_BILLING_PORTAL_SUMMARY,
+  UNAVAILABLE_BILLING_VERIFIED_PAYMENT_RECORDS,
   type BillingStateDto,
 } from '@veltrixeye/contracts';
 
@@ -40,6 +42,9 @@ export const BILLING_CUSTOMER_RATE_LIMIT_MAX = 10;
  */
 export const BILLING_VERIFY_RATE_LIMIT_MAX = 10;
 
+/** Billing Step 9b-R1: bound the session-authenticated records read per IP. */
+export const BILLING_PAYMENT_RECORDS_RATE_LIMIT_MAX = 30;
+
 /**
  * Provisioning refusals that are about LOCAL state needing operator review
  * (409); every other refusal is a provider-side unavailability (502).
@@ -61,6 +66,13 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
   const sync = composeBillingSync(ctx.pool, ctx.billingProviders);
   const customers = composeBillingCustomers(ctx.pool, ctx.billingProviders);
   const verify = composeBillingVerify(ctx.pool, ctx.billingProviders, config);
+  /**
+   * Credentials this deployment was configured with, resolved once at
+   * registration time. They are matched by exact value in addition to the
+   * shape-based scrubber, so a key that does not look like anything known is
+   * still removed from anything this route logs.
+   */
+  const logSecrets = configuredSecrets(config);
 
   // Billing Step 5.2 — the secure webhook receiver route. Signature-verified,
   // never session-authenticated; registered only when a billing provider
@@ -232,8 +244,68 @@ export async function billingRoutes(app: FastifyInstance, ctx: AppContext, confi
     try {
       return reply.send(projectBillingPortalSummary(await readBillingPortalFacts(ctx.pool, user.id)));
     } catch (error) {
-      req.log.error({ err: error }, 'billing portal summary unavailable');
+      // Same reasoning as the verified-payment-records route: the thrown value
+      // is projected, never logged. `readBillingPortalFacts` is a driver read
+      // that can fail with a connection-string error (password included), and
+      // its schema-refusal message quotes stored field paths. 500-level detail
+      // stays server-side; the browser gets nothing but the fail-closed DTO.
+      logErrorSafely(req.log, error, 'billing portal summary unavailable', {
+        route: '/api/billing/portal',
+        method: 'GET',
+        requestId: req.id,
+        billingMode: config.billing.mode,
+      }, logSecrets);
       return reply.send(UNAVAILABLE_BILLING_PORTAL_SUMMARY);
+    }
+  });
+
+  /**
+   * Billing Step 9b-R1 — the read-only Verified Payment Records view.
+   *
+   * The account id is always the authenticated session user and the provider
+   * mode is always server configuration; neither can be supplied by query,
+   * body or header. The reader selects only the newest bounded set of stored
+   * `billing_verified_transactions` facts for that user and mode. It makes no
+   * provider call, does not recalculate FX, and cannot create an invoice or
+   * receipt. The strict DTO contains only the stored GHS minor-unit amount and
+   * the paid/verified instants — no identifiers, references, hashes, provider
+   * status, pricing snapshot or credential-shaped material.
+   *
+   * A read or row-validation failure fails closed to an empty `unavailable`
+   * answer. Nothing in this route writes a billing fact or changes
+   * entitlements, payment confirmation, automation or execution.
+   */
+  app.get('/api/billing/verified-payment-records', {
+    config: { rateLimit: { max: BILLING_PAYMENT_RECORDS_RATE_LIMIT_MAX, timeWindow: '1 minute' } },
+  }, async (req, reply) => {
+    if (!await requireAuth(req, reply)) return;
+    const { user } = req as AuthenticatedRequest;
+    try {
+      return reply.send(await readBillingVerifiedPaymentRecords(ctx.pool, user.id, config.billing.mode));
+    } catch (error) {
+      /**
+       * SECURITY: the thrown object is NEVER handed to the logger. A database
+       * or row-validation failure can carry a connection string, an
+       * authorization header, a provider key or an authorization code, and a
+       * raw pino `err` serialisation would also write the stack. `logErrorSafely`
+       * logs only an allow-listed projection (type, redacted message, short
+       * driver code) plus scrubbed context, so the diagnostic survives and the
+       * credential does not. The response is the fixed unavailable DTO either
+       * way: no reason, message or row value reaches the browser.
+       */
+      logErrorSafely(
+        req.log,
+        error,
+        'verified payment records unavailable',
+        {
+          route: '/api/billing/verified-payment-records',
+          method: 'GET',
+          requestId: req.id,
+          billingMode: config.billing.mode,
+        },
+        logSecrets,
+      );
+      return reply.send(UNAVAILABLE_BILLING_VERIFIED_PAYMENT_RECORDS);
     }
   });
 

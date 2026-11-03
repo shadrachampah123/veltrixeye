@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify';
 import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -6,6 +6,7 @@ import type pg from 'pg';
 import type { AppConfig } from './config.js';
 import { isProduction } from './config.js';
 import { errorHandler } from './errors.js';
+import { configuredSecrets } from './safe-error-log.js';
 import {
   redactSecrets,
   UserService,
@@ -601,12 +602,64 @@ export async function runStartupScannerRecovery(
 }
 
 /**
+ * Optional overrides for {@link buildApp}.
+ *
+ * `logger` exists so tests can capture what the API actually writes to a log
+ * sink (a pino destination) and assert on it — without it, logging is off
+ * outside production and a logging regression is invisible. Production never
+ * passes it and keeps deriving the level from configuration.
+ */
+export interface BuildAppOptions {
+  logger?: FastifyServerOptions['logger'];
+}
+
+/**
+ * Pino-level redaction: last line of defence for anything that reaches a log
+ * sink. Every handler is expected to build its own safe, allow-listed payload
+ * (see `safe-error-log.ts`), but a future `req.log.error({ err })` must not be
+ * able to write a stack trace, an `Authorization`/`Cookie` header or a field
+ * named like a credential. Censoring is structural, so the field survives with
+ * `[redacted]` and the line stays useful.
+ *
+ * Exported so tests can drive a capture sink with the EXACT production
+ * configuration instead of a lookalike.
+ */
+export const LOGGER_REDACT_PATHS = [
+  // A serialized exception: the stack is never worth the risk it carries.
+  'err.stack', '*.err.stack', 'error.stack', '*.error.stack',
+  // The message is the highest-risk part of a serialized exception: a driver
+  // error quotes the connection string (password included) and a provider
+  // error echoes the submitted key. Any call site that still passes a raw
+  // exception under `err` therefore loses the message too — the type and the
+  // code stay, and the routes that need a readable reason use `logErrorSafely`
+  // (which writes a *scrubbed, truncated* message under `error`, untouched by
+  // these paths). This is the backstop, not the primary control.
+  'err.message', '*.err.message',
+  'err.headers.authorization', '*.err.headers.authorization',
+  'req.headers.authorization', '*.req.headers.authorization',
+  'req.headers.cookie', '*.req.headers.cookie',
+  'req.headers["set-cookie"]', '*.req.headers["set-cookie"]',
+  // Fields named like a credential, at the top level and one level down.
+  ...['password', 'passwd', 'secret', 'token', 'authorization', 'apiKey', 'api_key',
+    'accessToken', 'refreshToken', 'connectionString', 'databaseUrl', 'DATABASE_URL']
+    .flatMap((field) => [field, `*.${field}`]),
+];
+
+/**
  * Build the Fastify app WITHOUT listening.
  * Tests use `app.inject()` against this factory.
  */
-export async function buildApp(config: AppConfig, ctx: AppContext): Promise<FastifyInstance> {
+export async function buildApp(
+  config: AppConfig,
+  ctx: AppContext,
+  options: BuildAppOptions = {},
+): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: config.NODE_ENV === 'production' ? { level: config.LOG_LEVEL } : false,
+    logger:
+      options.logger ??
+      (config.NODE_ENV === 'production'
+        ? { level: config.LOG_LEVEL, redact: { paths: LOGGER_REDACT_PATHS, censor: '[redacted]' } }
+        : false),
     /**
      * Client-IP resolution — pinned to the proxies that actually front this
      * service, never `true`.
@@ -641,7 +694,16 @@ export async function buildApp(config: AppConfig, ctx: AppContext): Promise<Fast
     bodyLimit: 256 * 1024, // 256 KB — strategy configs are small; reject fat payloads
   });
 
-  app.setErrorHandler(errorHandler);
+  // The central handler logs unhandled exceptions, so it needs the deployment
+  // credentials to substitute before writing them. Computed once per app, not
+  // per error.
+  const errorLogSecrets = configuredSecrets(config);
+  app.setErrorHandler((err, req, reply) => {
+    // Fastify hands the handler an unknown thrown value; a non-Error is still
+    // answered generically, so normalising here keeps the contract honest.
+    const asError = err instanceof Error ? err : new Error(String(err));
+    errorHandler(asError, req, reply, errorLogSecrets);
+  });
   app.setNotFoundHandler((_req, reply) => {
     void reply.code(404).send({
       error: { code: 'not_found', message: 'Route not found' },
