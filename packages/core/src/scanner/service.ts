@@ -30,6 +30,13 @@ import type { SetupService } from '../setups/service.js';
 import type { ScoringService } from '../scoring/service.js';
 import type { AlertService } from '../alerts/service.js';
 import { resolveEntitlements } from '../billing/entitlement-resolution.js';
+import {
+  acquireSessionAdvisoryLock,
+  DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS,
+  holderLogMeta,
+  type AdvisoryLockRelease,
+  type SessionAdvisoryLock,
+} from '../db/advisory-lock.js';
 import type { UserPlan } from '@veltrixeye/contracts';
 import { normalizeSymbol, normalizeTimeframe, normalizeCandleBatch } from './normalization.js';
 import { validateCandleBatch, validateMultiTimeframe } from './validation.js';
@@ -128,6 +135,19 @@ export interface ScannerServiceOptions {
    * never propagates into `pruneTerminalRuns`.
    */
   onRetentionSweep?: (observation: RetentionSweepObservation) => void;
+  /**
+   * How often (ms) the running scan re-proves that it still owns the advisory
+   * lock. `0` disables the heartbeat. Defaults to a quarter of `leaseMs`
+   * (minimum 1s), so ownership is re-checked several times per lease window
+   * without adding measurable database load.
+   */
+  advisoryLockHeartbeatMs?: number;
+  /**
+   * Idle age (ms) at which the session currently holding the scanner lock is
+   * reported as *suspected orphaned* when a cycle cannot acquire it. This is
+   * diagnostic only — nothing is terminated automatically.
+   */
+  advisoryLockOrphanIdleMs?: number;
 }
 
 export interface ScannerLogger {
@@ -391,6 +411,8 @@ export class ScannerService {
   private readonly retryMaxMs: number;
   private readonly expectedIntervalMs: number;
   private readonly leaseMs: number;
+  private readonly advisoryLockHeartbeatMs: number;
+  private readonly advisoryLockOrphanIdleMs: number;
   private readonly runRetentionDays: number;
   private readonly logger: ScannerLogger;
   private readonly redact: (text: string) => string;
@@ -414,6 +436,13 @@ export class ScannerService {
     this.retryMaxMs = options.retryMaxMs ?? SCANNER_RETRY_MAX_MS;
     this.expectedIntervalMs = options.expectedIntervalMs ?? SCANNER_EXPECTED_INTERVAL_MS;
     this.leaseMs = options.leaseMs ?? DEFAULT_SCANNER_LEASE_MS;
+    const heartbeatMs =
+      options.advisoryLockHeartbeatMs ?? Math.max(1_000, Math.floor(this.leaseMs / 4));
+    this.advisoryLockHeartbeatMs = Number.isFinite(heartbeatMs) ? Math.max(0, Math.floor(heartbeatMs)) : 0;
+    const orphanIdleMs = options.advisoryLockOrphanIdleMs ?? DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS;
+    this.advisoryLockOrphanIdleMs = Number.isFinite(orphanIdleMs)
+      ? Math.max(0, Math.floor(orphanIdleMs))
+      : DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS;
     this.runRetentionDays = clampRetentionDays(options.runRetentionDays);
     this.logger = options.logger ?? DEFAULT_LOGGER;
     this.redact = options.redact ?? ((text: string) => text);
@@ -683,32 +712,61 @@ export class ScannerService {
   private async triggerScanInternal(args: ScanTriggerArgs = {}): Promise<ScanRunResult> {
     const nowMs = args.nowMs ?? Date.now();
 
-    // Try advisory lock
+    // Try advisory lock (hardened: pid-recorded acquire, proven ownership,
+    // classified release — see db/advisory-lock.ts).
     const lockClient = await this.pool.connect();
     let destroyLockClient = false;
     try {
-      const lockRes = await lockClient.query<{ acquired: boolean }>(
-        `SELECT pg_try_advisory_lock($1) as acquired`,
-        [SCANNER_ADVISORY_LOCK_KEY],
-      );
-      const acquired = lockRes.rows[0]?.acquired ?? false;
-      if (!acquired) {
-        this.logger.info('scan skipped: already running', { lockKey: SCANNER_ADVISORY_LOCK_KEY });
+      const lockRes = await acquireSessionAdvisoryLock(lockClient, SCANNER_ADVISORY_LOCK_KEY, {
+        orphanIdleMs: this.advisoryLockOrphanIdleMs,
+        logger: this.logger,
+        label: 'scanner advisory lock',
+      });
+
+      if (!lockRes.acquired) {
+        // An acquire that could not be proven (query error, or a lock that is
+        // not visible on the acquiring backend — e.g. a transaction-mode
+        // connection pooler) must never be treated as ordinary contention:
+        // the session is evicted so it cannot retain an orphaned lock, and the
+        // cycle is reported as skipped rather than silently overlapping.
+        if (lockRes.mustDestroyClient) {
+          destroyLockClient = true;
+          this.logger.error('scanner advisory lock acquire failed', {
+            lockKey: SCANNER_ADVISORY_LOCK_KEY,
+            reason: lockRes.reason ?? 'not_owned',
+            ...(lockRes.code !== undefined ? { code: lockRes.code } : {}),
+            connectionDestroyed: true,
+          });
+          const lastRun = await this.lastRunOrNull();
+          if (lastRun) {
+            return { run: lastRun, skipped: true, reason: 'already_running' };
+          }
+          throw Errors.conflict('Scanner lock could not be acquired safely');
+        }
+
+        this.logger.info('scan skipped: already running', {
+          lockKey: SCANNER_ADVISORY_LOCK_KEY,
+          ...holderLogMeta(lockRes.holder ?? null),
+        });
         // Return last run info
-        const lastRunRes = await this.pool.query<ScannerRunRow>(
-          `SELECT * FROM scanner_runs ORDER BY started_at DESC LIMIT 1`,
-        );
-        const lastRun = lastRunRes.rows[0] ? toScannerRunDto(lastRunRes.rows[0]) : null;
+        const lastRun = await this.lastRunOrNull();
         if (lastRun) {
           return { run: lastRun, skipped: true, reason: 'already_running' };
         }
         throw Errors.conflict('Scanner is already running');
       }
 
+      const lock = lockRes.lock!;
+      const heartbeat = this.startAdvisoryLockHeartbeat(lock);
       try {
-        return await this.executeScan(args, nowMs);
+        return await this.executeScan(args, nowMs, heartbeat);
       } finally {
-        destroyLockClient = !(await this.releaseAdvisoryLock(lockClient));
+        heartbeat.stop();
+        const release = await lock.release();
+        if (!release.released) {
+          destroyLockClient = true;
+          this.logAdvisoryLockReleaseFailure(release);
+        }
       }
     } finally {
       if (destroyLockClient) {
@@ -722,54 +780,102 @@ export class ScannerService {
     }
   }
 
+  /** Most recent scanner run (operator-safe DTO), or null when none exists. */
+  private async lastRunOrNull(): Promise<ScannerRunDto | null> {
+    const lastRunRes = await this.pool.query<ScannerRunRow>(
+      `SELECT * FROM scanner_runs ORDER BY started_at DESC LIMIT 1`,
+    );
+    return lastRunRes.rows[0] ? toScannerRunDto(lastRunRes.rows[0]) : null;
+  }
+
   /**
-   * Release the session-level scanner advisory lock held by `lockClient`.
+   * Re-verify lock ownership while a scan runs.
    *
-   * `pg_try_advisory_lock` is session-scoped: if `pg_advisory_unlock` throws or
-   * reports `unlocked = false` and the client is returned to `pg.Pool` intact,
-   * the pooled backend session keeps holding `SCANNER_ADVISORY_LOCK_KEY` and
-   * silently blocks all future scans (M7 audit finding F5).
+   * A scan can hold the advisory lock for minutes while its lock session sits
+   * idle, so ownership must be re-proven rather than assumed: if the session
+   * that holds the lock disappears (server-side kill, idle timeout, pooler
+   * reassignment, or an operator terminating the backend) PostgreSQL drops the
+   * lock, and a *second* scan can then acquire it. Continuing here would mean
+   * two scans detecting the same setups concurrently. The heartbeat therefore
+   * flips `lost` and the scan aborts at the next strategy boundary.
    *
-   * Returns `true` when PostgreSQL confirms the lock was released, or `false`
-   * after logging safe diagnostics (no secrets, no tenant identifiers) so the
-   * caller destroys and evicts the pooled client instead of returning it to
-   * the pool.
+   * The timer is `unref`'d so it never keeps the process alive, and the check
+   * is serialized: a slow database cannot stack overlapping verifications.
    */
-  private async releaseAdvisoryLock(lockClient: pg.PoolClient): Promise<boolean> {
-    try {
-      const unlockRes = await lockClient.query<{ unlocked?: boolean; pg_advisory_unlock?: boolean }>(
-        `SELECT pg_advisory_unlock($1) as unlocked`,
-        [SCANNER_ADVISORY_LOCK_KEY],
-      );
-      const row = unlockRes?.rows?.[0];
-      const unlocked =
-        typeof row?.unlocked === 'boolean'
-          ? row.unlocked
-          : typeof row?.pg_advisory_unlock === 'boolean'
-            ? row.pg_advisory_unlock
-            : false;
-      if (!unlocked) {
-        this.logger.error('scanner advisory unlock failed', {
-          lockKey: SCANNER_ADVISORY_LOCK_KEY,
-          unlocked: false,
-          reason: 'unlock_returned_false',
-          connectionDestroyed: true,
-        });
-        return false;
-      }
-      return true;
-    } catch (err) {
-      const { error, code } = sanitizeScannerUnlockError(err);
-      this.logger.error('scanner advisory unlock failed', {
-        lockKey: SCANNER_ADVISORY_LOCK_KEY,
-        unlocked: false,
-        reason: 'query_error',
-        error,
-        ...(code !== undefined ? { code } : {}),
-        connectionDestroyed: true,
-      });
-      return false;
-    }
+  private startAdvisoryLockHeartbeat(lock: SessionAdvisoryLock): {
+    /** True once a heartbeat has proven the lock is no longer ours. */
+    isLost(): boolean;
+    stop(): void;
+  } {
+    const state = { lost: false };
+    const intervalMs = this.advisoryLockHeartbeatMs;
+    let inFlight = false;
+    const timer =
+      intervalMs > 0
+        ? setInterval(() => {
+            if (state.lost || inFlight) return;
+            inFlight = true;
+            void lock
+              .verify()
+              .then((check) => {
+                if (!check.owned) {
+                  state.lost = true;
+                  this.logger.error('scanner advisory lock lost while scanning', {
+                    lockKey: SCANNER_ADVISORY_LOCK_KEY,
+                    reason: check.reason ?? 'not_owned',
+                    ...(check.code !== undefined ? { code: check.code } : {}),
+                  });
+                }
+              })
+              .catch(() => {
+                state.lost = true;
+              })
+              .finally(() => {
+                inFlight = false;
+              });
+          }, intervalMs)
+        : null;
+    timer?.unref?.();
+    return {
+      // A method (not a readonly property) so TypeScript cannot narrow the
+      // result of an earlier check across later `await` boundaries — the flag
+      // genuinely can change while the scan runs.
+      isLost: () => state.lost,
+      stop() {
+        if (timer !== null) clearInterval(timer);
+      },
+    };
+  }
+
+  /**
+   * Log a non-clean advisory-lock release with a bounded machine-readable
+   * reason and, when readable, the session that holds the lock instead. No
+   * secrets, no connection string, no tenant identifiers.
+   */
+  private logAdvisoryLockReleaseFailure(release: AdvisoryLockRelease): void {
+    const reason =
+      release.reason === 'not_owned'
+        ? 'unlock_returned_false'
+        : release.reason === 'session_changed'
+          ? 'session_changed'
+          : 'query_error';
+    // A thrown unlock keeps its redacted message/SQLSTATE (M7 audit F5): the
+    // message is sanitized here, never logged raw.
+    const sanitized =
+      release.error !== undefined ? sanitizeScannerUnlockError(release.error) : undefined;
+    this.logger.error('scanner advisory unlock failed', {
+      lockKey: SCANNER_ADVISORY_LOCK_KEY,
+      unlocked: false,
+      reason,
+      ...(sanitized !== undefined ? { error: sanitized.error } : {}),
+      ...(sanitized?.code !== undefined
+        ? { code: sanitized.code }
+        : release.code !== undefined
+          ? { code: release.code }
+          : {}),
+      ...holderLogMeta(release.holder),
+      connectionDestroyed: true,
+    });
   }
 
   /**
@@ -867,7 +973,11 @@ export class ScannerService {
     };
   }
 
-  private async executeScan(args: ScanTriggerArgs, nowMs: number): Promise<ScanRunResult> {
+  private async executeScan(
+    args: ScanTriggerArgs,
+    nowMs: number,
+    lockGuard?: { isLost(): boolean },
+  ): Promise<ScanRunResult> {
     const provider = this.requireProvider();
     const runId = await this.createRun(provider.id, args);
 
@@ -899,6 +1009,10 @@ export class ScannerService {
     try {
       const eligibleStrategies = await this.getEligibleStrategies(args.strategyId, args.instruments);
 
+      if (lockGuard?.isLost() === true) {
+        throw Errors.conflict('Scanner advisory lock was lost; aborting this run');
+      }
+
       if (eligibleStrategies.length === 0) {
         this.logger.info('scan completed: no eligible strategies', { runId });
         await this.completeRun(runId, 'completed', metrics, null);
@@ -915,6 +1029,12 @@ export class ScannerService {
       const cycleCache: ScanCycleCache = new Map();
 
       for (const strategy of strategiesToScan) {
+        // Fail closed: if the advisory lock was lost while this run was in
+        // flight, another scan may already be executing. Continuing would
+        // duplicate detection/alert work under two "exclusive" runs.
+        if (lockGuard?.isLost() === true) {
+          throw Errors.conflict('Scanner advisory lock was lost; aborting this run');
+        }
         try {
           await this.scanStrategy(strategy, args, nowMs, metrics, cycleCache);
         } catch (err) {
@@ -929,6 +1049,13 @@ export class ScannerService {
           });
           finalStatus = 'partial';
         }
+      }
+
+      // Fail closed on ownership loss discovered by the last heartbeat: a run
+      // that believes it is exclusive but is not must not be recorded as a
+      // clean success.
+      if (lockGuard?.isLost() === true) {
+        throw Errors.conflict('Scanner advisory lock was lost; aborting this run');
       }
 
       if (metrics.providerFailures > 0 && metrics.setupsDetected === 0 && metrics.alertsCreated === 0) {

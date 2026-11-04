@@ -1,6 +1,22 @@
 // Database
 export { createPool, type DatabaseConfig } from './db/pool.js';
 export {
+  acquireSessionAdvisoryLock,
+  readAdvisoryLockHolder,
+  holderLogMeta,
+  SessionAdvisoryLock,
+  DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS,
+  advisoryLockErrorCode,
+  type AdvisoryLockAcquireResult,
+  type AdvisoryLockClient,
+  type AdvisoryLockHolder,
+  type AdvisoryLockLogger,
+  type AdvisoryLockOptions,
+  type AdvisoryLockRelease,
+  type AdvisoryLockReleaseReason,
+  type AdvisoryLockVerification,
+} from './db/advisory-lock.js';
+export {
   runMigrations,
   migrationStatus,
   listMigrationFiles,
@@ -82,8 +98,11 @@ export {
   type BackfillRequest as IngestionBackfillRequest,
   type CandleReadRequest,
 } from './market-data/ingestion.js';
+export { ProviderBudgetExhaustedError } from './market-data/request-budget.js';
 export {
   ScheduledIngestionService,
+  SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+  nextRotationOffset,
   isRateLimitedError,
   DEFAULT_SCHEDULED_TIMEFRAMES,
   DEFAULT_SCHEDULED_LOOKBACK_CANDLES,

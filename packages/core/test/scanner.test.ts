@@ -36,6 +36,7 @@ import {
   StubAlertSender,
   NotificationOutbox,
   ScannerService,
+  type ScannerServiceOptions,
   Errors,
   normalizeSymbol,
   normalizeTimeframe,
@@ -827,7 +828,10 @@ describe('F5: Advisory unlock reliability', () => {
     meta?: Record<string, unknown>;
   }
 
-  function createTrackedScanner(customPool: ReturnType<typeof createPool> = pool) {
+  function createTrackedScanner(
+    customPool: ReturnType<typeof createPool> = pool,
+    optionOverrides: Partial<ScannerServiceOptions> = {},
+  ) {
     const infoLogs: LoggedCall[] = [];
     const warnLogs: LoggedCall[] = [];
     const errorLogs: LoggedCall[] = [];
@@ -848,6 +852,7 @@ describe('F5: Advisory unlock reliability', () => {
         },
         maxRetries: 1,
         providerTimeoutMs: 100,
+        ...optionOverrides,
       },
     );
     return { svc, infoLogs, warnLogs, errorLogs };
@@ -1093,12 +1098,16 @@ describe('F5: Advisory unlock reliability', () => {
 
     const unlockErrors = errorLogs.filter((e) => e.message === 'scanner advisory unlock failed');
     assert.equal(unlockErrors.length, 1);
-    assert.deepEqual(unlockErrors[0]!.meta, {
-      lockKey: SCANNER_ADVISORY_LOCK_KEY,
-      unlocked: false,
-      reason: 'unlock_returned_false',
-      connectionDestroyed: true,
-    });
+    const meta = unlockErrors[0]!.meta ?? {};
+    assert.equal(meta.lockKey, SCANNER_ADVISORY_LOCK_KEY);
+    assert.equal(meta.unlocked, false);
+    assert.equal(meta.reason, 'unlock_returned_false');
+    assert.equal(meta.connectionDestroyed, true);
+    // The holder of the still-held lock is named, so a leaked lock is
+    // actionable instead of just alarming.
+    assert.equal(typeof meta.holderPid, 'number');
+    assert.equal(meta.holderSuspectedOrphaned, false, 'the holder is this live session');
+    assert.ok(!JSON.stringify(meta).includes(FAKE_DB_PASS));
     assert.ok(!JSON.stringify(unlockErrors[0]).includes(TENANT_USER_ID));
     assert.deepEqual(releaseArgs, [true]);
     assert.equal(await countGrantedScannerLocks(), 0, 'destroying connection must release the un-unlocked session lock');
@@ -1155,6 +1164,123 @@ describe('F5: Advisory unlock reliability', () => {
       await holder.query(`SELECT pg_advisory_unlock($1)`, [SCANNER_ADVISORY_LOCK_KEY]).catch(() => {});
       holder.release();
     }
+  });
+
+  test('contention names the holding backend so a stuck lock is actionable', async () => {
+    const holder = await pool.connect();
+    try {
+      await holder.query('SELECT pg_try_advisory_lock($1::bigint)', [SCANNER_ADVISORY_LOCK_KEY]);
+      const holderPid = (await holder.query<{ pid: number }>('SELECT pg_backend_pid()::int AS pid')).rows[0]?.pid;
+
+      const { svc, infoLogs, errorLogs } = createTrackedScanner();
+      const skipped = await svc.triggerScan({ force: true });
+
+      assert.equal(skipped.skipped, true);
+      assert.equal(skipped.reason, 'already_running');
+      assert.equal(errorLogs.length, 0, 'contention is not an error');
+      const skipLog = infoLogs.find((l) => l.message === 'scan skipped: already running');
+      assert.ok(skipLog, 'the skip is reported');
+      assert.equal(skipLog.meta?.holderPid, holderPid, 'the log names the session holding the lock');
+      assert.equal(skipLog.meta?.holderSuspectedOrphaned, false, 'a live holder is not reported as an orphan');
+    } finally {
+      await holder.query('SELECT pg_advisory_unlock($1::bigint)', [SCANNER_ADVISORY_LOCK_KEY]).catch(() => {});
+      holder.release();
+    }
+  });
+
+  test('an unprovable acquire evicts the session instead of leaking the lock into the pool', async () => {
+    const releaseArgs: (boolean | Error | undefined)[] = [];
+    let acquiringPid: number | null = null;
+    let provingAttempts = 0;
+    const proxyPool = wrapLockClientPool((client) => {
+      const origQuery = client.query.bind(client);
+      const origRelease = client.release.bind(client);
+      // Restore the real methods before the client returns to the pool: a
+      // patched `query` on a pooled session would corrupt later tests.
+      client.release = (err?: boolean | Error) => {
+        client.query = origQuery;
+        client.release = origRelease;
+        return origRelease(err);
+      };
+      client.query = async (text: unknown, values?: unknown) => {
+        // The acquire reports success, but the lock is not visible on the very
+        // backend that took it — the shape a pooler or a reset session produces.
+        if (typeof text === 'string' && text.includes('AS owned') && provingAttempts === 1) {
+          provingAttempts += 1;
+          return { rows: [{ pid: acquiringPid, owned: false }], rowCount: 1 };
+        }
+        const result = await origQuery(text, values);
+        if (typeof text === 'string' && text.includes('pg_try_advisory_lock')) {
+          acquiringPid = (result.rows[0] as { pid?: number } | undefined)?.pid ?? null;
+          provingAttempts += 1;
+        }
+        return result;
+      };
+      client.release = (err?: boolean | Error) => {
+        releaseArgs.push(err);
+        client.query = origQuery;
+        return origRelease(err);
+      };
+    });
+
+    const { svc, errorLogs } = createTrackedScanner(proxyPool);
+    const skipped = await svc.triggerScan({
+      force: true,
+      initiatedBy: TENANT_USER_ID,
+    });
+
+    assert.equal(skipped.skipped, true, 'an unprovable lock must never run a scan');
+    assert.deepEqual(releaseArgs, [true], 'the unproven session is destroyed, not pooled');
+    const acquireError = errorLogs.find((e) => e.message === 'scanner advisory lock acquire failed');
+    assert.ok(acquireError, 'the failure is loud');
+    assert.equal(acquireError.meta?.reason, 'not_owned');
+    assert.equal(acquireError.meta?.connectionDestroyed, true);
+
+    // No lock is left behind: the next scan runs normally.
+    const next = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
+    assert.equal(next.skipped, undefined, 'the next scan is not blocked');
+  });
+
+  test('losing lock ownership mid-scan aborts the run (fail closed) instead of scanning unguarded', async () => {
+    let verifyCalls = 0;
+    let delayedRunInsert = false;
+    const proxyPool = wrapLockClientPool((client) => {
+      const origQuery = client.query.bind(client);
+      const origRelease = client.release.bind(client);
+      client.release = (err?: boolean | Error) => {
+        client.query = origQuery;
+        client.release = origRelease;
+        return origRelease(err);
+      };
+      client.query = async (text: unknown, values?: unknown) => {
+        if (typeof text === 'string' && text.includes('AS owned')) {
+          verifyCalls += 1;
+          // The acquire-time proof succeeds; every heartbeat afterwards reports
+          // that the session no longer owns the lock (killed backend, pooler
+          // rotation, server-side reset).
+          if (verifyCalls > 1) return { rows: [{ pid: 1, owned: false }], rowCount: 1 };
+        }
+        // Hold the scan open past the first heartbeat so the loss is observed
+        // deterministically rather than racing the timer.
+        if (!delayedRunInsert && typeof text === 'string' && text.includes('INSERT INTO scanner_runs')) {
+          delayedRunInsert = true;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        return origQuery(text, values as unknown[]);
+      };
+    });
+
+    const { svc, errorLogs } = createTrackedScanner(proxyPool, { advisoryLockHeartbeatMs: 1 });
+    const result = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
+
+    assert.ok(result.run, 'the aborted run is still recorded');
+    assert.equal(result.run.status, 'failed', 'the run fails closed');
+    assert.match(String(result.run.error ?? ''), /lock/i, 'the recorded reason points at the lock');
+    assert.ok(
+      errorLogs.some((e) => e.message === 'scanner advisory lock lost while scanning'),
+      'losing the lock is an error-level event',
+    );
+    assert.ok(verifyCalls > 1, 'ownership was re-verified during the scan');
   });
 });
 

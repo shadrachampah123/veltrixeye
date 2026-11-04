@@ -25,6 +25,8 @@ import {
   CandleStore,
   IngestionService,
   ScheduledIngestionService,
+  SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+  nextRotationOffset,
   isRateLimitedError,
   Errors,
 } from '../src/index.js';
@@ -59,6 +61,10 @@ class MockProvider implements MarketDataProvider {
   public beforeFetch: (() => Promise<void>) | null = null;
   /** When set, every fetch fails with this provider failure kind (tests). */
   public failKind: ProviderFailureKind | null = null;
+  /** Symbols whose fetches fail with `failKind` while others succeed (tests). */
+  public failForSymbols: Set<string> | null = null;
+  /** Every (symbol, timeframe) actually fetched, in request order (tests). */
+  public requestedPairs: { symbol: string; timeframe: Timeframe }[] = [];
 
   async getSymbols() {
     return [];
@@ -75,8 +81,13 @@ class MockProvider implements MarketDataProvider {
       assetClass: req.instrument.assetClass,
       symbol: req.instrument.symbol,
     });
+    this.requestedPairs.push({ symbol: req.instrument.symbol, timeframe: req.timeframe });
     await this.beforeFetch?.();
-    if (this.failKind) throw new ProviderError(this.failKind, 'mock provider failure');
+    if (this.failKind) {
+      if (this.failForSymbols === null || this.failForSymbols.has(req.instrument.symbol)) {
+        throw new ProviderError(this.failKind, 'mock provider failure');
+      }
+    }
     const periodMs = getTimeframeMs(req.timeframe);
     const candles: Candle[] = [];
     const start = Math.ceil(req.from / periodMs) * periodMs;
@@ -471,8 +482,9 @@ describe('ScheduledIngestionService', () => {
     assert.ok(result.candlesUpserted > 0);
   });
 
-  test('warmCache stops at the configured provider-request budget', async () => {
+  test('a spent provider-request budget defers the remaining pairs instead of failing them', async () => {
     await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
     const budgeted = new ScheduledIngestionService(pool, ingestion, {
       lookbackCandles: 10,
       maxRequestsPerCycle: 2,
@@ -480,14 +492,35 @@ describe('ScheduledIngestionService', () => {
     });
     const fetchCountBefore = mockProvider.fetchCount;
 
+    // 2 instruments x 2 timeframes = 4 pairs, 1 request each on a cold cache.
     const result = await budgeted.warmCache({
       timeframes: ['1h', '4h'],
       nowMs: Date.now(),
     });
 
-    assert.equal(result.providerRequests, 2);
-    assert.equal(mockProvider.fetchCount, fetchCountBefore + 2);
-    assert.equal(result.abortedDueToRateLimit, true);
+    assert.equal(result.providerRequests, 2, 'no request beyond the budget');
+    assert.equal(mockProvider.fetchCount, fetchCountBefore + 2, 'no duplicate provider requests');
+    assert.equal(result.budgetExhausted, true, 'the budget stop is reported explicitly');
+    assert.equal(
+      result.abortedDueToRateLimit,
+      false,
+      'a planned budget stop must not be reported as a provider rate limit',
+    );
+    assert.equal(result.pairsFailed, 0, 'deferred pairs were never attempted, so none failed');
+    assert.equal(result.pairsDeferred, 2, 'the untried pairs are counted as deferred');
+    assert.equal(result.pairsCompleted, 2);
+
+    // The run row must not claim an ingestion failure: the old behaviour wrote
+    // "N of M pairs failed (cycle stopped early: … request budget exhausted)",
+    // which is what made the same symbol/timeframe look like a chronic failure.
+    const run = await pool.query<{ status: string; error: string | null; request: Record<string, unknown> }>(
+      `SELECT status, error, request FROM ingestion_runs WHERE trigger = 'scheduled'`,
+    );
+    assert.equal(run.rows[0]?.status, 'completed');
+    assert.equal(run.rows[0]?.error, null, 'budget exhaustion is not an ingestion error');
+    assert.equal(run.rows[0]?.request.budgetExhausted, true);
+    assert.equal(run.rows[0]?.request.pairsDeferred, 2);
+    assert.equal(typeof run.rows[0]?.request.rotationOffset, 'number');
   });
 
   test('warmCache counts both provider ranges needed by one pair', async () => {
@@ -533,7 +566,14 @@ describe('ScheduledIngestionService', () => {
 
     assert.equal(result.providerRequests, 2);
     assert.equal(mockProvider.fetchCount, fetchCountBefore + 2);
-    assert.equal(result.abortedDueToRateLimit, true);
+    assert.equal(result.budgetExhausted, true);
+    assert.equal(result.abortedDueToRateLimit, false);
+    assert.equal(result.pairsDeferred, 1, 'the untried pair is deferred, never attempted');
+    assert.equal(
+      result.pairsCompleted + result.pairsFailed + result.pairsDeferred,
+      2,
+      'every pair is accounted for exactly once (completed, failed or deferred)',
+    );
   });
 
   test('cached pairs consume no provider-request budget', async () => {
@@ -791,20 +831,28 @@ describe('ScheduledIngestionService', () => {
     await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
     const cooldownScheduled = new ScheduledIngestionService(pool, ingestion, {
       lookbackCandles: 10,
-      maxRequestsPerCycle: 2,
+      maxRequestsPerCycle: 8,
       minIntervalMs: 900_000,
     });
 
-    // Two pairs warm, then the third runs into the provider-request budget:
-    // the cycle is recorded 'partial', not 'completed'.
-    const partial = await cooldownScheduled.warmCache({ timeframes: ['1h', '4h'], nowMs: Date.now() });
-    assert.equal(partial.abortedDueToRateLimit, true);
-    assert.ok(partial.pairsCompleted > 0);
-    assert.ok(partial.pairsFailed > 0);
-    const runRes = await pool.query<{ status: string }>(
-      `SELECT status FROM ingestion_runs WHERE trigger = 'scheduled'`,
-    );
-    assert.equal(runRes.rows[0]?.status, 'partial');
+    // One instrument fails at the provider while the other warms: the cycle is
+    // recorded 'partial' (a real failure), not 'completed'.
+    mockProvider.failKind = 'unavailable';
+    mockProvider.failForSymbols = new Set(['EURUSD']);
+    try {
+      const partial = await cooldownScheduled.warmCache({ timeframes: ['1h', '4h'], nowMs: Date.now() });
+      assert.equal(partial.abortedDueToRateLimit, false, 'a non-rate-limit failure keeps cycling');
+      assert.equal(partial.budgetExhausted, false);
+      assert.ok(partial.pairsCompleted > 0);
+      assert.ok(partial.pairsFailed > 0);
+      const runRes = await pool.query<{ status: string }>(
+        `SELECT status FROM ingestion_runs WHERE trigger = 'scheduled'`,
+      );
+      assert.equal(runRes.rows[0]?.status, 'partial');
+    } finally {
+      mockProvider.failKind = null;
+      mockProvider.failForSymbols = null;
+    }
 
     const lastAttemptAtMs = await cooldownScheduled.lastScheduledRunAttemptAtMs();
     assert.ok(lastAttemptAtMs !== null);
@@ -976,8 +1024,11 @@ describe('ScheduledIngestionService', () => {
     const failingPool = {
       connect: async () => ({
         query: async (sql: string) => {
-          if (sql.includes('pg_try_advisory_lock')) return { rows: [{ acquired: true }] };
-          if (sql.includes('pg_advisory_unlock')) return { rows: [{ unlocked: true }] };
+          if (sql.includes('pg_try_advisory_lock')) return { rows: [{ pid: 42, acquired: true }] };
+          if (sql.includes('FROM pg_locks') && sql.includes('AS owned')) {
+            return { rows: [{ pid: 42, owned: true }] };
+          }
+          if (sql.includes('pg_advisory_unlock')) return { rows: [{ pid: 42, unlocked: true }] };
           queryCount++;
           throw new Error('database unavailable');
         },
@@ -996,6 +1047,198 @@ describe('ScheduledIngestionService', () => {
     assert.equal(result.skippedDueToMinInterval, true);
     assert.equal(result.providerRequests, 0);
     assert.equal(queryCount, 1);
+  });
+});
+
+describe('scheduled ingestion — lock ownership, fairness and budget (regression)', () => {
+  type LogEntry = { level: 'info' | 'warn' | 'error'; message: string; meta?: Record<string, unknown> };
+
+  function captureLogger(): { logger: { info: (m: string, meta?: Record<string, unknown>) => void; warn: (m: string, meta?: Record<string, unknown>) => void; error: (m: string, meta?: Record<string, unknown>) => void }; entries: LogEntry[] } {
+    const entries: LogEntry[] = [];
+    return {
+      entries,
+      logger: {
+        info: (message, meta) => entries.push({ level: 'info', message, meta }),
+        warn: (message, meta) => entries.push({ level: 'warn', message, meta }),
+        error: (message, meta) => entries.push({ level: 'error', message, meta }),
+      },
+    };
+  }
+
+  function wrapLockClientPool(transform: (client: any) => void): typeof pool {
+    const origConnect = pool.connect.bind(pool);
+    return Object.create(pool, {
+      connect: {
+        value: () => origConnect().then((client: any) => {
+          transform(client);
+          return client;
+        }),
+      },
+    }) as typeof pool;
+  }
+
+  test('the pair order rotates, so a small budget cannot starve the tail of the universe', async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const rotating = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      maxRequestsPerCycle: 1,
+      minIntervalMs: 0,
+    });
+
+    const warmed = new Set<string>();
+    for (let cycle = 0; cycle < 4; cycle += 1) {
+      mockProvider.requestedPairs = [];
+      const result = await rotating.warmCache({
+        timeframes: ['1h', '4h'],
+        nowMs: Date.now() + cycle * 6 * 3_600_000,
+      });
+      assert.equal(result.budgetExhausted, true, 'each cycle spends exactly its one-request budget');
+      assert.equal(result.providerRequests, 1);
+      for (const pair of mockProvider.requestedPairs) {
+        warmed.add(`${pair.symbol}/${pair.timeframe}`);
+      }
+    }
+
+    // Fixed-order iteration used to re-warm the head forever; with rotation all
+    // four pairs are reached within four one-request cycles.
+    for (const expected of ['XAUUSD/1h', 'XAUUSD/4h', 'EURUSD/1h', 'EURUSD/4h']) {
+      assert.ok(warmed.has(expected), `${expected} must be warmed within budget cycles`);
+    }
+  });
+
+  test('nextRotationOffset walks the list, wraps, and normalises bad input', () => {
+    assert.equal(nextRotationOffset(0, 8, 5), 3, 'advance wraps modulo the pair count');
+    assert.equal(nextRotationOffset(3, 1, 4), 0);
+    assert.equal(nextRotationOffset(0, 0, 4), 1, 'a zero budget still advances by one');
+    assert.equal(nextRotationOffset(99, 8, 4), 3, 'an out-of-range cursor is normalised');
+    assert.equal(nextRotationOffset(-5, 2, 4), 1);
+    assert.equal(nextRotationOffset(Number.NaN, 2, 4), 2);
+    assert.equal(nextRotationOffset(1, 2, 0), 0, 'an empty universe stays at zero');
+  });
+
+  test('a held (stale) warm-cycle lock skips the cycle, is reported, and recovers when released', async () => {
+    await pool.query('DELETE FROM candles');
+    const { logger, entries } = captureLogger();
+    const observed = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      minIntervalMs: 0,
+      logger,
+      advisoryLockOrphanIdleMs: 0,
+    });
+
+    const holder = await pool.connect();
+    try {
+      const acquired = await holder.query<{ acquired: boolean }>(
+        'SELECT pg_try_advisory_lock($1::bigint) AS acquired',
+        [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY],
+      );
+      assert.equal(acquired.rows[0]?.acquired, true);
+
+      const skipped = await observed.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+      assert.equal(skipped.providerRequests, 0, 'no provider credit is spent while the lock is held');
+      assert.equal(skipped.skippedDueToMinInterval, false, 'this was lock contention, not the cooldown');
+
+      const skipLog = entries.find((e) => e.message.includes('warm-cycle lock is already held'));
+      assert.ok(skipLog, 'the contention is reported');
+      assert.equal(typeof skipLog.meta?.holderPid, 'number', 'the operator gets the holder pid');
+      assert.equal(skipLog.meta?.holderState, 'idle');
+      assert.equal(
+        skipLog.meta?.holderSuspectedOrphaned,
+        true,
+        'an idle holder past the threshold is flagged as a suspected orphan',
+      );
+    } finally {
+      await holder.query('SELECT pg_advisory_unlock($1::bigint)', [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY]);
+      holder.release();
+    }
+
+    // Recovery: once the lock is free the next cycle runs normally.
+    const recovered = await observed.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+    assert.equal(
+      recovered.providerRequests > 0 || recovered.pairsAlreadyCached > 0,
+      true,
+      'the cycle executes again after the holder releases',
+    );
+  });
+
+  test('a failed lock acquire evicts the session instead of pooling it', async () => {
+    const releases: (boolean | Error | undefined)[] = [];
+    const { logger, entries } = captureLogger();
+    const failingPool = {
+      connect: async () => ({
+        query: async (sql: string) => {
+          if (sql.includes('pg_try_advisory_lock')) {
+            // A connection that failed *after* the statement may have been
+            // applied server-side: the session must not be reused.
+            throw Object.assign(new Error('server closed the connection unexpectedly'), { code: '57P01' });
+          }
+          return { rows: [] };
+        },
+        release: (err?: boolean | Error) => releases.push(err),
+      }),
+      query: async () => ({ rows: [] }),
+    } as unknown as typeof pool;
+
+    const svc = new ScheduledIngestionService(failingPool, ingestion, { lookbackCandles: 10, logger });
+    const result = await svc.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+
+    assert.equal(result.providerRequests, 0);
+    assert.deepEqual(releases, [true], 'the unproven session is destroyed, not returned to the pool');
+    const failure = entries.find((e) => e.message.includes('failed to acquire warm-cycle lock'));
+    assert.ok(failure);
+    assert.equal(failure.meta?.reason, 'query_error');
+    assert.equal(failure.meta?.code, '57P01');
+    assert.equal(failure.meta?.connectionDestroyed, true);
+  });
+
+  test('a failed lock release evicts the session and logs a bounded reason', async () => {
+    await pool.query('DELETE FROM candles');
+    const releases: (boolean | Error | undefined)[] = [];
+    const { logger, entries } = captureLogger();
+    let failNextUnlock = true;
+
+    const proxyPool = wrapLockClientPool((client) => {
+      const origQuery = client.query.bind(client);
+      const origRelease = client.release.bind(client);
+      client.query = async (text: unknown, values?: unknown) => {
+        if (failNextUnlock && typeof text === 'string' && text.includes('pg_advisory_unlock')) {
+          failNextUnlock = false;
+          // Report `false` while the backend still holds the lock: only session
+          // teardown can clear it, so the client must be destroyed.
+          return { rows: [{ unlocked: false }], rowCount: 1 };
+        }
+        return origQuery(text, values);
+      };
+      client.release = (err?: boolean | Error) => {
+        releases.push(err);
+        client.query = origQuery;
+        return origRelease(err);
+      };
+    });
+
+    const svc = new ScheduledIngestionService(proxyPool, ingestion, {
+      lookbackCandles: 10,
+      minIntervalMs: 0,
+      logger,
+    });
+    await svc.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+
+    const unlockError = entries.find((e) => e.message.includes('warm-cycle advisory unlock failed'));
+    assert.ok(unlockError, 'a failed release is never silently swallowed');
+    assert.equal(unlockError.meta?.unlocked, false);
+    assert.equal(unlockError.meta?.reason, 'unlock_returned_false');
+    assert.equal(unlockError.meta?.connectionDestroyed, true);
+    assert.equal(typeof unlockError.meta?.holderPid, 'number', 'the current holder is reported');
+    assert.equal(releases.includes(true), true, 'the session is evicted');
+
+    const locks = await pool.query<{ cnt: number }>(
+      `SELECT count(*)::int AS cnt FROM pg_locks
+        WHERE locktype = 'advisory' AND granted = true
+          AND ((classid::bigint << 32) | objid::bigint) = $1::bigint`,
+      [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY],
+    );
+    assert.equal(locks.rows[0]?.cnt, 0, 'destroying the session clears the leaked lock');
   });
 });
 

@@ -7,7 +7,14 @@ import {
   timeframeMinutes,
   retentionCutoffMs,
 } from '@veltrixeye/contracts';
-import { Errors, isDomainError } from '../errors.js';
+import { isDomainError } from '../errors.js';
+import { ProviderBudgetExhaustedError } from './request-budget.js';
+import {
+  acquireSessionAdvisoryLock,
+  DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS,
+  holderLogMeta,
+  type AdvisoryLockRelease,
+} from '../db/advisory-lock.js';
 import type { MarketDataQueryable } from './candles.js';
 import type { IngestionService } from './ingestion.js';
 
@@ -73,19 +80,40 @@ export interface ScheduledIngestionResult {
   /** True when the minimum-interval guard skipped the cycle, including fail-closed state-read errors. */
   skippedDueToMinInterval: boolean;
   /**
-   * True when the cycle stopped early because of a provider rate limit or the
-   * scheduled provider-request budget — remaining pairs were not attempted.
+   * True when the cycle stopped early because the *provider* reported a rate
+   * limit — remaining pairs were not attempted and the cooldown applies.
+   *
+   * A spent per-cycle request budget is NOT a rate limit: it is a planned
+   * deferral, reported through {@link budgetExhausted} / {@link pairsDeferred}.
    */
   abortedDueToRateLimit: boolean;
+  /**
+   * True when the cycle stopped early because the configured per-cycle
+   * provider-request budget was spent. The remaining pairs stay cached-as-was
+   * and are attempted first on a later cycle (the pair order rotates), so a
+   * fixed slice of the universe can never starve.
+   */
+  budgetExhausted: boolean;
+  /**
+   * Pairs not attempted by this cycle because the request budget was spent.
+   * They are deferred, not failed: nothing about them is known to be broken.
+   */
+  pairsDeferred: number;
+  /** Index into the rotated pair order this cycle started at (fairness cursor). */
+  rotationOffset: number;
 }
 
 /**
- * True when a pair should stop the scheduled cycle: for a provider rate limit
- * or the scheduled provider-request budget. `IngestionService` maps provider
- * failures to domain errors, so the usual provider-limit shape is a
- * `DomainError` with code `rate_limited`; the raw `ProviderError` and a bare
- * HTTP 429 are also recognized. Everything else (unknown instrument, provider
- * unavailable, network blip, …) remains an ordinary per-pair failure.
+ * True when a pair should stop the scheduled cycle because the *provider*
+ * reported a rate limit. `IngestionService` maps provider failures to domain
+ * errors, so the usual provider-limit shape is a `DomainError` with code
+ * `rate_limited`; the raw `ProviderError` and a bare HTTP 429 are also
+ * recognized. Everything else (unknown instrument, provider unavailable,
+ * network blip, …) remains an ordinary per-pair failure.
+ *
+ * A spent per-cycle request budget is deliberately NOT this condition: it is a
+ * planned deferral (`budgetExhausted` / `pairsDeferred`), not a provider
+ * refusal, and it must not start the cooldown or mark the cycle aborted.
  */
 export function isRateLimitedError(err: unknown): boolean {
   if (isDomainError(err)) return err.code === ERROR_CODES.RATE_LIMITED;
@@ -117,10 +145,35 @@ export const DEFAULT_SCHEDULED_MAX_REQUESTS_PER_CYCLE = 8;
 export const DEFAULT_SCHEDULED_MIN_INTERVAL_MS = 900_000;
 
 /** Dedicated database advisory lock for one scheduled-ingestion warm cycle. */
-const SCHEDULED_INGESTION_ADVISORY_LOCK_KEY = 875_421_010;
+export const SCHEDULED_INGESTION_ADVISORY_LOCK_KEY = 875_421_010;
 
 /** Max instruments the scheduled ingestion will process per cycle. */
 export const MAX_SCHEDULED_INSTRUMENTS = 50;
+
+/**
+ * Advance the persisted fairness cursor for the next warm cycle.
+ *
+ * The cursor walks the flat instrument × timeframe pair list by one budget's
+ * worth of pairs per cycle, wrapping at the end. With `maxRequestsPerCycle`
+ * requests per cycle and `totalPairs` pairs, every pair is reached within
+ * `ceil(totalPairs / budget)` cycles — no pair can starve, whatever the
+ * universe ordering happens to be.
+ *
+ * Deterministic and total: out-of-range, negative and non-finite inputs are
+ * normalised, so a stale cursor from a larger universe (or an edited config)
+ * can never index outside the list.
+ */
+export function nextRotationOffset(
+  previousOffset: number,
+  budget: number,
+  totalPairs: number,
+): number {
+  if (!Number.isFinite(totalPairs) || totalPairs <= 0) return 0;
+  const size = Math.max(0, Math.floor(totalPairs));
+  const advance = Number.isFinite(budget) ? Math.max(1, Math.floor(budget)) : 1;
+  const previous = Number.isFinite(previousOffset) ? Math.floor(previousOffset) : 0;
+  return (((previous + advance) % size) + size) % size;
+}
 
 export interface ScheduledIngestionLogger {
   info(message: string, meta?: Record<string, unknown>): void;
@@ -139,6 +192,7 @@ export class ScheduledIngestionService {
   private readonly maxRequestsPerCycle: number;
   private readonly minIntervalMs: number;
   private readonly logger: ScheduledIngestionLogger;
+  private readonly advisoryLockOrphanIdleMs: number;
 
   constructor(
     private readonly pool: pg.Pool,
@@ -148,6 +202,12 @@ export class ScheduledIngestionService {
       maxRequestsPerCycle?: number;
       minIntervalMs?: number;
       logger?: ScheduledIngestionLogger;
+      /**
+       * Idle age (ms) at which the session holding the warm-cycle lock is
+       * reported as *suspected orphaned* when a cycle cannot acquire it.
+       * Diagnostic only — nothing is terminated automatically.
+       */
+      advisoryLockOrphanIdleMs?: number;
     },
   ) {
     this.lookbackCandles = Math.max(
@@ -163,6 +223,10 @@ export class ScheduledIngestionService {
       ? Math.max(0, Math.floor(minIntervalMs))
       : DEFAULT_SCHEDULED_MIN_INTERVAL_MS;
     this.logger = options?.logger ?? NOOP_LOGGER;
+    const orphanIdleMs = options?.advisoryLockOrphanIdleMs ?? DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS;
+    this.advisoryLockOrphanIdleMs = Number.isFinite(orphanIdleMs)
+      ? Math.max(0, Math.floor(orphanIdleMs))
+      : DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS;
   }
 
   /**
@@ -197,6 +261,44 @@ export class ScheduledIngestionService {
   }
 
   /**
+   * Prior scheduled attempt (for the cooldown) together with the fairness
+   * cursor it recorded, in one read. A row written before the cursor existed
+   * (or with a non-numeric value) yields offset 0; `nextRotationOffset`
+   * normalises it against the current pair count.
+   */
+  private async lastScheduledRunState(
+    queryable: MarketDataQueryable = this.pool,
+  ): Promise<{ attemptedAtMs: number | null; rotationOffset: number }> {
+    const res = await queryable.query<{ attempted_at: Date | string | null; rotation_offset: unknown }>(
+      `SELECT COALESCE(finished_at, started_at) AS attempted_at,
+              CASE
+                WHEN jsonb_typeof(request) = 'object' AND (request ->> 'rotationOffset') ~ '^[0-9]{1,9}$'
+                  THEN (request ->> 'rotationOffset')::int
+                ELSE 0
+              END AS rotation_offset
+         FROM ingestion_runs
+        WHERE trigger = 'scheduled'
+        ORDER BY COALESCE(finished_at, started_at) DESC
+        LIMIT 1`,
+    );
+    const row = res.rows[0];
+    if (!row) return { attemptedAtMs: null, rotationOffset: 0 };
+    const attemptedAt = row.attempted_at;
+    const attemptedAtMs =
+      attemptedAt == null
+        ? null
+        : attemptedAt instanceof Date
+          ? attemptedAt.getTime()
+          : Date.parse(attemptedAt);
+    if (attemptedAtMs !== null && !Number.isFinite(attemptedAtMs)) {
+      throw new Error('Most recent scheduled ingestion attempt has an invalid timestamp.');
+    }
+    const raw = row.rotation_offset;
+    const parsed = typeof raw === 'number' ? raw : Number(raw);
+    return { attemptedAtMs, rotationOffset: Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0 };
+  }
+
+  /**
    * Warm the candle cache for the active instrument universe.
    *
    * Safe to call even when no provider is registered — all pairs will fail
@@ -226,72 +328,74 @@ export class ScheduledIngestionService {
       return this.skippedResult(startedAt, false);
     }
 
-    let lockAcquired = false;
     let destroyLockClient = false;
+    let lock: Awaited<ReturnType<typeof acquireSessionAdvisoryLock>>['lock'] = null;
     try {
-      let lockRes;
-      try {
-        lockRes = await lockClient.query<{ acquired: boolean }>(
-          'SELECT pg_try_advisory_lock($1) AS acquired',
-          [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY],
-        );
-      } catch (err) {
-        // The server may have acquired the lock before the connection failed;
-        // evict this session so it cannot retain an orphaned advisory lock.
-        destroyLockClient = true;
-        this.logger.error('scheduled ingestion: failed to acquire warm-cycle lock; skipping cycle', {
-          lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
-          error: err instanceof Error ? err.message : 'unknown',
-        });
-        return this.skippedResult(startedAt, false);
-      }
+      const lockRes = await acquireSessionAdvisoryLock(lockClient, SCHEDULED_INGESTION_ADVISORY_LOCK_KEY, {
+        orphanIdleMs: this.advisoryLockOrphanIdleMs,
+        logger: this.logger,
+        label: 'scheduled ingestion warm-cycle lock',
+      });
 
-      lockAcquired = lockRes.rows[0]?.acquired ?? false;
-      if (!lockAcquired) {
+      if (!lockRes.acquired) {
+        if (lockRes.mustDestroyClient) {
+          // The server may hold the lock on a session this client can no
+          // longer address (failed/misdirected acquire). Evict the session so
+          // it cannot retain an orphaned lock that would skip every cycle.
+          destroyLockClient = true;
+          this.logger.error('scheduled ingestion: failed to acquire warm-cycle lock; skipping cycle', {
+            lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+            reason: lockRes.reason ?? 'not_owned',
+            ...(lockRes.code !== undefined ? { code: lockRes.code } : {}),
+            connectionDestroyed: true,
+          });
+          return this.skippedResult(startedAt, false);
+        }
         this.logger.info('scheduled ingestion: warm-cycle lock is already held; skipping cycle', {
           lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+          ...holderLogMeta(lockRes.holder ?? null),
         });
         return this.skippedResult(startedAt, false);
       }
 
+      lock = lockRes.lock;
       // Keep the session-scoped lock held through the interval check, warming,
       // and the final ingestion_runs write.
       return await this.warmCacheLocked(args, lockClient);
     } finally {
       try {
-        if (lockAcquired) {
-          try {
-            const unlockRes = await lockClient.query<{
-              unlocked?: boolean;
-              pg_advisory_unlock?: boolean;
-            }>('SELECT pg_advisory_unlock($1) AS unlocked', [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY]);
-            const row = unlockRes?.rows?.[0];
-            const unlocked =
-              typeof row?.unlocked === 'boolean'
-                ? row.unlocked
-                : typeof row?.pg_advisory_unlock === 'boolean'
-                  ? row.pg_advisory_unlock
-                  : false;
-            if (!unlocked) {
-              destroyLockClient = true;
-              this.logger.error('scheduled ingestion: warm-cycle advisory unlock failed', {
-                lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
-                reason: 'unlock_returned_false',
-              });
-            }
-          } catch (err) {
+        if (lock !== null) {
+          const release = await lock.release();
+          if (!release.released) {
             destroyLockClient = true;
-            this.logger.error('scheduled ingestion: warm-cycle advisory unlock failed', {
-              lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
-              reason: 'query_error',
-              error: err instanceof Error ? err.message : 'unknown',
-            });
+            this.logWarmCycleReleaseFailure(release);
           }
         }
       } finally {
         lockClient.release(destroyLockClient || undefined);
       }
     }
+  }
+
+  /**
+   * Log a non-clean warm-cycle lock release with a bounded machine-readable
+   * reason and the (readable) holder session. No secrets, no tenant data.
+   */
+  private logWarmCycleReleaseFailure(release: AdvisoryLockRelease): void {
+    const reason =
+      release.reason === 'not_owned'
+        ? 'unlock_returned_false'
+        : release.reason === 'session_changed'
+          ? 'session_changed'
+          : 'query_error';
+    this.logger.error('scheduled ingestion: warm-cycle advisory unlock failed', {
+      lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+      unlocked: false,
+      reason,
+      ...(release.code !== undefined ? { code: release.code } : {}),
+      ...holderLogMeta(release.holder),
+      connectionDestroyed: true,
+    });
   }
 
   private async warmCacheLocked(
@@ -305,8 +409,11 @@ export class ScheduledIngestionService {
     const startedAt = new Date(nowMs).toISOString();
 
     let lastAttemptAtMs: number | null;
+    let previousRotationOffset = 0;
     try {
-      lastAttemptAtMs = await this.lastScheduledRunAttemptAtMs(lockClient);
+      const prior = await this.lastScheduledRunState(lockClient);
+      lastAttemptAtMs = prior.attemptedAtMs;
+      previousRotationOffset = prior.rotationOffset;
     } catch (err) {
       this.logger.error('scheduled ingestion: failed to read prior run state; skipping cycle', {
         error: err instanceof Error ? err.message : 'unknown',
@@ -345,6 +452,9 @@ export class ScheduledIngestionService {
         pairsAlreadyCached: 0,
         skippedDueToMinInterval: false,
         abortedDueToRateLimit: false,
+        budgetExhausted: false,
+        pairsDeferred: 0,
+        rotationOffset: 0,
       };
     }
 
@@ -362,49 +472,85 @@ export class ScheduledIngestionService {
     let providerRequests = 0;
     let pairsAlreadyCached = 0;
     let abortedDueToRateLimit = false;
+    let budgetExhausted = false;
+    let pairsDeferred = 0;
+
+    // One flat, deterministic pair order (instrument × timeframe), rotated by a
+    // persisted cursor. Previously this was a fixed nested loop, so whenever the
+    // per-cycle budget ran out mid-way the SAME trailing pairs were the ones
+    // never attempted (a chronic `BTCUSD 1d` warm failure in production) while
+    // the head of the list was re-warmed every cycle.
+    const pairs: { inst: { assetClass: AssetClass; symbol: string }; tf: Timeframe }[] = [];
+    for (const inst of instruments) {
+      for (const tf of timeframes) pairs.push({ inst, tf });
+    }
+    const totalPairs = pairs.length;
+    const rotationOffset = nextRotationOffset(previousRotationOffset, this.maxRequestsPerCycle, totalPairs);
 
     const beforeProviderRequest = (): void => {
       if (providerRequests >= this.maxRequestsPerCycle) {
-        throw Errors.rateLimited('Scheduled ingestion provider request budget exhausted.');
+        // Planned stop, not an error: the remaining pairs are deferred to a
+        // later cycle, where the rotation makes them the head of the order.
+        throw new ProviderBudgetExhaustedError(this.maxRequestsPerCycle);
       }
       providerRequests++;
     };
 
-    for (const inst of instruments) {
-      for (const tf of timeframes) {
-        try {
-          const result = await this.warmPair(inst, tf, nowMs, beforeProviderRequest, lockClient);
-          candlesUpserted += result.candlesUpserted;
-          if (result.fetchedFromProvider) {
-            pairsCompleted++;
-          } else {
-            pairsAlreadyCached++;
-            pairsCompleted++;
-          }
-        } catch (err) {
-          pairsFailed++;
-          const rateLimited = isRateLimitedError(err);
-          this.logger.warn(
-            rateLimited
-              ? 'scheduled ingestion: provider rate limit or request budget reached — stopping warm cycle'
-              : 'scheduled ingestion: pair failed',
-            {
-              assetClass: inst.assetClass,
-              symbol: inst.symbol,
-              timeframe: tf,
-              error: err instanceof Error ? err.message : 'unknown',
-            },
-          );
-          // Provider rate limits and an exhausted request budget both stop the
-          // cycle here; any other failure stays per-pair and the cycle continues.
-          if (rateLimited) {
-            abortedDueToRateLimit = true;
-            break;
-          }
+    for (let i = 0; i < totalPairs; i += 1) {
+      const pair = pairs[(rotationOffset + i) % totalPairs]!;
+      const inst = pair.inst;
+      const tf = pair.tf;
+      try {
+        const result = await this.warmPair(inst, tf, nowMs, beforeProviderRequest, lockClient);
+        candlesUpserted += result.candlesUpserted;
+        pairsCompleted += 1;
+        if (!result.fetchedFromProvider) pairsAlreadyCached += 1;
+      } catch (err) {
+        if (err instanceof ProviderBudgetExhaustedError) {
+          budgetExhausted = true;
+          // The current pair made no provider request (the guard throws before
+          // it), so it is deferred along with the pairs after it — never
+          // counted as a failure.
+          pairsDeferred = totalPairs - i;
+          break;
+        }
+        pairsFailed += 1;
+        const rateLimited = isRateLimitedError(err);
+        this.logger.warn(
+          rateLimited
+            ? 'scheduled ingestion: provider rate limit reached — stopping warm cycle'
+            : 'scheduled ingestion: pair failed',
+          {
+            assetClass: inst.assetClass,
+            symbol: inst.symbol,
+            timeframe: tf,
+            error: err instanceof Error ? err.message : 'unknown',
+          },
+        );
+        // A provider rate limit stops the cycle; any other failure stays
+        // per-pair and the cycle continues.
+        if (rateLimited) {
+          abortedDueToRateLimit = true;
+          pairsDeferred = totalPairs - i - 1;
+          break;
         }
       }
-      if (abortedDueToRateLimit) break;
     }
+
+    this.logger.info('scheduled ingestion: warm cycle pairs complete', {
+      instruments: instruments.length,
+      timeframes: timeframes.length,
+      totalPairs,
+      rotationOffset,
+      pairsCompleted,
+      pairsFailed,
+      pairsAlreadyCached,
+      pairsDeferred,
+      budgetExhausted,
+      abortedDueToRateLimit,
+      providerRequests,
+      maxRequestsPerCycle: this.maxRequestsPerCycle,
+    });
 
     const finishedAt = new Date().toISOString();
     this.logger.info('scheduled ingestion: warm cycle complete', {
@@ -413,9 +559,11 @@ export class ScheduledIngestionService {
       pairsCompleted,
       pairsFailed,
       pairsAlreadyCached,
+      pairsDeferred,
       candlesUpserted,
       providerRequests,
       abortedDueToRateLimit,
+      budgetExhausted,
     });
 
     // Record the run in ingestion_runs for observability
@@ -428,6 +576,9 @@ export class ScheduledIngestionService {
       candlesUpserted,
       providerRequests,
       abortedDueToRateLimit,
+      budgetExhausted,
+      pairsDeferred,
+      rotationOffset,
       startedAt,
       finishedAt,
     }, lockClient).catch((err) => {
@@ -448,6 +599,9 @@ export class ScheduledIngestionService {
       pairsAlreadyCached,
       skippedDueToMinInterval: false,
       abortedDueToRateLimit,
+      budgetExhausted,
+      pairsDeferred,
+      rotationOffset,
     };
   }
 
@@ -498,6 +652,9 @@ export class ScheduledIngestionService {
       pairsAlreadyCached: 0,
       skippedDueToMinInterval,
       abortedDueToRateLimit: false,
+      budgetExhausted: false,
+      pairsDeferred: 0,
+      rotationOffset: 0,
     };
   }
 
@@ -565,6 +722,9 @@ export class ScheduledIngestionService {
       candlesUpserted: number;
       providerRequests: number;
       abortedDueToRateLimit: boolean;
+      budgetExhausted: boolean;
+      pairsDeferred: number;
+      rotationOffset: number;
       startedAt: string;
       finishedAt: string;
     },
@@ -586,14 +746,16 @@ export class ScheduledIngestionService {
           pairsAlreadyCached: args.pairsAlreadyCached,
           totalPairs,
           providerRequests: args.providerRequests,
+          maxRequestsPerCycle: this.maxRequestsPerCycle,
           abortedDueToRateLimit: args.abortedDueToRateLimit,
+          budgetExhausted: args.budgetExhausted,
+          pairsDeferred: args.pairsDeferred,
+          rotationOffset: args.rotationOffset,
         }),
         args.candlesUpserted,
         args.pairsFailed > 0
           ? `${args.pairsFailed} of ${totalPairs} pairs failed${
-              args.abortedDueToRateLimit
-                ? ' (cycle stopped early: provider rate limited or request budget exhausted)'
-                : ''
+              args.abortedDueToRateLimit ? ' (cycle stopped early: provider rate limited)' : ''
             }`
           : null,
         args.finishedAt,

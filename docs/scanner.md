@@ -33,7 +33,15 @@ See `docs/provider-abstraction.md` and `docs/market-data.md` for the abstraction
 **Mechanism:**
 
 - Database-backed advisory locking: `pg_try_advisory_lock(875421009)` — pinned key `SCANNER_ADVISORY_LOCK_KEY`
-- Advisory unlock reliability (M7 audit finding F5): `SELECT pg_advisory_unlock(875421009) as unlocked` is never silently swallowed; any query error or `unlocked: false` response is logged with sanitized diagnostics (no credentials, tokens, or tenant/strategy UUIDs) and the pooled client is terminated and evicted (`release(true)`) so a leaked session-level lock can never block future scans
+- Advisory lock ownership hardening (M7 audit finding F5, extended by the
+  `unlock_returned_false` / `scan skipped: already running` investigation — see
+  [Advisory lock ownership hardening](#advisory-lock-ownership-hardening)
+  below): acquire and release are pid-stamped, ownership is proven immediately
+  after acquisition and re-proven by a heartbeat during the run, and any
+  unprovable state is logged with sanitized diagnostics (no credentials,
+  tokens, or tenant/strategy UUIDs) while the pooled client is terminated and
+  evicted (`release(true)`) so a leaked session-level lock can never block
+  future scans
 - Only one scanner run executes at a time across all processes/instances; concurrent triggers return `skipped: true, reason: 'already_running'` with last run info
 - Runs are recorded in `scanner_runs` table (append-only ledger): status `running → completed|failed|partial`, provider slug, metrics, error, metadata
 - Cursors in `scanner_cursors` table: per `(strategy_version_id, instrument_id, timeframe)` last processed closed candle open time — prevents re-processing same closed candle, survives restarts
@@ -41,6 +49,40 @@ See `docs/provider-abstraction.md` and `docs/market-data.md` for the abstraction
 - Recovery on restart: `recoverStaleRuns()` marks runs older than 30 minutes that are still `running` as `failed` (crash/deploy safety)
 - In-process ticker (optional): when `SCANNER_ENABLED=true`, the API starts an interval timer (`SCANNER_INTERVAL_MS`) that calls `scanner.runOnce()` — safe to run alongside manual triggers due to advisory locking
 - Manual trigger via `POST /api/scanner/trigger` (session-authenticated, entitlement-gated, rate limited 10/min)
+
+### Advisory lock ownership hardening
+
+`pg_try_advisory_lock` is **session** state: the lock belongs to the server
+backend that took it, not to the client object and not to the logical job. The
+production symptom set `scanner advisory unlock failed` /
+`unlock_returned_false` / `scan skipped: already running` (and the identical
+warm-cycle messages) is consistent with that identity being lost or
+unverifiable. `packages/core/src/db/advisory-lock.ts` therefore implements a
+single, shared, hardened path used by both the scanner and the scheduled
+warm cycle:
+
+| Guarantee | How |
+|---|---|
+| **Ownership is recorded atomically** | `SELECT pg_backend_pid(), pg_try_advisory_lock($1)` — the pid returned *is* the pid that evaluated the acquire |
+| **Ownership is proven before the job runs** | the lock must be visible in `pg_locks` for that same pid (`classid/objid` reconstruction of the bigint key); otherwise the cycle refuses to run and the session is evicted |
+| **Losing ownership mid-run fails closed** | a heartbeat re-verifies every `leaseMs / 4` (min 1s); on loss the run aborts at the next strategy boundary with a `conflict` error and `scanner advisory lock lost while scanning` is logged |
+| **Release outcomes are classified** | `released` / `not_owned` (`unlock_returned_false`) / `session_changed` (release evaluated on a different backend) / `query_error`; every non-clean outcome destroys and evicts the session |
+| **Contention is actionable** | the skip log names the holder: `holderPid`, `holderState`, `holderIdleMs`, `holderSuspectedOrphaned` |
+| **An acquire failure cannot leak a lock** | an error thrown by the acquire statement evicts the session (the server may have applied the lock before the connection died) — the scanner previously returned that session to the pool intact |
+
+Why `session_changed` matters: a transaction-mode connection pooler (PgBouncer,
+or Neon's `-pooler` endpoint) can serve two statements of one client from two
+backends. The acquire then succeeds on backend A while the release runs on
+backend B and returns `false`, leaving A's lock orphaned — the exact shape of a
+permanent `already running`. The pid comparison detects this instead of
+reporting a mysterious unlock failure, and the run refuses to proceed without a
+proven lock.
+
+`suspectedOrphaned` is **diagnostic only**: nothing is terminated automatically.
+A holder that stays `idle` for ≥ 120 s (no heartbeat) is reported so an operator
+can inspect or restart, rather than the service killing sessions by guesswork.
+Session teardown always releases the lock, so evicting a session is the only
+recovery primitive this codebase uses.
 
 **Frequency:**
 
