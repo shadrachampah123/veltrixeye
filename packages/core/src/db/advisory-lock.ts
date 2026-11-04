@@ -424,7 +424,10 @@ export async function acquireSessionAdvisoryLock(
     };
   }
   const preRow = precheck.rows[0] ?? {};
+  // The pre-check pid is only used to detect a backend change between the
+  // pre-check and the acquire. The pid that *must* exist is the acquiring one.
   const prePid = typeof preRow.pid === 'number' ? preRow.pid : null;
+
   if (preRow.already_owned === true) {
     // The session cannot be trusted to release what it is already holding, so
     // it is evicted rather than reused. No new lock level is stacked.
@@ -482,6 +485,18 @@ export async function acquireSessionAdvisoryLock(
       holder: null,
       mustDestroyClient: true,
       reason: 'session_changed',
+    };
+  }
+
+  // An unreadable acquiring pid cannot be proven later (release and heartbeat
+  // both key off it), so a "grant" without one is refused and the session evicted.
+  if (acquired && pid === null) {
+    return {
+      acquired: false,
+      lock: null,
+      holder: null,
+      mustDestroyClient: true,
+      reason: 'not_owned',
     };
   }
 

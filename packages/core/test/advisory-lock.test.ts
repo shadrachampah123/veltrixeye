@@ -529,6 +529,30 @@ describe('advisory lock — classified states (unit)', () => {
     assert.equal(res.mustDestroyClient, true);
   });
 
+  test('an acquire without a readable backend pid is refused (ownership unprovable)', async () => {
+    const noPid = fakeClient((sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { acquired: true };
+      if (isVerify(sql)) return { owned: true };
+      return {};
+    });
+    const res = await acquireSessionAdvisoryLock(noPid, TEST_LOCK_KEY);
+    assert.equal(res.acquired, false, 'nothing this session does later could be attributed to it');
+    assert.equal(res.reason, 'not_owned');
+    assert.equal(res.mustDestroyClient, true);
+
+    // A pre-check without a pid is tolerated (the acquiring pid is the one that
+    // must exist); the lock still has to be proven by the acquire statement.
+    const precheckWithoutPid = fakeClient((sql) => {
+      if (sql.includes('AS already_owned')) return { already_owned: false };
+      if (sql.includes('pg_try_advisory_lock')) return { pid: 100, acquired: true };
+      if (isVerify(sql)) return { pid: 100, owned: true };
+      return {};
+    });
+    const res2 = await acquireSessionAdvisoryLock(precheckWithoutPid, TEST_LOCK_KEY);
+    assert.equal(res2.acquired, true);
+    assert.equal(res2.lock?.pid, 100);
+  });
+
   test('a null/absent result is treated as not owned, never as success', async () => {
     const client: AdvisoryLockClient = {
       async query(sql: string) {
