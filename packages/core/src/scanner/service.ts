@@ -803,44 +803,57 @@ export class ScannerService {
    * is serialized: a slow database cannot stack overlapping verifications.
    */
   private startAdvisoryLockHeartbeat(lock: SessionAdvisoryLock): {
-    /** True once a heartbeat has proven the lock is no longer ours. */
+    /** True once ownership has been disproven (cheap, non-blocking). */
     isLost(): boolean;
+    /** Prove ownership again *now*; false when it is gone (blocking). */
+    verifyNow(): Promise<boolean>;
     stop(): void;
   } {
     const state = { lost: false };
     const intervalMs = this.advisoryLockHeartbeatMs;
-    let inFlight = false;
-    const timer =
-      intervalMs > 0
-        ? setInterval(() => {
-            if (state.lost || inFlight) return;
-            inFlight = true;
-            void lock
-              .verify()
-              .then((check) => {
-                if (!check.owned) {
-                  state.lost = true;
-                  this.logger.error('scanner advisory lock lost while scanning', {
-                    lockKey: SCANNER_ADVISORY_LOCK_KEY,
-                    reason: check.reason ?? 'not_owned',
-                    ...(check.code !== undefined ? { code: check.code } : {}),
-                  });
-                }
-              })
-              .catch(() => {
-                state.lost = true;
-              })
-              .finally(() => {
-                inFlight = false;
-              });
-          }, intervalMs)
-        : null;
+    const markLost = (reason: string | undefined, code: string | undefined): void => {
+      if (state.lost) return;
+      state.lost = true;
+      this.logger.error('scanner advisory lock lost while scanning', {
+        lockKey: SCANNER_ADVISORY_LOCK_KEY,
+        reason: reason ?? 'not_owned',
+        ...(code !== undefined ? { code } : {}),
+      });
+    };
+
+    // One verification at a time: the timer and the in-run checkpoints share
+    // this lock session, and `pg` must not interleave queries on one client.
+    // Every call is appended to a chain, so a slow database cannot stack
+    // overlapping verifications either.
+    let queue: Promise<unknown> = Promise.resolve();
+    const verify = (): Promise<boolean> => {
+      const run = queue.then(async () => {
+        if (state.lost) return false;
+        try {
+          const check = await lock.verify();
+          if (!check.owned) {
+            markLost(check.reason, check.code);
+            return false;
+          }
+          return true;
+        } catch {
+          // An unreadable verification is not proof of ownership: fail closed.
+          markLost('query_error', undefined);
+          return false;
+        }
+      });
+      queue = run.catch(() => undefined);
+      return run;
+    };
+
+    const timer = intervalMs > 0 ? setInterval(() => void verify(), intervalMs) : null;
     timer?.unref?.();
     return {
       // A method (not a readonly property) so TypeScript cannot narrow the
       // result of an earlier check across later `await` boundaries — the flag
       // genuinely can change while the scan runs.
       isLost: () => state.lost,
+      verifyNow: verify,
       stop() {
         if (timer !== null) clearInterval(timer);
       },
@@ -976,7 +989,7 @@ export class ScannerService {
   private async executeScan(
     args: ScanTriggerArgs,
     nowMs: number,
-    lockGuard?: { isLost(): boolean },
+    lockGuard?: { isLost(): boolean; verifyNow(): Promise<boolean> },
   ): Promise<ScanRunResult> {
     const provider = this.requireProvider();
     const runId = await this.createRun(provider.id, args);
@@ -1051,10 +1064,12 @@ export class ScannerService {
         }
       }
 
-      // Fail closed on ownership loss discovered by the last heartbeat: a run
-      // that believes it is exclusive but is not must not be recorded as a
-      // clean success.
-      if (lockGuard?.isLost() === true) {
+      // Final fail-closed gate: prove ownership once more, synchronously,
+      // before recording a terminal status. A run that believes it is
+      // exclusive but is not must never be written as a clean success, and a
+      // wall-clock heartbeat alone could miss a loss that happened between the
+      // last tick and this decision.
+      if (lockGuard !== undefined && !(await lockGuard.verifyNow())) {
         throw Errors.conflict('Scanner advisory lock was lost; aborting this run');
       }
 

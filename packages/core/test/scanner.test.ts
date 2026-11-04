@@ -858,6 +858,22 @@ describe('F5: Advisory unlock reliability', () => {
     return { svc, infoLogs, warnLogs, errorLogs };
   }
 
+  /**
+   * Evicting a session (`release(true)`) closes the socket; the server backend
+   * exits and drops its session-level lock asynchronously. Poll instead of
+   * assuming the lock is gone by the time the callback returns — CI is slower
+   * than a laptop and the earlier instant assertion flaked there.
+   */
+  async function waitForGrantedScannerLocks(expected: number, timeoutMs = 5_000): Promise<number> {
+    const deadline = Date.now() + timeoutMs;
+    let cnt = await countGrantedScannerLocks();
+    while (cnt !== expected && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      cnt = await countGrantedScannerLocks();
+    }
+    return cnt;
+  }
+
   async function countGrantedScannerLocks(): Promise<number> {
     const res = await pool.query<{ cnt: number }>(
       `SELECT count(*)::int AS cnt
@@ -943,7 +959,7 @@ describe('F5: Advisory unlock reliability', () => {
     assert.equal(result.skipped, undefined);
     assert.equal(errorLogs.length, 0, 'clean unlock must not log any errors');
     assert.deepEqual(releaseArgs, [undefined], 'clean unlock must return client to pool without destroying it');
-    assert.equal(await countGrantedScannerLocks(), 0, 'advisory lock must be released in pg_locks');
+    assert.equal(await waitForGrantedScannerLocks(0), 0, 'advisory lock must be released in pg_locks');
   });
 
   test('advisory unlock query error is logged safely, destroys the pooled connection, and subsequent scans recover', async () => {
@@ -1009,7 +1025,7 @@ describe('F5: Advisory unlock reliability', () => {
     // 4. Pooled connection was destroyed (release(true)) and the real Postgres advisory lock is gone.
     assert.deepEqual(releaseArgs, [true], 'failed unlock must destroy/evict the pooled connection');
     assert.equal(
-      await countGrantedScannerLocks(),
+      await waitForGrantedScannerLocks(0),
       0,
       'destroying the pooled connection must release the session-level advisory lock in PostgreSQL',
     );
@@ -1058,7 +1074,7 @@ describe('F5: Advisory unlock reliability', () => {
     assert.equal(unlockErrors[0]!.meta?.reason, 'query_error');
     assert.equal(unlockErrors[0]!.meta?.code, '25P02');
     assert.equal(unlockErrors[0]!.meta?.connectionDestroyed, true);
-    assert.equal(await countGrantedScannerLocks(), 0, 'session advisory lock must be cleared after session teardown');
+    assert.equal(await waitForGrantedScannerLocks(0), 0, 'session advisory lock must be cleared after session teardown');
 
     const second = await svc.triggerScan({ force: true });
     assert.ok(second.run);
@@ -1110,7 +1126,7 @@ describe('F5: Advisory unlock reliability', () => {
     assert.ok(!JSON.stringify(meta).includes(FAKE_DB_PASS));
     assert.ok(!JSON.stringify(unlockErrors[0]).includes(TENANT_USER_ID));
     assert.deepEqual(releaseArgs, [true]);
-    assert.equal(await countGrantedScannerLocks(), 0, 'destroying connection must release the un-unlocked session lock');
+    assert.equal(await waitForGrantedScannerLocks(0), 0, 'destroying connection must release the un-unlocked session lock');
 
     const second = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
     assert.ok(second.run);
@@ -1243,7 +1259,6 @@ describe('F5: Advisory unlock reliability', () => {
 
   test('losing lock ownership mid-scan aborts the run (fail closed) instead of scanning unguarded', async () => {
     let verifyCalls = 0;
-    let delayedRunInsert = false;
     const proxyPool = wrapLockClientPool((client) => {
       const origQuery = client.query.bind(client);
       const origRelease = client.release.bind(client);
@@ -1255,22 +1270,32 @@ describe('F5: Advisory unlock reliability', () => {
       client.query = async (text: unknown, values?: unknown) => {
         if (typeof text === 'string' && text.includes('AS owned')) {
           verifyCalls += 1;
-          // The acquire-time proof succeeds; every heartbeat afterwards reports
+          // The acquire-time proof succeeds; every later verification reports
           // that the session no longer owns the lock (killed backend, pooler
           // rotation, server-side reset).
           if (verifyCalls > 1) return { rows: [{ pid: 1, owned: false }], rowCount: 1 };
         }
-        // Hold the scan open past the first heartbeat so the loss is observed
-        // deterministically rather than racing the timer.
-        if (!delayedRunInsert && typeof text === 'string' && text.includes('INSERT INTO scanner_runs')) {
-          delayedRunInsert = true;
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
         return origQuery(text, values as unknown[]);
       };
     });
+    // Hold the run open long enough for the 1 ms heartbeat to observe the loss
+    // before the first fail-closed checkpoint, so the assertion never races the
+    // timer (it flaked ~1 run in 4 before this).
+    const delayedPool = Object.create(proxyPool, {
+      query: {
+        value: async (text: unknown, values?: unknown) => {
+          if (typeof text === 'string' && text.includes('FROM strategies s')) {
+            await new Promise((resolve) => setTimeout(resolve, 60));
+          }
+          return (proxyPool as unknown as { query: (t: unknown, v?: unknown) => Promise<unknown> }).query(
+            text,
+            values,
+          );
+        },
+      },
+    }) as typeof proxyPool;
 
-    const { svc, errorLogs } = createTrackedScanner(proxyPool, { advisoryLockHeartbeatMs: 1 });
+    const { svc, errorLogs } = createTrackedScanner(delayedPool, { advisoryLockHeartbeatMs: 1 });
     const result = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
 
     assert.ok(result.run, 'the aborted run is still recorded');

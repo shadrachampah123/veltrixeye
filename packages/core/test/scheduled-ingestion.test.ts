@@ -1232,13 +1232,24 @@ describe('scheduled ingestion — lock ownership, fairness and budget (regressio
     assert.equal(typeof unlockError.meta?.holderPid, 'number', 'the current holder is reported');
     assert.equal(releases.includes(true), true, 'the session is evicted');
 
-    const locks = await pool.query<{ cnt: number }>(
-      `SELECT count(*)::int AS cnt FROM pg_locks
-        WHERE locktype = 'advisory' AND granted = true
-          AND ((classid::bigint << 32) | objid::bigint) = $1::bigint`,
-      [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY],
-    );
-    assert.equal(locks.rows[0]?.cnt, 0, 'destroying the session clears the leaked lock');
+    // Eviction closes the socket; the backend exits and drops its session lock
+    // asynchronously, so poll rather than assume it is gone immediately.
+    const countLocks = async (): Promise<number> => {
+      const locks = await pool.query<{ cnt: number }>(
+        `SELECT count(*)::int AS cnt FROM pg_locks
+          WHERE locktype = 'advisory' AND granted = true
+            AND ((classid::bigint << 32) | objid::bigint) = $1::bigint`,
+        [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY],
+      );
+      return locks.rows[0]?.cnt ?? 0;
+    };
+    const deadline = Date.now() + 5_000;
+    let remaining = await countLocks();
+    while (remaining !== 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      remaining = await countLocks();
+    }
+    assert.equal(remaining, 0, 'destroying the session clears the leaked lock');
   });
 });
 

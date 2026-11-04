@@ -65,7 +65,7 @@ warm cycle:
 |---|---|
 | **Ownership is recorded atomically** | `SELECT pg_backend_pid(), pg_try_advisory_lock($1)` — the pid returned *is* the pid that evaluated the acquire |
 | **Ownership is proven before the job runs** | the lock must be visible in `pg_locks` for that same pid (`classid/objid` reconstruction of the bigint key); otherwise the cycle refuses to run and the session is evicted |
-| **Losing ownership mid-run fails closed** | a heartbeat re-verifies every `leaseMs / 4` (min 1s); on loss the run aborts at the next strategy boundary with a `conflict` error and `scanner advisory lock lost while scanning` is logged |
+| **Losing ownership mid-run fails closed** | a heartbeat re-verifies every `leaseMs / 4` (min 1s) and the run is aborted at the next strategy boundary; **the terminal status decision re-verifies ownership synchronously**, so no run is ever recorded `completed`/`partial` without a fresh proof. Aborts raise a `conflict` error and log `scanner advisory lock lost while scanning` |
 | **Release outcomes are classified** | `released` / `not_owned` (`unlock_returned_false`) / `session_changed` (release evaluated on a different backend) / `query_error`; every non-clean outcome destroys and evicts the session |
 | **Contention is actionable** | the skip log names the holder: `holderPid`, `holderState`, `holderIdleMs`, `holderSuspectedOrphaned` |
 | **An acquire failure cannot leak a lock** | an error thrown by the acquire statement evicts the session (the server may have applied the lock before the connection died) — the scanner previously returned that session to the pool intact |
