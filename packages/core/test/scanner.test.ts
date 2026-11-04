@@ -1307,6 +1307,115 @@ describe('F5: Advisory unlock reliability', () => {
     );
     assert.ok(verifyCalls > 1, 'ownership was re-verified during the scan');
   });
+
+  test('a release that leaves the key held is logged as still_held and evicts the session', async () => {
+    // `pg_advisory_unlock` answers "one level removed". A stacked level makes it
+    // return true while the key is still held; reporting that as a clean release
+    // is how a pooled session keeps a lock forever.
+    const releaseArgs: (boolean | Error | undefined)[] = [];
+    const proxyPool = wrapLockClientPool((client) => {
+      const origQuery = client.query.bind(client);
+      const origRelease = client.release.bind(client);
+      client.release = (err?: boolean | Error) => {
+        releaseArgs.push(err);
+        client.query = origQuery;
+        client.release = origRelease;
+        return origRelease(err);
+      };
+      client.query = async (text: unknown, values?: unknown) => {
+        if (typeof text === 'string' && text.includes('pg_advisory_unlock')) {
+          // Remove nothing, but answer as a real one-level unlock would.
+          const pidRes = await origQuery('SELECT pg_backend_pid()::int AS pid');
+          const pid = (pidRes as { rows: { pid: number }[] }).rows[0]!.pid;
+          return { rows: [{ pid, unlocked: true }], rowCount: 1 };
+        }
+        return origQuery(text, values as unknown[]);
+      };
+    });
+
+    const { svc, errorLogs } = createTrackedScanner(proxyPool);
+    const result = await svc.triggerScan({ force: true, initiatedBy: TENANT_USER_ID });
+    assert.ok(result.run, 'the scan itself completes');
+
+    const releaseError = errorLogs.find((e) => e.message === 'scanner advisory unlock failed');
+    assert.ok(releaseError, 'a release that did not empty the key is never silent');
+    assert.equal(releaseError.meta?.reason, 'still_held');
+    assert.equal(releaseError.meta?.connectionDestroyed, true);
+    assert.deepEqual(releaseArgs, [true], 'the session is evicted so the stacked level cannot survive');
+
+    assert.equal(await waitForGrantedScannerLocks(0), 0, 'eviction clears the lock');
+  });
+
+  test('a lock lost while strategies load fails closed even when no strategies are eligible', async () => {
+    // Regression: the zero-eligible-strategies path records `completed` and
+    // returns early. It used to skip the synchronous ownership proof, so a lock
+    // lost while strategies were loading could be written as a clean success —
+    // the one success path that never reached the final gate.
+    let verifyCalls = 0;
+    const proxyPool = wrapLockClientPool((client) => {
+      const origQuery = client.query.bind(client);
+      const origRelease = client.release.bind(client);
+      client.release = (err?: boolean | Error) => {
+        client.query = origQuery;
+        client.release = origRelease;
+        return origRelease(err);
+      };
+      client.query = async (text: unknown, values?: unknown) => {
+        if (typeof text === 'string' && text.includes('AS owned')) {
+          verifyCalls += 1;
+          // Acquire-time proof succeeds; every later proof reports the loss.
+          if (verifyCalls > 1) return { rows: [{ pid: 1, owned: false }], rowCount: 1 };
+        }
+        return origQuery(text, values as unknown[]);
+      };
+    });
+
+    // Heartbeat disabled: only the synchronous terminal proof can catch the loss,
+    // so this test cannot pass by racing a timer.
+    const { svc, infoLogs, errorLogs } = createTrackedScanner(proxyPool, { advisoryLockHeartbeatMs: 0 });
+    const result = await svc.triggerScan({
+      force: true,
+      // A strategy id that cannot match makes `getEligibleStrategies` return zero
+      // rows, which is the early-return path under test.
+      strategyId: 'bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb',
+      initiatedBy: TENANT_USER_ID,
+    });
+
+    assert.ok(result.run, 'the aborted run is still recorded');
+    assert.equal(result.run.status, 'failed', 'a lost lock must never be recorded as a completed run');
+    assert.match(String(result.run.error ?? ''), /lock/i, 'the recorded reason points at the lock');
+    assert.equal(
+      infoLogs.some((e) => e.message === 'scan completed: no eligible strategies'),
+      false,
+      'the successful no-work path must not be reached without ownership',
+    );
+    assert.ok(
+      errorLogs.some((e) => e.message === 'scanner advisory lock lost while scanning'),
+      'the loss is reported at error level',
+    );
+    // At least the acquire proof plus the synchronous terminal proof. (The
+    // post-release proof makes a third call, and it also observes the loss — so
+    // the count is a lower bound, not an exact figure.)
+    assert.ok(verifyCalls >= 2, 'the synchronous terminal proof ran');
+  });
+
+  test('the no-work path still completes when ownership is proven', async () => {
+    // Control: the same zero-eligible path must stay a success when the lock is
+    // genuinely still held, so the fix cannot degrade into "always fail".
+    const { svc, infoLogs } = createTrackedScanner();
+    const result = await svc.triggerScan({
+      force: true,
+      strategyId: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb',
+      initiatedBy: TENANT_USER_ID,
+    });
+    assert.ok(result.run);
+    assert.equal(result.run.status, 'completed');
+    assert.ok(
+      infoLogs.some((e) => e.message === 'scan completed: no eligible strategies'),
+      'the no-work path is still taken when the lock is owned',
+    );
+    assert.equal(await waitForGrantedScannerLocks(0), 0, 'the lock is released after the no-work run');
+  });
 });
 
 // ---------------------------------------------------------------------------

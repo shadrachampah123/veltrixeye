@@ -637,6 +637,16 @@ the in-process ticker and `POST /api/internal/scanner/run`.
   cycles, so no pair can be permanently starved — previously the fixed order
   meant the same trailing pairs (for example `BTCUSD 1d`) were the only ones
   ever deferred.
+- **Interpreting lock diagnostics** — the warm cycle and the scanner share one
+  hardened advisory-lock path, so the same reasons appear in both logs:
+  `unlock_returned_false` (the session no longer owned the key at release),
+  `session_changed` (**the connection is not session-pinned** — see
+  [scanner.md](./scanner.md#session-pinned-connection-requirement-production);
+  point that connection at a direct or session-pooled endpoint),
+  `still_held` (a stacked lock level survived one unlock; the session was
+  evicted) and `query_error` (the unlock statement itself failed). In every case
+  the session is destroyed so the lock cannot outlive the cycle; the scan itself
+  is never allowed to continue unguarded.
 - **Durable record** — every attempted cycle (including failed and partial
   ones) writes an `ingestion_runs` row with `trigger = 'scheduled'`, `status`
   `completed` / `partial` / `failed`, and the counters above inside `request`:

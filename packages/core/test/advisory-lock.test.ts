@@ -282,6 +282,61 @@ describe('advisory lock — real PostgreSQL', () => {
     assert.equal(release.mustDestroyClient, true);
     client.release();
   });
+
+  test('a session that already holds the key is refused and evicted, never stacked', async () => {
+    // `pg_try_advisory_lock` is re-entrant per session: acquiring on a session
+    // that already holds the key would stack a second level and report `true`,
+    // letting two jobs believe they are exclusive while one unlock leaves the
+    // key held. The acquire must refuse and hand the session back for eviction.
+    const holder = await holdRawLock(TEST_LOCK_KEY);
+    try {
+      const res = await acquireSessionAdvisoryLock(holder.client, TEST_LOCK_KEY);
+      assert.equal(res.acquired, false, 'an inherited lock is never a fresh exclusive grant');
+      assert.equal(res.reason, 'already_owned');
+      assert.equal(res.mustDestroyClient, true, 'the poisoned session is evicted, not reused');
+      assert.equal(res.lock, null);
+      assert.equal(await countLocks(TEST_LOCK_KEY), 1, 'no second level was stacked');
+    } finally {
+      holder.destroy();
+    }
+
+    await waitFor(async () => (await countLocks(TEST_LOCK_KEY)) === 0);
+    assert.equal(await countLocks(TEST_LOCK_KEY), 0, 'evicting the session clears the inherited lock');
+
+    // Recovery: a clean session acquires immediately afterwards.
+    const fresh = await pool.connect();
+    try {
+      const res = await acquireSessionAdvisoryLock(fresh, TEST_LOCK_KEY);
+      assert.equal(res.acquired, true, 'the next cycle is not blocked by the evicted session');
+      const release = await res.lock!.release();
+      assert.equal(release.released, true);
+    } finally {
+      fresh.release();
+    }
+  });
+
+  test('a release that leaves a stacked level behind is still_held, never "released"', async () => {
+    const client = await pool.connect();
+    try {
+      const res = await acquireSessionAdvisoryLock(client, TEST_LOCK_KEY);
+      assert.equal(res.acquired, true);
+      // Stage the state the pre-check exists to prevent: a second level of the
+      // same key on the same session (a leaked acquire from an earlier cycle).
+      await client.query('SELECT pg_advisory_lock($1::bigint)', [TEST_LOCK_KEY]);
+
+      const release = await res.lock!.release();
+      assert.equal(release.released, false, 'one unlock does not empty a stacked lock');
+      assert.equal(release.reason, 'still_held');
+      assert.equal(release.mustDestroyClient, true, 'the caller must evict the session');
+      assert.equal(await countLocks(TEST_LOCK_KEY), 1, 'the surviving level is visible in pg_locks');
+    } finally {
+      // Evict: only session teardown is guaranteed to clear a stacked lock.
+      client.release(true);
+    }
+
+    await waitFor(async () => (await countLocks(TEST_LOCK_KEY)) === 0);
+    assert.equal(await countLocks(TEST_LOCK_KEY), 0, 'eviction clears the stacked lock');
+  });
 });
 
 /* ------------------------------------------------------------------------ */
@@ -394,6 +449,84 @@ describe('advisory lock — classified states (unit)', () => {
     assert.equal(meta.holderPid, 321);
     assert.equal(meta.holderState, 'idle');
     assert.equal(meta.holderSuspectedOrphaned, true, 'a 5-minute-idle holder is a suspected orphan');
+  });
+
+  test('an unreadable post-release proof is query_error, never a clean release', async () => {
+    let verified = 0;
+    const client: AdvisoryLockClient = {
+      async query(sql: string) {
+        if (sql.includes('AS already_owned')) return { rows: [{ pid: 100, already_owned: false }] };
+        if (sql.includes('pg_try_advisory_lock')) return { rows: [{ pid: 100, acquired: true }] };
+        if (sql.includes('AS owned')) {
+          verified += 1;
+          // The acquire-time proof works; the post-release proof cannot be read.
+          if (verified > 1) throw Object.assign(new Error('connection reset'), { code: '08006' });
+          return { rows: [{ pid: 100, owned: true }] };
+        }
+        if (sql.includes('pg_advisory_unlock')) return { rows: [{ pid: 100, unlocked: true }] };
+        return { rows: [] };
+      },
+    };
+    const res = await acquireSessionAdvisoryLock(client, TEST_LOCK_KEY);
+    const release = await res.lock!.release();
+    assert.equal(release.released, false, 'an unprovable release is not a release');
+    assert.equal(release.reason, 'query_error');
+    assert.equal(release.mustDestroyClient, true);
+    assert.equal(release.code, '08006');
+  });
+
+  test('an unlock that returns true while the key is still held is still_held', async () => {
+    // `pg_advisory_unlock` answers "I removed one level", not "the key is now
+    // free". Reporting a release on that alone is how a pooled session keeps a
+    // lock while the caller believes it is gone.
+    const client = fakeClient((sql) => {
+      if (isAcquire(sql)) return { pid: 100, acquired: true };
+      if (isVerify(sql)) return { pid: 100, owned: true };
+      if (isRelease(sql)) return { pid: 100, unlocked: true };
+      if (isHolder(sql)) return { pid: 100, state: 'idle', state_idle_ms: 1_000 };
+      return {};
+    });
+    const res = await acquireSessionAdvisoryLock(client, TEST_LOCK_KEY);
+    const release = await res.lock!.release();
+    assert.equal(release.released, false);
+    assert.equal(release.reason, 'still_held');
+    assert.equal(release.mustDestroyClient, true);
+    assert.equal(release.holder?.pid, 100, 'the surviving holder is named for the operator');
+  });
+
+  test('a session that already owns the key is refused before any acquire is attempted', async () => {
+    const client = fakeClient((sql) => {
+      if (sql.includes('AS already_owned')) return { pid: 100, already_owned: true };
+      if (isAcquire(sql)) return { pid: 100, acquired: true };
+      if (isVerify(sql)) return { pid: 100, owned: true };
+      return {};
+    });
+    const res = await acquireSessionAdvisoryLock(client, TEST_LOCK_KEY);
+    assert.equal(res.acquired, false);
+    assert.equal(res.reason, 'already_owned');
+    assert.equal(res.mustDestroyClient, true);
+    assert.equal(
+      client.calls.some((sql) => sql.includes('pg_try_advisory_lock')),
+      false,
+      'no lock level is stacked on a session that already holds the key',
+    );
+  });
+
+  test('a pre-check answered by a different backend than the acquire is session_changed', async () => {
+    let pid = 100;
+    const client = fakeClient((sql) => {
+      if (sql.includes('AS already_owned')) return { pid, already_owned: false };
+      if (isAcquire(sql)) {
+        pid = 200; // the pooler moved the statement to another backend
+        return { pid, acquired: true };
+      }
+      if (isVerify(sql)) return { pid, owned: true };
+      return {};
+    });
+    const res = await acquireSessionAdvisoryLock(client, TEST_LOCK_KEY);
+    assert.equal(res.acquired, false, 'evidence from two backends proves nothing');
+    assert.equal(res.reason, 'session_changed');
+    assert.equal(res.mustDestroyClient, true);
   });
 
   test('a null/absent result is treated as not owned, never as success', async () => {

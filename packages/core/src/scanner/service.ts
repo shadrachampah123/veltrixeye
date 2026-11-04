@@ -861,6 +861,24 @@ export class ScannerService {
   }
 
   /**
+   * Prove this run still owns the advisory lock, immediately before recording a
+   * terminal status. Throws a `conflict` error (which the run's catch block
+   * records as `failed`) when ownership cannot be proven.
+   *
+   * Every path that writes a *successful* run must go through this: a cached
+   * heartbeat flag can be stale by the time the status is decided, and a
+   * zero-work run ("no eligible strategies") is still a run that must not be
+   * reported as successful while another scan may hold the lock.
+   */
+  private async assertLockOwnership(
+    lockGuard?: { isLost(): boolean; verifyNow(): Promise<boolean> },
+  ): Promise<void> {
+    if (lockGuard === undefined) return;
+    if (await lockGuard.verifyNow()) return;
+    throw Errors.conflict('Scanner advisory lock was lost; aborting this run');
+  }
+
+  /**
    * Log a non-clean advisory-lock release with a bounded machine-readable
    * reason and, when readable, the session that holds the lock instead. No
    * secrets, no connection string, no tenant identifiers.
@@ -871,7 +889,9 @@ export class ScannerService {
         ? 'unlock_returned_false'
         : release.reason === 'session_changed'
           ? 'session_changed'
-          : 'query_error';
+          : release.reason === 'still_held'
+            ? 'still_held'
+            : 'query_error';
     // A thrown unlock keeps its redacted message/SQLSTATE (M7 audit F5): the
     // message is sanitized here, never logged raw.
     const sanitized =
@@ -1027,6 +1047,12 @@ export class ScannerService {
       }
 
       if (eligibleStrategies.length === 0) {
+        // This path records a *successful* run, so it owes the same proof as the
+        // main path: ownership is re-verified synchronously here too. Otherwise a
+        // lock lost while strategies were loading would be written as a clean
+        // `completed` run by the one success path that never reached the final
+        // gate.
+        await this.assertLockOwnership(lockGuard);
         this.logger.info('scan completed: no eligible strategies', { runId });
         await this.completeRun(runId, 'completed', metrics, null);
         const run = await this.getRun(runId);
@@ -1069,9 +1095,7 @@ export class ScannerService {
       // exclusive but is not must never be written as a clean success, and a
       // wall-clock heartbeat alone could miss a loss that happened between the
       // last tick and this decision.
-      if (lockGuard !== undefined && !(await lockGuard.verifyNow())) {
-        throw Errors.conflict('Scanner advisory lock was lost; aborting this run');
-      }
+      await this.assertLockOwnership(lockGuard);
 
       if (metrics.providerFailures > 0 && metrics.setupsDetected === 0 && metrics.alertsCreated === 0) {
         if (metrics.providerFailures >= strategiesToScan.length) {

@@ -387,7 +387,9 @@ export class ScheduledIngestionService {
         ? 'unlock_returned_false'
         : release.reason === 'session_changed'
           ? 'session_changed'
-          : 'query_error';
+          : release.reason === 'still_held'
+            ? 'still_held'
+            : 'query_error';
     this.logger.error('scheduled ingestion: warm-cycle advisory unlock failed', {
       lockKey: SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
       unlocked: false,

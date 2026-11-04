@@ -66,7 +66,10 @@ warm cycle:
 | **Ownership is recorded atomically** | `SELECT pg_backend_pid(), pg_try_advisory_lock($1)` — the pid returned *is* the pid that evaluated the acquire |
 | **Ownership is proven before the job runs** | the lock must be visible in `pg_locks` for that same pid (`classid/objid` reconstruction of the bigint key); otherwise the cycle refuses to run and the session is evicted |
 | **Losing ownership mid-run fails closed** | a heartbeat re-verifies every `leaseMs / 4` (min 1s) and the run is aborted at the next strategy boundary; **the terminal status decision re-verifies ownership synchronously**, so no run is ever recorded `completed`/`partial` without a fresh proof. Aborts raise a `conflict` error and log `scanner advisory lock lost while scanning` |
-| **Release outcomes are classified** | `released` / `not_owned` (`unlock_returned_false`) / `session_changed` (release evaluated on a different backend) / `query_error`; every non-clean outcome destroys and evicts the session |
+| **An inherited lock is never re-acquired** | before acquiring, the session is asked whether it *already* holds the key. Advisory locks are re-entrant per session, so acquiring on top of a leaked level would return `true`, let two jobs run "exclusively", and leave one level behind after a single unlock. The acquire refuses (`already_owned`) and the session is evicted without stacking a level |
+| **Release outcomes are classified** | `released` / `not_owned` (`unlock_returned_false`) / `session_changed` (release evaluated on a different backend) / `still_held` (unlock returned true but the key survives — a stacked level) / `query_error`; every non-clean outcome destroys and evicts the session |
+| **A release is proven, not assumed** | `pg_advisory_unlock` answers "one level removed", so a successful unlock is followed by an ownership proof; if the key is still visible on the session the result is `still_held` and the session is destroyed |
+| **Every terminal success path proves ownership** | the proof runs synchronously before the final status decision **and** before the early "no eligible strategies" success return, so a zero-work run can no longer be recorded `completed` after the lock was lost |
 | **Contention is actionable** | the skip log names the holder: `holderPid`, `holderState`, `holderIdleMs`, `holderSuspectedOrphaned` |
 | **An acquire failure cannot leak a lock** | an error thrown by the acquire statement evicts the session (the server may have applied the lock before the connection died) — the scanner previously returned that session to the pool intact |
 
@@ -77,6 +80,35 @@ backend B and returns `false`, leaving A's lock orphaned — the exact shape of 
 permanent `already running`. The pid comparison detects this instead of
 reporting a mysterious unlock failure, and the run refuses to proceed without a
 proven lock.
+
+### Session-pinned connection requirement (production)
+
+Session-level advisory locks only work if the connection that acquires the lock
+is the connection that later releases it and re-proves ownership. The scanner
+and the warm cycle therefore require a **session-pinned** PostgreSQL
+connection:
+
+- **Supported:** a direct connection to PostgreSQL, or a pooler in **session**
+  mode (PgBouncer `pool_mode=session`).
+- **Not supported:** **transaction-mode** pooling (PgBouncer
+  `pool_mode=transaction`, and Neon's `-pooler` endpoint). There, consecutive
+  statements of one client may run on different backends; the lock survives on
+  the acquiring backend while the release reports `false`.
+- **How it is detected (no guessing):** the helper compares
+  `pg_backend_pid()` between the pre-check, the acquire, the heartbeat and the
+  release. Any change is reported as `session_changed` and the cycle refuses to
+  run rather than overlapping — a visible skip, never silent duplication.
+- **Operator action if it appears:** point the database connection used by the
+  API/worker at a non-pooled (or session-pooled) endpoint, or configure session
+  pooling for that connection. This is a deployment decision for the owner; no
+  code path bypasses the check, and the service never falls back to "run anyway".
+- **Assumption:** ownership proof reads `pg_locks`, and advisory locks are
+  visible there for the acquiring backend on the PostgreSQL versions exercised
+  by the regression suite. If a future server version hid them, the acquire
+  would fail closed (`not_owned`) rather than run unguarded — loud, not silent.
+
+No credentials, connection strings or hostnames are logged by any of these
+paths; diagnostics carry pid, `pg_stat_activity` state and state age only.
 
 `suspectedOrphaned` is **diagnostic only**: nothing is terminated automatically.
 A holder that stays `idle` for ≥ 120 s (no heartbeat) is reported so an operator

@@ -1021,14 +1021,24 @@ describe('ScheduledIngestionService', () => {
 
   test('warmCache fails closed when it cannot read previous-run state', async () => {
     let queryCount = 0;
+    // Models the real lock session: the key is held until the unlock runs, so
+    // the helper's pre-check and post-release proof both get truthful answers.
+    let locked = false;
     const failingPool = {
       connect: async () => ({
         query: async (sql: string) => {
-          if (sql.includes('pg_try_advisory_lock')) return { rows: [{ pid: 42, acquired: true }] };
-          if (sql.includes('FROM pg_locks') && sql.includes('AS owned')) {
-            return { rows: [{ pid: 42, owned: true }] };
+          if (sql.includes('AS already_owned')) return { rows: [{ pid: 42, already_owned: locked }] };
+          if (sql.includes('pg_try_advisory_lock')) {
+            locked = true;
+            return { rows: [{ pid: 42, acquired: true }] };
           }
-          if (sql.includes('pg_advisory_unlock')) return { rows: [{ pid: 42, unlocked: true }] };
+          if (sql.includes('FROM pg_locks') && sql.includes('AS owned')) {
+            return { rows: [{ pid: 42, owned: locked }] };
+          }
+          if (sql.includes('pg_advisory_unlock')) {
+            locked = false;
+            return { rows: [{ pid: 42, unlocked: true }] };
+          }
           queryCount++;
           throw new Error('database unavailable');
         },

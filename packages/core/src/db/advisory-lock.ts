@@ -94,9 +94,29 @@ const ADVISORY_LOCK_VERIFY_SQL = `
 `;
 
 /**
- * Acquire + pid in one statement: the pid that is returned is, by
- * construction, the pid that evaluated `pg_try_advisory_lock`.
+ * Does **this session** already hold `$1` before we try to acquire it?
+ *
+ * `pg_try_advisory_lock` is re-entrant per session: a session that already
+ * holds the key acquires again happily (the lock level is stacked) and reports
+ * `true`. Accepting that as a fresh exclusive grant is a silent mutual-exclusion
+ * failure — the second job runs while the first one still holds the lock, and a
+ * single `pg_advisory_unlock` later leaves one level behind. That is precisely
+ * the "inherited lock on a pooled session" case this module exists to stop, so
+ * it is detected *before* acquiring and the session is evicted instead.
  */
+const ADVISORY_LOCK_PRECHECK_SQL = `
+  SELECT pg_backend_pid()::int AS pid,
+         EXISTS (
+           SELECT 1
+             FROM pg_locks l
+            WHERE l.locktype = 'advisory'
+              AND l.granted = true
+              AND l.objsubid = 1
+              AND ((l.classid::bigint << 32) | l.objid::bigint) = $1::bigint
+              AND l.pid = pg_backend_pid()
+         ) AS already_owned
+`;
+
 const ADVISORY_LOCK_ACQUIRE_SQL = `
   SELECT pg_backend_pid()::int AS pid,
          pg_try_advisory_lock($1::bigint) AS acquired
@@ -164,7 +184,15 @@ export type AdvisoryLockReleaseReason =
   /** The release ran on a different backend than the acquisition (pooler/reset). */
   | 'session_changed'
   /** The unlock statement itself failed (connection lost, aborted transaction, …). */
-  | 'query_error';
+  | 'query_error'
+  /**
+   * PostgreSQL confirmed one unlock level, but the key is **still held by this
+   * session** — the session had stacked more than one acquisition of the same
+   * key (advisory locks are re-entrant per session). Reporting success here
+   * would leave an orphaned lock behind while telling the caller it was
+   * released, which is exactly the permanent `already running` failure mode.
+   */
+  | 'still_held';
 
 export interface AdvisoryLockRelease {
   released: boolean;
@@ -200,7 +228,7 @@ export interface AdvisoryLockAcquireResult {
   /** The caller MUST destroy/evict the connection when true. */
   mustDestroyClient: boolean;
   /** Why acquisition failed, when it was not ordinary contention. */
-  reason?: 'not_owned' | 'session_changed' | 'query_error' | 'contended';
+  reason?: 'not_owned' | 'session_changed' | 'query_error' | 'contended' | 'already_owned';
   /** SQLSTATE of the acquisition failure, when available. */
   code?: string;
 }
@@ -334,6 +362,30 @@ export class SessionAdvisoryLock {
       const holder = await readAdvisoryLockHolder(this.client, this.key, this.orphanIdleMs);
       return { released: false, reason: 'not_owned', mustDestroyClient: true, holder };
     }
+
+    // `pg_advisory_unlock` returns true when it removed *one* level. Advisory
+    // locks are re-entrant per session, so a stacked acquisition would leave the
+    // key held while this call reports success. Prove the key is gone before
+    // claiming a release; anything else must destroy the session.
+    const after = await this.verify();
+    if (after.owned) {
+      const holder = await readAdvisoryLockHolder(this.client, this.key, this.orphanIdleMs);
+      return { released: false, reason: 'still_held', mustDestroyClient: true, holder };
+    }
+    if (!after.sessionPinned) {
+      return { released: false, reason: 'session_changed', mustDestroyClient: true, holder: null };
+    }
+    if (after.reason === 'query_error') {
+      // The proof could not be read. "Unreadable" is not "released": the key may
+      // still be held by this session, so the caller must evict it.
+      return {
+        released: false,
+        reason: 'query_error',
+        mustDestroyClient: true,
+        holder: null,
+        ...(after.code !== undefined ? { code: after.code } : {}),
+      };
+    }
     return { released: true, reason: 'released', mustDestroyClient: false, holder: null };
   }
 }
@@ -353,6 +405,45 @@ export async function acquireSessionAdvisoryLock(
   key: number,
   options: AdvisoryLockOptions = {},
 ): Promise<AdvisoryLockAcquireResult> {
+  // Step 1 — refuse a session that already holds this key. Acquiring on top of
+  // an inherited lock would stack a second level: the job would run concurrently
+  // with whoever holds level one, and one unlock later the key would survive
+  // ("released" reported, lock still held).
+  let precheck: { rows: AdvisoryLockRow[] };
+  try {
+    precheck = await client.query(ADVISORY_LOCK_PRECHECK_SQL, [key]);
+  } catch (err) {
+    const code = advisoryLockErrorCode(err);
+    return {
+      acquired: false,
+      lock: null,
+      holder: null,
+      mustDestroyClient: true,
+      reason: 'query_error',
+      ...(code !== undefined ? { code } : {}),
+    };
+  }
+  const preRow = precheck.rows[0] ?? {};
+  const prePid = typeof preRow.pid === 'number' ? preRow.pid : null;
+  if (preRow.already_owned === true) {
+    // The session cannot be trusted to release what it is already holding, so
+    // it is evicted rather than reused. No new lock level is stacked.
+    options.logger?.error(`${options.label ?? 'advisory lock'}: session already holds the lock`, {
+      lockKey: key,
+      pid: prePid,
+      reason: 'already_owned',
+      connectionDestroyed: true,
+    });
+    return {
+      acquired: false,
+      lock: null,
+      holder: null,
+      mustDestroyClient: true,
+      reason: 'already_owned',
+    };
+  }
+
+  // Step 2 — acquire, recording the pid in the same statement.
   let res: { rows: AdvisoryLockRow[] };
   try {
     res = await client.query(ADVISORY_LOCK_ACQUIRE_SQL, [key]);
@@ -374,6 +465,25 @@ export async function acquireSessionAdvisoryLock(
   const row = res.rows[0] ?? {};
   const pid = typeof row.pid === 'number' ? row.pid : null;
   const acquired = row.acquired === true;
+
+  // The pre-check's evidence only describes the backend that ran it. If the
+  // acquire was evaluated elsewhere (transaction-mode pooler), the session is
+  // not pinned and nothing here is provable: evict.
+  if (pid !== null && prePid !== null && pid !== prePid) {
+    options.logger?.error(`${options.label ?? 'advisory lock'}: session is not pinned to one backend`, {
+      lockKey: key,
+      precheckPid: prePid,
+      acquirePid: pid,
+      reason: 'session_changed',
+    });
+    return {
+      acquired: false,
+      lock: null,
+      holder: null,
+      mustDestroyClient: true,
+      reason: 'session_changed',
+    };
+  }
 
   if (!acquired) {
     const holder = await readAdvisoryLockHolder(
