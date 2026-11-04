@@ -46,8 +46,14 @@ export type Queryable = Pick<pg.Pool, 'query'>;
 const EMAIL_DELIVERY_TABLE = 'notification_deliveries';
 const WEBHOOK_DELIVERY_TABLE = 'notification_webhook_deliveries';
 const PUSH_DELIVERY_TABLE = 'notification_push_deliveries';
-/** Shared PostgreSQL advisory lock for the durable cross-instance fairness decision. */
-const NOTIFICATION_FAIRNESS_LOCK_KEY = 611_231_008;
+/**
+ * Shared PostgreSQL advisory lock for the durable cross-instance fairness
+ * decision (transaction-scoped, released at commit).
+ *
+ * Exported so the regression suite can assert it is distinct from every other
+ * advisory key in the process.
+ */
+export const NOTIFICATION_FAIRNESS_LOCK_KEY = 611_231_008;
 function tableForChannel(channel: NotificationChannel): string {
   if (channel === 'webhook') return WEBHOOK_DELIVERY_TABLE;
   if (channel === 'push') return PUSH_DELIVERY_TABLE;

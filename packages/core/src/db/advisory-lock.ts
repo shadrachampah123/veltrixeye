@@ -67,11 +67,76 @@ export interface AdvisoryLockLogger {
 }
 
 /**
- * A holder session idle for at least this long is reported as *suspected
- * orphaned*. Real holders re-verify their ownership while the job runs, so a
- * live holder is never idle for this long between checks.
+ * Default idle age at which a holder is reported as *suspected orphaned*.
+ *
+ * This is a floor, not the effective threshold: the scanner derives a threshold
+ * that is never shorter than two heartbeat periods (see
+ * {@link deriveAdvisoryLockTiming}), because a **healthy** long-running job is
+ * idle in `pg_stat_activity` between ownership checks. An idle session is not
+ * evidence of a dead job — it is what a live job looks like while its only
+ * queries are the heartbeats.
  */
 export const DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS = 120_000;
+
+/**
+ * Upper bound for the ownership heartbeat.
+ *
+ * The heartbeat bounds how long a job can keep working after its lock session
+ * silently disappeared (server-side kill, compute suspend, network partition):
+ * the scan aborts at the first check that fails. Deriving it from the lease
+ * alone (`leaseMs / 4`) made that window 7.5 minutes at the production lease
+ * (30 minutes) while the orphan threshold stayed at 2 minutes — so a healthy
+ * scan looked *more* abandoned than the detection window it was supposed to
+ * have. One minute keeps detection inside the orphan threshold and costs one
+ * trivial `pg_locks` read per minute.
+ */
+export const MAX_ADVISORY_LOCK_HEARTBEAT_MS = 60_000;
+
+/** Effective ownership-heartbeat and orphan-observation timings. */
+export interface AdvisoryLockTiming {
+  /** Ownership re-verification period; `0` disables the heartbeat. */
+  heartbeatMs: number;
+  /** Idle age at which a holder is reported as suspected orphaned. */
+  orphanIdleMs: number;
+}
+
+/**
+ * Derive the heartbeat and orphan-threshold pair from a lease.
+ *
+ * Invariants (each is asserted by the regression suite):
+ *  - the heartbeat never exceeds {@link MAX_ADVISORY_LOCK_HEARTBEAT_MS}, so a
+ *    lost lock is detected well inside the lease;
+ *  - unless a caller states otherwise, the orphan threshold is at least
+ *    **two** heartbeat periods, so a live job that is merely idle between
+ *    checks can never be classified as abandoned;
+ *  - explicit options always win (a caller staging a test can force `0`), and a
+ *    disabled heartbeat (`0`) leaves the default threshold alone.
+ *
+ * Pure and total: non-finite inputs fall back to the documented defaults.
+ */
+export function deriveAdvisoryLockTiming(options: {
+  leaseMs: number;
+  heartbeatMs?: number;
+  orphanIdleMs?: number;
+}): AdvisoryLockTiming {
+  const leaseMs = Number.isFinite(options.leaseMs) ? Math.max(0, Math.floor(options.leaseMs)) : 0;
+  const requestedHeartbeat =
+    options.heartbeatMs ?? Math.max(1_000, Math.floor(leaseMs / 4));
+  const heartbeatMs = Number.isFinite(requestedHeartbeat)
+    ? Math.min(MAX_ADVISORY_LOCK_HEARTBEAT_MS, Math.max(0, Math.floor(requestedHeartbeat)))
+    : MAX_ADVISORY_LOCK_HEARTBEAT_MS;
+
+  const requestedOrphan =
+    options.orphanIdleMs ??
+    (heartbeatMs > 0
+      ? Math.max(DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS, heartbeatMs * 2)
+      : DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS);
+  const orphanIdleMs = Number.isFinite(requestedOrphan)
+    ? Math.max(0, Math.floor(requestedOrphan))
+    : DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS;
+
+  return { heartbeatMs, orphanIdleMs };
+}
 
 /**
  * Reconstructed advisory key + ownership test for the **single-bigint** form of

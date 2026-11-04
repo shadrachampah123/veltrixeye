@@ -553,7 +553,9 @@ migrations are unaffected.
   returns 404 and causes no outbound read; with no cron job nothing runs.
 - **Or in-process** — `FX_SOURCE_CHECK_ENABLED=true` runs the check on
   `FX_SOURCE_CHECK_INTERVAL_MS` (default 6 h) while the instance is awake. Both
-  paths serialize through advisory lock `875421010`, so running both is safe.
+  paths serialize through advisory lock `875421010` (the FX-source key, distinct
+  from the scanner's `875421009` and ingestion's `875421011`), so running both is
+  safe.
 - **Watching it without a token** — `GET /api/health` reports
   `workers.fxSource` (`lastSuccessAt`, `lastFailureAt`, `lastFailureCode`,
   `successes`, `failures`, `inFlight`, `successAgeMs`). A moving `lastSuccessAt`
@@ -613,9 +615,14 @@ the in-process ticker and `POST /api/internal/scanner/run`.
   `[api] live scanner enabled (… ) , scheduled ingestion warm enabled`. With
   `INGESTION_MIN_INTERVAL_MS=900000` the guard, not the 5-minute scanner
   cadence, sets the rate: a warm cycle runs at most once every 15 minutes, and
-  two instances cannot overlap it (advisory lock `875421010`, acquired with
+  two instances cannot overlap it (advisory lock `875421011`, acquired with
   proven ownership — see
-  [scanner.md](./scanner.md#advisory-lock-ownership-hardening)).
+  [scanner.md](./scanner.md#advisory-lock-ownership-hardening)). That key is
+  **distinct** from the FX-source check's `875421010`: while both shared one
+  key, an in-flight FX observation made the warm cycle log
+  `warm-cycle lock is already held; skipping cycle` and skip its work (and the
+  reverse), which read like a stale-lock incident but was ordinary contention
+  between unrelated subsystems.
 - **Per-cycle log** — `scheduled ingestion: warm cycle pairs complete` and
   `scheduled ingestion: warm cycle complete` carry `instruments`, `timeframes`,
   `totalPairs`, `rotationOffset`, `pairsCompleted`, `pairsFailed`,

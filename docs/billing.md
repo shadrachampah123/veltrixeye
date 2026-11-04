@@ -2358,7 +2358,13 @@ and is not attempted here.
 
 There are two invocation paths, exactly as for the other scheduled workers, and
 an unconditional PostgreSQL advisory lock (`FX_SOURCE_ADVISORY_LOCK_KEY`,
-`875421010`) means they are safe together:
+`875421010`) means they are safe together. That key is used **only** by this
+worker: advisory-lock keys live in one database-wide namespace, so it is kept
+distinct from the scanner (`875421009`) and the scheduled candle-ingestion warm
+cycle (`875421011`). It previously collided with the warm cycle's key, which made
+each subsystem silently exclude the other — an FX check in flight caused
+`scheduled ingestion: warm-cycle lock is already held; skipping cycle` and vice
+versa. The key assignment is now pinned by a regression test:
 
 * an in-process ticker while the instance is awake —
   `FX_SOURCE_CHECK_ENABLED=true` (default `false`), every

@@ -50,8 +50,11 @@ const MIGRATION_FILE_RE = /^(\d{4})_(.+)\.sql$/;
  * Any two instances (or a boot-time run racing an operator CLI run) that ask
  * for the same key queue behind each other instead of applying the same
  * migration twice. Arbitrary, but it must never change.
+ *
+ * Exported so the regression suite can assert it is distinct from every other
+ * advisory key in the process (advisory keys share one namespace).
  */
-const MIGRATION_LOCK_KEY = 611_231_007;
+export const MIGRATION_LOCK_KEY = 611_231_007;
 const MIGRATION_LOCK_WAIT_MS = 60_000;
 const MIGRATION_LOCK_POLL_MS = 500;
 

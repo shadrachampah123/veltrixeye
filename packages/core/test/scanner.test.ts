@@ -2185,3 +2185,49 @@ describe('F3: External scheduler invocation, sleep-resume recovery & graceful sh
     assert.ok(cursors.rows.some((c) => Number(c.last_candle_time) === FORMING_OPEN));
   });
 });
+
+describe('scanner — orphan classification (regression)', () => {
+  test('a live holder is reported with its idle age and is not flagged as an orphan', async () => {
+    const logged: { level: string; message: string; meta?: Record<string, unknown> }[] = [];
+    const logger = {
+      info: (message: string, meta?: Record<string, unknown>) => logged.push({ level: 'info', message, meta }),
+      warn: (message: string, meta?: Record<string, unknown>) => logged.push({ level: 'warn', message, meta }),
+      error: (message: string, meta?: Record<string, unknown>) => logged.push({ level: 'error', message, meta }),
+    };
+    // Production configuration (render.yaml: SCANNER_LEASE_MS=1800000) with the
+    // default heartbeat/orphan derivation — the exact shape that used to call a
+    // healthy 30-minute scan abandoned for ~330s of every 450s.
+    const service = new ScannerService(pool, providerRegistry, candleStore, ingestion, evaluation, setups, scoring, alerts, {
+      leaseMs: 1_800_000,
+      logger,
+      maxRetries: 1,
+      providerTimeoutMs: 100,
+    });
+    const holder = await pool.connect();
+    try {
+      const acquired = await holder.query('SELECT pg_try_advisory_lock($1::bigint) AS acquired', [
+        SCANNER_ADVISORY_LOCK_KEY,
+      ]);
+      assert.equal(acquired.rows[0]?.acquired, true);
+
+      // Contention is reported either as a skipped run (there is a last run) or
+      // as a conflict; both paths log the holder first.
+      await service.runOnce().catch(() => undefined);
+
+      const skipped = logged.find((entry) => entry.message.includes('scan skipped'));
+      assert.ok(skipped, 'the contended run must report who holds the lock');
+      assert.equal(
+        skipped.meta?.holderSuspectedOrphaned,
+        false,
+        'a holder that just acquired the lock is not an orphan, however long the lease is',
+      );
+      assert.ok(
+        typeof skipped.meta?.holderIdleMs === 'number' && (skipped.meta.holderIdleMs as number) < 120_000,
+        'the idle age is reported so an operator can judge it against the threshold',
+      );
+    } finally {
+      await holder.query('SELECT pg_advisory_unlock($1::bigint)', [SCANNER_ADVISORY_LOCK_KEY]);
+      holder.release();
+    }
+  });
+});

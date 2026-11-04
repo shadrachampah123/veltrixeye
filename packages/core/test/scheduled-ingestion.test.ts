@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 
+import { FX_SOURCE_ADVISORY_LOCK_KEY } from '@veltrixeye/contracts';
 import {
   type Candle,
   type MarketDataProvider,
@@ -1278,5 +1279,62 @@ describe('isRateLimitedError', () => {
     assert.equal(isRateLimitedError(Errors.notFound('unknown instrument')), false);
     assert.equal(isRateLimitedError(new Error('socket hang up')), false);
     assert.equal(isRateLimitedError(undefined), false);
+  });
+});
+
+describe('scheduled ingestion — advisory-key isolation from the FX source (regression)', () => {
+  test('a held FX-source key does not skip the warm cycle, and neither does the cycle block FX', async () => {
+    await pool.query('DELETE FROM candles');
+    await pool.query(`DELETE FROM ingestion_runs WHERE trigger = 'scheduled'`);
+    const logs: { level: string; message: string; meta?: Record<string, unknown> }[] = [];
+    const logger = {
+      info: (message: string, meta?: Record<string, unknown>) => logs.push({ level: 'info', message, meta }),
+      warn: (message: string, meta?: Record<string, unknown>) => logs.push({ level: 'warn', message, meta }),
+      error: (message: string, meta?: Record<string, unknown>) => logs.push({ level: 'error', message, meta }),
+    };
+    const observed = new ScheduledIngestionService(pool, ingestion, {
+      lookbackCandles: 10,
+      minIntervalMs: 0,
+      logger,
+    });
+
+    // An in-flight billing FX observation holds *its* session lock.
+    const fxClient = await pool.connect();
+    try {
+      const fx = await fxClient.query('SELECT pg_try_advisory_lock($1::bigint) AS acquired', [
+        FX_SOURCE_ADVISORY_LOCK_KEY,
+      ]);
+      assert.equal(fx.rows[0]?.acquired, true, 'staging the FX lock must succeed');
+
+      mockProvider.requestedPairs = [];
+      mockProvider.fetchCount = 0;
+      const cycle = await observed.warmCache({ timeframes: ['1h'], nowMs: Date.now() });
+
+      // Before the key split (both 875421010) this cycle was skipped outright and
+      // logged `warm-cycle lock is already held; skipping cycle`.
+      assert.equal(
+        logs.filter((entry) => entry.message.includes('warm-cycle lock is already held')).length,
+        0,
+        'an FX observation is a different subsystem and must not contend for the warm-cycle lock',
+      );
+      assert.equal(cycle.skippedDueToMinInterval, false);
+      assert.ok(
+        cycle.providerRequests > 0 || cycle.pairsAlreadyCached > 0,
+        'the cycle actually did its work while the FX key was held',
+      );
+
+      // The reverse direction: the ingest key is a different key on the server,
+      // so an FX owner can take it — proof the two are not the same lock.
+      const sameKey = await fxClient.query('SELECT pg_try_advisory_lock($1::bigint) AS acquired', [
+        SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+      ]);
+      assert.equal(sameKey.rows[0]?.acquired, true, 'the ingest key is distinct from the FX key');
+      await fxClient.query('SELECT pg_advisory_unlock($1::bigint)', [SCHEDULED_INGESTION_ADVISORY_LOCK_KEY]);
+    } finally {
+      await fxClient
+        .query('SELECT pg_advisory_unlock($1::bigint)', [FX_SOURCE_ADVISORY_LOCK_KEY])
+        .catch(() => {});
+      fxClient.release();
+    }
   });
 });

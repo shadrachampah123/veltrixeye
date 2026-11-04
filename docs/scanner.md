@@ -65,7 +65,7 @@ warm cycle:
 |---|---|
 | **Ownership is recorded atomically** | `SELECT pg_backend_pid(), pg_try_advisory_lock($1)` — the pid returned *is* the pid that evaluated the acquire |
 | **Ownership is proven before the job runs** | the lock must be visible in `pg_locks` for that same pid (`classid/objid` reconstruction of the bigint key); otherwise the cycle refuses to run and the session is evicted |
-| **Losing ownership mid-run fails closed** | a heartbeat re-verifies every `leaseMs / 4` (min 1s) and the run is aborted at the next strategy boundary; **the terminal status decision re-verifies ownership synchronously**, so no run is ever recorded `completed`/`partial` without a fresh proof. Aborts raise a `conflict` error and log `scanner advisory lock lost while scanning` |
+| **Losing ownership mid-run fails closed** | a heartbeat re-verifies every `min(leaseMs / 4, 60 s)` (min 1 s, disabled at `0`) and the run is aborted at the next strategy boundary; **the terminal status decision re-verifies ownership synchronously**, so no run is ever recorded `completed`/`partial` without a fresh proof. Aborts raise a `conflict` error and log `scanner advisory lock lost while scanning`. The 60 s cap matters: at the production lease (`SCANNER_LEASE_MS=1800000`) `leaseMs / 4` is 7.5 minutes, which would let a scan keep working long after its session died |
 | **An inherited lock is never re-acquired** | before acquiring, the session is asked whether it *already* holds the key. Advisory locks are re-entrant per session, so acquiring on top of a leaked level would return `true`, let two jobs run "exclusively", and leave one level behind after a single unlock. The acquire refuses (`already_owned`) and the session is evicted without stacking a level |
 | **Release outcomes are classified** | `released` / `not_owned` (`unlock_returned_false`) / `session_changed` (release evaluated on a different backend) / `still_held` (unlock returned true but the key survives — a stacked level) / `query_error`; every non-clean outcome destroys and evicts the session |
 | **A release is proven, not assumed** | `pg_advisory_unlock` answers "one level removed", so a successful unlock is followed by an ownership proof; if the key is still visible on the session the result is `still_held` and the session is destroyed |
@@ -110,18 +110,84 @@ connection:
 No credentials, connection strings or hostnames are logged by any of these
 paths; diagnostics carry pid, `pg_stat_activity` state and state age only.
 
-`suspectedOrphaned` is **diagnostic only**: nothing is terminated automatically.
-A holder that stays `idle` for ≥ 120 s (no heartbeat) is reported so an operator
-can inspect or restart, rather than the service killing sessions by guesswork.
-Session teardown always releases the lock, so evicting a session is the only
-recovery primitive this codebase uses.
-
 **Frequency:**
 
 - Expected interval: **5 minutes** (`SCANNER_EXPECTED_INTERVAL_MS = 300_000`)
 - Configurable via `SCANNER_INTERVAL_MS` (30s–1h, default 5m)
 - Actual frequency depends on deployment: if `SCANNER_ENABLED=false` (dev default), scanner only runs when manually triggered; in production, enable with `SCANNER_ENABLED=true`
 - The scanner itself does not enforce a cron — it is invoked by the ticker or external scheduler; advisory locking ensures no overlapping duplicate scans
+
+### Orphan detection (and why an idle session is not a dead scanner)
+
+`suspectedOrphaned` is **diagnostic only**: nothing is terminated automatically.
+It is set when, and only when, the holder backend is in `pg_stat_activity` state
+`idle` **and** has been in that state for at least the orphan threshold. A
+session that is `active`, `idle in transaction`, or whose `pg_stat_activity`
+row is unreadable (`holderDetailsUnavailable: true`) is never called an orphan.
+
+The threshold is **not** a fixed 120 s. It is derived together with the
+heartbeat (`deriveAdvisoryLockTiming` in `packages/core/src/db/advisory-lock.ts`):
+
+| Value | Rule | Production value |
+|---|---|---|
+| Heartbeat | `min(leaseMs / 4, 60 s)`, floor 1 s, `0` disables | `60 s` (lease `1800000`) |
+| Orphan threshold | `max(120 s, 2 × heartbeat)` unless explicitly overridden | `120 s` |
+
+The `2 × heartbeat` floor is the important part. A **healthy** long-running scan
+looks like an idle session between two heartbeats: its only activity is one
+`pg_locks` read per heartbeat, so for almost the whole period `pg_stat_activity`
+reports `idle`. If the threshold were shorter than a heartbeat, a live scan
+would be labelled a suspected orphan for part of every period — which is exactly
+what the earlier `leaseMs / 4` heartbeat with a fixed 120 s threshold did (450 s
+heartbeat vs 120 s threshold: ~73 % of every period a healthy scan looked
+abandoned). With one derivation for both values that can no longer happen: a
+session is only flagged once it has been idle for at least two missed
+heartbeats.
+
+How to read the flag:
+
+- **`holderSuspectedOrphaned: false`** — the holder checked in within the last
+  two heartbeat periods. It is alive; the skip is ordinary contention.
+- **`holderSuspectedOrphaned: true`** — the holder has not run a heartbeat for
+  at least two periods. *Likely* abandoned (killed process, suspended compute,
+  connection dropped without a clean unlock), but still only a suspicion: the
+  session may be blocked in a long statement whose `pg_stat_activity` snapshot
+  is stale. Confirm before restarting anything with the read-only query below.
+- Anything else — `holderDetailsUnavailable`, or no holder at all despite a
+  failed acquire — means the diagnosis is incomplete; do not read it as "dead".
+
+Diagnose a held lock without changing anything (read-only, safe to run while the
+API is live):
+
+```sql
+SELECT l.pid,
+       ((l.classid::bigint << 32) | l.objid::bigint) AS key,
+       a.application_name,
+       a.state,
+       now() - a.state_change                       AS idle_for,
+       a.backend_start,
+       a.client_addr
+  FROM pg_locks l
+  LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+ WHERE l.locktype = 'advisory'
+   AND l.granted
+   AND ((l.classid::bigint << 32) | l.objid::bigint)
+       IN (875421009, 875421010, 875421011)
+ ORDER BY l.pid;
+```
+
+Reading it: `875421009` is the scanner, `875421010` the FX source, `875421011`
+scheduled ingestion — three different subsystems, so a row here tells you *which*
+one is holding. `backend_start` older than the last restart means a session that
+outlived its process (stale); a steadily growing `idle_for` past two heartbeats
+means a stuck session; a short-lived holder that appears exactly when an
+`already held` message is logged means ordinary contention, not a leak.
+
+Session teardown always releases the lock, so evicting a session (which this
+codebase does only on unprovable ownership, never on a suspicion) is the only
+recovery primitive used. A genuinely orphaned lock from a *previous* process
+cannot be reaped by killing a session that no longer exists — restart the
+holder's compute or let it time out.
 
 **Duplicate Prevention:**
 

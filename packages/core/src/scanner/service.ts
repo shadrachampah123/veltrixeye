@@ -32,7 +32,7 @@ import type { AlertService } from '../alerts/service.js';
 import { resolveEntitlements } from '../billing/entitlement-resolution.js';
 import {
   acquireSessionAdvisoryLock,
-  DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS,
+  deriveAdvisoryLockTiming,
   holderLogMeta,
   type AdvisoryLockRelease,
   type SessionAdvisoryLock,
@@ -436,13 +436,21 @@ export class ScannerService {
     this.retryMaxMs = options.retryMaxMs ?? SCANNER_RETRY_MAX_MS;
     this.expectedIntervalMs = options.expectedIntervalMs ?? SCANNER_EXPECTED_INTERVAL_MS;
     this.leaseMs = options.leaseMs ?? DEFAULT_SCANNER_LEASE_MS;
-    const heartbeatMs =
-      options.advisoryLockHeartbeatMs ?? Math.max(1_000, Math.floor(this.leaseMs / 4));
-    this.advisoryLockHeartbeatMs = Number.isFinite(heartbeatMs) ? Math.max(0, Math.floor(heartbeatMs)) : 0;
-    const orphanIdleMs = options.advisoryLockOrphanIdleMs ?? DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS;
-    this.advisoryLockOrphanIdleMs = Number.isFinite(orphanIdleMs)
-      ? Math.max(0, Math.floor(orphanIdleMs))
-      : DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS;
+    // One derivation for both values (db/advisory-lock.ts): the heartbeat is
+    // capped at 60s so a lost lock is detected inside the lease, and the orphan
+    // threshold is at least two heartbeats so a *healthy* job that is merely
+    // idle between checks is never reported as abandoned.
+    const lockTiming = deriveAdvisoryLockTiming({
+      leaseMs: this.leaseMs,
+      ...(options.advisoryLockHeartbeatMs !== undefined
+        ? { heartbeatMs: options.advisoryLockHeartbeatMs }
+        : {}),
+      ...(options.advisoryLockOrphanIdleMs !== undefined
+        ? { orphanIdleMs: options.advisoryLockOrphanIdleMs }
+        : {}),
+    });
+    this.advisoryLockHeartbeatMs = lockTiming.heartbeatMs;
+    this.advisoryLockOrphanIdleMs = lockTiming.orphanIdleMs;
     this.runRetentionDays = clampRetentionDays(options.runRetentionDays);
     this.logger = options.logger ?? DEFAULT_LOGGER;
     this.redact = options.redact ?? ((text: string) => text);

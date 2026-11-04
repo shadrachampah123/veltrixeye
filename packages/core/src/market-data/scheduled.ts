@@ -11,7 +11,7 @@ import { isDomainError } from '../errors.js';
 import { ProviderBudgetExhaustedError } from './request-budget.js';
 import {
   acquireSessionAdvisoryLock,
-  DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS,
+  deriveAdvisoryLockTiming,
   holderLogMeta,
   type AdvisoryLockRelease,
 } from '../db/advisory-lock.js';
@@ -144,8 +144,18 @@ export const DEFAULT_SCHEDULED_LOOKBACK_CANDLES = 500;
 export const DEFAULT_SCHEDULED_MAX_REQUESTS_PER_CYCLE = 8;
 export const DEFAULT_SCHEDULED_MIN_INTERVAL_MS = 900_000;
 
-/** Dedicated database advisory lock for one scheduled-ingestion warm cycle. */
-export const SCHEDULED_INGESTION_ADVISORY_LOCK_KEY = 875_421_010;
+/**
+ * Dedicated database advisory lock for one scheduled-ingestion warm cycle.
+ *
+ * **Distinct from every other key in the process.** It previously collided with
+ * `FX_SOURCE_ADVISORY_LOCK_KEY` (billing FX source observations, also
+ * `875421010`), so an in-flight FX check made the warm cycle log
+ * `warm-cycle lock is already held; skipping cycle` and vice versa — two
+ * unrelated subsystems silently serialising on one advisory key. The
+ * regression suite now asserts that all advisory keys are unique and that an
+ * FX lock cannot block ingestion.
+ */
+export const SCHEDULED_INGESTION_ADVISORY_LOCK_KEY = 875_421_011;
 
 /** Max instruments the scheduled ingestion will process per cycle. */
 export const MAX_SCHEDULED_INSTRUMENTS = 50;
@@ -223,10 +233,15 @@ export class ScheduledIngestionService {
       ? Math.max(0, Math.floor(minIntervalMs))
       : DEFAULT_SCHEDULED_MIN_INTERVAL_MS;
     this.logger = options?.logger ?? NOOP_LOGGER;
-    const orphanIdleMs = options?.advisoryLockOrphanIdleMs ?? DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS;
-    this.advisoryLockOrphanIdleMs = Number.isFinite(orphanIdleMs)
-      ? Math.max(0, Math.floor(orphanIdleMs))
-      : DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS;
+    // No heartbeat on the warm-cycle lock (a cycle is short and bounded), so the
+    // derivation only resolves the orphan threshold — same rules as the scanner.
+    this.advisoryLockOrphanIdleMs = deriveAdvisoryLockTiming({
+      leaseMs: 0,
+      heartbeatMs: 0,
+      ...(options?.advisoryLockOrphanIdleMs !== undefined
+        ? { orphanIdleMs: options.advisoryLockOrphanIdleMs }
+        : {}),
+    }).orphanIdleMs;
   }
 
   /**

@@ -24,12 +24,18 @@ import {
   acquireSessionAdvisoryLock,
   advisoryLockErrorCode,
   createPool,
+  deriveAdvisoryLockTiming,
   holderLogMeta,
   readAdvisoryLockHolder,
   DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS,
+  MAX_ADVISORY_LOCK_HEARTBEAT_MS,
+  MIGRATION_LOCK_KEY,
+  NOTIFICATION_FAIRNESS_LOCK_KEY,
+  SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
   type AdvisoryLockClient,
   type SessionAdvisoryLock,
 } from '../src/index.js';
+import { FX_SOURCE_ADVISORY_LOCK_KEY, SCANNER_ADVISORY_LOCK_KEY } from '@veltrixeye/contracts';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const DB_PORT = 5594;
@@ -580,5 +586,174 @@ describe('advisory lock — classified states (unit)', () => {
   test('holderLogMeta never emits undefined-valued noise for a missing holder', () => {
     assert.deepEqual(holderLogMeta(null), {});
     assert.deepEqual(holderLogMeta(undefined), {});
+  });
+});
+
+describe('advisory lock — key namespace is unique across subsystems (regression)', () => {
+  /**
+   * PostgreSQL keeps every advisory lock in one namespace per database: a
+   * `pg_advisory_lock(k)` and a `pg_advisory_xact_lock(k)` on the same key
+   * exclude each other even when they belong to unrelated subsystems.
+   *
+   * This is the check that the scheduling/ingestion collision (both the scanner
+   * warm cycle and the billing FX source used `875421010`) violated: an FX
+   * observation being fetched made the warm cycle log `warm-cycle lock is
+   * already held; skipping cycle` and skip its work, and vice versa.
+   */
+  test('every subsystem uses a distinct advisory key', () => {
+    const keys: Record<string, number> = {
+      scanner: SCANNER_ADVISORY_LOCK_KEY,
+      'scheduled-ingestion': SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+      'fx-source': FX_SOURCE_ADVISORY_LOCK_KEY,
+      'notification-fairness': NOTIFICATION_FAIRNESS_LOCK_KEY,
+      migrations: MIGRATION_LOCK_KEY,
+    };
+    const entries = Object.entries(keys);
+    const seen = new Map<number, string>();
+    for (const [name, key] of entries) {
+      assert.equal(Number.isInteger(key), true, `${name} key must be an integer`);
+      assert.ok(key > 0 && key < 2 ** 52, `${name} key must be a positive safe integer`);
+      const clash = seen.get(key);
+      assert.equal(
+        clash,
+        undefined,
+        `${name} reuses advisory key ${key} already owned by ${clash} — advisory keys are one namespace, so the two subsystems would silently serialise on each other`,
+      );
+      seen.set(key, name);
+    }
+    assert.equal(new Set(entries.map(([, key]) => key)).size, entries.length);
+  });
+
+  test('the intended key assignment is pinned, so a rename cannot silently re-collide', () => {
+    // Pinned values: production logs and the database's `pg_locks` are read
+    // against these numbers, and a changed number is a deployment-visible event.
+    assert.equal(SCANNER_ADVISORY_LOCK_KEY, 875_421_009);
+    assert.equal(FX_SOURCE_ADVISORY_LOCK_KEY, 875_421_010, 'the FX source keeps its historical key');
+    assert.equal(SCHEDULED_INGESTION_ADVISORY_LOCK_KEY, 875_421_011, 'ingestion moved off the FX key');
+    assert.equal(MIGRATION_LOCK_KEY, 611_231_007);
+    assert.equal(NOTIFICATION_FAIRNESS_LOCK_KEY, 611_231_008);
+  });
+
+  test('an FX-source lock held on a real backend does not block a scheduled-ingestion acquire', async () => {
+    const holder = await holdRawLock(FX_SOURCE_ADVISORY_LOCK_KEY);
+    const client = await pool.connect();
+    let mustDestroy = true;
+    try {
+      const res = await acquireSessionAdvisoryLock(client, SCHEDULED_INGESTION_ADVISORY_LOCK_KEY);
+      assert.equal(
+        res.acquired,
+        true,
+        'the warm cycle must be able to run while an FX observation check holds its own key',
+      );
+      assert.notEqual(res.lock, null);
+      assert.equal(await countLocks(FX_SOURCE_ADVISORY_LOCK_KEY), 1, 'the FX key is still held by its owner');
+
+      const release = await res.lock!.release();
+      assert.equal(release.released, true);
+      assert.equal(release.mustDestroyClient, false);
+      mustDestroy = release.mustDestroyClient;
+    } finally {
+      // `SessionAdvisoryLock.release()` proves the unlock but never returns the
+      // pooled client — the caller does (the scanner does the same).
+      client.release(mustDestroy);
+    }
+    await holder.release();
+  });
+});
+
+describe('advisory lock — heartbeat/orphan derivation (regression)', () => {
+  const PRODUCTION_LEASE_MS = 1_800_000; // SCANNER_LEASE_MS in render.yaml
+
+  test('at the production lease the heartbeat is 60s, not lease/4 (450s)', () => {
+    const timing = deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS });
+    assert.equal(timing.heartbeatMs, MAX_ADVISORY_LOCK_HEARTBEAT_MS);
+    assert.equal(timing.heartbeatMs, 60_000);
+    assert.equal(timing.orphanIdleMs, DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS);
+  });
+
+  test('a healthy holder is never idle past the orphan threshold', () => {
+    // The invariant that the old code violated: heartbeat 450s > threshold 120s,
+    // so ~73% of every heartbeat period a *healthy* scan looked abandoned.
+    for (const leaseMs of [PRODUCTION_LEASE_MS, 60_000, 10_000, 2_000]) {
+      const { heartbeatMs, orphanIdleMs } = deriveAdvisoryLockTiming({ leaseMs });
+      assert.ok(
+        orphanIdleMs >= heartbeatMs * 2,
+        `lease ${leaseMs}: orphan threshold ${orphanIdleMs} must cover two heartbeat periods (${heartbeatMs})`,
+      );
+      assert.ok(
+        heartbeatMs < leaseMs,
+        `lease ${leaseMs}: a lost lock must be noticed inside the lease (heartbeat ${heartbeatMs})`,
+      );
+    }
+    // Degenerate leases fall back to the 1s heartbeat floor; the orphan
+    // threshold still covers it, so classification stays honest.
+    for (const leaseMs of [1, 0, Number.NaN]) {
+      const { heartbeatMs, orphanIdleMs } = deriveAdvisoryLockTiming({ leaseMs });
+      assert.equal(heartbeatMs, 1_000);
+      assert.ok(orphanIdleMs >= heartbeatMs * 2);
+    }
+  });
+
+  test('the heartbeat is capped, and still detects loss far inside the lease', () => {
+    const timing = deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS });
+    assert.ok(timing.heartbeatMs <= MAX_ADVISORY_LOCK_HEARTBEAT_MS);
+    assert.ok(
+      timing.heartbeatMs * 4 <= PRODUCTION_LEASE_MS,
+      'at least four ownership checks fit inside the production lease',
+    );
+    // An explicit, larger value is clamped rather than trusted.
+    assert.equal(
+      deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS, heartbeatMs: 900_000 }).heartbeatMs,
+      MAX_ADVISORY_LOCK_HEARTBEAT_MS,
+    );
+  });
+
+  test('an explicit heartbeat is honoured (including the sub-second values tests use)', () => {
+    assert.equal(deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS, heartbeatMs: 1 }).heartbeatMs, 1);
+    assert.equal(deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS, heartbeatMs: 5_000 }).heartbeatMs, 5_000);
+    assert.equal(deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS, heartbeatMs: -1 }).heartbeatMs, 0);
+    assert.equal(deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS, heartbeatMs: Number.NaN }).heartbeatMs, MAX_ADVISORY_LOCK_HEARTBEAT_MS);
+  });
+
+  test('a disabled heartbeat leaves the default orphan threshold alone', () => {
+    const timing = deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS, heartbeatMs: 0 });
+    assert.equal(timing.heartbeatMs, 0);
+    assert.equal(timing.orphanIdleMs, DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS);
+  });
+
+  test('an explicit orphan threshold still wins (tests stage states that way)', () => {
+    assert.equal(
+      deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS, orphanIdleMs: 0 }).orphanIdleMs,
+      0,
+    );
+    assert.equal(
+      deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS, orphanIdleMs: 30_000 }).orphanIdleMs,
+      30_000,
+    );
+    assert.equal(
+      deriveAdvisoryLockTiming({ leaseMs: PRODUCTION_LEASE_MS, orphanIdleMs: Number.NaN }).orphanIdleMs,
+      DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS,
+    );
+  });
+
+  test('a holder idle for less than the threshold is not called a suspected orphan', async () => {
+    const holder = await holdRawLock(SCANNER_ADVISORY_LOCK_KEY);
+    try {
+      const client = await pool.connect();
+      try {
+        const fresh = await readAdvisoryLockHolder(client, SCANNER_ADVISORY_LOCK_KEY, DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS);
+        assert.ok(fresh, 'the holder is readable');
+        assert.equal(fresh.state, 'idle');
+        assert.equal(fresh.suspectedOrphaned, false, 'a holder idle for milliseconds is healthy, not abandoned');
+        // The same backend, aged past the threshold, *is* flagged: the age test
+        // is what classifies the holder, not the mere fact of being idle.
+        const aged = await readAdvisoryLockHolder(client, SCANNER_ADVISORY_LOCK_KEY, 0);
+        assert.equal(aged?.suspectedOrphaned, true);
+      } finally {
+        client.release();
+      }
+    } finally {
+      await holder.release();
+    }
   });
 });

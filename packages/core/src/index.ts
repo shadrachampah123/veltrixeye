@@ -6,6 +6,8 @@ export {
   holderLogMeta,
   SessionAdvisoryLock,
   DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS,
+  MAX_ADVISORY_LOCK_HEARTBEAT_MS,
+  deriveAdvisoryLockTiming,
   advisoryLockErrorCode,
   type AdvisoryLockAcquireResult,
   type AdvisoryLockClient,
@@ -14,6 +16,7 @@ export {
   type AdvisoryLockOptions,
   type AdvisoryLockRelease,
   type AdvisoryLockReleaseReason,
+  type AdvisoryLockTiming,
   type AdvisoryLockVerification,
 } from './db/advisory-lock.js';
 export {
@@ -21,6 +24,7 @@ export {
   migrationStatus,
   listMigrationFiles,
   MIGRATIONS_DIR,
+  MIGRATION_LOCK_KEY,
   type MigrationFile,
   type MigrationRecord,
   type MigrationStatus,
@@ -144,6 +148,7 @@ export {
 // Notification delivery pipeline (M7.3: outbox + worker + provider adapters)
 export {
   NotificationOutbox,
+  NOTIFICATION_FAIRNESS_LOCK_KEY,
   toNotificationDto,
   type Queryable,
   type NotificationJobRow,
