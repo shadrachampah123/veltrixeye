@@ -18,6 +18,7 @@ import {
 import { Errors } from '../errors.js';
 import type { CandleStore, MarketDataQueryable } from './candles.js';
 import type { ProviderRegistry } from './registry.js';
+import { ProviderBudgetExhaustedError } from './request-budget.js';
 
 /** Preferred provider id; falls back to any registered historical provider. */
 const PREFERRED_PROVIDER_ID = 'twelve-data';
@@ -110,6 +111,10 @@ export class IngestionService {
           }, queryable);
         }
       } catch (err) {
+        // The caller's own budget guard stopped fetch-through: rethrow as-is so
+        // it is neither mapped to a provider error nor recorded as a failed
+        // fetch-through run (no provider request was made for it).
+        if (err instanceof ProviderBudgetExhaustedError) throw err;
         await this.recordRun({
           trigger: 'fetch_through',
           status: 'failed',

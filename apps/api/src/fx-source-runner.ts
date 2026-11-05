@@ -25,8 +25,14 @@ import {
  *    spin-down (`FX_SOURCE_WORKER_TOKEN`).
  *
  * Both paths coordinate through ONE PostgreSQL advisory lock
- * (`FX_SOURCE_ADVISORY_LOCK_KEY`), so an instance that wakes up mid-schedule can
- * never fetch or write twice.
+ * (`FX_SOURCE_ADVISORY_LOCK_KEY` = 875421010), so an instance that wakes up
+ * mid-schedule can never fetch or write twice.
+ *
+ * That key belongs to this worker alone. It used to be shared with the
+ * scheduled candle-ingestion warm cycle, and because PostgreSQL has a single
+ * advisory-lock namespace the two subsystems silently excluded each other: an
+ * FX check in flight made ingestion log `warm-cycle lock is already held;
+ * skipping cycle`. Ingestion now uses 875421011.
  *
  * WHY BOTH. The production API is a container a platform may stop at any time
  * (Render's free tier spins down after ~15 minutes idle). A ticker alone

@@ -20,6 +20,11 @@ was merged with that mainline on 2026-11-03; no production probe was attempted.
 No Render, Vercel, Neon, secret or environment-variable value was read or
 changed during that reconciliation, and no deployment was triggered or observed.
 
+Database backup/recovery status is also unverified: no Neon snapshot schedule
+had been observed previously, and nothing here was changed. See
+[neon-backup-recovery.md](./neon-backup-recovery.md) for the assessment and the
+owner-authorised recovery plan.
+
 The following production checks are blocked:
 
 - `GET /api/health` and `GET /api/health/ready`, including worker and retention
@@ -601,7 +606,9 @@ migrations are unaffected.
   returns 404 and causes no outbound read; with no cron job nothing runs.
 - **Or in-process** — `FX_SOURCE_CHECK_ENABLED=true` runs the check on
   `FX_SOURCE_CHECK_INTERVAL_MS` (default 6 h) while the instance is awake. Both
-  paths serialize through advisory lock `875421010`, so running both is safe.
+  paths serialize through advisory lock `875421010` (the FX-source key, distinct
+  from the scanner's `875421009` and ingestion's `875421011`), so running both is
+  safe.
 - **Watching it without a token** — `GET /api/health` reports
   `workers.fxSource` (`lastSuccessAt`, `lastFailureAt`, `lastFailureCode`,
   `successes`, `failures`, `inFlight`, `successAgeMs`). A moving `lastSuccessAt`
@@ -661,14 +668,45 @@ the in-process ticker and `POST /api/internal/scanner/run`.
   `[api] live scanner enabled (… ) , scheduled ingestion warm enabled`. With
   `INGESTION_MIN_INTERVAL_MS=900000` the guard, not the 5-minute scanner
   cadence, sets the rate: a warm cycle runs at most once every 15 minutes, and
-  two instances cannot overlap it (advisory lock `875421010`).
-- **Per-cycle log** — `scheduled ingestion: warm cycle complete` carries
-  `instruments`, `timeframes`, `pairsCompleted`, `pairsFailed`,
-  `pairsAlreadyCached`, `candlesUpserted`, `providerRequests` and
-  `abortedDueToRateLimit`. `providerRequests` never exceeds
-  `INGESTION_MAX_REQUESTS_PER_CYCLE`; a cycle that reaches the cap (or a
-  provider rate limit) stops early with `abortedDueToRateLimit: true` instead
-  of spending another credit.
+  two instances cannot overlap it (advisory lock `875421011`, acquired with
+  proven ownership — see
+  [scanner.md](./scanner.md#advisory-lock-ownership-hardening)). That key is
+  **distinct** from the FX-source check's `875421010`: while both shared one
+  key, an in-flight FX observation made the warm cycle log
+  `warm-cycle lock is already held; skipping cycle` and skip its work (and the
+  reverse), which read like a stale-lock incident but was ordinary contention
+  between unrelated subsystems.
+- **Per-cycle log** — `scheduled ingestion: warm cycle pairs complete` and
+  `scheduled ingestion: warm cycle complete` carry `instruments`, `timeframes`,
+  `totalPairs`, `rotationOffset`, `pairsCompleted`, `pairsFailed`,
+  `pairsAlreadyCached`, `pairsDeferred`, `candlesUpserted`, `providerRequests`,
+  `budgetExhausted` and `abortedDueToRateLimit`. `providerRequests` never
+  exceeds `INGESTION_MAX_REQUESTS_PER_CYCLE`.
+- **Budget exhaustion is a deferral, not a failure** (repair of the recurring
+  `Scheduled ingestion provider request budget exhausted.` pair failures). A
+  cycle that reaches the cap stops cleanly: the untried pairs are counted in
+  `pairsDeferred` (never in `pairsFailed`), `budgetExhausted` is `true`,
+  `abortedDueToRateLimit` stays `false` — that flag is now reserved for a real
+  provider `429` — and no `ingestion_runs.error` is written. `abortedDueToRateLimit`
+  (a genuine provider rate limit) is the only condition that still stops a
+  cycle for a provider reason and starts the cooldown early.
+- **Fair rotation** — the cycle walks one flat instrument × timeframe list from a
+  persisted `rotationOffset` cursor (stored in the run's `request` JSON and
+  advanced by `INGESTION_MAX_REQUESTS_PER_CYCLE` each cycle). With the shipped
+  budget of 8 the whole warmed universe is reached every `ceil(pairs / 8)`
+  cycles, so no pair can be permanently starved — previously the fixed order
+  meant the same trailing pairs (for example `BTCUSD 1d`) were the only ones
+  ever deferred.
+- **Interpreting lock diagnostics** — the warm cycle and the scanner share one
+  hardened advisory-lock path, so the same reasons appear in both logs:
+  `unlock_returned_false` (the session no longer owned the key at release),
+  `session_changed` (**the connection is not session-pinned** — see
+  [scanner.md](./scanner.md#session-pinned-connection-requirement-production);
+  point that connection at a direct or session-pooled endpoint),
+  `still_held` (a stacked lock level survived one unlock; the session was
+  evicted) and `query_error` (the unlock statement itself failed). In every case
+  the session is destroyed so the lock cannot outlive the cycle; the scan itself
+  is never allowed to continue unguarded.
 - **Durable record** — every attempted cycle (including failed and partial
   ones) writes an `ingestion_runs` row with `trigger = 'scheduled'`, `status`
   `completed` / `partial` / `failed`, and the counters above inside `request`:
@@ -679,6 +717,9 @@ the in-process ticker and `POST /api/internal/scanner/run`.
          request->>'pairsCompleted'        AS pairs_completed,
          request->>'pairsFailed'           AS pairs_failed,
          request->>'pairsAlreadyCached'    AS already_cached,
+         request->>'pairsDeferred'         AS deferred,
+         request->>'budgetExhausted'       AS budget_spent,
+         request->>'rotationOffset'        AS cursor,
          request->>'abortedDueToRateLimit' AS aborted
     FROM ingestion_runs
    WHERE trigger = 'scheduled'
