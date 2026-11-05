@@ -1,10 +1,30 @@
 // Database
 export { createPool, type DatabaseConfig } from './db/pool.js';
 export {
+  acquireSessionAdvisoryLock,
+  readAdvisoryLockHolder,
+  holderLogMeta,
+  SessionAdvisoryLock,
+  DEFAULT_ADVISORY_LOCK_ORPHAN_IDLE_MS,
+  MAX_ADVISORY_LOCK_HEARTBEAT_MS,
+  deriveAdvisoryLockTiming,
+  advisoryLockErrorCode,
+  type AdvisoryLockAcquireResult,
+  type AdvisoryLockClient,
+  type AdvisoryLockHolder,
+  type AdvisoryLockLogger,
+  type AdvisoryLockOptions,
+  type AdvisoryLockRelease,
+  type AdvisoryLockReleaseReason,
+  type AdvisoryLockTiming,
+  type AdvisoryLockVerification,
+} from './db/advisory-lock.js';
+export {
   runMigrations,
   migrationStatus,
   listMigrationFiles,
   MIGRATIONS_DIR,
+  MIGRATION_LOCK_KEY,
   type MigrationFile,
   type MigrationRecord,
   type MigrationStatus,
@@ -82,8 +102,11 @@ export {
   type BackfillRequest as IngestionBackfillRequest,
   type CandleReadRequest,
 } from './market-data/ingestion.js';
+export { ProviderBudgetExhaustedError } from './market-data/request-budget.js';
 export {
   ScheduledIngestionService,
+  SCHEDULED_INGESTION_ADVISORY_LOCK_KEY,
+  nextRotationOffset,
   isRateLimitedError,
   DEFAULT_SCHEDULED_TIMEFRAMES,
   DEFAULT_SCHEDULED_LOOKBACK_CANDLES,
@@ -125,6 +148,7 @@ export {
 // Notification delivery pipeline (M7.3: outbox + worker + provider adapters)
 export {
   NotificationOutbox,
+  NOTIFICATION_FAIRNESS_LOCK_KEY,
   toNotificationDto,
   type Queryable,
   type NotificationJobRow,

@@ -736,6 +736,9 @@ describe('F3: Internal scanner worker endpoints & ticker', () => {
         pairsAlreadyCached: 0,
         skippedDueToMinInterval: false,
         abortedDueToRateLimit: false,
+        budgetExhausted: false,
+        pairsDeferred: 0,
+        rotationOffset: 0,
       };
     };
     workerCtx.scanner.runWorkerOnce = async (args) => {
@@ -776,6 +779,9 @@ describe('F3: Internal scanner worker endpoints & ticker', () => {
         pairsAlreadyCached: 0,
         skippedDueToMinInterval: false,
         abortedDueToRateLimit: false,
+        budgetExhausted: false,
+        pairsDeferred: 0,
+        rotationOffset: 0,
       };
     };
     workerCtx.scanner.runWorkerOnce = async (args) => {
