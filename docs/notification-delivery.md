@@ -84,8 +84,8 @@ Four independent guards, so no duplicate delivery can be created by:
 |---|---|
 | `UNIQUE (alert_id, channel)` | replayed generation, double-clicks, concurrent twins, worker restarts |
 | `UNIQUE (idempotency_key)` | a second job for the same logical message (even if the channel index were dropped) |
-| `FOR UPDATE SKIP LOCKED` claim | two workers delivering the same job simultaneously |
-| stable `Message-ID` per job | a receiver-side duplicate when a provider accepted the message but the reply timed out |
+| `FOR UPDATE SKIP LOCKED` claim | two workers delivering the same unexpired lease simultaneously |
+| stable `Message-ID` per job | gives retries a consistent SMTP message identifier; SMTP does **not** guarantee receiver-side deduplication |
 
 `AlertService.generateAlert` enqueues with `ON CONFLICT … DO NOTHING` inside
 the alert transaction, so **alert + job commit together**: an alert can never
@@ -120,18 +120,38 @@ Invocation (all three are safe to run at the same time):
 | manual | `worker.runOnce()` | scripts, tests, ops |
 
 The API is a container that a platform may stop at any time (the Render free
-tier spins down), so nothing depends on the ticker being alive: the lease plus
-stale recovery guarantees a job is never lost, and an external scheduler can
-drain the queue whenever it likes. The scanner heartbeat route is the one
-external trigger that is reachable with the scanner's own secret, which is why
-it drains a batch too — see *Alert delivery operations* in
-[deployment.md](./deployment.md).
+tier spins down), so stale recovery makes interrupted work eligible for another
+attempt. This is **at-least-once**, not exactly-once delivery: after a provider
+accepts a message but its response is lost, a retry can send a duplicate, and
+SMTP does not provide a portable idempotency guarantee. The worker now claims
+one job immediately before each send (unstarted siblings stay pending) and
+renews the active job's lease every third of the lease interval. Each claim
+writes a fresh opaque fencing token in `locked_by`; renewal and every outcome
+transition require that token and a still-unexpired lease. Recovery and renew/
+ack updates serialize on the row, so whichever state transition wins prevents
+the former owner from acknowledging a reclaimed job. Retry/backoff and the
+attempt/dead-letter budget are unchanged.
 
-Whether delivery is actually running is observable WITHOUT a worker token:
+A database renewal failure is fail-closed: the worker logs a bounded event,
+waits for the provider call to settle, and does not acknowledge that result. A
+later recovery can retry it. If a provider accepted a message before the worker
+lost database ownership, a later attempt may duplicate it; no portable SMTP
+idempotency or exactly-once guarantee exists. As with any lease, a process pause
+longer than the lease or prolonged database unavailability can outlast renewal;
+owner fencing prevents stale database writes but cannot retract an external
+side effect already in flight. The scanner heartbeat route remains an external
+trigger reachable with the scanner's own secret — see *Alert delivery
+operations* in [deployment.md](./deployment.md).
+
+Whether this process is invoking delivery is observable WITHOUT a worker token:
 `GET /api/health` reports `workers.notifications` / `workers.scanner` with the
-last success, the last failure code and the counters. A never-advancing
-`lastSuccessAt` means the schedule is not executing, whatever the cron's own
-run status says.
+last success, the last failure code and the counters. These snapshots are
+process-local and indicate completed worker invocations, not provider acceptance
+or end-user receipt. `/api/health/ready` checks database/schema readiness, not
+notification-worker liveness. Maintenance calls through the separate internal
+maintenance route do not update the notification ticker snapshot. A
+never-advancing `lastSuccessAt` means this process has not recorded a successful
+worker invocation; it does not establish that every notification was delivered.
 
 ## 5. Retry policy
 
@@ -241,11 +261,19 @@ curl -X POST https://<api>/api/internal/notifications/deliveries/maintenance \
   -H "x-veltrixeye-worker-token: $NOTIFICATION_WORKER_TOKEN"
 ```
 
-To enable email delivery in production, set `SMTP_HOST`, `SMTP_PORT`,
-`SMTP_USER`, `SMTP_PASS` and `NOTIFICATION_FROM` on the API service (secrets in
-the platform dashboard, never in the repository) and redeploy. Until then the
-API logs a warning on every boot and every job is recorded `unavailable` —
-visible, honest, and re-queued automatically once credentials exist.
+The API's SMTP configuration surface is `SMTP_HOST`, `SMTP_PORT`,
+`SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `NOTIFICATION_FROM` and
+`NOTIFICATION_PROVIDER_TIMEOUT_MS`; internal scheduled delivery also uses
+`NOTIFICATION_WORKER_TOKEN`, while the in-process ticker is controlled by
+`NOTIFICATION_WORKER_ENABLED` and `NOTIFICATION_WORKER_INTERVAL_MS`. These names
+and code paths are implemented, and the deployment manifest declares
+operator-managed environment entries. That is **not evidence that production
+values are populated**. This repository review did not inspect production
+secrets/settings, connect to an SMTP provider, or send a real email. Unit tests
+use fake providers and verify the unconfigured path; actual production SMTP
+configuration, successful provider acceptance and inbox delivery remain
+unverified. Do not treat a passing build or a healthy API as email-readiness
+evidence.
 
 ## 10. What M7.3 does NOT do
 

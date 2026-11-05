@@ -5,14 +5,20 @@ wiring that lets the production web app talk to it. Nothing here contains a
 credential: every secret is supplied by the operator at deploy time
 (see [security.md](./security.md)).
 
-## Current production verification gate (2026-10-17 UTC)
+## Current production verification gate (2026-11-03 UTC)
 
-**Status: BLOCKED.** Neon production compute is exhausted. Until the
-authorized owner confirms that compute has recovered and explicitly authorizes
-a read-only observation, do not run or report production database or health
-checks. This is an operational blocker, not evidence that production is
-healthy or unhealthy. This status applies to latest `main` at
-`f9e660d66fe56af2ea4f1d2031759210af497d67`; no production probe was attempted.
+**Status: BLOCKED / not revalidated.** The last owner-reported evidence says
+Neon production compute was exhausted on `main` at
+`f9e660d66fe56af2ea4f1d2031759210af497d67` (2026-10-17). This review did not
+access production or verify whether compute has recovered. Until an authorized
+owner confirms recovery and explicitly authorizes a read-only observation, do
+not run or report production database or health checks. This is an operational
+blocker, not evidence that production is healthy or unhealthy. Latest
+repository `main` is `d5e4d68073018d5f082116a55635d28b9d4c5aa3` (PR #131,
+read-only verified payment records), and the notification branch behind PR #134
+was merged with that mainline on 2026-11-03; no production probe was attempted.
+No Render, Vercel, Neon, secret or environment-variable value was read or
+changed during that reconciliation, and no deployment was triggered or observed.
 
 Database backup/recovery status is also unverified: no Neon snapshot schedule
 had been observed previously, and nothing here was changed. See
@@ -33,6 +39,53 @@ not production verification. Do not change the production `DATABASE_URL`,
 production migrations, configuration or infrastructure to clear this block.
 After compute is restored, record sanitized HTTP status/JSON and schema/checksum
 evidence here before changing the status.
+
+### Historical Render deployment evidence (read-only)
+
+GitHub records Render deployment **7143549231** for SHA
+`f9e660d66fe56af2ea4f1d2031759210af497d67` as failed at
+`2026-10-17T18:01:34Z`. Its status points to the Render dashboard deployment
+log for service `veltrixeye-api`; that dashboard log is not accessible from this
+review environment, so the failing stage/cause and whether the previous service
+instance remained available are **unknown**. The GitHub deployment record is
+not the Render build/deploy log and does not establish current service health.
+
+A later GitHub deployment record exists for the service: **7481011027**, ref
+`main`, SHA `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`, created
+`2026-11-01T23:51:14Z` by `shadrachampah123`. Its GitHub status history later
+reported `success` at `2026-11-01T23:52:15Z` and links to the Render deploy log
+for `veltrixeye-api`. The preceding GitHub deployment record **7475005597** for
+SHA `743c89a8c164b3324f3ff276196e42c37af8f7f8` also reports `success`
+(`2026-11-01T15:25:26Z`) and links to Render deployment `dep-dbjlj8uq1p3s73asmdig`.
+The code diff between those two SHAs contains no migration/SQL files. These
+records establish prior successful deployment records, not current service
+health or a guaranteed safe rollback.
+
+**Owner-provided read-only Render dashboard snapshot (2026-11-02; not
+independently accessed in this environment):** service `veltrixeye-api`
+(`srv-dajhclm7bikc73c3a5pg`), production branch `main`, `autoDeploy: yes`,
+`autoDeployTrigger: commit`, pull-request previews disabled, maintenance mode
+disabled. The owner reports current live deployment
+`dep-dbjt0sbm8hqs7386rnmg` at SHA `085d3b6260ff444f3af489f0c0f3e2e7fee28d1f`,
+previous deployment `dep-dbjlj8uq1p3s73asmdig` now deactivated, and historical
+failed deployment `dep-db9rf7e7bikc73e1m51g` (SHA
+`f9e660d66fe56af2ea4f1d2031759210af497d67`) with status `update_failed`. GitHub
+metadata independently corroborates the current-main and previous-successful
+deployment records, but not the owner-reported dashboard state or failure
+cause. With `autoDeploy: yes` and trigger `commit`, merging to `main` is expected
+to start a Render production deployment; no hold or safe merge-without-deploy
+procedure has been established. Do not change this setting without explicit
+authorization.
+
+The authorized owner must provide sanitized Render event/build/deploy logs for
+`7143549231`, current deployment `7481011027`, and the successful candidate
+`7475005597`, establish whether the
+deactivated previous deploy is a viable rollback target, and state the required
+schema/data compatibility checks. Include the failure stage, exit code and
+redacted error context for `7143549231`; include relevant build/start metadata
+if logs point to configuration. Provide no secret values or customer data. No
+Render settings, environment variables, database, migrations, or deployments
+were changed or triggered by this review.
 
 ## Topology
 

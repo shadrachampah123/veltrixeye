@@ -125,6 +125,31 @@ test('Nodemailer 10 SMTP delivery keeps TLS policy, headers, and retry-stable Me
   }
 });
 
+test('SMTP errors suppress provider text when it echoes a short configured credential', async () => {
+  const shortPassword = 'p1';
+  const fake = installFakeTransport(async () => {
+    throw Object.assign(new Error(`535 authentication failed for ${shortPassword}`), { code: 'EAUTH' });
+  });
+
+  try {
+    const provider = createSmtpEmailProvider({
+      host: 'smtp.example.test',
+      port: 587,
+      secure: false,
+      user: 'smtp-user-test',
+      pass: shortPassword,
+      from: 'VeltrixEye Alerts <alerts@example.com>',
+    });
+    const result = await provider.send(emailRequest());
+    assert.equal(result.outcome, 'unavailable');
+    assert.equal(result.failureCategory, 'configuration');
+    assert.doesNotMatch(result.error ?? '', /p1|535 authentication failed/);
+    assert.match(result.error ?? '', /omitted because it echoed configured credential material/);
+  } finally {
+    fake.restore();
+  }
+});
+
 test('SMTP authentication errors remain unavailable and redact Nodemailer error text', async () => {
   const password = 'smtp-password-test-only';
   const fake = installFakeTransport(async () => {

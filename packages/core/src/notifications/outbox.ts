@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import {
   MAX_NOTIFICATIONS_PER_ALERT,
@@ -30,9 +31,9 @@ import { looksEncrypted } from './secret-manager.js';
  *  - `claimBatch` moves `pending → processing` in a single UPDATE … FROM
  *    (SELECT … FOR UPDATE SKIP LOCKED), which is atomic: the rows it returns
  *    are locked by THIS transaction and invisible to every other worker.
- *  - every state transition below is a single conditional UPDATE whose
- *    `WHERE` carries the expected status, so a stale worker cannot overwrite
- *    a newer state (it simply updates zero rows).
+ *  - each claim writes a fresh opaque token into `locked_by`; renewals and all
+ *    delivery acknowledgements require both that token and a still-live lease.
+ *    A stale/reclaimed owner updates zero rows and cannot overwrite new state.
  *  - cross-queue fairness is durable state in `notification_delivery_fairness`
  *    (M9.1 remediation, extended to 3-way in M9.2): every claim decision reads
  *    and writes it under the shared transaction-level advisory lock 611_231_008,
@@ -489,6 +490,10 @@ export class NotificationOutbox {
 
   private async claimTable(table: string, limit: number, workerId: string, q: Queryable): Promise<NotificationJobRow[]> {
     if (limit <= 0) return [];
+    // locked_by is an opaque fencing token, not merely a process identity. A
+    // fresh suffix prevents a restarted/reused worker id from acknowledging a
+    // later claim after an earlier claim has expired and been reclaimed.
+    const ownerToken = `${workerId}:${randomUUID()}`;
     const res = await q.query<NotificationJobRow>(
       `WITH candidate AS (
          SELECT id FROM ${table}
@@ -498,33 +503,46 @@ export class NotificationOutbox {
        UPDATE ${table} n SET status = 'processing', locked_at = now(), locked_by = $2,
          attempts = n.attempts + 1, failure_category = 'none', last_error = NULL
        FROM candidate c WHERE n.id = c.id RETURNING n.*`,
-      [limit, workerId],
+      [limit, ownerToken],
     );
     return res.rows;
   }
 
+  /** Extend a live lease only when the caller still owns the unexpired token. */
+  async renewLease(jobId: string, ownerToken: string, leaseMs: number, channel: NotificationChannel = 'email'): Promise<boolean> {
+    if (!ownerToken) return false;
+    const lease = Math.max(1, Math.trunc(leaseMs));
+    const renewed = await this.pool.query(
+      `UPDATE ${tableForChannel(channel)} SET locked_at = now()
+        WHERE id = $1 AND status = 'processing' AND locked_by = $2
+          AND locked_at >= now() - ($3::int * interval '1 millisecond')`,
+      [jobId, ownerToken, lease],
+    );
+    return (renewed.rowCount ?? 0) === 1;
+  }
+
   /** Success: terminal, keeps the provider's receipt for traceability. */
-  async markDelivered(jobId: string, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<void> {
-    await this.pool.query(
+  async markDelivered(jobId: string, ownerToken: string, leaseMs: number, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<boolean> {
+    if (!ownerToken) return false;
+    const lease = Math.max(1, Math.trunc(leaseMs));
+    const updated = await this.pool.query(
       `UPDATE ${tableForChannel(channel)}
           SET status = 'delivered',
-              provider = $2,
-              provider_message_id = $3,
-              provider_response_code = $4,
+              provider = $3,
+              provider_message_id = $4,
+              provider_response_code = $5,
               failure_category = 'none',
               last_error = NULL,
               delivered_at = now(),
               locked_at = NULL,
               locked_by = NULL,
               next_attempt_at = now()
-        WHERE id = $1 AND status = 'processing'`,
-      [
-        jobId,
-        result.provider ?? null,
-        result.providerMessageId ?? null,
-        result.providerResponseCode ?? null,
-      ],
+        WHERE id = $1 AND status = 'processing' AND locked_by = $2
+          AND locked_at >= now() - ($6::int * interval '1 millisecond')`,
+      [jobId, ownerToken, result.provider ?? null, result.providerMessageId ?? null,
+        result.providerResponseCode ?? null, lease],
     );
+    return (updated.rowCount ?? 0) === 1;
   }
 
   /**
@@ -532,47 +550,38 @@ export class NotificationOutbox {
    * exhausted. `delayMs` comes from the worker's (pure, deterministic) backoff
    * function, so the SQL stays a single bounded UPDATE.
    */
-  async markRetry(jobId: string, delayMs: number, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<'retried' | 'failed'> {
+  async markRetry(jobId: string, ownerToken: string, leaseMs: number, delayMs: number, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<'retried' | 'failed' | 'leaseLost'> {
+    if (!ownerToken) return 'leaseLost';
+    const lease = Math.max(1, Math.trunc(leaseMs));
+    const args = [jobId, ownerToken, lease, Math.max(0, Math.trunc(delayMs)), result.provider ?? null,
+      result.providerResponseCode ?? null, result.failureCategory, result.error ?? null];
     const retried = await this.pool.query(
       `UPDATE ${tableForChannel(channel)}
-          SET status = 'pending',
-              next_attempt_at = now() + ($2::int * interval '1 millisecond'),
-              provider = $3,
-              provider_response_code = $4,
-              failure_category = $5,
-              last_error = $6,
-              locked_at = NULL,
-              locked_by = NULL
-        WHERE id = $1 AND status = 'processing' AND attempts < max_attempts`,
-      [
-        jobId,
-        Math.max(0, Math.trunc(delayMs)),
-        result.provider ?? null,
-        result.providerResponseCode ?? null,
-        result.failureCategory,
-        result.error ?? null,
-      ],
+          SET status = 'pending', next_attempt_at = now() + ($4::int * interval '1 millisecond'),
+              provider = $5, provider_response_code = $6, failure_category = $7, last_error = $8,
+              locked_at = NULL, locked_by = NULL
+        WHERE id = $1 AND status = 'processing' AND locked_by = $2
+          AND locked_at >= now() - ($3::int * interval '1 millisecond') AND attempts < max_attempts`,
+      args,
     );
-    if ((retried.rowCount ?? 0) > 0) return 'retried';
-    await this.markFailed(jobId, result, channel);
-    return 'failed';
+    if ((retried.rowCount ?? 0) === 1) return 'retried';
+    return (await this.markFailed(jobId, ownerToken, lease, result, channel)) ? 'failed' : 'leaseLost';
   }
 
   /** Permanent failure or exhausted retries: dead-lettered, never retried. */
-  async markFailed(jobId: string, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<void> {
-    await this.pool.query(
+  async markFailed(jobId: string, ownerToken: string, leaseMs: number, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<boolean> {
+    if (!ownerToken) return false;
+    const updated = await this.pool.query(
       `UPDATE ${tableForChannel(channel)}
-          SET status = 'failed',
-              provider = $2,
-              provider_response_code = $3,
-              failure_category = $4,
-              last_error = $5,
-              next_attempt_at = now(),
-              locked_at = NULL,
-              locked_by = NULL
-        WHERE id = $1 AND status = 'processing'`,
-      [jobId, result.provider ?? null, result.providerResponseCode ?? null, result.failureCategory, result.error ?? null],
+          SET status = 'failed', provider = $3, provider_response_code = $4,
+              failure_category = $5, last_error = $6, next_attempt_at = now(),
+              locked_at = NULL, locked_by = NULL
+        WHERE id = $1 AND status = 'processing' AND locked_by = $2
+          AND locked_at >= now() - ($7::int * interval '1 millisecond')`,
+      [jobId, ownerToken, result.provider ?? null, result.providerResponseCode ?? null,
+        result.failureCategory, result.error ?? null, Math.max(1, Math.trunc(leaseMs))],
     );
+    return (updated.rowCount ?? 0) === 1;
   }
 
   /**
@@ -582,19 +591,18 @@ export class NotificationOutbox {
    * `unavailable` is the "configure delivery and these go out" state. It is
    * terminal, so a misconfigured deployment cannot spin forever.
    */
-  async markUnavailable(jobId: string, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<void> {
-    await this.pool.query(
+  async markUnavailable(jobId: string, ownerToken: string, leaseMs: number, result: AttemptResult, channel: NotificationChannel = 'email'): Promise<boolean> {
+    if (!ownerToken) return false;
+    const updated = await this.pool.query(
       `UPDATE ${tableForChannel(channel)}
-          SET status = 'unavailable',
-              provider = $2,
-              failure_category = $3,
-              last_error = $4,
-              next_attempt_at = now(),
-              locked_at = NULL,
-              locked_by = NULL
-        WHERE id = $1 AND status = 'processing'`,
-      [jobId, result.provider ?? null, result.failureCategory, result.error ?? null],
+          SET status = 'unavailable', provider = $3, failure_category = $4, last_error = $5,
+              next_attempt_at = now(), locked_at = NULL, locked_by = NULL
+        WHERE id = $1 AND status = 'processing' AND locked_by = $2
+          AND locked_at >= now() - ($6::int * interval '1 millisecond')`,
+      [jobId, ownerToken, result.provider ?? null, result.failureCategory, result.error ?? null,
+        Math.max(1, Math.trunc(leaseMs))],
     );
+    return (updated.rowCount ?? 0) === 1;
   }
 
   /**

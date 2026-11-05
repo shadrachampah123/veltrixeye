@@ -37,10 +37,12 @@ import type { SecretManager } from './secret-manager.js';
  *     budget is gone) — this is the crash-recovery path;
  *  2. `unavailable` rows whose channel now has a configured provider are
  *     re-queued (bounded);
- *  3. due jobs are claimed with `FOR UPDATE SKIP LOCKED`, so two workers —
- *     even in the same process — get disjoint sets and never deliver twice;
- *  4. each attempt is mapped to delivered / retry-scheduled / dead-lettered /
- *     unavailable and recorded on the row.
+ *  3. one due job is claimed immediately before each attempt, so unstarted
+ *     siblings remain pending and do not consume a lease;
+ *  4. a unique owner token is renewed during provider I/O and required for
+ *     acknowledgement, retry, unavailable and dead-letter transitions;
+ *  5. each attempt is mapped to delivered / retry-scheduled / dead-lettered /
+ *     unavailable and recorded only while that lease is still owned.
  *
  * Nothing here reads a credential, and nothing here logs one: log lines carry
  * ids, channel, attempt, status, provider and failure category only.
@@ -97,7 +99,7 @@ export interface DeliveryWorkerLogger {
 }
 
 export interface DeliveryWorkerOptions {
-  /** Identifies this worker in `locked_by` (default: a per-process uuid). */
+  /** Prefix for per-claim fencing tokens stored in `locked_by` (default: per-process uuid). */
   instanceId?: string;
   logger?: DeliveryWorkerLogger;
   retention?: CleanupPolicy;
@@ -189,13 +191,16 @@ export class DeliveryWorker {
       }
     }
 
-    // 3. claim + deliver.
-    const jobs = await this.outbox.claimBatch(limit, this.instanceId);
-    result.claimed = jobs.length;
-
-    for (const job of jobs) {
+    // 3. Claim only when ready to attempt the next job. A claimed-but-unstarted
+    // row would otherwise consume lease time while earlier sequential sends run.
+    // Each claim gets a unique fencing token, even within the same process.
+    for (let i = 0; i < limit; i += 1) {
+      const jobs = await this.outbox.claimBatch(1, this.instanceId);
+      const job = jobs[0];
+      if (!job) break;
+      result.claimed += 1;
       const outcome = await this.deliver(job);
-      result[outcome] += 1;
+      if (outcome) result[outcome] += 1;
     }
 
     return result;
@@ -239,8 +244,10 @@ export class DeliveryWorker {
 
   /* ---------------------------------------------------------------------- */
 
-  /** Send one claimed job and record the outcome. Returns the result bucket. */
-  private async deliver(job: NotificationJobRow): Promise<'delivered' | 'retried' | 'failed' | 'unavailable'> {
+  /** Send one claimed job while renewing its fenced lease. */
+  private async deliver(job: NotificationJobRow): Promise<'delivered' | 'retried' | 'failed' | 'unavailable' | undefined> {
+    const ownerToken = job.locked_by ?? '';
+    const channel = job.channel as NotificationChannel;
     const meta = {
       jobId: job.id,
       alertId: job.alert_id,
@@ -249,37 +256,36 @@ export class DeliveryWorker {
       attempt: job.attempts,
       provider: null as string | null,
     };
+    if (!ownerToken) {
+      this.logger.error('notification job claim omitted its lease token', { ...meta });
+      return undefined;
+    }
 
-    const provider = this.registry.get(job.channel as NotificationChannel);
+    const unavailable = async (provider: string | null, error: string): Promise<'unavailable' | undefined> => {
+      const updated = await this.outbox.markUnavailable(job.id, ownerToken, this.policy.leaseMs, {
+        provider, failureCategory: 'configuration', error,
+      }, channel);
+      if (!updated) {
+        this.logger.warn('notification lease lost before unavailable acknowledgement', { ...meta, provider });
+        return undefined;
+      }
+      this.logger.warn('notification delivery unavailable', {
+        ...meta, provider, status: 'unavailable', failureCategory: 'configuration',
+      });
+      return 'unavailable';
+    };
 
+    const provider = this.registry.get(channel);
     if (!provider) {
-      const error = `no notification provider is registered for channel "${job.channel}"`;
-      await this.outbox.markUnavailable(job.id, { failureCategory: 'configuration', error }, job.channel as NotificationChannel);
-      this.logger.warn('notification delivery unavailable', {
-        ...meta,
-        status: 'unavailable',
-        failureCategory: 'configuration',
-      });
-      return 'unavailable';
+      return unavailable(null, `no notification provider is registered for channel "${job.channel}"`);
     }
-
     if (!provider.configured) {
-      const error = `notification provider "${provider.name}" is not configured (missing credentials)`;
-      await this.outbox.markUnavailable(job.id, {
-        provider: provider.name,
-        failureCategory: 'configuration',
-        error,
-      }, job.channel as NotificationChannel);
-      this.logger.warn('notification delivery unavailable', {
-        ...meta,
-        provider: provider.name,
-        status: 'unavailable',
-        failureCategory: 'configuration',
-      });
-      return 'unavailable';
+      return unavailable(provider.name, `notification provider "${provider.name}" is not configured (missing credentials)`);
     }
 
+    const lease = await this.startLeaseRenewal(job, ownerToken);
     try {
+      if (lease.lost) return undefined;
       // M9.2: prefer encrypted secret, decrypt if needed
       let signingSecret: string | null = job.signing_secret;
       const enc = (job as { signing_secret_encrypted?: string | null }).signing_secret_encrypted;
@@ -288,40 +294,89 @@ export class DeliveryWorker {
         try {
           signingSecret = this.secretManager.decrypt(enc, keyVersion ?? this.secretManager.keyVersion);
         } catch {
-          // fallback to plaintext if decryption fails (migration path)
           signingSecret = job.signing_secret;
         }
       }
-      const result = await provider.send({
-        jobId: job.id,
-        idempotencyKey: job.idempotency_key,
-        channel: job.channel as NotificationChannel,
-        recipient: job.recipient,
-        template: job.template,
-        payload: job.payload,
-        attempt: job.attempts,
-        timeoutMs: this.policy.timeoutMs,
-        signingSecret,
-      });
-      return await this.record(job, provider.name, result, null);
-    } catch (err) {
-      // An unexpected exception is treated as transient: the retry budget still
-      // bounds it, and the row keeps the redacted reason.
-      const result: NotificationSendResult = {
-        outcome: 'retryable',
-        failureCategory: 'unknown',
-        error: describeError(err),
-      };
-      return await this.record(job, provider.name, result, err);
+      let result: NotificationSendResult;
+      let error: unknown = null;
+      try {
+        result = await provider.send({
+          jobId: job.id,
+          idempotencyKey: job.idempotency_key,
+          channel,
+          recipient: job.recipient,
+          template: job.template,
+          payload: job.payload,
+          attempt: job.attempts,
+          timeoutMs: this.policy.timeoutMs,
+          signingSecret,
+        });
+      } catch (err) {
+        error = err;
+        result = { outcome: 'retryable', failureCategory: 'unknown', error: describeError(err) };
+      }
+      // Stop/settle the heartbeat before the terminal transition so a racing
+      // renewal cannot make a successfully committed acknowledgement look lost.
+      await lease.stop();
+      // A failed/uncertain renewal is fail-closed: never persist this provider
+      // result under a lease that may have been reclaimed by another worker.
+      if (lease.lost) return undefined;
+      return await this.record(job, ownerToken, provider.name, result, error, lease);
+    } finally {
+      await lease.stop();
     }
+  }
+
+  private async startLeaseRenewal(job: NotificationJobRow, ownerToken: string): Promise<{
+    readonly lost: boolean;
+    stop(): Promise<void>;
+  }> {
+    const channel = job.channel as NotificationChannel;
+    let lost = false;
+    let inFlight: Promise<void> | null = null;
+    const renew = async (): Promise<void> => {
+      if (lost) return;
+      try {
+        const renewed = await this.outbox.renewLease(job.id, ownerToken, this.policy.leaseMs, channel);
+        if (!renewed) {
+          lost = true;
+          this.logger.warn('notification lease renewal rejected; provider result will not be acknowledged', { jobId: job.id, channel });
+        }
+      } catch {
+        // Do not expose database error text. A transient DB failure is treated
+        // as lease loss because ownership can no longer be proven safely.
+        lost = true;
+        this.logger.error('notification lease renewal failed; provider result will not be acknowledged', { jobId: job.id, channel });
+      }
+    };
+
+    // Confirm ownership immediately before I/O, then renew at one third of the
+    // configured lease. The claim is per job, so no queued sibling consumes
+    // this lease while the provider is active.
+    await renew();
+    const intervalMs = Math.max(1, Math.floor(Math.max(1, this.policy.leaseMs) / 3));
+    const timer = lost ? null : setInterval(() => {
+      if (inFlight) return;
+      inFlight = renew().finally(() => { inFlight = null; });
+    }, intervalMs);
+    timer?.unref?.();
+    return {
+      get lost() { return lost; },
+      async stop() {
+        if (timer) clearInterval(timer);
+        if (inFlight) await inFlight;
+      },
+    };
   }
 
   private async record(
     job: NotificationJobRow,
+    ownerToken: string,
     providerName: string,
     result: NotificationSendResult,
     err: unknown,
-  ): Promise<'delivered' | 'retried' | 'failed' | 'unavailable'> {
+    lease: { readonly lost: boolean },
+  ): Promise<'delivered' | 'retried' | 'failed' | 'unavailable' | undefined> {
     const meta = {
       jobId: job.id,
       alertId: job.alert_id,
@@ -333,12 +388,16 @@ export class DeliveryWorker {
     };
 
     if (result.outcome === 'delivered') {
-      await this.outbox.markDelivered(job.id, {
+      const acknowledged = await this.outbox.markDelivered(job.id, ownerToken, this.policy.leaseMs, {
         provider: providerName,
         providerMessageId: result.providerMessageId ?? null,
         providerResponseCode: result.providerResponseCode ?? null,
         failureCategory: 'none',
       }, job.channel as NotificationChannel);
+      if (!acknowledged || lease.lost) {
+        this.logger.warn('notification lease lost before delivery acknowledgement', { ...meta });
+        return undefined;
+      }
       this.logger.info('notification delivered', { ...meta, status: 'delivered' });
       return 'delivered';
     }
@@ -352,22 +411,22 @@ export class DeliveryWorker {
     };
 
     if (result.outcome === 'unavailable') {
-      await this.outbox.markUnavailable(job.id, attempt, job.channel as NotificationChannel);
-      this.logger.warn('notification delivery unavailable', {
-        ...meta,
-        status: 'unavailable',
-        failureCategory: category,
-      });
+      const acknowledged = await this.outbox.markUnavailable(job.id, ownerToken, this.policy.leaseMs, attempt, job.channel as NotificationChannel);
+      if (!acknowledged || lease.lost) {
+        this.logger.warn('notification lease lost before unavailable acknowledgement', { ...meta });
+        return undefined;
+      }
+      this.logger.warn('notification delivery unavailable', { ...meta, status: 'unavailable', failureCategory: category });
       return 'unavailable';
     }
 
     if (result.outcome === 'permanent') {
-      await this.outbox.markFailed(job.id, attempt, job.channel as NotificationChannel);
-      this.logger.warn('notification delivery failed permanently', {
-        ...meta,
-        status: 'failed',
-        failureCategory: category,
-      });
+      const acknowledged = await this.outbox.markFailed(job.id, ownerToken, this.policy.leaseMs, attempt, job.channel as NotificationChannel);
+      if (!acknowledged || lease.lost) {
+        this.logger.warn('notification lease lost before failure acknowledgement', { ...meta });
+        return undefined;
+      }
+      this.logger.warn('notification delivery failed permanently', { ...meta, status: 'failed', failureCategory: category });
       return 'failed';
     }
 
@@ -378,7 +437,11 @@ export class DeliveryWorker {
       policy: this.policy,
       idempotencyKey: job.idempotency_key,
     });
-    const outcome = await this.outbox.markRetry(job.id, delayMs, attempt, job.channel as NotificationChannel);
+    const outcome = await this.outbox.markRetry(job.id, ownerToken, this.policy.leaseMs, delayMs, attempt, job.channel as NotificationChannel);
+    if (outcome === 'leaseLost' || lease.lost) {
+      this.logger.warn('notification lease lost before retry acknowledgement', { ...meta });
+      return undefined;
+    }
     this.logger.warn(outcome === 'retried' ? 'notification attempt failed' : 'notification retries exhausted', {
       ...meta,
       status: outcome === 'retried' ? 'pending' : 'failed',

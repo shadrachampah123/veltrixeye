@@ -1,5 +1,5 @@
 import type { DeliveryWorker, DeliveryWorkerLogger } from '@veltrixeye/core';
-import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from './worker-liveness.js';
+import { failureCode, recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from './worker-liveness.js';
 
 /**
  * In-process invocation of the M7.3 delivery worker.
@@ -60,6 +60,10 @@ export function startDeliveryWorkerTicker(
     if (stopped) return;
     if (inFlight) return; // overlap guard: the previous batch is still running
     inFlight = (async () => {
+      // Include maintenance in this invocation's liveness window too: if the
+      // cleanup/recovery step fails, delivery is skipped and that missed tick
+      // must be visible just like a failed batch.
+      recordWorkerStart('notifications');
       try {
         runs += 1;
         if (runs % maintenanceEveryRuns === 0) {
@@ -73,26 +77,22 @@ export function startDeliveryWorkerTicker(
             });
           }
         }
-        // Liveness is recorded here as well as on the internal endpoint so
         // `GET /api/health` distinguishes "the ticker is draining" from "only
         // an external scheduler is draining" — and, when neither has run,
         // reports a stale timestamp instead of a healthy-looking instance.
-        recordWorkerStart('notifications');
-        let result: Awaited<ReturnType<DeliveryWorker['runOnce']>>;
-        try {
-          result = await worker.runOnce(options.batchSize);
-          recordWorkerSuccess('notifications');
-        } catch (err) {
-          recordWorkerFailure('notifications', err);
-          throw err;
-        }
+        const result = await worker.runOnce(options.batchSize);
+        recordWorkerSuccess('notifications');
         if (result.claimed > 0 || result.recovered > 0 || result.failed > 0 || result.unavailable > 0) {
           logger.info('notification worker batch', { ...result });
         }
       } catch (err) {
-        // A batch failure must never kill the timer (or the process).
+        recordWorkerFailure('notifications', err);
+        // A maintenance or batch failure must never kill the timer (or process).
+        // Do not log exception messages here: maintenance/DB failures can carry
+        // connection details. The public liveness record and log retain only a
+        // bounded machine code.
         logger.error('notification worker batch failed', {
-          error: err instanceof Error ? `${err.name}: ${err.message}` : 'unknown error',
+          failureCode: failureCode(err),
         });
       }
     })().finally(() => {

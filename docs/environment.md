@@ -58,10 +58,10 @@ git-ignored and never contain values you would commit.
 | `NOTIFICATION_BACKOFF_BASE_MS` | int 1000–600000 | `30000` | Attempt *n* waits `base · 2^(n-1)` ms. |
 | `NOTIFICATION_BACKOFF_MAX_MS` | int 1000–21600000 | `3600000` | Backoff cap. |
 | `NOTIFICATION_BACKOFF_JITTER_MS` | int 0–60000 | `5000` | Deterministic per-job jitter that spreads retry bursts. |
-| `NOTIFICATION_LEASE_MS` | int 5000–3600000 | `120000` | How long a claim may stay `processing` before another run recovers it. |
+| `NOTIFICATION_LEASE_MS` | int 5000–3600000 | `120000` | Lease duration; the active per-job lease is renewed every third of this interval, and an expired row is eligible for recovery. |
 | `NOTIFICATION_WORKER_ENABLED` | `true` \| `false` | `true` | Run the delivery worker on an interval inside the API process. |
 | `NOTIFICATION_WORKER_INTERVAL_MS` | int 5000–3600000 | `60000` | Interval between batches. |
-| `NOTIFICATION_WORKER_BATCH_SIZE` | int 1–200 | `25` | Jobs claimed per batch. |
+| `NOTIFICATION_WORKER_BATCH_SIZE` | int 1–200 | `25` | Maximum jobs processed per run; each job is claimed only immediately before its own send. |
 | `NOTIFICATION_WORKER_TOKEN` | secret, ≤256 chars | *(empty)* | Shared secret for `POST /api/internal/notifications/deliveries/*` (external cron). **Empty ⇒ those routes return 404.** |
 | `NOTIFICATION_RETENTION_DELIVERED_DAYS` | int 1–3650 | `30` | How long delivered rows are kept. |
 | `NOTIFICATION_RETENTION_FAILED_DAYS` | int 1–3650 | `120` | How long dead letters are kept (failure audit trail). |

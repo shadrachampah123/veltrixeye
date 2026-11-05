@@ -171,7 +171,7 @@ describe('M9.2 outbox — push channel + 3-way fairness', () => {
     assert.equal(before.rows[0]!.e, '1');
 
     // Mark retry (does not change fairness) — job goes back to pending
-    await outbox.markRetry(claimed[0]!.id, 0, { failureCategory: 'transient', error: 'retry' }, 'email');
+    await outbox.markRetry(claimed[0]!.id, claimed[0]!.locked_by!, TEST_POLICY.leaseMs, 0, { failureCategory: 'transient', error: 'retry' }, 'email');
     const afterRetry = await pool.query<{ e: string }>('SELECT email_claims::text AS e FROM notification_delivery_fairness WHERE singleton=true');
     assert.equal(afterRetry.rows[0]!.e, '1', 'retries do not disturb fairness');
 

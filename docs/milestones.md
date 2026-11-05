@@ -1,40 +1,46 @@
 # Milestone Boundaries
 
-## Current roadmap and release-status reconciliation (2026-10-17)
+## Current roadmap and release-status reconciliation (2026-11-03)
 
 This is the canonical roadmap/status record. The milestone sections below describe
 implemented scope; **implementation/merge is not the same as production
 verification or release approval**. This checkpoint starts from latest `main`
-SHA `a5a36fd4e9df53056e991311d1ccbbfbf91ddd22`, confirmed by both `git fetch
-origin main` and GitHub's `refs/heads/main` API on 2026-10-17. PR #130 is merged
-as that SHA; the asset-class-aware notification subject in
-`packages/core/src/notifications/render.ts`, its regression in
-`packages/core/test/m92-outbox.test.ts`, and the corresponding roadmap change
-are present in the fetched tree. This checkpoint reconciles current PR metadata,
-CI checks and GitHub deployment records; it does not authorize production
-changes. No overall completion percentage is stated: the roadmap mixes
-delivered milestones, deferred product decisions, external validations and
-blocking gates without a stable, non-overlapping denominator.
+SHA `d5e4d68073018d5f082116a55635d28b9d4c5aa3`, which merged PR #131
+(read-only verified payment records); the notification branch behind PR #134
+was merged with that mainline on 2026-11-03. PR #130 (M9.2 notification subject
+disambiguation), #132 (runtime dependency-advisory patch) and #133 (strategy
+entitlements aligned with the subscription catalogue) are also merged on that
+mainline; the asset-class-aware notification subject in
+`packages/core/src/notifications/render.ts` and its regression in
+`packages/core/test/m92-outbox.test.ts` are present in the fetched tree. PR #134
+remains open, unmerged and in Draft. This checkpoint reconciles current PR
+metadata, CI checks and recorded deployment/status data; it does not authorize
+production changes. No overall completion percentage is stated: the roadmap
+mixes delivered milestones, deferred product decisions, external validations
+and blocking gates without a stable, non-overlapping denominator.
 
 - **Production database and health verification: BLOCKED (2026-10-17 UTC).**
   Neon production compute is exhausted. Do not use the production
   `DATABASE_URL`, run migration/status queries, call production `/api/health`
   or `/api/health/ready`, or report worker/retention health until compute is
-  restored and an authorized owner explicitly permits a read-only check. This
-  underlying compute-exhaustion report was recorded while reviewing `main` at
+  restored and an authorized owner explicitly permits a read-only check. The
+  last compute-exhaustion report was recorded while reviewing `main` at
   `f9e660d66fe56af2ea4f1d2031759210af497d67` and is carried forward from that
   owner evidence; this task did not access production or revalidate compute.
   Local embedded-Postgres tests and deployment records are not production
-  evidence; no production configuration, data, migration or infrastructure may
-  be changed to clear this block.
+  evidence. The latest main SHA is `d5e4d68073018d5f082116a55635d28b9d4c5aa3`
+  (PR #131 merged); compute status has not been revalidated. No production configuration, data,
+  migration or infrastructure may be changed to clear this block.
 
 ### Current delivery and gates
 
 - **Merged, repository/CI verified:** M1–M9.2 and M10.0/Gate 9/B1/B2 are present
   on `main`; latest merges include #122 (sandbox provisioning dry-run tests),
   #123 (checkout epoch revalidation), #124 (typed scanner transient failures),
-  and #130 (M9.2 notification subject disambiguation). PR #130's required CI
-  jobs passed. This is code/test evidence, not proof that every feature is
+  #130 (M9.2 notification subject disambiguation), #131 (read-only verified
+  payment records), #132 (runtime dependency-advisory patch) and #133 (strategy
+  entitlements aligned with the subscription catalogue). Their reported required
+  CI jobs passed. This is code/test evidence, not proof that every feature is
   operational or production-verified.
 - **M9.2 outbox symbol collision — closed on `main` by PR #130.**
   Rendering otherwise identical alerts for the same canonical ticker under
@@ -51,7 +57,12 @@ blocking gates without a stable, non-overlapping denominator.
   `7146335883` as `failure`. The Render deployment cause is not available in
   the GitHub deployment record. No production API health probe, database query,
   or migration check was performed; these deployment states do not establish
-  production readiness.
+  production readiness. [deployment.md](./deployment.md) carries the later
+  read-only deployment evidence, including the owner-provided Render dashboard
+  snapshot for `085d3b6`; none of it was revalidated while reconciling this
+  branch, and `main` has since advanced to `d5e4d68` with no new deployment or
+  health observation recorded here.
+- **Notification reliability reconciliation — PR #128 closed as superseded; PR #134 remains open (Draft), awaiting an authorized independent review and deployment-safety confirmation.** PR #128 (`5e9df827c40a5352d1c95f7ea16367102f8fcf1c`) was closed without merge on 2026-11-02; its notification ticker liveness, CI hardening, tests, and docs were carried forward in PR #134. PR #134's implementation commit is `df7bc4900a7328717de190b4b13a7d0b49ef4248`; later PR commits are documentation-only. The live PR head, exact-head verification, review requests, and deployment gate are maintained in the [PR description](https://github.com/shadrachampah123/veltrixeye/pull/134), not duplicated here as a stale current-head claim. The implementation claims one job at a time, renews each active lease, writes a unique owner token, and requires the live token for renewal and every delivery outcome transition. Tests against real embedded PostgreSQL cover an attempt longer than the initial lease, concurrent recovery while sending, current/stale token behavior, failed renewal, old-owner acknowledgement after reclaim, crash recovery, and duplicate prevention. At review checkpoint `667aff4`, focused outbox/worker + SMTP + delivery-ticker tests **53/53 passed**; full `npm test` **3,359/3,359 passed**; `npm run typecheck`, `npm run lint`, `npm run build`, and `git diff --check` passed. Exact-head CI and Preview evidence for that checkpoint is recorded in the PR conversation. These are code/test evidence, not production email evidence. At-least-once delivery remains: if a provider has accepted a message before lease ownership is lost, a later retry can duplicate it; no exactly-once SMTP claim is made. Production email and the historical Render failure remain unverified; see [deployment.md](./deployment.md).
 - **Execution safety:** automation remains OFF; live execution remains
   unavailable/impossible by the enforced boundary. M10/Gate 9 is a non-live
   foundation only. Trading remains paper-only. No broker orders, live/demo
@@ -125,23 +136,30 @@ resume the paused work. Automation stays OFF and execution stays paper-only.
 
 ### Remaining validation sequence (gates, not completion claims)
 
-1. **BLOCKED — Render deployment diagnosis.** GitHub reports the latest main
-   deployment `7146335883` for `a5a36fd4e9df53056e991311d1ccbbfbf91ddd22` as
-   failed, without a cause in the deployment record. An authorized owner must
-   inspect Render Dashboard → `veltrixeye-api` → Deploys and report the
-   sanitized failure cause before any deployment remediation. Open PR #128 is
-   separate, remains open and untouched here; do not modify or merge it as part
-   of this task.
-2. **BLOCKED — production verification:** after Neon compute is restored and an
+1. Obtain an authorized independent review of notification PR #134 (PR #128
+   was closed as superseded without merging). The active-job lease-expiry risk
+   is addressed with per-job claims, renewal and owner fencing. Keep #134
+   unmerged pending approval and deployment safety; SMTP acceptance/deduplication
+   and historical Render diagnosis remain separate, unverified evidence gates.
+2. **BLOCKED — Render deployment diagnosis.** GitHub reports main deployment
+   `7146335883` for `a5a36fd4e9df53056e991311d1ccbbfbf91ddd22` as failed,
+   without a cause in the deployment record. The later read-only deployment
+   evidence recorded in [deployment.md](./deployment.md) (including the
+   owner-provided Render dashboard snapshot) was not revalidated by this
+   reconciliation. An authorized owner must provide sanitized Render
+   build/deploy logs for the failed and current deployments before any
+   deployment remediation; no Render setting, environment variable, deployment
+   or database may be changed to clear this block.
+3. **BLOCKED — production verification:** after compute is restored and an
    authorized owner permits a read-only check, verify the current production
    schema/health and operational monitoring without changing production
    configuration. Until then, keep all production database/health checks
    blocked; keep billing sandbox and FX publication behind their explicit owner
    approvals. No such check was performed for this checkpoint.
-3. Close legal approval, commercial policy, retention/monitoring, CI reliability
+4. Close legal approval, commercial policy, retention/monitoring, CI reliability
    and release-readiness gaps with evidence. Billing Step 9b-R1 is delivered as
    a local, read-only verified-payment view; C-1 cancellation remains deferred.
-4. Consider the AI/ChatGPT Strategy Builder only after the preceding gates.
+5. Consider the AI/ChatGPT Strategy Builder only after the preceding gates.
 
 This repository currently contains **Milestones M1 + M2 + M3 + M4 + M5,
 M6 Phases 1–4, M7.1, M7.2, M7.3, M7.4, M7.5, M8.1, M8.2, M8.3, M8.4, M8.5,
