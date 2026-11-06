@@ -171,6 +171,65 @@ export async function notificationRoutes(
     return ctx.notifications.listForAlert(user.id, alertId).then((notifications) => ({ notifications }));
   });
 
+  // One-time SMTP diagnostic. This is deliberately independent of the shared outbox/worker.
+  // It is invisible unless BOTH the feature flag and worker token are configured.
+  app.post('/api/internal/notifications/smtp-test', adminRateLimit, async (req, reply) => {
+    if (!config.notification.smtpTestEnabled || !hasWorkerToken(config)) return notFound(reply);
+    if (!tokenMatches(req, config)) return unauthorized(reply);
+    if (!ctx.smtpTestProvider?.configured) {
+      return reply.code(503).send({ status: 'unavailable', reason: 'smtp_not_configured' });
+    }
+
+    // The singleton key is fixed in code and protected by a primary key in
+    // its own table. Claim commits before network I/O; never release on timeout.
+    const claim = await ctx.pool.query<{ test_key: string }>(
+      `INSERT INTO notification_smtp_test_claims (test_key)
+       VALUES ('production-smtp-diagnostic-v1')
+       ON CONFLICT (test_key) DO NOTHING
+       RETURNING test_key`,
+    );
+    if (claim.rowCount !== 1) {
+      return reply.code(409).send({ status: 'already_claimed' });
+    }
+
+    const request = {
+      jobId: 'smtp-diagnostic-once',
+      idempotencyKey: 'smtp-diagnostic-once',
+      channel: 'email',
+      recipient: 'shadrachampah123@gmail.com',
+      template: 'operator.smtp-diagnostic.v1',
+      payload: {
+        subject: 'VeltrixEye SMTP diagnostic',
+        text: 'This is the one-time SMTP delivery diagnostic requested by the VeltrixEye operator.',
+      },
+      attempt: 1,
+      timeoutMs: config.notification.email.timeoutMs,
+    } as never;
+    try {
+      const result = await ctx.smtpTestProvider.send(request);
+      const succeeded = result.outcome === 'delivered';
+      await ctx.pool.query(
+        `UPDATE notification_smtp_test_claims
+            SET outcome = $1, failure_category = $2, finished_at = now()
+          WHERE test_key = 'production-smtp-diagnostic-v1'`,
+        [succeeded ? 'delivered' : 'failed', result.failureCategory ?? null],
+      );
+      return reply.code(succeeded ? 200 : 502).send({
+        status: succeeded ? 'sent' : 'failed',
+        outcome: result.outcome,
+        failureCategory: result.failureCategory ?? null,
+      });
+    } catch {
+      // Claim remains consumed: SMTP acceptance may be ambiguous after a crash/error.
+      await ctx.pool.query(
+        `UPDATE notification_smtp_test_claims
+            SET outcome = 'failed', failure_category = 'unknown', finished_at = now()
+          WHERE test_key = 'production-smtp-diagnostic-v1'`,
+      ).catch(() => {});
+      return reply.code(502).send({ status: 'failed', outcome: 'unknown' });
+    }
+  });
+
   // POST /api/internal/notifications/deliveries/run — process one batch now
   app.post('/api/internal/notifications/deliveries/run', adminRateLimit, async (req, reply) => {
     if (!hasWorkerToken(config)) return notFound(reply);
