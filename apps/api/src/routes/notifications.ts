@@ -7,7 +7,7 @@ import {
   pushSubscriptionRequestSchema,
   strategyNotificationPreferenceRequestSchema,
 } from '@veltrixeye/contracts';
-import { Errors } from '@veltrixeye/core';
+import { Errors, type NotificationSendRequest } from '@veltrixeye/core';
 import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
@@ -192,6 +192,7 @@ export async function notificationRoutes(
       return reply.code(409).send({ status: 'already_claimed' });
     }
 
+    const diagnosticTimestamp = new Date().toISOString();
     const request = {
       jobId: 'smtp-diagnostic-once',
       idempotencyKey: 'smtp-diagnostic-once',
@@ -199,12 +200,34 @@ export async function notificationRoutes(
       recipient: 'shadrachampah123@gmail.com',
       template: 'operator.smtp-diagnostic.v1',
       payload: {
+        template: 'operator.smtp-diagnostic.v1',
         subject: 'VeltrixEye SMTP diagnostic',
         text: 'This is the one-time SMTP delivery diagnostic requested by the VeltrixEye operator.',
+        data: {
+          alertId: '00000000-0000-4000-8000-000000000039',
+          setupId: '00000000-0000-4000-8000-000000000039',
+          strategyId: '00000000-0000-4000-8000-000000000039',
+          strategyVersionId: '00000000-0000-4000-8000-000000000039',
+          versionNumber: 1,
+          instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+          timeframe: '1h',
+          direction: 'long',
+          triggerState: 'confirmed',
+          qualityScore: 75,
+          qualityGrade: 'B',
+          minQualityScore: 50,
+          entryPrice: null,
+          stopLossPrice: null,
+          tp1Price: null,
+          tp2Price: null,
+          tp3Price: null,
+          detectedAt: diagnosticTimestamp,
+          generatedAt: diagnosticTimestamp,
+        },
       },
       attempt: 1,
       timeoutMs: config.notification.email.timeoutMs,
-    } as never;
+    } satisfies NotificationSendRequest;
     try {
       const result = await ctx.smtpTestProvider.send(request);
       const succeeded = result.outcome === 'delivered';
