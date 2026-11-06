@@ -291,7 +291,7 @@ after(async () => {
 });
 
 describe('Billing PR3 — 0032 file conventions and history integrity', () => {
-  test('0001-0031 are byte-identical, and the newest migration is 0035 (live-mode widening)', () => {
+  test('0001-0031 are byte-identical, and 0035 remains the live-mode step tip', () => {
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((file) => /^\d{4}_.+\.sql$/.test(file))
       .sort();
@@ -320,6 +320,7 @@ describe('Billing PR3 — 0032 file conventions and history integrity', () => {
     assert.equal(files.filter((file) => file.startsWith('0036_')).length, 1, 'exactly one 0036 migration (non-commercial grants)');
     assert.equal(files.filter((file) => file.startsWith('0037_')).length, 1, 'exactly one 0037 migration (scheduled ingestion trigger)');
     assert.equal(files.filter((file) => file.startsWith('0038_')).length, 1, 'exactly one 0038 migration (read-only FX source observations)');
+    assert.equal(files.filter((file) => file.startsWith('0039_')).length, 1, 'exactly one 0039 migration (isolated SMTP diagnostic claim)');
     assert.equal(
       files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 39).length,
       0,
