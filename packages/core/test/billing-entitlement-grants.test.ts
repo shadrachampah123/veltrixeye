@@ -143,7 +143,7 @@ const auditRows = async (userId: string) =>
 /* ========================================================================== */
 
 describe('0036 — the grant fact table', () => {
-  it('is applied and is the newest migration of this change', async () => {
+  it('all shipped migrations are applied and 0039 is the current tip', async () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
     assert.equal(status.expectedCount, 39);
     assert.equal(status.appliedCount, 39);
