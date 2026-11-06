@@ -228,7 +228,7 @@ no hard-coded credentials.
 | owner scoping | `GET /api/alerts/:alertId/notifications` is session-authenticated and owner-scoped; foreign/unknown/malformed ids are masked 404s |
 | minimal DTO | the owner sees status, attempts, failure category, provider and timestamps — never the recipient, payload, provider error or upstream id |
 | credentials stay server-side | SMTP settings live in the API environment; `describe()` logs host/port/from/auth-mode only; provider errors are redacted before they are stored or logged |
-| no secrets in logs | worker log lines carry job id, alert id, user id, channel, attempt, status, provider, response code and failure category — no recipient, no payload, no credential |
+| no secrets in logs | worker log lines carry job id, alert id, user id, channel, attempt, status, provider, response code and failure category — no recipient, provider error text, payload or credential. Provider error summaries remain in the restricted delivery row for operational diagnosis and are not copied to the log stream |
 | safe cleanup | retention deletes aged `delivered` (30 d) and `failed` (120 d) rows only; `pending`, `processing` and `unavailable` rows are never deleted |
 
 ## 8. Observability

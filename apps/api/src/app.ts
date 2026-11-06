@@ -65,6 +65,7 @@ import {
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
 import { recordRetentionSweep } from './retention-liveness.js';
+import { consoleDeliveryLogger } from './delivery-worker.js';
 import type { PaystackFetchFn } from '@veltrixeye/provider-paystack';
 import { authRoutes } from './routes/auth.js';
 import { userRoutes } from './routes/users.js';
@@ -272,6 +273,7 @@ export function createAppContext(
         config.notification.push.privateKey,
         config.notification.secret.encryptionKey,
       ]),
+    logger: consoleDeliveryLogger('[notification-delivery]'),
   });
 
   const ingestion = new IngestionService(pool, providerRegistry, candles);
