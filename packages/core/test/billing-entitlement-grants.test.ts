@@ -292,9 +292,11 @@ describe('0036 — the grant fact table', () => {
         assert.equal(status.expectedCount, 35, 'the base file set is exactly 0001-0035');
         assert.equal(status.pending.length, 0, 'the base set is fully applied');
         assert.equal(full.appliedCount, 36, 'the upgrade path ends at 0036, this step’s tip');
+        assert.equal(full.expectedCount, 39, 'the full shipped migration set includes later additive migrations');
         assert.deepEqual(full.pending, [
           '0037_scheduled_ingestion_trigger.sql',
           '0038_billing_fx_source_observations.sql',
+          '0039_notification_smtp_test_claim.sql',
         ]);
         assert.equal(full.latestApplied, '0036_billing_entitlement_grants.sql');
         assert.equal(full.checksumsMatch, true, '0001-0035 are byte-identical after the upgrade');
