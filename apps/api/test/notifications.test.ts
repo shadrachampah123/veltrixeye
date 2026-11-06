@@ -966,6 +966,23 @@ describe('isolated one-time SMTP diagnostic', () => {
     assert.equal(await countRows('alerts'), alertsBefore);
   });
 
+  test('returns 503 when the feature is enabled but SMTP is not configured', async () => {
+    const config = makeConfig({
+      DATABASE_URL: databaseUrl,
+      NOTIFICATION_WORKER_TOKEN: WORKER_TOKEN,
+      NOTIFICATION_SMTP_TEST_ENABLED: 'true',
+    });
+    const context = createAppContext(pool, config);
+    const local = await buildApp(config, context);
+    try {
+      const res = await local.inject({ method: 'POST', url, headers: headers(), payload: {} });
+      assert.equal(res.statusCode, 503);
+      assert.deepEqual(res.json(), { status: 'unavailable', reason: 'smtp_not_configured' });
+    } finally {
+      await local.close();
+    }
+  });
+
   test('a definitive SMTP authentication/configuration rejection releases only the unsent claim', async () => {
     await pool.query('DELETE FROM notification_smtp_test_claims');
     const provider = adminCtx.smtpTestProvider;
