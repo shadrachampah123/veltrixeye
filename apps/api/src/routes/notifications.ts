@@ -22,6 +22,7 @@ import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from '../
  * | `GET /api/alerts/:alertId/notifications` | session | Owner-scoped; foreign/unknown ids are masked as 404. Returns status/attempt/failure-category only — never the recipient, payload or provider error. |
  * | `POST /api/internal/notifications/deliveries/run` | worker token | Runs one delivery batch (recover stale → re-queue what became deliverable → claim → send). 404 when no token is configured. |
  * | `POST /api/internal/notifications/deliveries/maintenance` | worker token | Stale recovery + retention + queue depth. 404 when no token is configured. |
+ * | `POST /api/internal/notifications/smtp-test` | worker token + explicit feature flag | One fixed-recipient SMTP diagnostic, guarded by a separate singleton claim; never touches the shared outbox or worker. |
  *
  * Why an internal HTTP trigger exists at all: the API is a container a
  * platform may stop at any time (the Render free tier spins down), so delivery
@@ -35,10 +36,13 @@ import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from '../
  *    deployment must not advertise an administrative surface);
  *  - the token is compared in constant time over SHA-256 digests, so neither
  *    the length nor the prefix leaks through response timing;
- *  - they are rate limited per IP and never accept user ids, alert ids or
- *    payloads — a caller can only say "process a batch", never "send this";
- *  - no response ever contains a credential, a recipient address or provider
- *    error text (counts and statuses only).
+ *  - worker routes are rate limited and accept no caller-selected alert,
+ *    recipient or message payload;
+ *  - the SMTP diagnostic additionally requires its explicit feature flag,
+ *    uses one fixed recipient and a separate permanent claim for ambiguous
+ *    outcomes, and never reads or writes the shared delivery queue;
+ *  - no response ever contains a credential, recipient address or provider
+ *    error text (only redacted outcomes and failure categories).
  */
 
 /** Header carrying the shared worker secret. */
