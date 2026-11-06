@@ -230,6 +230,17 @@ export async function notificationRoutes(
     } satisfies NotificationSendRequest;
     try {
       const result = await ctx.smtpTestProvider.send(request);
+      // SMTP AUTH failures are classified by the adapter as configuration
+      // failures before an envelope/message can be accepted. Release only
+      // that definitive pre-send failure so an operator can correct credentials
+      // and retry. Every ambiguous transport outcome keeps the claim forever.
+      if (result.outcome === 'unavailable' && result.failureCategory === 'configuration') {
+        await ctx.pool.query(
+          `DELETE FROM notification_smtp_test_claims
+            WHERE test_key = 'production-smtp-diagnostic-v1' AND outcome = 'claimed'`,
+        );
+        return reply.code(503).send({ status: 'unavailable', reason: 'smtp_configuration' });
+      }
       const succeeded = result.outcome === 'delivered';
       await ctx.pool.query(
         `UPDATE notification_smtp_test_claims
