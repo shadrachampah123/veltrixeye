@@ -65,6 +65,7 @@ import {
 } from '@veltrixeye/core';
 import { healthRoutes } from './routes/health.js';
 import { recordRetentionSweep } from './retention-liveness.js';
+import { consoleDeliveryLogger } from './delivery-worker.js';
 import type { PaystackFetchFn } from '@veltrixeye/provider-paystack';
 import { authRoutes } from './routes/auth.js';
 import { userRoutes } from './routes/users.js';
@@ -272,19 +273,7 @@ export function createAppContext(
         config.notification.push.privateKey,
         config.notification.secret.encryptionKey,
       ]),
-    // Emit identifier-only diagnostics and already-redacted provider summaries.
-    // Never include recipients, message bodies, credentials, or raw provider errors.
-    logger: {
-      info: (message, meta) => {
-        if (config.NODE_ENV === 'production') {
-          console.info(`[notification-delivery] ${message}`, meta ? JSON.stringify(meta) : '');
-        }
-      },
-      warn: (message, meta) =>
-        console.warn(`[notification-delivery] ${message}`, meta ? JSON.stringify(meta) : ''),
-      error: (message, meta) =>
-        console.error(`[notification-delivery] ${message}`, meta ? JSON.stringify(meta) : ''),
-    },
+    logger: consoleDeliveryLogger('[notification-delivery]'),
   });
 
   const ingestion = new IngestionService(pool, providerRegistry, candles);
