@@ -272,6 +272,19 @@ export function createAppContext(
         config.notification.push.privateKey,
         config.notification.secret.encryptionKey,
       ]),
+    // Emit identifier-only diagnostics and already-redacted provider summaries.
+    // Never include recipients, message bodies, credentials, or raw provider errors.
+    logger: {
+      info: (message, meta) => {
+        if (config.NODE_ENV === 'production') {
+          console.info(`[notification-delivery] ${message}`, meta ? JSON.stringify(meta) : '');
+        }
+      },
+      warn: (message, meta) =>
+        console.warn(`[notification-delivery] ${message}`, meta ? JSON.stringify(meta) : ''),
+      error: (message, meta) =>
+        console.error(`[notification-delivery] ${message}`, meta ? JSON.stringify(meta) : ''),
+    },
   });
 
   const ingestion = new IngestionService(pool, providerRegistry, candles);
