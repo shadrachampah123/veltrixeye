@@ -1531,7 +1531,7 @@ describe('payload rendering and secret hygiene', () => {
     assert.equal(failure.meta?.providerResponseCode, '451');
     assert.equal(failure.meta?.failureCategory, 'transient');
     assert.equal(Object.hasOwn(failure.meta ?? {}, 'error'), false, 'raw provider error is not logged');
-    assert.doesNotMatch(JSON.stringify(events), /owner@customer\\.example/i);
+    assert.doesNotMatch(JSON.stringify(events), /owner@customer\.example/i);
     assert.equal((await getJob(row.id)).last_error?.includes(recipient), true,
       'the restricted delivery record retains its operational error detail');
   });
