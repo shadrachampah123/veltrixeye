@@ -1019,4 +1019,52 @@ describe('isolated one-time SMTP diagnostic', () => {
       provider.send = originalSend;
     }
   });
+
+  test('the feature flag alone is not enough: with no worker token the route stays invisible', async () => {
+    const config = makeConfig({ DATABASE_URL: databaseUrl, NOTIFICATION_SMTP_TEST_ENABLED: 'true' });
+    const context = createAppContext(pool, config);
+    const local = await buildApp(config, context);
+    try {
+      const res = await local.inject({ method: 'POST', url, headers: headers(), payload: {} });
+      assert.equal(res.statusCode, 404, 'an unconfigured deployment must not advertise the diagnostic');
+    } finally {
+      await local.close();
+    }
+  });
+
+  test('an ambiguous transport outcome consumes the claim permanently and can never send twice', async () => {
+    await pool.query('DELETE FROM notification_smtp_test_claims');
+    const provider = adminCtx.smtpTestProvider;
+    assert.ok(provider);
+    const originalSend = provider.send;
+    let attempts = 0;
+    // A timeout is the dangerous case: the provider may have accepted the
+    // message even though we never saw a response, so the claim must survive.
+    provider.send = async () => {
+      attempts += 1;
+      return { outcome: 'timeout', failureCategory: 'timeout', error: 'SMTP socket timeout' };
+    };
+    try {
+      const ambiguous = await adminApp.inject({ method: 'POST', url, headers: headers(), payload: {} });
+      assert.equal(ambiguous.statusCode, 502);
+      assert.deepEqual(ambiguous.json(), { status: 'failed', outcome: 'timeout', failureCategory: 'timeout' });
+
+      const again = await adminApp.inject({ method: 'POST', url, headers: headers(), payload: {} });
+      assert.equal(again.statusCode, 409, 'an ambiguous attempt is never retried automatically');
+      assert.equal(attempts, 1, 'the ambiguous attempt remains the only send');
+
+      const rows = await pool.query<{ outcome: string; failure_category: string | null; finished_at: Date | null }>(
+        `SELECT outcome, failure_category, finished_at
+           FROM notification_smtp_test_claims
+          WHERE test_key = 'production-smtp-diagnostic-v1'`,
+      );
+      assert.equal(rows.rows.length, 1, 'the consumed claim is retained as the audit record');
+      assert.equal(rows.rows[0]?.outcome, 'failed');
+      assert.equal(rows.rows[0]?.failure_category, 'timeout');
+      assert.ok(rows.rows[0]?.finished_at, 'a consumed claim is closed, never left "claimed"');
+    } finally {
+      provider.send = originalSend;
+      await pool.query('DELETE FROM notification_smtp_test_claims');
+    }
+  });
 });
