@@ -5,7 +5,7 @@ import { classifySmtpError } from '../src/notifications/email.js';
 test('SMTP diagnostics classify connection timeouts without exposing credentials', () => {
   const secret = 'resend-api-secret-value';
   const result = classifySmtpError(
-    Object.assign(new Error('Connection timed out while authenticating'), { code: 'ETIMEDOUT' }),
+    Object.assign(new Error('Connection timed out while authenticating: resend-api-secret-value'), { code: 'ETIMEDOUT' }),
     [secret],
   );
 
