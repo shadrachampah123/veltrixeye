@@ -145,11 +145,11 @@ const auditRows = async (userId: string) =>
 describe('0036 — the grant fact table', () => {
   it('is applied and is the newest migration of this change', async () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
-    assert.equal(status.expectedCount, 38);
-    assert.equal(status.appliedCount, 38);
-    // 0037 and 0038 legitimately follow this step's 0036 and are named here
+    assert.equal(status.expectedCount, 39);
+    assert.equal(status.appliedCount, 39);
+    // 0037–0039 legitimately follow this step's 0036 and are named here
     // deliberately, so the tip cannot drift silently.
-    assert.equal(status.latestApplied, '0038_billing_fx_source_observations.sql');
+    assert.equal(status.latestApplied, '0039_notification_smtp_test_claim.sql');
     assert.equal(status.checksumsMatch, true);
   });
 
@@ -314,17 +314,17 @@ describe('0036 — the grant fact table', () => {
     // still verifies every historical file. What this catches is a migration
     // set that drifted rather than grew.
     const files = readdirSync(MIGRATIONS_DIR).filter((file) => file.endsWith('.sql')).sort();
-    assert.equal(files.length, 38);
+    assert.equal(files.length, 39);
     const versions = files.map((file) => Number(/^(\d{4})_/.exec(file)![1]));
     assert.equal(new Set(versions).size, versions.length, 'no duplicate migration version');
-    for (let expected = 1; expected <= 38; expected += 1) {
+    for (let expected = 1; expected <= 39; expected += 1) {
       assert.ok(versions.includes(expected), `migration ${String(expected).padStart(4, '0')} exists`);
     }
     assert.equal(
       files.filter((file) => Number(/^(\d{4})_/.exec(file)![1]) <= 36).at(-1),
       '0036_billing_entitlement_grants.sql',
     );
-    assert.equal(files.at(-1), '0038_billing_fx_source_observations.sql');
+    assert.equal(files.at(-1), '0039_notification_smtp_test_claim.sql');
   });
 });
 
