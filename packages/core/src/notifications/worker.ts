@@ -446,8 +446,6 @@ export class DeliveryWorker {
       ...meta,
       status: outcome === 'retried' ? 'pending' : 'failed',
       failureCategory: category,
-      // attempt.error has passed through the deployment redactor above.
-      error: attempt.error,
       retryDelayMs: outcome === 'retried' ? delayMs : 0,
     });
     return outcome;
