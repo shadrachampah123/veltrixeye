@@ -1504,6 +1504,38 @@ describe('payload rendering and secret hygiene', () => {
     assert.match(stored.last_error ?? '', /\[redacted\]/);
   });
 
+
+  test('worker log metadata never includes provider error text or recipient addresses', async () => {
+    const owner = await makeUser();
+    const alertId = await makeAlert(owner.id);
+    const { row } = await enqueueAlert(alertId, owner.id);
+    const recipient = 'owner@customer.example';
+    const events: Array<{ message: string; meta?: Record<string, unknown> }> = [];
+    const leaky = fakeProvider(async () => ({
+      outcome: 'retryable',
+      error: `451 4.7.1 <${recipient}>: Recipient address rejected: greylisted`,
+      providerResponseCode: '451',
+    }));
+    const worker = new DeliveryWorker(pool, registryWith(leaky), TEST_POLICY, {
+      logger: {
+        info: (message, meta) => events.push({ message, meta }),
+        warn: (message, meta) => events.push({ message, meta }),
+        error: (message, meta) => events.push({ message, meta }),
+      },
+    });
+
+    await worker.runOnce();
+
+    const failure = events.find((event) => event.message === 'notification attempt failed');
+    assert.ok(failure, 'retry failure event is emitted');
+    assert.equal(failure.meta?.providerResponseCode, '451');
+    assert.equal(failure.meta?.failureCategory, 'transient');
+    assert.equal(Object.hasOwn(failure.meta ?? {}, 'error'), false, 'raw provider error is not logged');
+    assert.doesNotMatch(JSON.stringify(events), /owner@customer\\.example/i);
+    assert.equal((await getJob(row.id)).last_error?.includes(recipient), true,
+      'the restricted delivery record retains its operational error detail');
+  });
+
   test('redactSecrets only masks real secrets and leaves ordinary text alone', () => {
     assert.equal(redactSecrets('connection refused for smtp.example.com', ['secret-value']), 'connection refused for smtp.example.com');
     assert.equal(redactSecrets('failed with secret-value here', ['secret-value']), 'failed with [redacted] here');
