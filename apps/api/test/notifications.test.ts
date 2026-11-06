@@ -335,6 +335,7 @@ before(async () => {
     SMTP_USER: 'api-key-user',
     SMTP_PASS: SMTP_SECRET,
     NOTIFICATION_FROM: 'VeltrixEye Alerts <alerts@example.com>',
+    NOTIFICATION_SMTP_TEST_ENABLED: 'true',
   });
   adminCtx = createAppContext(pool, withSmtp);
   adminApp = await buildApp(withSmtp, adminCtx);
@@ -883,5 +884,109 @@ describe('M9.1 multi-channel enqueue', () => {
       assert.equal(await generateCase(null, false), 1, 'no preference preserves default email enqueue');
       assert.equal(await generateCase({ enabled: true }, true), 1, 'explicit email enable permits email enqueue');
     } finally { await local.close(); }
+  });
+});
+
+
+/* -------------------------------------------------------------------------- */
+/* Isolated one-time SMTP diagnostic                                           */
+/* -------------------------------------------------------------------------- */
+
+describe('isolated one-time SMTP diagnostic', () => {
+  const url = '/api/internal/notifications/smtp-test';
+  const headers = () => ({
+    'x-forwarded-for': freshIp(),
+    'x-veltrixeye-worker-token': WORKER_TOKEN,
+  });
+
+  test('gating, fixed recipient, redaction, one-shot and concurrent claim are isolated from shared delivery data', async () => {
+    await pool.query('DELETE FROM notification_smtp_test_claims');
+    const deliveriesBefore = await countRows('notification_deliveries');
+    const alertsBefore = await countRows('alerts');
+    const provider = adminCtx.smtpTestProvider;
+    assert.ok(provider, 'SMTP provider is configured for this test');
+    const originalSend = provider.send;
+    const sent: NotificationSendRequest[] = [];
+    provider.send = async (request) => {
+      sent.push(request);
+      return { outcome: 'delivered', providerMessageId: '<diagnostic@fake>', providerResponseCode: '250' };
+    };
+
+    try {
+      const disabled = await workerApp.inject({ method: 'POST', url, headers: headers(), payload: {} });
+      assert.equal(disabled.statusCode, 404, 'the feature flag defaults off');
+
+      const unauthorized = await adminApp.inject({
+        method: 'POST', url,
+        headers: { 'x-forwarded-for': freshIp(), 'x-veltrixeye-worker-token': 'wrong-token' },
+        payload: {},
+      });
+      assert.equal(unauthorized.statusCode, 401);
+
+      const first = await adminApp.inject({ method: 'POST', url, headers: headers(), payload: { recipient: 'attacker@example.com' } });
+      assert.equal(first.statusCode, 200, first.body);
+      assert.deepEqual(first.json(), { status: 'sent', outcome: 'delivered', failureCategory: null });
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0]?.recipient, 'shadrachampah123@gmail.com', 'the recipient is fixed in the server');
+      assert.equal(sent[0]?.payload.data.alertId, '00000000-0000-4000-8000-000000000039');
+
+      const duplicate = await adminApp.inject({ method: 'POST', url, headers: headers(), payload: {} });
+      assert.equal(duplicate.statusCode, 409);
+      assert.equal(sent.length, 1, 'a consumed one-time claim cannot send again');
+      assert.equal(duplicate.body.includes(SMTP_SECRET), false);
+    } finally {
+      provider.send = originalSend;
+    }
+
+    assert.equal(await countRows('notification_deliveries'), deliveriesBefore, 'diagnostic never writes the shared outbox');
+    assert.equal(await countRows('alerts'), alertsBefore, 'diagnostic never writes alerts');
+
+    // Atomic PK claim: two simultaneous requests can produce only one send.
+    await pool.query('DELETE FROM notification_smtp_test_claims');
+    const concurrentProvider = adminCtx.smtpTestProvider;
+    assert.ok(concurrentProvider);
+    const concurrentOriginal = concurrentProvider.send;
+    let concurrentSends = 0;
+    concurrentProvider.send = async () => {
+      concurrentSends += 1;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { outcome: 'delivered', providerMessageId: '<concurrent@fake>', providerResponseCode: '250' };
+    };
+    try {
+      const results = await Promise.all([
+        adminApp.inject({ method: 'POST', url, headers: headers(), payload: {} }),
+        adminApp.inject({ method: 'POST', url, headers: headers(), payload: {} }),
+      ]);
+      assert.deepEqual(results.map((result) => result.statusCode).sort(), [200, 409]);
+      assert.equal(concurrentSends, 1, 'only the request that acquired the claim may send');
+    } finally {
+      concurrentProvider.send = concurrentOriginal;
+    }
+    assert.equal(await countRows('notification_deliveries'), deliveriesBefore);
+    assert.equal(await countRows('alerts'), alertsBefore);
+  });
+
+  test('a definitive SMTP authentication/configuration rejection releases only the unsent claim', async () => {
+    await pool.query('DELETE FROM notification_smtp_test_claims');
+    const provider = adminCtx.smtpTestProvider;
+    assert.ok(provider);
+    const originalSend = provider.send;
+    let attempts = 0;
+    provider.send = async () => {
+      attempts += 1;
+      return attempts === 1
+        ? { outcome: 'unavailable', failureCategory: 'configuration', error: SMTP_SECRET }
+        : { outcome: 'delivered', providerResponseCode: '250' };
+    };
+    try {
+      const refused = await adminApp.inject({ method: 'POST', url, headers: headers(), payload: {} });
+      assert.equal(refused.statusCode, 503);
+      assert.equal(refused.body.includes(SMTP_SECRET), false);
+      const retry = await adminApp.inject({ method: 'POST', url, headers: headers(), payload: {} });
+      assert.equal(retry.statusCode, 200);
+      assert.equal(attempts, 2);
+    } finally {
+      provider.send = originalSend;
+    }
   });
 });
