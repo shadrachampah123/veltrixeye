@@ -893,6 +893,19 @@ describe('M9.1 multi-channel enqueue', () => {
 /* -------------------------------------------------------------------------- */
 
 describe('isolated one-time SMTP diagnostic', () => {
+  test('migration creates a separate singleton claim table with guarded state transitions', async () => {
+    const constraints = await pool.query<{ definition: string; type: string }>(
+      `SELECT pg_get_constraintdef(oid) AS definition, contype AS type
+         FROM pg_constraint
+        WHERE conrelid = 'notification_smtp_test_claims'::regclass
+        ORDER BY contype, conname`,
+    );
+    assert.equal(constraints.rows.some((row) => row.type === 'p' && /test_key/.test(row.definition)), true);
+    assert.equal(constraints.rows.some((row) => row.type === 'c' && /production-smtp-diagnostic-v1/.test(row.definition)), true);
+    assert.equal(constraints.rows.some((row) => row.type === 'c' && /claimed/.test(row.definition) && /finished_at/.test(row.definition)), true);
+    assert.equal(constraints.rows.some((row) => row.type === 'f'), false, 'the diagnostic table has no dependency on shared notification rows');
+  });
+
   const url = '/api/internal/notifications/smtp-test';
   const headers = () => ({
     'x-forwarded-for': freshIp(),
