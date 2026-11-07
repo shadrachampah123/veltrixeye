@@ -47,7 +47,8 @@ git-ignored and never contain values you would commit.
 | `PAYSTACK_WEBHOOK_ALLOWED_IPS` | comma/whitespace-separated IPs/CIDRs | *(empty = documented provider IPs)* | Billing Step 5.2. Source-IP allow-list for `POST /api/billing/webhook`. Empty pins the provider's **documented** delivery addresses (`52.31.139.75`, `52.49.173.169`, `52.214.14.220` — same set in test and live). A `/0` entry is refused at boot. Defence in depth: the `x-paystack-signature` HMAC check remains the authority. The route itself exists **only** when `PAYSTACK_SECRET_KEY` is set. |
 | `PAYSTACK_WEBHOOK_RATE_LIMIT_MAX` | int 1–1000 | `30` | Billing Step 5.2. Deliveries per minute per IP accepted on the webhook route. Far above the provider's documented delivery/retry cadence, far below the global API limit — an unsigned flood stops here. |
 | `PUBLIC_APPLICATION_ORIGIN` | absolute **https** origin — no credentials, path, query or fragment | *(empty = checkout disabled)* | Billing PR-C, surfaced in the browser by Billing Step 9. The public origin of the web app (e.g. `https://app.example.com`) and the ONLY source of the checkout callback URL: the API derives `<origin>/settings` and never infers an origin from a request, so `Host` / `X-Forwarded-Host` / `X-Forwarded-Proto` cannot redirect a payment. Empty ⇒ `POST /api/billing/checkout` fails closed (`callback_not_configured`, 502) and the `/settings` checkout surface shows that refusal instead of a payment link — nothing else in the app changes. `npm run setup` and `.env.example` do **not** set it, so local development has no checkout until an operator adds it; a non-https value, a path, a query, a fragment or embedded credentials fail the boot. **Server-side only** — never a `NEXT_PUBLIC_*` variable, and Step 9 adds no new variable. |
-| `RESEND_API_KEY` | secret, ≤512 chars | *(empty)* | Preferred email transport. When set with `NOTIFICATION_FROM`, uses Resend HTTPS (port 443); takes precedence over SMTP. |\n| `SMTP_HOST` | string | *(empty)* | Legacy SMTP fallback, used only when `RESEND_API_KEY` is empty. |
+| `RESEND_API_KEY` | secret, ≤512 chars | *(empty)* | Preferred email transport. When set with `NOTIFICATION_FROM`, uses Resend HTTPS (port 443); takes precedence over SMTP. |
+| `SMTP_HOST` | string | *(empty)* | Legacy SMTP fallback, used only when `RESEND_API_KEY` is empty. |
 | `SMTP_PORT` | int 1–65535 | `587` | 587 = submission + STARTTLS (required), 465 = implicit TLS. |
 | `SMTP_SECURE` | `auto` \| `always` \| `never` | `auto` | `auto` = implicit TLS on port 465 only; STARTTLS is mandatory otherwise. |
 | `SMTP_USER` | string | *(empty = no AUTH)* | SMTP username (often the vendor's API key). |
@@ -202,7 +203,7 @@ See [deployment.md](./deployment.md) for the full production runbook.
   browsers), `PAYSTACK_SECRET_KEY` (the prefix must match `PAYSTACK_MODE` —
   `sk_test_` for the default test mode, `sk_live_` only for an explicitly
   configured live mode; a mismatch refuses the boot), and — once delivery is
-  switched on — `SMTP_PASS` and
+  switched on — `RESEND_API_KEY` (preferred) or `SMTP_PASS` (legacy SMTP), and
   `NOTIFICATION_WORKER_TOKEN`. Session tokens are server-side (random per
   session, stored hashed) — no JWT secret is required.
 - Delivery credentials never leave the API process: they are read at boot, held
