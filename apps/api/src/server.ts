@@ -94,9 +94,9 @@ async function main(): Promise<void> {
     );
   } else {
     console.warn(
-      '[api] email delivery is NOT configured (SMTP_HOST / NOTIFICATION_FROM missing) — ' +
+      '[api] email delivery is NOT configured (RESEND_API_KEY / NOTIFICATION_FROM missing; SMTP fallback may also be unavailable) — ' +
         'alert notifications are queued and recorded as "unavailable", never as delivered. ' +
-        'Set the SMTP_* / NOTIFICATION_FROM environment variables to enable delivery.',
+        'Set RESEND_API_KEY and NOTIFICATION_FROM to enable the preferred HTTPS provider; configure SMTP_* only as a supported-host fallback.',
     );
   }
 

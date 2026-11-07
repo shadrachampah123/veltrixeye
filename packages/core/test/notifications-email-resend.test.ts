@@ -62,17 +62,25 @@ test('sends through HTTPS with a stable idempotency key and redacted description
   });
 });
 
-test('classifies invalid credentials as configuration and invalid messages as permanent', async () => {
+test('dead-letters rejected Resend credentials as configuration failures instead of re-queueing forever', async () => {
   const unauthorized = createResendEmailProvider(
     { apiKey: 're_secret', from: 'alerts@example.com' },
     async () => new Response(JSON.stringify({ message: 'Invalid API key' }), { status: 401 }),
+  );
+  const forbidden = createResendEmailProvider(
+    { apiKey: 're_secret', from: 'alerts@example.com' },
+    async () => new Response(JSON.stringify({ message: 'Forbidden' }), { status: 403 }),
   );
   const invalid = createResendEmailProvider(
     { apiKey: 're_secret', from: 'alerts@example.com' },
     async () => new Response(JSON.stringify({ message: 'Invalid recipient' }), { status: 422 }),
   );
-  assert.equal((await unauthorized.send(request)).failureCategory, 'configuration');
-  assert.equal((await unauthorized.send(request)).outcome, 'unavailable');
+  const unauthorizedResult = await unauthorized.send(request);
+  const forbiddenResult = await forbidden.send(request);
+  assert.equal(unauthorizedResult.failureCategory, 'configuration');
+  assert.equal(unauthorizedResult.outcome, 'permanent');
+  assert.equal(forbiddenResult.failureCategory, 'configuration');
+  assert.equal(forbiddenResult.outcome, 'permanent');
   assert.equal((await invalid.send(request)).failureCategory, 'permanent');
   assert.equal((await invalid.send(request)).outcome, 'permanent');
 });

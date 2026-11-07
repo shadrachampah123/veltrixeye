@@ -80,7 +80,13 @@ export function createResendEmailProvider(
         // and make credential echo/leakage impossible at this boundary.
         const error = `Resend rejected request (HTTP ${code})`;
         if (response.status === 401 || response.status === 403) {
-          return { outcome: 'unavailable', failureCategory: 'configuration', providerResponseCode: code, error };
+          // A configured key rejected by Resend is not the same as missing
+          // provider configuration. Park this job as a permanent failure:
+          // `unavailable` rows are automatically re-queued when a provider is
+          // configured, which would otherwise retry a bad key on every worker
+          // cycle and reset attempts indefinitely. Correct the key, then use
+          // the documented ID-scoped SQL recovery procedure before draining.
+          return { outcome: 'permanent', failureCategory: 'configuration', providerResponseCode: code, error };
         }
         if (response.status === 400 || response.status === 422) {
           return { outcome: 'permanent', failureCategory: 'permanent', providerResponseCode: code, error };
