@@ -51,7 +51,7 @@ git-ignored and never contain values you would commit.
 | `SMTP_PORT` | int 1–65535 | `587` | 587 = submission + STARTTLS (required), 465 = implicit TLS. |
 | `SMTP_SECURE` | `auto` \| `always` \| `never` | `auto` | `auto` = implicit TLS on port 465 only; STARTTLS is mandatory otherwise. |
 | `SMTP_USER` | string | *(empty = no AUTH)* | SMTP username (often the vendor's API key). |
-| `SMTP_PASS` | secret, ≤512 chars | *(empty)* | SMTP password / API secret. **Server-side only** — never logged, never returned by a route, redacted out of provider errors. |
+| `SMTP_PASS` | secret, ≤512 chars | *(empty)* | SMTP password. **Server-side only** — never logged, never returned by a route, redacted out of provider errors. |
 | `NOTIFICATION_FROM` | ≤320 chars | *(empty)* | From address, e.g. `VeltrixEye Alerts <alerts@example.com>`. |
 | `NOTIFICATION_PROVIDER_TIMEOUT_MS` | int 1000–120000 | `15000` | Per-attempt provider budget. |
 | `NOTIFICATION_MAX_ATTEMPTS` | int 1–10 | `5` | Send attempts per job before it is dead-lettered. |
