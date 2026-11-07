@@ -216,10 +216,10 @@ API key is configured:
 Nothing was added for demonstration purposes: no second vendor, no SDK wrapper,
 no hard-coded credentials.
 
-> **No credentials ⇒ no fake success.** With `SMTP_HOST` / `NOTIFICATION_FROM`
-> empty the adapter reports `configured: false` and every job is recorded
-> `unavailable` (never `delivered`). Production is switched on purely through
-> environment variables — see [environment.md](./environment.md).
+> **No credentials ⇒ no fake success.** With `RESEND_API_KEY` and the legacy
+> SMTP settings absent, the email adapter reports `configured: false` and every
+> job is recorded `unavailable` (never `delivered`). Production is switched on
+> through server-side environment variables — see [environment.md](./environment.md).
 
 ## 7. Security
 
@@ -275,8 +275,8 @@ The API's SMTP configuration surface is `SMTP_HOST`, `SMTP_PORT`,
 and code paths are implemented, and the deployment manifest declares
 operator-managed environment entries. That is **not evidence that production
 values are populated**. This repository review did not inspect production
-secrets/settings, connect to an SMTP provider, or send a real email. Unit tests
-use fake providers and verify the unconfigured path; actual production SMTP
+secrets/settings, connect to an email provider, or send a real email. Unit tests
+use fake providers and verify provider behavior; actual production Resend/SMTP
 configuration, successful provider acceptance and inbox delivery remain
 unverified. Do not treat a passing build or a healthy API as email-readiness
 evidence.
