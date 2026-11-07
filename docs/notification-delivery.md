@@ -213,8 +213,8 @@ API key is configured:
 - SMTP reply codes mapped to outcomes (4xx → retry, 5xx → dead letter,
   535/530/534 → unavailable).
 
-Nothing was added for demonstration purposes: no second vendor, no SDK wrapper,
-no hard-coded credentials.
+No SDK wrapper or hard-coded credentials were added; the Resend adapter uses
+Node's built-in HTTPS-capable `fetch`.
 
 > **No credentials ⇒ no fake success.** With `RESEND_API_KEY` and the legacy
 > SMTP settings absent, the email adapter reports `configured: false` and every
@@ -267,9 +267,10 @@ curl -X POST https://<api>/api/internal/notifications/deliveries/maintenance \
   -H "x-veltrixeye-worker-token: $NOTIFICATION_WORKER_TOKEN"
 ```
 
-The API's SMTP configuration surface is `SMTP_HOST`, `SMTP_PORT`,
-`SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `NOTIFICATION_FROM` and
-`NOTIFICATION_PROVIDER_TIMEOUT_MS`; internal scheduled delivery also uses
+The preferred email configuration is `RESEND_API_KEY` plus `NOTIFICATION_FROM`.
+When the Resend key is absent, the legacy SMTP fallback uses `SMTP_HOST`,
+`SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` and `NOTIFICATION_FROM`.
+Both use `NOTIFICATION_PROVIDER_TIMEOUT_MS`; internal scheduled delivery also uses
 `NOTIFICATION_WORKER_TOKEN`, while the in-process ticker is controlled by
 `NOTIFICATION_WORKER_ENABLED` and `NOTIFICATION_WORKER_INTERVAL_MS`. These names
 and code paths are implemented, and the deployment manifest declares
