@@ -37,6 +37,7 @@ const CONNECTION_STRING = `postgres://veltrix:${DB_PASSWORD}@db.internal.veltrix
 const JWT =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';
 const OPAQUE_SECRET = 'VeltrixEye-Opaque-Configured-Secret-42';
+const RESEND_API_KEY = 'resend-secret-value-for-redaction-test';
 
 function text(...parts: string[]): string {
   return parts.join(' ');
@@ -169,6 +170,7 @@ test('configuredSecrets collects deployment credentials, including the DATABASE_
     PAYSTACK_SECRET_KEY: SK_TEST,
     PAYSTACK_MODE: 'test',
     SMTP_PASS: 'smtp-pass-word',
+    RESEND_API_KEY,
     SMTP_HOST: '',
     NOTIFICATION_WORKER_TOKEN: 'worker-token-value',
     WEBHOOK_SECRET_ENCRYPTION_KEY: 'encryption-key-value',
@@ -182,6 +184,7 @@ test('configuredSecrets collects deployment credentials, including the DATABASE_
     DB_PASSWORD,
     SK_TEST,
     'smtp-pass-word',
+    RESEND_API_KEY,
     'worker-token-value',
     'encryption-key-value',
     'vapid-private-value',
