@@ -371,15 +371,46 @@ interface EligibleStrategy {
 interface ScanMetrics {
   strategiesScanned: number;
   instrumentsScanned: number;
+  /**
+   * TOTAL candles handed to the pipeline this run
+   * (`candlesFromStore + candlesFromProvider`).
+   *
+   * Phase A observability: this is what `scanner_runs.candles_fetched` and the
+   * Scanner UI's "Candles" metric report. Before Phase A the counter was
+   * incremented only on the provider fetch-through path, so a scan served
+   * entirely by the shared CandleStore reported zero candles processed.
+   */
   candlesFetched: number;
+  /** Candles served by the CandleStore fast path (read, normalized, validated, fresh). */
+  candlesFromStore: number;
+  /** Candles returned by the market-data provider (fetch-through) — the historical meaning of `candlesFetched`. */
+  candlesFromProvider: number;
   setupsDetected: number;
   setupsCreated: number;
   alertsCreated: number;
   staleRejections: number;
+  /** Evaluations skipped because the setup candle had already been processed (cursor hit). */
+  duplicateCandleSkips: number;
   providerFailures: number;
   symbolsProcessed: Set<string>;
   timeframesProcessed: Set<string>;
   errors: string[];
+}
+
+/**
+ * Attribute `count` candles to exactly one source and to the run total.
+ *
+ * This is the single funnel for candle accounting: the total is advanced
+ * exactly once here, on whichever path actually loaded the candles, so
+ * `candlesFetched === candlesFromStore + candlesFromProvider` always holds and
+ * no candle can be counted twice. Per-cycle cache hits are re-uses of a batch
+ * the loading pair already counted, so they deliberately add nothing.
+ */
+function recordCandleLoad(metrics: ScanMetrics, source: 'store' | 'provider', count: number): void {
+  if (!Number.isFinite(count) || count <= 0) return;
+  if (source === 'store') metrics.candlesFromStore += count;
+  else metrics.candlesFromProvider += count;
+  metrics.candlesFetched += count;
 }
 
 /**
@@ -1034,10 +1065,13 @@ export class ScannerService {
       strategiesScanned: 0,
       instrumentsScanned: 0,
       candlesFetched: 0,
+      candlesFromStore: 0,
+      candlesFromProvider: 0,
       setupsDetected: 0,
       setupsCreated: 0,
       alertsCreated: 0,
       staleRejections: 0,
+      duplicateCandleSkips: 0,
       providerFailures: 0,
       symbolsProcessed: new Set<string>(),
       timeframesProcessed: new Set<string>(),
@@ -1320,6 +1354,9 @@ export class ScannerService {
     if (!args.force) {
       const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
       if (cursor && cursor.last_candle_time === latestClosedSetupCandle.time) {
+        // Phase A: make the de-duplication observable. The skip itself is
+        // unchanged — the cursor still prevents re-evaluating a processed bar.
+        metrics.duplicateCandleSkips += 1;
         this.logger.info('skipping duplicate candle', {
           strategyId: strategy.strategyId,
           instrument: `${instrument.assetClass}/${instrument.symbol}`,
@@ -1465,6 +1502,9 @@ export class ScannerService {
         });
 
         if (normalized.length >= args.minimumCandles && validation.valid && freshness.fresh) {
+          // Phase A: store-served candles are candles processed. Counted once,
+          // here, on the only path that returns them.
+          recordCandleLoad(args.metrics, 'store', normalized.length);
           if (args.cycleCache) {
             const cacheKey = makeCacheKey(args.assetClass, args.symbol, args.timeframe);
             args.cycleCache.set(cacheKey, { candles: normalized });
@@ -1551,7 +1591,10 @@ export class ScannerService {
           });
         }
 
-        args.metrics.candlesFetched += normalized.length;
+        // Phase A: same funnel as the store path, attributed to the provider.
+        // `candlesFetched` keeps advancing here, so provider fetches remain
+        // visible exactly as before (also surfaced as `candlesFromProvider`).
+        recordCandleLoad(args.metrics, 'provider', normalized.length);
 
         // P2: store in per-cycle cache for subsequent strategies in this scan.
         if (args.cycleCache) {
@@ -1666,7 +1709,18 @@ export class ScannerService {
         JSON.stringify([...metrics.symbolsProcessed]),
         JSON.stringify([...metrics.timeframesProcessed]),
         safeError,
-        JSON.stringify({ errors: safeErrors }),
+        JSON.stringify({
+          errors: safeErrors,
+          // Phase A observability: candle provenance for this run. Non-identifying,
+          // so it survives tenant redaction (unlike `errors`/`strategyId`).
+          // Invariant: total === store + provider (each candle counted once).
+          candles: {
+            store: metrics.candlesFromStore,
+            provider: metrics.candlesFromProvider,
+            total: metrics.candlesFetched,
+          },
+          duplicateCandleSkips: metrics.duplicateCandleSkips,
+        }),
       ],
     );
   }

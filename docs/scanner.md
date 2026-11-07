@@ -268,6 +268,26 @@ Structured operational information (no secrets, no excessive raw payloads):
 
 Logs never contain API keys, credentials, tokens, sensitive user data, or full provider secrets — redaction via `redactSecrets`.
 
+### Candle-source counters (Phase A)
+
+Candle accounting is attributed to the path that actually loaded the candles, so an operational view can tell "no candles were available" apart from "candles were loaded and nothing qualified":
+
+| Counter | Meaning |
+|---|---|
+| `scanner_runs.candles_fetched` | **Total** candles handed to the pipeline this run (`store + provider`). This is the Scanner UI's "Candles" metric |
+| `metadata.candles.store` | Candles served by the shared `candles` store fast path (read, normalized, validated, fresh) |
+| `metadata.candles.provider` | Candles returned by the market-data provider (fetch-through) — the historical meaning of `candles_fetched` |
+| `metadata.candles.total` | Same value as `scanner_runs.candles_fetched`; always equal to `store + provider` |
+| `metadata.duplicateCandleSkips` | Evaluations skipped because the setup candle had already been processed (cursor hit) |
+
+Rules:
+
+- Every candle is counted **exactly once**, on the path that loaded it, through a single funnel — `total === store + provider` is therefore an invariant, not a coincidence.
+- Per-cycle cache hits are re-uses of a batch another pair already counted, so they add nothing: a second strategy scanning the same instrument × timeframe reports the same totals, not double.
+- Counters are **per run** and never cumulative.
+- A cursor-skipped run still reports its loaded candles (the fetch precedes the cursor check) **and** `duplicateCandleSkips ≥ 1`, which is what makes a skip distinguishable from a failed evaluation.
+- These counters are non-identifying, so they survive tenant metadata redaction (unlike `errors`/`strategyId`/`triggeredBy`).
+
 ## API / UI
 
 **API (session-authenticated, entitlement-gated):**
