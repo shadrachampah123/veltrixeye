@@ -38,6 +38,7 @@ import { startEmbeddedPostgres, stopEmbeddedPostgres } from '../../db/embedded.m
 import {
   ALLOWED_URL_PARAMS,
   Q_CONNECTION,
+  WRITE_PRIVILEGE_COLUMNS,
   ReadOnlySession,
   anyStringLeaks,
   chooseStrategy,
@@ -179,6 +180,34 @@ describe('connection URL parameters are allowlisted', () => {
     });
   }
 
+  it('refuses a duplicate sslmode even when every value is verify-full', () => {
+    const problem = connectionUrlProblem('postgres://u:p@h:5432/db?sslmode=verify-full&sslmode=verify-full');
+    assert.notEqual(problem, null);
+    assert.match(problem!, /repeats a query parameter/);
+  });
+
+  it('refuses duplicates that differ only in case', () => {
+    const problem = connectionUrlProblem('postgres://u:p@h:5432/db?sslmode=verify-full&SSLMode=verify-full');
+    assert.notEqual(problem, null);
+    assert.match(problem!, /repeats a query parameter/);
+  });
+
+  it('refuses a repeated parameter that is not allowlisted too', () => {
+    // A disallowed key is refused before the duplicate rule can matter, but the
+    // outcome must be a refusal either way — never a silently-taken last value.
+    for (const url of [
+      'postgres://u:p@h:5432/db?foo=1&foo=2',
+      'postgres://u:p@h:5432/db?options=a&options=b',
+      'postgres://u:p@h:5432/db?sslmode=verify-full&options=-c%20default_transaction_read_only=off',
+    ]) {
+      assert.notEqual(connectionUrlProblem(url), null, `expected a refusal for ${url}`);
+    }
+  });
+
+  it('still accepts the single occurrence', () => {
+    assert.equal(connectionUrlProblem('postgres://u:p@h:5432/db?sslmode=verify-full'), null);
+  });
+
   it('never echoes a parameter name that carries credential material', () => {
     const problem = connectionUrlProblem(`postgres://u:p@h:5432/db?ssl${MARKER}=1`);
     assert.notEqual(problem, null);
@@ -228,12 +257,19 @@ describe('TLS environment overrides are refused', () => {
 // 7 + 10. Safety verdict (pure, fail-closed)
 // ---------------------------------------------------------------------------
 
+/** Every canonical privilege answered with an explicit `false`. */
+function allPrivilegesFalse(): Record<string, boolean | null> {
+  const map: Record<string, boolean | null> = {};
+  for (const label of Object.keys(WRITE_PRIVILEGE_COLUMNS)) map[label] = false;
+  return map;
+}
+
 function safeFacts(): Parameters<typeof evaluateSafety>[0] {
   return {
     defaultTransactionReadOnly: 'on',
     transactionReadOnly: 'on',
     isSuperuser: 'off',
-    writePrivileges: { 'INSERT on setups': false, 'UPDATE on strategies': false },
+    writePrivileges: allPrivilegesFalse(),
   };
 }
 
@@ -264,6 +300,25 @@ describe('evaluateSafety fails closed', () => {
     assert.ok(verdict.violations.some((v) => v.includes('superuser')));
   });
 
+  it("accepts is_superuser only when it is exactly 'off'", () => {
+    for (const value of ['', 'of', 'off ', 'unknown', 'null', 'undefined', 'false', '0', 'OFF ']) {
+      const verdict = evaluateSafety({ ...safeFacts(), isSuperuser: value });
+      assert.equal(verdict.ok, false, `is_superuser='${value}' must be refused`);
+      assert.ok(
+        verdict.violations.some((v) => v.includes('superuser status could not be established')),
+        `expected an "unestablished superuser" violation for '${value}', got: ${verdict.violations.join('; ')}`,
+      );
+    }
+    assert.equal(evaluateSafety({ ...safeFacts(), isSuperuser: 'off' }).ok, true);
+  });
+
+  it('refuses a null-derived is_superuser answer', () => {
+    // factsFromConnectionRow maps a missing/non-string answer to ''.
+    const facts = factsFromConnectionRow({ default_tx_read_only: 'on', tx_read_only: 'on' });
+    assert.equal(facts.isSuperuser, '');
+    assert.equal(evaluateSafety(facts).ok, false);
+  });
+
   it('refuses every write privilege and names it', () => {
     for (const label of ['INSERT on setups', 'UPDATE on strategies', 'DELETE on setups']) {
       const verdict = evaluateSafety({ ...safeFacts(), writePrivileges: { [label]: true } });
@@ -272,11 +327,56 @@ describe('evaluateSafety fails closed', () => {
     }
   });
 
-  it('treats an unknown (null) privilege answer as unsafe, not as "no privilege"', () => {
-    // A missing privilege answer must never be read as permission. It is not a
-    // violation on its own, but the read-only facts still have to hold.
+  it('refuses a privilege answered with null instead of an explicit false', () => {
+    for (const label of Object.keys(WRITE_PRIVILEGE_COLUMNS)) {
+      const facts = safeFacts();
+      facts.writePrivileges[label] = null;
+      const verdict = evaluateSafety(facts);
+      assert.equal(verdict.ok, false, `null for '${label}' must be refused`);
+      assert.ok(
+        verdict.violations.some((v) => v.includes(label) && v.includes('not answered with an explicit false')),
+        `expected a "not answered with an explicit false" violation naming '${label}', got: ${verdict.violations.join('; ')}`,
+      );
+    }
+  });
+
+  it('refuses a privilege whose answer is missing entirely (no vacuous pass)', () => {
     const facts = safeFacts();
-    assert.equal(evaluateSafety(facts).ok, true);
+    delete facts.writePrivileges['INSERT on setups'];
+    const verdict = evaluateSafety(facts);
+    assert.equal(verdict.ok, false, 'an absent privilege answer must not pass');
+    assert.ok(verdict.violations.some((v) => v.includes('INSERT on setups') && v.includes('missing')));
+  });
+
+  it('refuses an undefined privilege answer', () => {
+    const facts = safeFacts();
+    facts.writePrivileges['UPDATE on strategies'] = undefined as unknown as null;
+    const verdict = evaluateSafety(facts);
+    assert.equal(verdict.ok, false);
+    assert.ok(verdict.violations.some((v) => v.includes('UPDATE on strategies') && v.includes('missing')));
+  });
+
+  it('refuses a non-boolean privilege answer', () => {
+    const facts = safeFacts();
+    facts.writePrivileges['DELETE on setups'] = 'false' as unknown as boolean;
+    const verdict = evaluateSafety(facts);
+    assert.equal(verdict.ok, false, "the string 'false' is not an explicit false");
+    assert.ok(verdict.violations.some((v) => v.includes('DELETE on setups') && v.includes('string')));
+  });
+
+  it('refuses a whole privilege map that is missing', () => {
+    const facts = safeFacts();
+    delete (facts as { writePrivileges?: unknown }).writePrivileges;
+    const verdict = evaluateSafety(facts);
+    assert.equal(verdict.ok, false, 'a missing privilege map must not pass vacuously');
+  });
+
+  it('refuses an unrecognised privilege entry that is not false', () => {
+    const facts = safeFacts();
+    facts.writePrivileges['TRUNCATE on candles'] = true;
+    const verdict = evaluateSafety(facts);
+    assert.equal(verdict.ok, false);
+    assert.ok(verdict.violations.some((v) => v.includes('TRUNCATE on candles')));
   });
 });
 
@@ -488,6 +588,12 @@ describe('CLI refuses unsafe configuration before connecting', () => {
       { DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db?sslmode=disable' },
       2,
       /verify-full/,
+    ],
+    [
+      'duplicate sslmode, both verify-full',
+      { DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db?sslmode=verify-full&sslmode=verify-full' },
+      2,
+      /repeats a query parameter/,
     ],
   ];
 

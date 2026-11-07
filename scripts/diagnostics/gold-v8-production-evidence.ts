@@ -304,10 +304,21 @@ export function connectionUrlProblem(rawUrl: string): string | null {
   } catch {
     return 'DATABASE_URL could not be parsed as a URL (URL-encode special characters in the password). Nothing was attempted.';
   }
-  // Every occurrence is checked: a repeated key could otherwise hide a weaker
-  // value behind an acceptable first one.
+  // Every occurrence is checked, and a repeated key is refused outright: a
+  // duplicate could hide a weaker value behind an acceptable first one
+  // (`sslmode=verify-full&sslmode=disable`), and even a benign-looking
+  // repetition (`sslmode=verify-full&sslmode=verify-full`) makes it ambiguous
+  // which value the driver will honour. One parameter, once, or nothing.
+  const seen = new Set<string>();
   for (const [key, value] of url.searchParams.entries()) {
     const k = key.toLowerCase();
+    if (seen.has(k)) {
+      return (
+        'DATABASE_URL repeats a query parameter. Each parameter may appear at most once — ' +
+        'remove the duplicate. Nothing was attempted.'
+      );
+    }
+    seen.add(k);
     if (!ALLOWED_URL_PARAMS.includes(k)) {
       return (
         'DATABASE_URL carries a query parameter that is not allowed. Only `sslmode=verify-full` is accepted; ' +
@@ -368,7 +379,12 @@ export interface SessionFacts {
   defaultTransactionReadOnly: string;
   transactionReadOnly: string;
   isSuperuser: string;
-  /** `has_table_privilege` answers, by human-readable label. */
+  /**
+   * `has_table_privilege` answers, by human-readable label. Only an explicit
+   * `false` means "cannot write": `true` is a write grant and `null` (the value
+   * `factsFromConnectionRow` uses for a missing or non-boolean answer) means the
+   * answer was never established. Both are refusals.
+   */
   writePrivileges: Record<string, boolean | null>;
 }
 
@@ -412,6 +428,23 @@ export function factsFromConnectionRow(row: Record<string, unknown>): SessionFac
 
 export function evaluateSafety(facts: SessionFacts): { ok: boolean; violations: string[] } {
   const violations: string[] = [];
+
+  /**
+   * A write privilege is safe ONLY when the server answered an explicit
+   * `false`. `true` is a grant; `null`, `undefined` or any other value means the
+   * answer was never established. An unverifiable privilege must never be read
+   * as permission, so both cases are violations.
+   */
+  const checkPrivilege = (label: string, value: boolean | null | undefined): void => {
+    if (value === false) return;
+    if (value === true) {
+      violations.push(`the connecting role holds ${label} — use a least-privilege role`);
+      return;
+    }
+    const got = value === null ? 'null' : value === undefined ? 'missing' : typeof value;
+    violations.push(`the ${label} privilege was not answered with an explicit false (got ${got}) — refusing to continue`);
+  };
+
   if (facts.defaultTransactionReadOnly !== 'on') {
     violations.push(
       `default_transaction_read_only is '${facts.defaultTransactionReadOnly}' (expected 'on') — the session was not opened read-only`,
@@ -420,12 +453,28 @@ export function evaluateSafety(facts: SessionFacts): { ok: boolean; violations: 
   if (facts.transactionReadOnly !== 'on') {
     violations.push(`transaction_read_only is '${facts.transactionReadOnly}' (expected 'on') — the transaction is not read-only`);
   }
-  if (facts.isSuperuser === 'on') {
-    violations.push('the connecting role is a superuser — use a least-privilege role');
+  // Exactly 'off' is safe. 'on' is a superuser; '', 'unknown' or any other
+  // value means superuser status was not established, which is equally unsafe.
+  if (facts.isSuperuser !== 'off') {
+    violations.push(
+      facts.isSuperuser === 'on'
+        ? 'the connecting role is a superuser — use a least-privilege role'
+        : `is_superuser is '${facts.isSuperuser}' (expected 'off') — superuser status could not be established`,
+    );
   }
-  for (const [label, can] of Object.entries(facts.writePrivileges)) {
-    if (can === true) violations.push(`the connecting role holds ${label} — use a least-privilege role`);
+
+  // Every privilege the session must NOT hold, by canonical label, so a map
+  // that simply omits an answer cannot pass vacuously. Any additional entry is
+  // checked too, so an unrecognised grant cannot hide.
+  const checked = new Set<string>();
+  for (const label of Object.keys(WRITE_PRIVILEGE_COLUMNS)) {
+    checked.add(label);
+    checkPrivilege(label, facts.writePrivileges?.[label]);
   }
+  for (const [label, value] of Object.entries(facts.writePrivileges ?? {})) {
+    if (!checked.has(label)) checkPrivilege(label, value);
+  }
+
   return { ok: violations.length === 0, violations };
 }
 
