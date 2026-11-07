@@ -278,6 +278,7 @@ export function createAppContext(
     redact: (text) =>
       redactSecrets(text, [
         config.notification.email.pass,
+        config.notification.resend.apiKey,
         config.notification.push.privateKey,
         config.notification.secret.encryptionKey,
       ]),
