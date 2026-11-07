@@ -91,7 +91,7 @@ test('classifies rate limits and provider errors as retryable without leaking cr
 test('classifies request aborts as timeouts', async () => {
   const provider = createResendEmailProvider(
     { apiKey: 're_secret', from: 'alerts@example.com' },
-    async (_input, init) => await new Promise((_resolve, reject) => {
+    async (_input, init) => await new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
     }),
   );
