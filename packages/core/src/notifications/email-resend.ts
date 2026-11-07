@@ -85,8 +85,7 @@ export function createResendEmailProvider(
           // `unavailable` rows are automatically re-queued when a provider is
           // configured, which would otherwise retry a bad key on every worker
           // cycle and reset attempts indefinitely. Correct the key, then
-          // explicitly replay the failed notification through the supported
-          // operational recovery path.
+          // explicitly recover the failed job after correcting the key.
           return { outcome: 'permanent', failureCategory: 'configuration', providerResponseCode: code, error };
         }
         if (response.status === 400 || response.status === 422) {
