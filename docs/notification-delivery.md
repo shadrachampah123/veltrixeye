@@ -197,9 +197,13 @@ provider — it resolves one through `NotificationProviderRegistry`. Adding
 `push`, `webhook` or `sms` later is additive: a new enum value, a new adapter,
 one `registry.register()` line in `createAppContext`.
 
-**Implemented in M7.3: `email` via SMTP** (`notifications/email.ts`,
-`nodemailer`, no transitive dependencies). It works with any SMTP endpoint —
-the operator's own server or a transactional vendor's SMTP relay:
+**M7.3 originally implemented `email` via SMTP** (`notifications/email.ts`).
+The hosted deployment now prefers **Resend's HTTPS API** (`notifications/email-resend.ts`)
+when `RESEND_API_KEY` and `NOTIFICATION_FROM` are configured. HTTPS uses port 443,
+which avoids Render Free's outbound SMTP port restrictions. Resend requests carry
+the outbox idempotency key in the `Idempotency-Key` header; the worker/outbox
+contract remains unchanged. SMTP remains a compatibility fallback when no Resend
+API key is configured:
 
 - implicit TLS on port 465, **STARTTLS required** otherwise (`requireTLS`);
 - lazy transporter, so an unconfigured deployment opens no socket;
