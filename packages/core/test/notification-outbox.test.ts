@@ -41,6 +41,7 @@ import {
   NotificationOutbox,
   createNotificationProviderRegistry,
   createSmtpEmailProvider,
+  createResendEmailProvider,
   classifySmtpError,
   DeliveryWorker,
   backoffDelayMs,
@@ -1209,6 +1210,60 @@ describe('worker — provider availability', () => {
     assert.equal(after.status, 'unavailable');
     assert.equal(after.failure_category, 'configuration');
     assert.equal(after.provider, SMTP_PROVIDER_NAME);
+  });
+
+  test('Resend 401/403 failures are dead-lettered and are not re-queued after credentials are corrected', async () => {
+    const owner = await makeUser();
+    const firstAlert = await makeAlert(owner.id);
+    const secondAlert = await makeAlert(owner.id);
+    const first = await enqueueAlert(firstAlert, owner.id);
+    const second = await enqueueAlert(secondAlert, owner.id);
+
+    const unauthorized = createResendEmailProvider(
+      { apiKey: 're_invalid_test_key', from: 'alerts@example.com' },
+      async () => new Response(JSON.stringify({ message: 'Invalid API key' }), { status: 401 }),
+    );
+    const forbidden = createResendEmailProvider(
+      { apiKey: 're_invalid_test_key', from: 'alerts@example.com' },
+      async () => new Response(JSON.stringify({ message: 'Forbidden' }), { status: 403 }),
+    );
+    // One real worker/registry, with a provider returning the two auth outcomes.
+    let calls = 0;
+    const authProvider = {
+      ...unauthorized,
+      async send(request: NotificationSendRequest) {
+        calls += 1;
+        return calls === 1 ? unauthorized.send(request) : forbidden.send(request);
+      },
+    };
+    const registry = registryWith(authProvider);
+    const rejected = await worker(registry).runOnce();
+    assert.equal(rejected.claimed, 2);
+    assert.equal(rejected.failed, 2);
+    assert.equal(rejected.unavailable, 0);
+
+    for (const [job, code] of [[first.row, '401'], [second.row, '403']] as const) {
+      const stored = await getJob(job.id);
+      assert.equal(stored.status, 'failed');
+      assert.equal(stored.failure_category, 'configuration');
+      assert.equal(stored.provider, 'resend');
+      assert.equal(stored.provider_response_code, code);
+      assert.equal(stored.attempts, 1);
+      assert.doesNotMatch(stored.last_error ?? '', /re_invalid_test_key/);
+    }
+
+    // Simulate a corrected key/provider. Failed rows must not be picked up by
+    // requeueUnavailable or claimed, even when their next-attempt time is due.
+    const corrected = createResendEmailProvider(
+      { apiKey: 're_corrected_test_key', from: 'alerts@example.com' },
+      async () => new Response(JSON.stringify({ id: 'should-not-send' }), { status: 200 }),
+    );
+    const recovered = await worker(registryWith(corrected)).runOnce();
+    assert.equal(recovered.requeued, 0);
+    assert.equal(recovered.claimed, 0);
+    assert.equal(recovered.delivered, 0);
+    assert.equal((await getJob(first.row.id)).status, 'failed');
+    assert.equal((await getJob(second.row.id)).status, 'failed');
   });
 
   test('unavailable jobs are re-queued when a configured provider appears, then delivered', async () => {
