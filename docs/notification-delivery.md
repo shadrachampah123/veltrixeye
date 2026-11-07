@@ -92,6 +92,12 @@ the alert transaction, so **alert + job commit together**: an alert can never
 exist without exactly one job per channel, and a job can never exist without an
 alert.
 
+## Resend authentication failures
+
+A Resend HTTP `401` or `403` means the configured credential was rejected. The adapter records this as a **permanent failed job** with `failure_category = 'configuration'`, rather than `unavailable`. This distinction is intentional: the worker automatically re-queues `unavailable` rows whenever a provider is configured, resetting their attempt counter. Treating a rejected key as unavailable would therefore cause the same job to be retried on every worker cycle without consuming its retry budget.
+
+Correcting `RESEND_API_KEY` does not automatically retry jobs already marked `failed`; inspect and explicitly recover those jobs after fixing the credential. Transient responses (including rate limits and server errors) continue through the bounded retry/backoff policy. No provider response body or credential is stored in the failure summary.
+
 ## 4. Worker (`packages/core/src/notifications/worker.ts`)
 
 `DeliveryWorker.runOnce(batchSize?)` is a bounded, idempotent batch:
