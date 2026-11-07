@@ -160,6 +160,8 @@ const baseEnvSchema = z.object({
    * instead of pretending to deliver. Server-side only, never logged.
    */
   SMTP_HOST: z.string().max(255).default(''),
+  /** Resend API key. Preferred over SMTP for hosted deployments. */
+  RESEND_API_KEY: z.string().max(512).default(''),
   /** SMTP port (587 = submission + STARTTLS, 465 = implicit TLS). */
   SMTP_PORT: intEnv(1, 65535, 587),
   /** 'auto' = implicit TLS on port 465 only; STARTTLS is required otherwise. */
@@ -427,8 +429,9 @@ const envSchema = baseEnvSchema.superRefine((values, ctx) => {
   }
 });
 
-/** Email-channel configuration passed to the SMTP provider adapter. */
+/** Email-channel configuration passed to the SMTP provider adapters. */
 export type NotificationEmailConfig = SmtpEmailConfigShape & { timeoutMs: number };
+export interface NotificationResendConfig { apiKey: string; from: string; }
 
 export interface NotificationPushConfig {
   publicKey: string;
@@ -445,6 +448,7 @@ export interface NotificationSecretConfig {
 /** Everything the delivery pipeline needs, derived once at boot. */
 export interface NotificationConfig {
   email: NotificationEmailConfig;
+  resend: NotificationResendConfig;
   push: NotificationPushConfig;
   secret: NotificationSecretConfig;
   retry: {
@@ -629,6 +633,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         pass: values.SMTP_PASS,
         from: values.NOTIFICATION_FROM,
         timeoutMs: values.NOTIFICATION_PROVIDER_TIMEOUT_MS,
+      },
+      resend: {
+        apiKey: values.RESEND_API_KEY,
+        from: values.NOTIFICATION_FROM,
       },
       push: {
         publicKey: values.VAPID_PUBLIC_KEY,

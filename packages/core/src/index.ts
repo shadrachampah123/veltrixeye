@@ -186,6 +186,12 @@ export {
   type WorkerMaintenanceResult,
 } from './notifications/worker.js';
 export {
+  createResendEmailProvider,
+  isResendConfigured,
+  RESEND_PROVIDER_NAME,
+  type ResendEmailConfig,
+} from './notifications/email-resend.js';
+export {
   createSmtpEmailProvider,
   isSmtpConfigured,
   classifySmtpError,

@@ -434,8 +434,8 @@ disagree. The failing `schema` block is included in the response.
 | `SESSION_TTL_DAYS` | no (default 30) | 1–90 |
 | `LOG_LEVEL` | no (default `info`) | `info` in production |
 | `TRUSTED_PROXY_CIDRS` | no (default = Cloudflare ranges + Render-internal) | Proxies allowed to speak for the client in `X-Forwarded-For` — this decides `req.ip`, the key for every rate limit. **Leave unset on Render**; the default is already the pinned production list. See [Scaling and rate limiting](#scaling-and-rate-limiting) |
-| `SMTP_HOST` / `NOTIFICATION_FROM` | for email delivery (M7.3) | Empty = email delivery unavailable: outbox jobs are created and recorded `unavailable`, never `delivered`. Set them plus `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` to switch delivery on |
-| `SMTP_PASS` | for email delivery | SMTP password / vendor API secret (`sync: false` in `render.yaml`). Server-side only — never logged, never returned by a route |
+| `RESEND_API_KEY` / `NOTIFICATION_FROM` | **preferred for email delivery** | Resend API key (`sync: false` in `render.yaml`) and verified sender. Uses HTTPS port 443 and works on Render Free. When both are set, Resend takes precedence over SMTP. |
+| `SMTP_HOST` / `SMTP_USER` / `SMTP_PASS` | optional SMTP fallback | Used only when `RESEND_API_KEY` is empty. SMTP credentials are server-side only (`sync: false`); Render Free blocks outbound SMTP ports, so use Resend there. |
 | `NOTIFICATION_WORKER_TOKEN` | for scheduled draining | Shared secret for `POST /api/internal/notifications/deliveries/*`. **Empty = those routes return 404.** Set it if an external scheduler (Render Cron Job) should drain the outbox while the instance is asleep |
 | `NOTIFICATION_WORKER_ENABLED` | no (default `true`) | `false` disables the in-process ticker; the outbox then drains only through the internal endpoint |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | **yes in production for M9.2** | 32-byte base64 AES-256-GCM key for webhook/push secrets at rest (`sync: false`). **Production fails closed without it.** Generate: `openssl rand -base64 32`. Render's encrypted env vars alone do NOT constitute DB secret protection. |
@@ -522,10 +522,13 @@ migrations are unaffected.
 
 ### Alert delivery operations (M7.3)
 
-- **Enabling email** — set `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`,
-  `SMTP_USER`, `SMTP_PASS` and `NOTIFICATION_FROM` on the service and redeploy.
-  Until then the API logs a warning on every boot and every job is recorded
-  `unavailable`; nothing is ever recorded as delivered without a provider.
+- **Enabling email** — preferred: set `RESEND_API_KEY` and `NOTIFICATION_FROM`
+  on the API service, then redeploy. This uses Resend over HTTPS (port 443) and
+  works on Render Free. SMTP is a compatibility fallback only when the Resend
+  key is empty; configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`,
+  `SMTP_PASS` and `NOTIFICATION_FROM` only on a host that permits outbound SMTP.
+  Until a provider is configured, jobs are recorded `unavailable`; nothing is
+  ever recorded as delivered without provider acceptance.
 - **Draining the outbox** — the in-process ticker runs every
   `NOTIFICATION_WORKER_INTERVAL_MS` (60 s) while the instance is awake. On a
   free instance (which sleeps), delivery must be driven from outside; there are

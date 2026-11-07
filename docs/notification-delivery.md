@@ -92,6 +92,12 @@ the alert transaction, so **alert + job commit together**: an alert can never
 exist without exactly one job per channel, and a job can never exist without an
 alert.
 
+## Resend authentication failures
+
+A Resend HTTP `401` or `403` means the configured credential was rejected. The adapter records this as a **permanent failed job** with `failure_category = 'configuration'`, rather than `unavailable`. This distinction is intentional: the worker automatically re-queues `unavailable` rows whenever a provider is configured, resetting their attempt counter. Treating a rejected key as unavailable would therefore cause the same job to be retried on every worker cycle without consuming its retry budget.
+
+Correcting `RESEND_API_KEY` does not automatically retry jobs already marked `failed`. Use the guarded, manual recovery procedure in §9 only after verifying the corrected key and sender. Transient responses (including rate limits and server errors) continue through the bounded retry/backoff policy. No provider response body or credential is stored in the failure summary.
+
 ## 4. Worker (`packages/core/src/notifications/worker.ts`)
 
 `DeliveryWorker.runOnce(batchSize?)` is a bounded, idempotent batch:
@@ -197,9 +203,13 @@ provider — it resolves one through `NotificationProviderRegistry`. Adding
 `push`, `webhook` or `sms` later is additive: a new enum value, a new adapter,
 one `registry.register()` line in `createAppContext`.
 
-**Implemented in M7.3: `email` via SMTP** (`notifications/email.ts`,
-`nodemailer`, no transitive dependencies). It works with any SMTP endpoint —
-the operator's own server or a transactional vendor's SMTP relay:
+**M7.3 originally implemented `email` via SMTP** (`notifications/email.ts`).
+The hosted deployment now prefers **Resend's HTTPS API** (`notifications/email-resend.ts`)
+when `RESEND_API_KEY` and `NOTIFICATION_FROM` are configured. HTTPS uses port 443,
+which avoids Render Free's outbound SMTP port restrictions. Resend requests carry
+the outbox idempotency key in the `Idempotency-Key` header; the worker/outbox
+contract remains unchanged. SMTP remains a compatibility fallback when no Resend
+API key is configured:
 
 - implicit TLS on port 465, **STARTTLS required** otherwise (`requireTLS`);
 - lazy transporter, so an unconfigured deployment opens no socket;
@@ -209,13 +219,13 @@ the operator's own server or a transactional vendor's SMTP relay:
 - SMTP reply codes mapped to outcomes (4xx → retry, 5xx → dead letter,
   535/530/534 → unavailable).
 
-Nothing was added for demonstration purposes: no second vendor, no SDK wrapper,
-no hard-coded credentials.
+No SDK wrapper or hard-coded credentials were added; the Resend adapter uses
+Node's built-in HTTPS-capable `fetch`.
 
-> **No credentials ⇒ no fake success.** With `SMTP_HOST` / `NOTIFICATION_FROM`
-> empty the adapter reports `configured: false` and every job is recorded
-> `unavailable` (never `delivered`). Production is switched on purely through
-> environment variables — see [environment.md](./environment.md).
+> **No credentials ⇒ no fake success.** With `RESEND_API_KEY` and the legacy
+> SMTP settings absent, the email adapter reports `configured: false` and every
+> job is recorded `unavailable` (never `delivered`). Production is switched on
+> through server-side environment variables — see [environment.md](./environment.md).
 
 ## 7. Security
 
@@ -261,18 +271,90 @@ curl -X POST https://<api>/api/internal/notifications/deliveries/run \
 # stale recovery + retention + queue depth
 curl -X POST https://<api>/api/internal/notifications/deliveries/maintenance \
   -H "x-veltrixeye-worker-token: $NOTIFICATION_WORKER_TOKEN"
+
+# After manually recovering eligible Resend-authentication failures below,
+# drain one bounded batch (the endpoint requires the worker token).
+curl --fail-with-body -X POST https://<api>/api/internal/notifications/deliveries/run \
+  -H "x-veltrixeye-worker-token: $NOTIFICATION_WORKER_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"batchSize":25}'
 ```
 
-The API's SMTP configuration surface is `SMTP_HOST`, `SMTP_PORT`,
-`SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `NOTIFICATION_FROM` and
-`NOTIFICATION_PROVIDER_TIMEOUT_MS`; internal scheduled delivery also uses
+### Recover Resend 401/403 jobs after credential rotation
+
+A Resend `401`/`403` is deliberately dead-lettered as `failed` with
+`failure_category = 'configuration'`. Correcting the environment variable does
+not requeue these rows. There is no public/API recovery endpoint: perform this
+manual, ID-scoped operation only after the corrected `RESEND_API_KEY` and
+`NOTIFICATION_FROM` have been verified in the deployment environment.
+
+First inspect candidates and record only the job IDs you intend to replay:
+
+```sql
+SELECT id, alert_id, created_at, attempts, provider_response_code, last_error
+FROM notification_deliveries
+WHERE status = 'failed'
+  AND provider = 'resend'
+  AND failure_category = 'configuration'
+  AND provider_response_code IN ('401', '403')
+ORDER BY created_at;
+```
+
+Then, in the same database, replace the example UUID below with the exact
+reviewed IDs from that result. The additional predicates are deliberate
+safeguards: rows that have since changed state, provider, failure category or
+response code will not be requeued.
+
+```sql
+BEGIN;
+
+UPDATE notification_deliveries
+SET status = 'pending',
+    attempts = 0,
+    failure_category = 'none',
+    last_error = NULL,
+    next_attempt_at = now(),
+    locked_at = NULL,
+    locked_by = NULL,
+    provider_message_id = NULL,
+    delivered_at = NULL
+WHERE id = ANY (ARRAY[
+    '00000000-0000-4000-8000-000000000000'::uuid
+  ])
+  AND status = 'failed'
+  AND provider = 'resend'
+  AND failure_category = 'configuration'
+  AND provider_response_code IN ('401', '403')
+RETURNING id, status, attempts, next_attempt_at;
+
+-- Confirm the returned row count and IDs are exactly the intended jobs.
+-- COMMIT only after checking; otherwise ROLLBACK.
+COMMIT;
+```
+
+After commit, call the bounded drain command above. It may process at most the
+requested batch size; repeat only after inspecting each result and queue depth.
+Do not run the recovery UPDATE against all failed jobs or against webhook/push
+tables. Keep a record of the IDs and the operator-approved replay.
+
+**Retention warning:** failed rows are eligible for deletion by maintenance
+after `NOTIFICATION_RETENTION_FAILED_DAYS` (default **120 days**, configurable
+from 1 to 3650). The cleanup age is based on `created_at`. Recover eligible
+jobs before that retention window expires; once a row is deleted, this
+outbox-based recovery procedure cannot replay it. The alert record itself may
+remain, but it is not a substitute for the deleted delivery job.
+
+The preferred email configuration is `RESEND_API_KEY` plus `NOTIFICATION_FROM`.
+When the Resend key is absent, the legacy SMTP fallback uses `SMTP_HOST`,
+`SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` and `NOTIFICATION_FROM`.
+Both use `NOTIFICATION_PROVIDER_TIMEOUT_MS`; internal scheduled delivery also uses
 `NOTIFICATION_WORKER_TOKEN`, while the in-process ticker is controlled by
 `NOTIFICATION_WORKER_ENABLED` and `NOTIFICATION_WORKER_INTERVAL_MS`. These names
-and code paths are implemented, and the deployment manifest declares
-operator-managed environment entries. That is **not evidence that production
+and code paths are implemented, and the Render deployment manifest now declares `RESEND_API_KEY` plus the
+legacy SMTP fallback entries as operator-managed environment variables. That is **not evidence that production
 values are populated**. This repository review did not inspect production
-secrets/settings, connect to an SMTP provider, or send a real email. Unit tests
-use fake providers and verify the unconfigured path; actual production SMTP
+secrets/settings, connect to an email provider, or send a real email. Unit tests
+use fake providers and verify provider behavior; actual production Resend/SMTP
 configuration, successful provider acceptance and inbox delivery remain
 unverified. Do not treat a passing build or a healthy API as email-readiness
 evidence.
