@@ -84,10 +84,13 @@ attempted), `3` a safety condition failed or a query failed (no report written).
   selector matches more than one strategy, or the selected strategy has more
   than one version with the requested number, the run **aborts** rather than
   reporting evidence for an arbitrary one.
-- **`--version` is strict.** It must be a whole number greater than zero.
-  `abc`, `9x`, `0`, `-3` and `8.5` are refused with exit 2 — the run never falls
-  back to the default 8, because that would collect evidence for a version the
-  operator did not ask for. Omitting the flag altogether means version 8.
+- **`--version` is strict.** It must be a whole number greater than zero and
+  within JavaScript's safe integer range (`Number.isSafeInteger`). `abc`, `9x`,
+  `0`, `-3`, `8.5` and digit strings beyond `Number.MAX_SAFE_INTEGER`
+  (`9007199254740992`, `99999999999999999999`) are refused with exit 2 — the run
+  never falls back to the default 8, because that would collect evidence for a
+  version the operator did not ask for. Omitting the flag altogether means
+  version 8.
 - **TLS is `verify-full` and nothing else.** `DATABASE_SSL_MODE` may only be
   `verify-full` (the default). The URL may carry exactly one query parameter,
   once: `sslmode=verify-full`. Every other parameter is refused — `options`,

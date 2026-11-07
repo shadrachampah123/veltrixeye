@@ -455,7 +455,26 @@ describe('strategy selection never picks the first match', () => {
   });
 
   it('refuses every invalid --version instead of falling back to 8', () => {
-    for (const value of ['abc', '9x', '0', '-3', '-0', '8.5', '', ' ', '1e3', '+8', '08x', '0x10', 'Infinity', 'NaN']) {
+    for (const value of [
+      'abc',
+      '9x',
+      '0',
+      '-3',
+      '-0',
+      '8.5',
+      '',
+      ' ',
+      '1e3',
+      '+8',
+      '08x',
+      '0x10',
+      'Infinity',
+      'NaN',
+      // Digit-only, but not a safe JavaScript integer:
+      String(Number.MAX_SAFE_INTEGER + 1), // 9007199254740992
+      '99999999999999999999',
+      '9'.repeat(400),
+    ]) {
       assert.throws(
         () => parseOptions(['--strategy', 's', '--version', value]),
         OptionError,
@@ -469,7 +488,19 @@ describe('strategy selection never picks the first match', () => {
   it('accepts a valid --version and still defaults when the flag is absent', () => {
     assert.equal(parseOptions(['--strategy', 's', '--version', '9']).version, 9);
     assert.equal(parseOptions(['--strategy', 's', '--version', '12']).version, 12);
+    assert.equal(parseOptions(['--strategy', 's', '--version', '0012']).version, 12);
+    // The largest safe integer is accepted; one more is not.
+    assert.equal(
+      parseOptions(['--strategy', 's', '--version', String(Number.MAX_SAFE_INTEGER)]).version,
+      Number.MAX_SAFE_INTEGER,
+    );
     assert.equal(parseOptions(['--strategy', 's']).version, 8);
+  });
+
+  it('every accepted version is a safe integer', () => {
+    for (const value of ['1', '8', '12', String(Number.MAX_SAFE_INTEGER)]) {
+      assert.ok(Number.isSafeInteger(parseOptions(['--strategy', 's', '--version', value]).version));
+    }
   });
 });
 
@@ -567,6 +598,8 @@ describe('driver errors are reduced to a code', () => {
 describe('report rendering resists fence and table injection', () => {
   const HOSTILE_SELECTOR = 'pipe|column';
   const HOSTILE_TEXT = 'row1\nrow2 ```json {"x":1} ``` `tick`';
+  const HOSTILE_ROLE = 'entry|exit';
+  const HOSTILE_TIMEFRAME = '4H\n```json `4H`';
 
   /** A minimal but complete Evidence object with hostile DB text in both tables. */
   function evidenceWithHostileRows(): Parameters<typeof renderMarkdown>[0] {
@@ -579,8 +612,20 @@ describe('report rendering resists fence and table injection', () => {
         secretsRedacted: true,
       },
       declaredNotVerified: { triggersNothing: ['no ScannerService'] },
-      connection: null,
-      migrations: [],
+      connection: {
+        database: 'db',
+        serverVersion: 'PostgreSQL 16',
+        tlsRequestedMode: 'verify-full',
+        ssl: true,
+        defaultTransactionReadOnly: 'on',
+        transactionReadOnly: 'on',
+        isSuperuser: 'off',
+        statementTimeout: '30s',
+        privileges: { [HOSTILE_SELECTOR]: false, 'INSERT on setups': false },
+      },
+      migrations: [
+        { version: 1, name: `0001|init\n\`\`\``, applied_at: '2026-01-01T00:00:00.000Z' },
+      ],
       candidateStrategies: [
         {
           id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
@@ -601,18 +646,55 @@ describe('report rendering resists fence and table injection', () => {
           changelog: HOSTILE_TEXT,
         },
       ],
-      v8: null,
-      timeframes: [],
+      v8: { found: true, id: 'v8-id', status: 'published', publishedAt: null, changelog: null },
+      timeframes: [
+        { role: HOSTILE_ROLE, timeframe: HOSTILE_TIMEFRAME },
+        { role: 'entry', timeframe: '4H' },
+      ],
       risk: null,
       marketScope: null,
       conditions: [],
-      conditionRoleResolution: [],
+      conditionRoleResolution: [
+        {
+          conditionId: 'c1',
+          conditionType: `liquidity_sweep|sweep\n\`x\``,
+          storedTimeframeRole: HOSTILE_ROLE,
+          resolvedRole: 'entry',
+          resolvedTimeframe: HOSTILE_TIMEFRAME,
+          roleTimeframeRowPresent: true,
+          is4h: false,
+          storedAnchorOffsetCandles: { nested: 'a|b' },
+          storedAnchorOffsetType: 'object',
+          effectiveAnchorOffsetCandles: 3,
+          classification: 'a|b',
+          group: 'liquidity|group',
+          groupLogic: 'AND|OR',
+          params: null,
+          lookbackCandles: 120,
+          deepestDeclaredRead: 123,
+          candlesStoredForRole: 500,
+        },
+      ],
       liquiditySweepFocus: { count: 0, entries: [] },
       sessionFilters: [],
       filters: [],
       instrument: null,
-      candleCoverage: [],
-      setups: { total: 0, byState: [], latest: [], scores: [], stateEvents: [] },
+      candleCoverage: [
+        {
+          timeframe: HOSTILE_ROLE,
+          candles: 500,
+          first_ts: '1700000000000',
+          last_ts: '1700003600000',
+          last_fetched_at: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      setups: {
+        total: 1,
+        byState: [{ state: `active|waiting\n\`x\``, setups: 1 }],
+        latest: [],
+        scores: [],
+        stateEvents: [],
+      },
       alerts: [],
       alertDeliveries: [],
       notificationDeliveries: [],
@@ -622,12 +704,91 @@ describe('report rendering resists fence and table injection', () => {
     } as unknown as Parameters<typeof renderMarkdown>[0];
   }
 
+  /** Consecutive `|`-prefixed lines form one table block. */
+  function tableBlocks(md: string): string[][] {
+    const blocks: string[][] = [];
+    let current: string[] = [];
+    for (const line of md.split('\n')) {
+      if (line.startsWith('|')) {
+        current.push(line);
+      } else if (current.length > 0) {
+        blocks.push(current);
+        current = [];
+      }
+    }
+    if (current.length > 0) blocks.push(current);
+    return blocks;
+  }
+
+  /** A `\|` inside a cell is not a column separator. */
+  const columnCount = (row: string): number => row.split(/(?<!\\)\|/).length - 1;
+
+  it('keeps every table rectangular and fence-free with hostile values', () => {
+    const md = renderMarkdown(evidenceWithHostileRows());
+    const blocks = tableBlocks(md);
+
+    assert.equal(blocks.length, 9, `expected 9 tables, got ${blocks.length}`);
+    for (const block of blocks) {
+      const header = block[0]!;
+      const expected = columnCount(header);
+      assert.ok(expected >= 2, `table header has no columns: ${header}`);
+      for (const row of block.slice(1)) {
+        assert.equal(
+          columnCount(row),
+          expected,
+          `table row does not match its ${expected}-column header: ${row}`,
+        );
+        assert.ok(!row.includes('```'), `a fence sequence survived in a row: ${row}`);
+        assert.ok(!/[\r\n]/.test(row), `a raw newline survived in a row: ${row}`);
+      }
+    }
+
+    // The hostile payload must not survive as a real fence anywhere; the only
+    // fences in the report are the legitimate `jsonBlock` sections.
+    assert.ok(!md.includes('```json {"x":1}'), 'the hostile fence payload survived');
+    assert.ok(md.includes("'''json"), 'the hostile backticks were not neutralised');
+    assert.equal(
+      md.split('\n').filter((l) => /^```/.test(l)).length % 2,
+      0,
+      'fences must stay balanced',
+    );
+  });
+
+  it('escapes pipes, newlines and backticks in the role -> timeframe table', () => {
+    const md = renderMarkdown(evidenceWithHostileRows());
+    const row = md.split('\n').find((l) => /^\| entry\\\|exit \|/.test(l));
+    assert.ok(row, 'the role/timeframe row should still be rendered');
+
+    assert.equal(columnCount(row!), 3, `expected 2 columns: ${row}`);
+    assert.ok(row!.includes('entry\\|exit'), 'the role pipe was not escaped');
+    assert.ok(!row!.includes('entry|exit'), 'an unescaped pipe reached the table');
+    assert.ok(row!.includes("4H '''json"), 'the timeframe newline was not collapsed');
+    assert.ok(!row!.includes('`4H`'), 'a code span survived in a cell');
+    assert.ok(!row!.includes('```'), 'a fence sequence survived in a cell');
+    assert.ok(!md.includes('entry|exit'), 'an unescaped pipe appears anywhere in the report');
+  });
+
+  it('escapes the privileges, migrations, coverage and by-state tables too', () => {
+    const md = renderMarkdown(evidenceWithHostileRows());
+    // privileges: a hostile key, migrations: a hostile name, coverage: a hostile
+    // timeframe, by-state: a hostile state — none may add a column or a fence.
+    assert.ok(md.includes('pipe\\|column'), 'privilege key pipe not escaped');
+    assert.ok(!md.includes('0001|init'), 'migration name pipe not escaped');
+    assert.ok(!md.includes('`x`'), 'by-state backticks survived');
+    assert.ok(!md.includes('active|waiting'), 'by-state pipe not escaped');
+  });
+
   it('escapes every dynamic cell in the strategy and version tables', () => {
     const md = renderMarkdown(evidenceWithHostileRows());
     const lines = md.split('\n');
 
-    // A hostile value can neither open a fence nor add a table column/row.
-    assert.equal(lines.filter((l) => l.startsWith('```')).length, 0, 'a fence was injected at line start');
+    // A hostile value can neither open a fence inside a table nor add a column.
+    assert.equal(
+      lines.filter((l) => l.startsWith('|') && l.includes('```')).length,
+      0,
+      'a fence was injected into a table row',
+    );
+    assert.ok(!md.includes('```json {"x":1}'), 'the hostile fence payload survived');
     assert.ok(!md.includes('pipe|column'), 'an unescaped pipe reached the report');
     assert.ok(md.includes('pipe\\|column'), 'the pipe was not escaped');
 
@@ -749,7 +910,7 @@ describe('CLI refuses unsafe configuration before connecting', () => {
   }
 
   it('refuses an invalid --version with exit 2, before connecting', () => {
-    for (const value of ['abc', '9x', '0', '-3', '8.5']) {
+    for (const value of ['abc', '9x', '0', '-3', '8.5', '9007199254740992', '99999999999999999999']) {
       const run = runCli({ DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db' }, [
         '--strategy',
         'Gold Break & Retest Test Pro VI',
@@ -761,6 +922,11 @@ describe('CLI refuses unsafe configuration before connecting', () => {
       assert.ok(
         !/falling back|defaulting to|using (the )?default/i.test(run.stderr),
         'the refusal must not announce a fallback to the default version',
+      );
+      // Refused before the pool is created: no connection attempt is reported.
+      assert.ok(
+        !/cannot reach the database|query failed/i.test(run.stderr),
+        'an invalid --version must be refused before any connection attempt',
       );
       assertNoMarker(run);
       assert.deepEqual(filesUnder(run.outDir), [], 'a refused run must not write a report');

@@ -535,19 +535,24 @@ export function parseOptions(argv: readonly string[]): Options {
   };
   const strategy = read('--strategy');
   if (strategy) opts.strategy = strategy;
-  // `--version` is strict: digits only, greater than zero. `abc`, `9x`, `8.5`,
-  // `-3` and `0` are REFUSED (OptionError → exit 2). Falling back to the
-  // default 8 would collect evidence for a version the operator did not ask for,
-  // which is the same silent wrong-target failure the strategy selector removed.
+  // `--version` is strict: digits only, a SAFE integer, greater than zero.
+  // `abc`, `9x`, `8.5`, `-3`, `0` and digit strings beyond
+  // Number.MAX_SAFE_INTEGER are REFUSED (OptionError → exit 2). Falling back to
+  // the default 8 would collect evidence for a version the operator did not ask
+  // for, which is the same silent wrong-target failure the strategy selector
+  // removed; an unsafe integer would silently land on a different number than
+  // the one typed.
   if (argv.includes('--version')) {
     const raw = read('--version');
-    if (raw === null || !/^[0-9]+$/.test(raw) || Number(raw) < 1) {
+    const parsed = raw !== null && /^[0-9]+$/.test(raw) ? Number(raw) : Number.NaN;
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
       throw new OptionError(
-        '--version must be a whole number greater than zero (for example --version 8). ' +
-          'The given value was refused rather than replaced with the default. Nothing was attempted.',
+        '--version must be a whole number greater than zero and within the safe integer range ' +
+          '(for example --version 8). The given value was refused rather than replaced with the ' +
+          'default. Nothing was attempted.',
       );
     }
-    opts.version = Number(raw);
+    opts.version = parsed;
   }
   const symbol = read('--symbol');
   if (symbol) opts.symbol = symbol.toUpperCase();
@@ -1789,7 +1794,7 @@ export function renderMarkdown(e: Evidence): string {
     out.push('| privilege | value |');
     out.push('| --- | --- |');
     for (const [k, v] of Object.entries(e.connection.privileges)) {
-      out.push(`| \`${k}\` | ${v === null ? 'unknown' : String(v)} |`);
+      out.push(mdRow([k, v === null ? 'unknown' : String(v)]));
     }
     out.push('');
   }
@@ -1798,7 +1803,7 @@ export function renderMarkdown(e: Evidence): string {
     out.push('');
     out.push('| version | name | applied_at |');
     out.push('| --- | --- | --- |');
-    for (const m of e.migrations) out.push(`| ${m.version} | \`${m.name}\` | ${m.applied_at} |`);
+    for (const m of e.migrations) out.push(mdRow([m.version, m.name, m.applied_at]));
     out.push('');
   }
 
@@ -1845,7 +1850,7 @@ export function renderMarkdown(e: Evidence): string {
     } else {
       out.push('| role | timeframe |');
       out.push('| --- | --- |');
-      for (const t of e.timeframes) out.push(`| \`${t.role}\` | \`${t.timeframe}\` |`);
+      for (const t of e.timeframes) out.push(mdRow([t.role, t.timeframe]));
     }
     out.push('');
     out.push('### 4.2 Risk config');
@@ -1865,7 +1870,20 @@ export function renderMarkdown(e: Evidence): string {
       out.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
       e.conditionRoleResolution.forEach((c, i) => {
         out.push(
-          `| ${i + 1} | ${mdCell(c.group)} (${mdCell(c.groupLogic)}) | \`${mdCell(c.conditionType)}\` | ${mdCell(c.classification)} | \`${mdCell(c.storedTimeframeRole)}\` | \`${mdCell(c.resolvedRole)}\` | ${c.resolvedTimeframe ? `\`${mdCell(c.resolvedTimeframe)}\`` : '⚠ no row'} | ${c.roleTimeframeRowPresent ? (c.is4h ? 'yes' : 'no') : '?'} | ${JSON.stringify(c.storedAnchorOffsetCandles)} (${c.storedAnchorOffsetType}) | ${c.effectiveAnchorOffsetCandles} | ${c.lookbackCandles ?? '—'} | ${c.candlesStoredForRole ?? '—'} |`,
+          mdRow([
+            i + 1,
+            `${c.group} (${c.groupLogic})`,
+            c.conditionType,
+            c.classification,
+            c.storedTimeframeRole,
+            c.resolvedRole,
+            c.resolvedTimeframe ? c.resolvedTimeframe : '⚠ no row',
+            c.roleTimeframeRowPresent ? (c.is4h ? 'yes' : 'no') : '?',
+            `${JSON.stringify(c.storedAnchorOffsetCandles)} (${c.storedAnchorOffsetType})`,
+            c.effectiveAnchorOffsetCandles,
+            c.lookbackCandles ?? '—',
+            c.candlesStoredForRole ?? '—',
+          ]),
         );
       });
       out.push('');
@@ -1877,7 +1895,15 @@ export function renderMarkdown(e: Evidence): string {
       out.push('| --- | --- | --- | --- | --- | --- | --- |');
       for (const c of e.conditionRoleResolution) {
         out.push(
-          `| \`${mdCell(c.conditionType)}\` | \`${mdCell(c.resolvedRole)}\` | ${c.resolvedTimeframe ? `\`${mdCell(c.resolvedTimeframe)}\`` : '—'} | ${c.lookbackCandles ?? '—'} | ${c.effectiveAnchorOffsetCandles} | ${c.deepestDeclaredRead ?? '—'} | ${c.candlesStoredForRole ?? '—'} |`,
+          mdRow([
+            c.conditionType,
+            c.resolvedRole,
+            c.resolvedTimeframe ? c.resolvedTimeframe : '—',
+            c.lookbackCandles ?? '—',
+            c.effectiveAnchorOffsetCandles,
+            c.deepestDeclaredRead ?? '—',
+            c.candlesStoredForRole ?? '—',
+          ]),
         );
       }
     }
@@ -1916,9 +1942,7 @@ export function renderMarkdown(e: Evidence): string {
     out.push('| timeframe | candles (all time) | first open (epoch ms) | last open (epoch ms) | last fetched (UTC) |');
     out.push('| --- | --- | --- | --- | --- |');
     for (const c of e.candleCoverage) {
-      out.push(
-        `| \`${mdCell(c.timeframe)}\` | ${c.candles} | ${mdCell(c.first_ts ?? '—')} | ${mdCell(c.last_ts ?? '—')} | ${mdCell(c.last_fetched_at ?? '—')} |`,
-      );
+      out.push(mdRow([c.timeframe, c.candles, c.first_ts ?? '—', c.last_ts ?? '—', c.last_fetched_at ?? '—']));
     }
   }
   out.push('');
@@ -1930,7 +1954,7 @@ export function renderMarkdown(e: Evidence): string {
   if (e.setups.byState.length > 0) {
     out.push('| state | setups |');
     out.push('| --- | --- |');
-    for (const s of e.setups.byState) out.push(`| ${mdCell(s.state)} | ${s.setups} |`);
+    for (const s of e.setups.byState) out.push(mdRow([s.state, s.setups]));
   } else {
     out.push('_No setups._');
   }
