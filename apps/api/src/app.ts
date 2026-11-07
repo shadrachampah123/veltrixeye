@@ -58,6 +58,7 @@ import {
   ExecutionCompositionService,
   type ProviderRegistry,
   type NotificationProviderRegistry,
+  type NotificationProvider,
   type BillingProviderRegistry,
   type BillingWebhookReceiver,
   type DeliveryRetryPolicy,
@@ -137,6 +138,8 @@ export interface AppContext {
   billingWebhook: BillingWebhookReceiver | null;
   /** M7.3: channel → provider adapter registry (the only provider-aware object). */
   notificationProviders: NotificationProviderRegistry;
+  /** Direct SMTP adapter handle used only by the separately gated diagnostic route. */
+  smtpTestProvider: NotificationProvider | null;
   /** M7.3: durable outbox — writes/reads `notification_deliveries`. */
   notifications: NotificationOutbox;
   preferences: NotificationPreferenceService;
@@ -558,6 +561,7 @@ export function createAppContext(
     billingComposition: billing.status,
     billingWebhook,
     notificationProviders,
+    smtpTestProvider: emailProvider.configured ? emailProvider : null,
     notifications,
     preferences,
     deliveryWorker,

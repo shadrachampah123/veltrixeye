@@ -223,7 +223,9 @@ no hard-coded credentials.
 |---|---|
 | internal worker routes are unreachable by default | `NOTIFICATION_WORKER_TOKEN` empty ⇒ the routes answer **404** (not 401), so an unconfigured deployment advertises nothing |
 | constant-time token check | SHA-256 digests compared with `timingSafeEqual` (`routes/notifications.ts`) |
-| rate limited | 30/min per IP on both internal routes, on top of the global 300/min |
+| SMTP diagnostic is doubly gated | `POST /api/internal/notifications/smtp-test` answers **404** unless `NOTIFICATION_SMTP_TEST_ENABLED=true` **and** `NOTIFICATION_WORKER_TOKEN` is set; it sends to one recipient fixed in code to one message fixed in code, so a caller can neither choose a destination nor supply content |
+| SMTP diagnostic is one-time | a singleton claim row (`notification_smtp_test_claims`, primary key + `CHECK`) is committed **before** SMTP I/O, so a second send is impossible. Only a definitive SMTP AUTH/configuration rejection (which proves no message was accepted) releases the claim; timeouts and every other ambiguous outcome consume it permanently. The table is separate from `notification_deliveries` and the diagnostic never reads, claims or drains the shared outbox |
+| rate limited | 30/min per IP on every internal notification route (`deliveries/run`, `deliveries/maintenance`, `smtp-test`), on top of the global 300/min |
 | no caller-supplied content | the run/maintenance bodies accept **only** `batchSize` / retention days; ids, recipients, channels and payloads are rejected with 400 |
 | owner scoping | `GET /api/alerts/:alertId/notifications` is session-authenticated and owner-scoped; foreign/unknown/malformed ids are masked 404s |
 | minimal DTO | the owner sees status, attempts, failure category, provider and timestamps — never the recipient, payload, provider error or upstream id |

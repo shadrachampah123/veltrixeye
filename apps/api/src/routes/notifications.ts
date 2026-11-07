@@ -7,7 +7,7 @@ import {
   pushSubscriptionRequestSchema,
   strategyNotificationPreferenceRequestSchema,
 } from '@veltrixeye/contracts';
-import { Errors } from '@veltrixeye/core';
+import { Errors, type NotificationSendRequest } from '@veltrixeye/core';
 import type { AppContext } from '../app.js';
 import type { AppConfig } from '../config.js';
 import { sendZodError } from '../errors.js';
@@ -22,6 +22,7 @@ import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from '../
  * | `GET /api/alerts/:alertId/notifications` | session | Owner-scoped; foreign/unknown ids are masked as 404. Returns status/attempt/failure-category only — never the recipient, payload or provider error. |
  * | `POST /api/internal/notifications/deliveries/run` | worker token | Runs one delivery batch (recover stale → re-queue what became deliverable → claim → send). 404 when no token is configured. |
  * | `POST /api/internal/notifications/deliveries/maintenance` | worker token | Stale recovery + retention + queue depth. 404 when no token is configured. |
+ * | `POST /api/internal/notifications/smtp-test` | worker token + explicit feature flag | One fixed-recipient SMTP diagnostic, guarded by a separate singleton claim; never touches the shared outbox or worker. |
  *
  * Why an internal HTTP trigger exists at all: the API is a container a
  * platform may stop at any time (the Render free tier spins down), so delivery
@@ -35,10 +36,13 @@ import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from '../
  *    deployment must not advertise an administrative surface);
  *  - the token is compared in constant time over SHA-256 digests, so neither
  *    the length nor the prefix leaks through response timing;
- *  - they are rate limited per IP and never accept user ids, alert ids or
- *    payloads — a caller can only say "process a batch", never "send this";
- *  - no response ever contains a credential, a recipient address or provider
- *    error text (counts and statuses only).
+ *  - worker routes are rate limited and accept no caller-selected alert,
+ *    recipient or message payload;
+ *  - the SMTP diagnostic additionally requires its explicit feature flag,
+ *    uses one fixed recipient and a separate permanent claim for ambiguous
+ *    outcomes, and never reads or writes the shared delivery queue;
+ *  - no response ever contains a credential, recipient address or provider
+ *    error text (only redacted outcomes and failure categories).
  */
 
 /** Header carrying the shared worker secret. */
@@ -169,6 +173,99 @@ export async function notificationRoutes(
     // Owner scoping lives in the service: it throws a masked 404 when the
     // alert belongs to somebody else, so the route cannot leak existence.
     return ctx.notifications.listForAlert(user.id, alertId).then((notifications) => ({ notifications }));
+  });
+
+  // One-time SMTP diagnostic. This is deliberately independent of the shared outbox/worker.
+  // It is invisible unless BOTH the feature flag and worker token are configured.
+  app.post('/api/internal/notifications/smtp-test', adminRateLimit, async (req, reply) => {
+    if (!config.notification.smtpTestEnabled || !hasWorkerToken(config)) return notFound(reply);
+    if (!tokenMatches(req, config)) return unauthorized(reply);
+    if (!ctx.smtpTestProvider?.configured) {
+      return reply.code(503).send({ status: 'unavailable', reason: 'smtp_not_configured' });
+    }
+
+    // The singleton key is fixed in code and protected by a primary key in
+    // its own table. Claim commits before network I/O; never release on timeout.
+    const claim = await ctx.pool.query<{ test_key: string }>(
+      `INSERT INTO notification_smtp_test_claims (test_key)
+       VALUES ('production-smtp-diagnostic-v1')
+       ON CONFLICT (test_key) DO NOTHING
+       RETURNING test_key`,
+    );
+    if (claim.rowCount !== 1) {
+      return reply.code(409).send({ status: 'already_claimed' });
+    }
+
+    const diagnosticTimestamp = new Date().toISOString();
+    const request = {
+      jobId: 'smtp-diagnostic-once',
+      idempotencyKey: 'smtp-diagnostic-once',
+      channel: 'email',
+      recipient: 'shadrachampah123@gmail.com',
+      template: 'operator.smtp-diagnostic.v1',
+      payload: {
+        template: 'operator.smtp-diagnostic.v1',
+        subject: 'VeltrixEye SMTP diagnostic',
+        text: 'This is the one-time SMTP delivery diagnostic requested by the VeltrixEye operator.',
+        data: {
+          alertId: '00000000-0000-4000-8000-000000000039',
+          setupId: '00000000-0000-4000-8000-000000000039',
+          strategyId: '00000000-0000-4000-8000-000000000039',
+          strategyVersionId: '00000000-0000-4000-8000-000000000039',
+          versionNumber: 1,
+          instrument: { assetClass: 'forex', symbol: 'EURUSD' },
+          timeframe: '1h',
+          direction: 'long',
+          triggerState: 'confirmed',
+          qualityScore: 75,
+          qualityGrade: 'B',
+          minQualityScore: 50,
+          entryPrice: null,
+          stopLossPrice: null,
+          tp1Price: null,
+          tp2Price: null,
+          tp3Price: null,
+          detectedAt: diagnosticTimestamp,
+          generatedAt: diagnosticTimestamp,
+        },
+      },
+      attempt: 1,
+      timeoutMs: config.notification.email.timeoutMs,
+    } satisfies NotificationSendRequest;
+    try {
+      const result = await ctx.smtpTestProvider.send(request);
+      // SMTP AUTH failures are classified by the adapter as configuration
+      // failures before an envelope/message can be accepted. Release only
+      // that definitive pre-send failure so an operator can correct credentials
+      // and retry. Every ambiguous transport outcome keeps the claim forever.
+      if (result.outcome === 'unavailable' && result.failureCategory === 'configuration') {
+        await ctx.pool.query(
+          `DELETE FROM notification_smtp_test_claims
+            WHERE test_key = 'production-smtp-diagnostic-v1' AND outcome = 'claimed'`,
+        );
+        return reply.code(503).send({ status: 'unavailable', reason: 'smtp_configuration' });
+      }
+      const succeeded = result.outcome === 'delivered';
+      await ctx.pool.query(
+        `UPDATE notification_smtp_test_claims
+            SET outcome = $1, failure_category = $2, finished_at = now()
+          WHERE test_key = 'production-smtp-diagnostic-v1'`,
+        [succeeded ? 'delivered' : 'failed', result.failureCategory ?? null],
+      );
+      return reply.code(succeeded ? 200 : 502).send({
+        status: succeeded ? 'sent' : 'failed',
+        outcome: result.outcome,
+        failureCategory: result.failureCategory ?? null,
+      });
+    } catch {
+      // Claim remains consumed: SMTP acceptance may be ambiguous after a crash/error.
+      await ctx.pool.query(
+        `UPDATE notification_smtp_test_claims
+            SET outcome = 'failed', failure_category = 'unknown', finished_at = now()
+          WHERE test_key = 'production-smtp-diagnostic-v1'`,
+      ).catch(() => {});
+      return reply.code(502).send({ status: 'failed', outcome: 'unknown' });
+    }
   });
 
   // POST /api/internal/notifications/deliveries/run — process one batch now

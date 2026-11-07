@@ -291,7 +291,7 @@ after(async () => {
 });
 
 describe('Billing PR3 — 0032 file conventions and history integrity', () => {
-  test('0001-0031 are byte-identical, and the newest migration is 0035 (live-mode widening)', () => {
+  test('0001-0031 are byte-identical, and 0035 remains the live-mode step tip', () => {
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((file) => /^\d{4}_.+\.sql$/.test(file))
       .sort();
@@ -315,16 +315,16 @@ describe('Billing PR3 — 0032 file conventions and history integrity', () => {
     assert.equal(files.filter((file) => file.startsWith('0033_')).length, 1, 'exactly one 0033 migration (Step 7)');
     assert.equal(files.filter((file) => file.startsWith('0034_')).length, 1, 'exactly one 0034 migration (Step 8)');
     assert.equal(files.filter((file) => file.startsWith('0035_')).length, 1, 'exactly one 0035 migration (live mode)');
-    // 0035 is the newest migration OF THIS STEP; 0036 (non-commercial operator
-    // grants) and 0037 (scheduled ingestion trigger) are later migrations and
-    // are named here deliberately.
+    // 0035 is the newest migration OF THIS STEP; 0036–0039 are later migrations
+    // and are named here deliberately.
     assert.equal(files.filter((file) => file.startsWith('0036_')).length, 1, 'exactly one 0036 migration (non-commercial grants)');
     assert.equal(files.filter((file) => file.startsWith('0037_')).length, 1, 'exactly one 0037 migration (scheduled ingestion trigger)');
     assert.equal(files.filter((file) => file.startsWith('0038_')).length, 1, 'exactly one 0038 migration (read-only FX source observations)');
+    assert.equal(files.filter((file) => file.startsWith('0039_')).length, 1, 'exactly one 0039 migration (isolated SMTP diagnostic claim)');
     assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 38).length,
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 39).length,
       0,
-      'nothing is numbered after 0038',
+      'nothing is numbered after 0039',
     );
   });
 

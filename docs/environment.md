@@ -63,6 +63,7 @@ git-ignored and never contain values you would commit.
 | `NOTIFICATION_WORKER_INTERVAL_MS` | int 5000–3600000 | `60000` | Interval between batches. |
 | `NOTIFICATION_WORKER_BATCH_SIZE` | int 1–200 | `25` | Maximum jobs processed per run; each job is claimed only immediately before its own send. |
 | `NOTIFICATION_WORKER_TOKEN` | secret, ≤256 chars | *(empty)* | Shared secret for `POST /api/internal/notifications/deliveries/*` (external cron). **Empty ⇒ those routes return 404.** |
+| `NOTIFICATION_SMTP_TEST_ENABLED` | `true` \| `false` | `false` | Explicit opt-in for `POST /api/internal/notifications/smtp-test`; also requires `NOTIFICATION_WORKER_TOKEN` and configured SMTP. Uses a fixed recipient and a separate one-time claim. Keep disabled except during an explicitly approved diagnostic. A definitive SMTP AUTH/configuration rejection releases the claim because no message was accepted; timeouts and other ambiguous outcomes consume it permanently. |
 | `NOTIFICATION_RETENTION_DELIVERED_DAYS` | int 1–3650 | `30` | How long delivered rows are kept. |
 | `NOTIFICATION_RETENTION_FAILED_DAYS` | int 1–3650 | `120` | How long dead letters are kept (failure audit trail). |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | secret, 32-byte base64 | *(empty, required in production)* | M9.2 AES-256-GCM key for webhook signing secrets and push keys at rest. **Server-only, never logged, never returned, redacted.** Production fails closed if missing/invalid. Generate: `openssl rand -base64 32`. Render's encrypted env vars alone do NOT constitute DB secret protection. |

@@ -145,18 +145,18 @@ const countRows = async (table: string): Promise<number> => {
   return Number.parseInt(rows[0]!.count, 10);
 };
 
-describe('migration 0038 — additive, and the newest', () => {
-  test('0038 is present, is the newest migration, and nothing is numbered after it', () => {
+describe('migration 0038 — additive historical migration', () => {
+  test('0038 remains present and immutable before later migrations', () => {
     const files = readdirSync(MIGRATIONS_DIR_PATH)
       .filter((file) => file.endsWith('.sql'))
       .sort();
-    assert.equal(files.length, 38, 'the observation migration is the only new migration');
-    assert.equal(files.at(-1), '0038_billing_fx_source_observations.sql');
+    assert.equal(files.length, 39, 'the SMTP diagnostic migration is additive after the observation migration');
+    assert.equal(files.at(-1), '0039_notification_smtp_test_claim.sql');
     assert.equal(files.filter((file) => file.startsWith('0038_')).length, 1);
     assert.equal(
-      files.filter((file) => Number.parseInt(file.slice(0, 4), 10) > 38).length,
+      files.filter((file) => Number.parseInt(file.slice(0, 4), 10) > 39).length,
       0,
-      'nothing is numbered after 0038',
+      'nothing is numbered after 0039',
     );
   });
 

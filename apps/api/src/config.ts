@@ -196,6 +196,8 @@ const baseEnvSchema = z.object({
    * exposes no administrative surface at all.
    */
   NOTIFICATION_WORKER_TOKEN: z.string().max(256).default(''),
+  /** Explicit opt-in for the isolated, one-time SMTP diagnostic route. */
+  NOTIFICATION_SMTP_TEST_ENABLED: boolEnv(false),
   /** Retention: how long terminal jobs are kept for auditing. */
   NOTIFICATION_RETENTION_DELIVERED_DAYS: intEnv(1, 3650, 30),
   NOTIFICATION_RETENTION_FAILED_DAYS: intEnv(1, 3650, 120),
@@ -454,6 +456,8 @@ export interface NotificationConfig {
     batchSize: number;
     timeoutMs: number;
   };
+  /** Explicit feature gate; defaults off and never enables the shared queue. */
+  smtpTestEnabled: boolean;
   worker: {
     enabled: boolean;
     intervalMs: number;
@@ -645,6 +649,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         batchSize: values.NOTIFICATION_WORKER_BATCH_SIZE,
         timeoutMs: values.NOTIFICATION_PROVIDER_TIMEOUT_MS,
       },
+      smtpTestEnabled: values.NOTIFICATION_SMTP_TEST_ENABLED,
       worker: {
         enabled: values.NOTIFICATION_WORKER_ENABLED,
         intervalMs: values.NOTIFICATION_WORKER_INTERVAL_MS,
