@@ -20,7 +20,6 @@ export function createResendEmailProvider(
   fetchImpl: typeof fetch = fetch,
 ): NotificationProvider {
   const configured = isResendConfigured(config);
-  const secrets = [config.apiKey].filter(Boolean);
 
   return {
     channel: 'email',
@@ -68,7 +67,7 @@ export function createResendEmailProvider(
           signal: controller.signal,
         });
 
-        const body = await response.json().catch(() => null) as { id?: unknown; message?: unknown } | null;
+        const body = await response.json().catch(() => null) as { id?: unknown } | null;
         if (response.ok) {
           return {
             outcome: 'delivered',
@@ -77,7 +76,9 @@ export function createResendEmailProvider(
           };
         }
         const code = String(response.status);
-        const error = safeProviderMessage(body?.message, secrets);
+        // Never persist provider-supplied error text: keep diagnostics bounded
+        // and make credential echo/leakage impossible at this boundary.
+        const error = `Resend rejected request (HTTP ${code})`;
         if (response.status === 401 || response.status === 403) {
           return { outcome: 'unavailable', failureCategory: 'configuration', providerResponseCode: code, error };
         }
@@ -100,10 +101,3 @@ export function createResendEmailProvider(
   };
 }
 
-function safeProviderMessage(value: unknown, secrets: readonly string[]): string {
-  if (typeof value !== 'string' || value.length === 0) return 'Resend rejected the email request';
-  if (secrets.some((secret) => secret.length > 0 && value.includes(secret))) {
-    return 'Resend error omitted because it echoed credential material';
-  }
-  return value.slice(0, 240);
-}
