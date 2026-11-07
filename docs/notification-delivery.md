@@ -273,8 +273,8 @@ When the Resend key is absent, the legacy SMTP fallback uses `SMTP_HOST`,
 Both use `NOTIFICATION_PROVIDER_TIMEOUT_MS`; internal scheduled delivery also uses
 `NOTIFICATION_WORKER_TOKEN`, while the in-process ticker is controlled by
 `NOTIFICATION_WORKER_ENABLED` and `NOTIFICATION_WORKER_INTERVAL_MS`. These names
-and code paths are implemented, and the deployment manifest declares
-operator-managed environment entries. That is **not evidence that production
+and code paths are implemented, and the Render deployment manifest now declares `RESEND_API_KEY` plus the
+legacy SMTP fallback entries as operator-managed environment variables. That is **not evidence that production
 values are populated**. This repository review did not inspect production
 secrets/settings, connect to an email provider, or send a real email. Unit tests
 use fake providers and verify provider behavior; actual production Resend/SMTP
