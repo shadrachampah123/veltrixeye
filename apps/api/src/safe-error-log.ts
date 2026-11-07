@@ -201,6 +201,7 @@ export function configuredSecrets(config: AppConfig): string[] {
     config.TWELVE_DATA_API_KEY,
     config.SMTP_USER,
     config.SMTP_PASS,
+    config.notification.resend.apiKey,
     config.VAPID_PRIVATE_KEY,
     config.WEBHOOK_SECRET_ENCRYPTION_KEY,
     config.NOTIFICATION_WORKER_TOKEN,

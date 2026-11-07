@@ -197,9 +197,13 @@ provider — it resolves one through `NotificationProviderRegistry`. Adding
 `push`, `webhook` or `sms` later is additive: a new enum value, a new adapter,
 one `registry.register()` line in `createAppContext`.
 
-**Implemented in M7.3: `email` via SMTP** (`notifications/email.ts`,
-`nodemailer`, no transitive dependencies). It works with any SMTP endpoint —
-the operator's own server or a transactional vendor's SMTP relay:
+**M7.3 originally implemented `email` via SMTP** (`notifications/email.ts`).
+The hosted deployment now prefers **Resend's HTTPS API** (`notifications/email-resend.ts`)
+when `RESEND_API_KEY` and `NOTIFICATION_FROM` are configured. HTTPS uses port 443,
+which avoids Render Free's outbound SMTP port restrictions. Resend requests carry
+the outbox idempotency key in the `Idempotency-Key` header; the worker/outbox
+contract remains unchanged. SMTP remains a compatibility fallback when no Resend
+API key is configured:
 
 - implicit TLS on port 465, **STARTTLS required** otherwise (`requireTLS`);
 - lazy transporter, so an unconfigured deployment opens no socket;
@@ -209,13 +213,13 @@ the operator's own server or a transactional vendor's SMTP relay:
 - SMTP reply codes mapped to outcomes (4xx → retry, 5xx → dead letter,
   535/530/534 → unavailable).
 
-Nothing was added for demonstration purposes: no second vendor, no SDK wrapper,
-no hard-coded credentials.
+No SDK wrapper or hard-coded credentials were added; the Resend adapter uses
+Node's built-in HTTPS-capable `fetch`.
 
-> **No credentials ⇒ no fake success.** With `SMTP_HOST` / `NOTIFICATION_FROM`
-> empty the adapter reports `configured: false` and every job is recorded
-> `unavailable` (never `delivered`). Production is switched on purely through
-> environment variables — see [environment.md](./environment.md).
+> **No credentials ⇒ no fake success.** With `RESEND_API_KEY` and the legacy
+> SMTP settings absent, the email adapter reports `configured: false` and every
+> job is recorded `unavailable` (never `delivered`). Production is switched on
+> through server-side environment variables — see [environment.md](./environment.md).
 
 ## 7. Security
 
@@ -263,16 +267,17 @@ curl -X POST https://<api>/api/internal/notifications/deliveries/maintenance \
   -H "x-veltrixeye-worker-token: $NOTIFICATION_WORKER_TOKEN"
 ```
 
-The API's SMTP configuration surface is `SMTP_HOST`, `SMTP_PORT`,
-`SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `NOTIFICATION_FROM` and
-`NOTIFICATION_PROVIDER_TIMEOUT_MS`; internal scheduled delivery also uses
+The preferred email configuration is `RESEND_API_KEY` plus `NOTIFICATION_FROM`.
+When the Resend key is absent, the legacy SMTP fallback uses `SMTP_HOST`,
+`SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS` and `NOTIFICATION_FROM`.
+Both use `NOTIFICATION_PROVIDER_TIMEOUT_MS`; internal scheduled delivery also uses
 `NOTIFICATION_WORKER_TOKEN`, while the in-process ticker is controlled by
 `NOTIFICATION_WORKER_ENABLED` and `NOTIFICATION_WORKER_INTERVAL_MS`. These names
-and code paths are implemented, and the deployment manifest declares
-operator-managed environment entries. That is **not evidence that production
+and code paths are implemented, and the Render deployment manifest now declares `RESEND_API_KEY` plus the
+legacy SMTP fallback entries as operator-managed environment variables. That is **not evidence that production
 values are populated**. This repository review did not inspect production
-secrets/settings, connect to an SMTP provider, or send a real email. Unit tests
-use fake providers and verify the unconfigured path; actual production SMTP
+secrets/settings, connect to an email provider, or send a real email. Unit tests
+use fake providers and verify provider behavior; actual production Resend/SMTP
 configuration, successful provider acceptance and inbox delivery remain
 unverified. Do not treat a passing build or a healthy API as email-readiness
 evidence.

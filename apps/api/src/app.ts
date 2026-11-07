@@ -27,6 +27,7 @@ import {
   // M7.3 delivery pipeline
   createNotificationProviderRegistry,
   createSmtpEmailProvider,
+  createResendEmailProvider,
   createWebhookNotificationProvider,
   createPushNotificationProvider,
   createSecretManager,
@@ -239,7 +240,11 @@ export function createAppContext(
 
   const notificationProviders = createNotificationProviderRegistry();
   const emailProvider = createSmtpEmailProvider(config.notification.email);
-  if (emailProvider.configured) notificationProviders.register(emailProvider);
+  const resendEmailProvider = createResendEmailProvider(config.notification.resend);
+  // Prefer Resend's HTTPS API on hosted platforms (Render Free blocks SMTP).
+  // Retain SMTP as a compatibility fallback when no Resend key is configured.
+  if (resendEmailProvider.configured) notificationProviders.register(resendEmailProvider);
+  else if (emailProvider.configured) notificationProviders.register(emailProvider);
   // M9.1 — webhook is endpoint-configured per notification preference.
   notificationProviders.register(createWebhookNotificationProvider({ timeoutMs: config.notification.retry.timeoutMs }));
   // M9.2 — push provider (Web Push with VAPID)
@@ -273,6 +278,7 @@ export function createAppContext(
     redact: (text) =>
       redactSecrets(text, [
         config.notification.email.pass,
+        config.notification.resend.apiKey,
         config.notification.push.privateKey,
         config.notification.secret.encryptionKey,
       ]),

@@ -45,11 +45,12 @@ services:
       - key: LOG_LEVEL
         value: info
       # --- M7.3 alert notification delivery ---
-      # Leave SMTP_HOST and NOTIFICATION_FROM empty to run WITHOUT email
-      # delivery: outbox jobs are still created and the worker records them
-      # "unavailable" (never "delivered"). Fill them in (plus SMTP_USER /
-      # SMTP_PASS) to switch delivery on — no code change, no redeploy of the
-      # web app. See docs/notification-delivery.md.
+      # Prefer Resend HTTPS (port 443), including on Render Free. When
+      # RESEND_API_KEY and NOTIFICATION_FROM are set, Resend is selected.
+      # SMTP is a compatibility fallback only when the Resend key is empty;
+      # Render Free blocks outbound SMTP ports. See docs/notification-delivery.md.
+      - key: RESEND_API_KEY
+        sync: false
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT
