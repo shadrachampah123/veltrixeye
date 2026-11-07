@@ -84,8 +84,8 @@ export function createResendEmailProvider(
           // provider configuration. Park this job as a permanent failure:
           // `unavailable` rows are automatically re-queued when a provider is
           // configured, which would otherwise retry a bad key on every worker
-          // cycle and reset attempts indefinitely. Correct the key, then
-          // explicitly recover the failed job after correcting the key.
+          // cycle and reset attempts indefinitely. Correct the key, then use
+          // the documented ID-scoped SQL recovery procedure before draining.
           return { outcome: 'permanent', failureCategory: 'configuration', providerResponseCode: code, error };
         }
         if (response.status === 400 || response.status === 422) {
