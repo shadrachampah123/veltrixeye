@@ -598,8 +598,13 @@ describe('driver errors are reduced to a code', () => {
 describe('report rendering resists fence and table injection', () => {
   const HOSTILE_SELECTOR = 'pipe|column';
   const HOSTILE_TEXT = 'row1\nrow2 ```json {"x":1} ``` `tick`';
+  // Backslashes BEFORE the pipe are the interesting case: `\|` in the source
+  // data must still end up as an escaped pipe (`\\\|`), never as an even
+  // number of backslashes that would let the pipe act as a delimiter again.
   const HOSTILE_ROLE = 'entry|exit';
   const HOSTILE_TIMEFRAME = '4H\n```json `4H`';
+  const HOSTILE_BACKSLASH_ROLE = 'entry\\|exit';
+  const HOSTILE_BACKSLASH_TIMEFRAME = '4H\\\\|1H';
 
   /** A minimal but complete Evidence object with hostile DB text in both tables. */
   function evidenceWithHostileRows(): Parameters<typeof renderMarkdown>[0] {
@@ -625,6 +630,7 @@ describe('report rendering resists fence and table injection', () => {
       },
       migrations: [
         { version: 1, name: `0001|init\n\`\`\``, applied_at: '2026-01-01T00:00:00.000Z' },
+        { version: 2, name: '0002\\|backslash', applied_at: '2026-01-02T00:00:00.000Z' },
       ],
       candidateStrategies: [
         {
@@ -649,6 +655,7 @@ describe('report rendering resists fence and table injection', () => {
       v8: { found: true, id: 'v8-id', status: 'published', publishedAt: null, changelog: null },
       timeframes: [
         { role: HOSTILE_ROLE, timeframe: HOSTILE_TIMEFRAME },
+        { role: HOSTILE_BACKSLASH_ROLE, timeframe: HOSTILE_BACKSLASH_TIMEFRAME },
         { role: 'entry', timeframe: '4H' },
       ],
       risk: null,
@@ -723,6 +730,111 @@ describe('report rendering resists fence and table injection', () => {
   /** A `\|` inside a cell is not a column separator. */
   const columnCount = (row: string): number => row.split(/(?<!\\)\|/).length - 1;
 
+  /** The same shape, with benign values — the baseline for column counts. */
+  function evidenceWithCleanRows(): Parameters<typeof renderMarkdown>[0] {
+    return {
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      target: { strategy: 'Gold Break & Retest Test Pro VI', version: 8, symbol: 'XAUUSD', assetClass: 'commodity', outDir: 'o' },
+      safety: {
+        connectionOpenedWithDefaultTransactionReadOnly: true,
+        everyQueryRanInsideBeginReadOnly: true,
+        secretsRedacted: true,
+      },
+      declaredNotVerified: { triggersNothing: ['no ScannerService'] },
+      connection: {
+        database: 'db',
+        serverVersion: 'PostgreSQL 16',
+        tlsRequestedMode: 'verify-full',
+        ssl: true,
+        defaultTransactionReadOnly: 'on',
+        transactionReadOnly: 'on',
+        isSuperuser: 'off',
+        statementTimeout: '30s',
+        privileges: { 'INSERT on setups': false, 'UPDATE on strategies': false },
+      },
+      migrations: [
+        { version: 1, name: '0001_init', applied_at: '2026-01-01T00:00:00.000Z' },
+        { version: 2, name: '0002_second', applied_at: '2026-01-02T00:00:00.000Z' },
+      ],
+      candidateStrategies: [
+        {
+          id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          name: 'Gold Break & Retest Test Pro VI',
+          status: 'active',
+          created_at: '2026-01-01T00:00:00.000Z',
+          version_count: 1,
+          match_reason: 'matched by exact strategy name',
+        },
+      ],
+      versions: [
+        {
+          id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+          strategy_id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          version_number: 8,
+          status: 'published',
+          published_at: '2026-01-01T00:00:00.000Z',
+          changelog: 'initial',
+        },
+      ],
+      v8: { found: true, id: 'v8-id', status: 'published', publishedAt: null, changelog: null },
+      timeframes: [
+        { role: 'entry', timeframe: '4H' },
+        { role: 'exit', timeframe: '1H' },
+        { role: 'trend', timeframe: '1D' },
+      ],
+      risk: null,
+      marketScope: null,
+      conditions: [],
+      conditionRoleResolution: [
+        {
+          conditionId: 'c1',
+          conditionType: 'liquidity_sweep',
+          storedTimeframeRole: 'entry',
+          resolvedRole: 'entry',
+          resolvedTimeframe: '4H',
+          roleTimeframeRowPresent: true,
+          is4h: true,
+          storedAnchorOffsetCandles: 2,
+          storedAnchorOffsetType: 'number',
+          effectiveAnchorOffsetCandles: 2,
+          classification: 'liquidity',
+          group: 'group-1',
+          groupLogic: 'AND',
+          params: null,
+          lookbackCandles: 120,
+          deepestDeclaredRead: 122,
+          candlesStoredForRole: 500,
+        },
+      ],
+      liquiditySweepFocus: { count: 0, entries: [] },
+      sessionFilters: [],
+      filters: [],
+      instrument: null,
+      candleCoverage: [
+        {
+          timeframe: '4H',
+          candles: 500,
+          first_ts: '1700000000000',
+          last_ts: '1700003600000',
+          last_fetched_at: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+      setups: {
+        total: 1,
+        byState: [{ state: 'active', setups: 1 }],
+        latest: [],
+        scores: [],
+        stateEvents: [],
+      },
+      alerts: [],
+      alertDeliveries: [],
+      notificationDeliveries: [],
+      scannerRuns: [],
+      scannerCursors: [],
+      notes: [],
+    } as unknown as Parameters<typeof renderMarkdown>[0];
+  }
+
   it('keeps every table rectangular and fence-free with hostile values', () => {
     const md = renderMarkdown(evidenceWithHostileRows());
     const blocks = tableBlocks(md);
@@ -766,6 +878,56 @@ describe('report rendering resists fence and table injection', () => {
     assert.ok(!row!.includes('`4H`'), 'a code span survived in a cell');
     assert.ok(!row!.includes('```'), 'a fence sequence survived in a cell');
     assert.ok(!md.includes('entry|exit'), 'an unescaped pipe appears anywhere in the report');
+  });
+
+  it('escapes backslashes before pipes so a pipe can never become a delimiter', () => {
+    // 0, 1, 2 and 3 literal backslashes in front of a pipe. Escaping `|` alone
+    // turned `a\|b` into `a\\|b` — an EVEN count, where Markdown reads `\\` as
+    // an escaped backslash and lets the pipe split the cell.
+    const samples: Array<[number, string]> = [
+      [0, 'a|b'],
+      [1, 'a\\|b'],
+      [2, 'a\\\\|b'],
+      [3, 'a\\\\\\|b'],
+    ];
+
+    for (const [inputBackslashes, input] of samples) {
+      const out = mdCell(input);
+      const runs = [...out.matchAll(/\\*\|/g)];
+      assert.equal(runs.length, 1, `expected exactly one pipe in ${JSON.stringify(out)}`);
+      const beforePipe = runs[0]![0].length - 1;
+      assert.equal(
+        beforePipe,
+        inputBackslashes * 2 + 1,
+        `expected ${inputBackslashes * 2 + 1} backslashes before the pipe in ${JSON.stringify(out)}`,
+      );
+      assert.equal(beforePipe % 2, 1, `even backslash count lets the pipe delimit: ${JSON.stringify(out)}`);
+      // Exactly one escape backslash per original backslash, plus the pipe escape.
+      assert.equal(out, `a${'\\'.repeat(inputBackslashes * 2 + 1)}|b`);
+    }
+
+    // The reported case, verbatim.
+    assert.equal(mdCell('a\\|b'), 'a\\\\\\|b');
+    // And the other protections are unchanged.
+    assert.equal(mdCell('a|b'), 'a\\|b');
+    assert.equal(mdCell('x\ny'), 'x y');
+    assert.equal(mdCell('`t`'), "'t'");
+    // A backslash with no pipe is doubled too, so it renders literally.
+    assert.equal(mdCell('C:\\path'), 'C:\\\\path');
+  });
+
+  it('hostile values never change the number of columns in any table', () => {
+    const hostile = tableBlocks(renderMarkdown(evidenceWithHostileRows()));
+    const clean = tableBlocks(renderMarkdown(evidenceWithCleanRows()));
+
+    assert.equal(hostile.length, clean.length, 'the same tables must be rendered');
+    hostile.forEach((block, index) => {
+      assert.deepEqual(
+        block.map((row) => columnCount(row)),
+        clean[index]!.map((row) => columnCount(row)),
+        `table ${index + 1} changed shape under hostile input`,
+      );
+    });
   });
 
   it('escapes the privileges, migrations, coverage and by-state tables too', () => {

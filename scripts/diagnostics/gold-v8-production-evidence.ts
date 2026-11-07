@@ -1736,14 +1736,26 @@ export function jsonBlock(value: unknown): string {
 }
 
 /**
- * A value placed inside a Markdown table cell: pipes are escaped (they would
- * split the row), newlines collapsed and backticks neutralised.
+ * A value placed inside a Markdown table cell: backslashes are doubled first,
+ * then pipes are escaped (they would split the row), newlines collapsed and
+ * backticks neutralised. Doubling the backslashes first is what keeps the pipe
+ * behind an ODD number of backslashes — otherwise `a\|b` would render as an
+ * escaped backslash followed by a live cell delimiter.
  */
 export function mdCell(value: unknown): string {
-  return String(value ?? '')
-    .replace(/\|/g, '\\|')
-    .replace(/[\r\n]+/g, ' ')
-    .replace(/`/g, "'");
+  return (
+    String(value ?? '')
+      // Backslashes FIRST. Escaping `|` alone is not enough: a value that already
+      // contains `a\|b` would otherwise become `a\\|b`, where Markdown reads
+      // `\\` as an escaped backslash and lets the `|` act as a cell delimiter —
+      // an even number of backslashes un-escapes the pipe. Doubling first means
+      // the pipe always ends up behind an ODD number of backslashes, so it is
+      // always escaped.
+      .replace(/\\/g, '\\\\')
+      .replace(/\|/g, '\\|')
+      .replace(/[\r\n]+/g, ' ')
+      .replace(/`/g, "'")
+  );
 }
 
 /**
