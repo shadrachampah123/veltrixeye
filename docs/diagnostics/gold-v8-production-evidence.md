@@ -30,9 +30,11 @@ diagnostics-out/gold-v8-production-evidence.md
 ```
 
 It is **not** uploaded to a GitHub Actions artifact, **not** copied into a job
-summary, and **not** printed to a log or terminal. stdout carries a one-line
-status; errors print a machine-readable code (a SQLSTATE or a Node TLS code)
-and never the driver message, the stack, or the connection string.
+summary, and **not** printed to a log or terminal. On success stdout carries a
+short three-line status only — completion and output directory, the
+`secretsRedacted` result, and a reminder that the report is not uploaded.
+Errors print a machine-readable code (a SQLSTATE or a Node TLS code) and never
+the driver message, the stack, or the connection string.
 
 Retention is the operator's file system. There is no public copy: a short
 artifact retention period is not an access control, so no artifact exists.
@@ -82,14 +84,21 @@ attempted), `3` a safety condition failed or a query failed (no report written).
   selector matches more than one strategy, or the selected strategy has more
   than one version with the requested number, the run **aborts** rather than
   reporting evidence for an arbitrary one.
+- **`--version` is strict.** It must be a whole number greater than zero.
+  `abc`, `9x`, `0`, `-3` and `8.5` are refused with exit 2 — the run never falls
+  back to the default 8, because that would collect evidence for a version the
+  operator did not ask for. Omitting the flag altogether means version 8.
 - **TLS is `verify-full` and nothing else.** `DATABASE_SSL_MODE` may only be
-  `verify-full` (the default). The URL may carry exactly one query parameter:
-  `sslmode=verify-full`. Every other parameter is refused — `options`, `host`,
-  `port`, `user`, `password`, `db`, `application_name`, `statement_timeout`,
-  `search_path`, any `ssl*` setting, `uselibpqcompat`, and anything unknown —
-  because `pg` merges the parsed connection string over the explicit pool
-  configuration, so `?options=-c default_transaction_read_only=off` would
-  otherwise disable the read-only session default.
+  `verify-full` (the default). The URL may carry exactly one query parameter,
+  once: `sslmode=verify-full`. Every other parameter is refused — `options`,
+  `host`, `port`, `user`, `password`, `db`, `application_name`,
+  `statement_timeout`, `search_path`, any `ssl*` setting, `uselibpqcompat`, and
+  anything unknown — because `pg` merges the parsed connection string over the
+  explicit pool configuration, so `?options=-c default_transaction_read_only=off`
+  would otherwise disable the read-only session default. **A repeated parameter
+  is refused too**, in any case and even when every value is acceptable
+  (`?sslmode=verify-full&sslmode=verify-full`): with two values it is ambiguous
+  which one the driver honours.
   `NODE_TLS_REJECT_UNAUTHORIZED=0` and any libpq `PGSSL*` override in the
   environment are refused as well.
 - **The database role must be least-privilege.** The script reads

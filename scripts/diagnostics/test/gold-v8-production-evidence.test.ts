@@ -47,11 +47,15 @@ import {
   errorCodeOf,
   evaluateSafety,
   factsFromConnectionRow,
+  OptionError,
   isStrategyUuid,
   jsonBlock,
   mapStrings,
   mdCell,
+  mdRow,
   parseOptions,
+  renderMarkdown,
+  versionAmbiguityMessage,
   redact,
   scrubSecrets,
   secretValuesFrom,
@@ -449,6 +453,46 @@ describe('strategy selection never picks the first match', () => {
     assert.equal(parseOptions(['--strategy', 'abc']).strategy, 'abc');
     assert.equal(parseOptions(['--strategy', 'abc', '--version', '8']).version, 8);
   });
+
+  it('refuses every invalid --version instead of falling back to 8', () => {
+    for (const value of ['abc', '9x', '0', '-3', '-0', '8.5', '', ' ', '1e3', '+8', '08x', '0x10', 'Infinity', 'NaN']) {
+      assert.throws(
+        () => parseOptions(['--strategy', 's', '--version', value]),
+        OptionError,
+        `--version '${value}' must be refused`,
+      );
+    }
+    // A bare `--version` with no value is refused too.
+    assert.throws(() => parseOptions(['--strategy', 's', '--version']), OptionError);
+  });
+
+  it('accepts a valid --version and still defaults when the flag is absent', () => {
+    assert.equal(parseOptions(['--strategy', 's', '--version', '9']).version, 9);
+    assert.equal(parseOptions(['--strategy', 's', '--version', '12']).version, 12);
+    assert.equal(parseOptions(['--strategy', 's']).version, 8);
+  });
+});
+
+describe('the duplicate-version refusal is multiline', () => {
+  it('puts each colliding version on its own line', () => {
+    const ids = [
+      'aaaa0000-0000-0000-0000-000000000001',
+      'aaaa0000-0000-0000-0000-000000000002',
+      'aaaa0000-0000-0000-0000-000000000003',
+    ];
+    const message = versionAmbiguityMessage('Gold Break & Retest Test Pro VI', 8, ids);
+    const lines = message.split('\n');
+
+    assert.equal(lines.length, ids.length + 2, `expected ${ids.length + 2} lines, got:\n${message}`);
+    assert.match(lines[0]!, /has 3 versions numbered 8/);
+    assert.equal(lines[1], `  - ${ids[0]}`);
+    assert.equal(lines[2], `  - ${ids[1]}`);
+    assert.equal(lines[3], `  - ${ids[2]}`);
+    assert.match(lines[4]!, /select a version that is unique/);
+    // No literal escape sequence survived (the defect this replaces).
+    assert.ok(!message.includes('\\n'), 'the message still contains a literal backslash-n');
+    assert.ok(!message.includes('\\'), 'the message still contains a literal backslash');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -521,6 +565,99 @@ describe('driver errors are reduced to a code', () => {
 // ---------------------------------------------------------------------------
 
 describe('report rendering resists fence and table injection', () => {
+  const HOSTILE_SELECTOR = 'pipe|column';
+  const HOSTILE_TEXT = 'row1\nrow2 ```json {"x":1} ``` `tick`';
+
+  /** A minimal but complete Evidence object with hostile DB text in both tables. */
+  function evidenceWithHostileRows(): Parameters<typeof renderMarkdown>[0] {
+    return {
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      target: { strategy: HOSTILE_SELECTOR, version: 8, symbol: 'XAUUSD', assetClass: 'commodity', outDir: 'o' },
+      safety: {
+        connectionOpenedWithDefaultTransactionReadOnly: true,
+        everyQueryRanInsideBeginReadOnly: true,
+        secretsRedacted: true,
+      },
+      declaredNotVerified: { triggersNothing: ['no ScannerService'] },
+      connection: null,
+      migrations: [],
+      candidateStrategies: [
+        {
+          id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          name: HOSTILE_TEXT,
+          status: 'active',
+          created_at: '2026-01-01T00:00:00.000Z',
+          version_count: 1,
+          match_reason: `matched by exact strategy name | ${HOSTILE_SELECTOR}`,
+        },
+      ],
+      versions: [
+        {
+          id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+          strategy_id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          version_number: 8,
+          status: 'published',
+          published_at: '2026-01-01T00:00:00.000Z',
+          changelog: HOSTILE_TEXT,
+        },
+      ],
+      v8: null,
+      timeframes: [],
+      risk: null,
+      marketScope: null,
+      conditions: [],
+      conditionRoleResolution: [],
+      liquiditySweepFocus: { count: 0, entries: [] },
+      sessionFilters: [],
+      filters: [],
+      instrument: null,
+      candleCoverage: [],
+      setups: { total: 0, byState: [], latest: [], scores: [], stateEvents: [] },
+      alerts: [],
+      alertDeliveries: [],
+      notificationDeliveries: [],
+      scannerRuns: [],
+      scannerCursors: [],
+      notes: [],
+    } as unknown as Parameters<typeof renderMarkdown>[0];
+  }
+
+  it('escapes every dynamic cell in the strategy and version tables', () => {
+    const md = renderMarkdown(evidenceWithHostileRows());
+    const lines = md.split('\n');
+
+    // A hostile value can neither open a fence nor add a table column/row.
+    assert.equal(lines.filter((l) => l.startsWith('```')).length, 0, 'a fence was injected at line start');
+    assert.ok(!md.includes('pipe|column'), 'an unescaped pipe reached the report');
+    assert.ok(md.includes('pipe\\|column'), 'the pipe was not escaped');
+
+    const strategyRow = lines.find((l) => l.includes('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'));
+    const versionRow = lines.find((l) => l.includes('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'));
+    assert.ok(strategyRow && versionRow, 'the hostile rows should still be rendered');
+
+    // strategy table: 6 columns (7 separators); version table: 5 (6 separators).
+    // A `\|` inside a cell is not a separator.
+    const columns = (row: string): number => row.split(/(?<!\\)\|/).length - 1;
+    assert.equal(columns(strategyRow!), 7, `strategy row should keep 6 columns, got: ${strategyRow}`);
+    assert.equal(columns(versionRow!), 6, `version row should keep 5 columns, got: ${versionRow}`);
+
+    for (const row of [strategyRow!, versionRow!]) {
+      assert.ok(row.includes('row1 row2 '), 'the newline in the value was not collapsed');
+      assert.ok(!row.includes('```'), 'a fence sequence survived in a cell');
+      assert.ok(!row.includes('`tick`'), 'a code span survived in a cell');
+    }
+  });
+
+  it('mdRow escapes pipes, newlines and backtick runs', () => {
+    const row = mdRow(['a|b', 'line1\nline2', '```json', 8, null]);
+    assert.equal(row.split(/(?<!\\)\|/).length - 1, 6, 'one separator per column boundary');
+    assert.ok(!row.includes('\n'));
+    assert.ok(row.includes('a\\|b'));
+    assert.ok(row.includes("line1 line2"));
+    assert.ok(!row.includes('```'));
+    assert.ok(row.endsWith('|  |'), `null becomes an empty cell: ${row}`);
+  });
+
   it('uses a fence longer than any backtick run in the payload', () => {
     const block = jsonBlock({ params: { note: '```json\n{"x":1}\n```' } });
     const lines = block.split('\n');
@@ -610,6 +747,25 @@ describe('CLI refuses unsafe configuration before connecting', () => {
       );
     });
   }
+
+  it('refuses an invalid --version with exit 2, before connecting', () => {
+    for (const value of ['abc', '9x', '0', '-3', '8.5']) {
+      const run = runCli({ DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db' }, [
+        '--strategy',
+        'Gold Break & Retest Test Pro VI',
+        '--version',
+        value,
+      ]);
+      assert.equal(run.status, 2, `--version ${value} should exit 2; stderr:\n${run.stderr}`);
+      assert.match(run.stderr, /--version must be a whole number greater than zero/);
+      assert.ok(
+        !/falling back|defaulting to|using (the )?default/i.test(run.stderr),
+        'the refusal must not announce a fallback to the default version',
+      );
+      assertNoMarker(run);
+      assert.deepEqual(filesUnder(run.outDir), [], 'a refused run must not write a report');
+    }
+  });
 
   it('requires --strategy and has no default target', () => {
     const run = runCli({ DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db' }, []);
@@ -807,6 +963,8 @@ describe('read-only session (real Postgres)', () => {
     const client = await connect();
     const ro = new ReadOnlySession(client);
     let failedCode: string | undefined;
+    let stateAfterRollback: string | undefined;
+    let usableAfterRollback: number | undefined;
     try {
       await ro.begin();
       await ro
@@ -816,11 +974,24 @@ describe('read-only session (real Postgres)', () => {
           throw err;
         });
     } catch {
+      // This is exactly what main() does in its catch block.
       await client.query('ROLLBACK');
+      // Prove the transaction is GONE, not merely that ROLLBACK was sent: an
+      // open transaction would report transaction_read_only='on'.
+      const state = await client.query<{ tx: string }>(
+        "SELECT coalesce(current_setting('transaction_read_only'), '') AS tx",
+      );
+      stateAfterRollback = state.rows[0]?.tx;
+      // And prove the session is usable again, which it is not inside an
+      // aborted transaction (SQLSTATE 25P02).
+      const again = await client.query<{ one: number }>('SELECT 1::int AS one');
+      usableAfterRollback = again.rows[0]?.one;
     } finally {
       await client.end();
     }
-    assert.equal(failedCode, '42P01');
+    assert.equal(failedCode, '42P01', 'the failing query should report undefined_table');
+    assert.equal(stateAfterRollback, 'off', 'the failed transaction was not rolled back');
+    assert.equal(usableAfterRollback, 1, 'the session stayed in the aborted transaction');
   });
 });
 

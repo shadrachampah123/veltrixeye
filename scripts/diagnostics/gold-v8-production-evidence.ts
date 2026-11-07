@@ -106,12 +106,16 @@
  *     npx tsx scripts/diagnostics/gold-v8-production-evidence.ts \
  *       --strategy <uuid|exact strategy name> [--version 8] \
  *       [--symbol XAUUSD] [--asset-class commodity] [--out <dir>]
- *   (DATABASE_SSL_MODE defaults to verify-full; it is the only accepted value.)
+ *   (DATABASE_SSL_MODE defaults to verify-full; it is the only accepted value.
+ *   --version, when given, must be a whole number > 0: an invalid value is
+ *   refused with exit 2 rather than replaced by the default 8.)
  *
  * EXIT CODES
  *   0  evidence collected (whether or not anything is found)
- *   2  DATABASE_URL missing/empty, or TLS configuration refused — nothing attempted
- *   3  connection or query failure, or the output check failed — nothing written
+ *   2  DATABASE_URL missing/empty, TLS configuration refused, or an invalid
+ *      argument (for example a non-integer --version) — nothing attempted
+ *   3  connection or query failure, ambiguous target, failed safety check, or
+ *      the output check failed — nothing written
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -209,12 +213,6 @@ function mapStrings<T>(value: T, fn: (s: string) => string): T {
 }
 
 /**
- * Guard for every query the script issues. It refuses to run a query unless
- * the explicit `BEGIN READ ONLY` transaction is open, and it records what the
- * server reported from inside that transaction. The report's
- * `everyQueryRanInsideBeginReadOnly` is derived from these runtime facts.
- */
-/**
  * The only capability `ReadOnlySession` needs. Declaring it explicitly keeps the
  * class testable with a fake client and usable with both `pg.Client` (local
  * scripts, tests) and `pg.PoolClient` (the pool in `main()`).
@@ -226,6 +224,12 @@ export interface Queryable {
   ): Promise<pg.QueryResult<R>>;
 }
 
+/**
+ * Guard for every query the script issues. It refuses to run a query unless
+ * the explicit `BEGIN READ ONLY` transaction is open, and it records what the
+ * server reported from inside that transaction. The report's
+ * `everyQueryRanInsideBeginReadOnly` is derived from these runtime facts.
+ */
 class ReadOnlySession {
   private open = false;
   private observedReadOnly = false;
@@ -503,6 +507,18 @@ interface Options {
   outDir: string;
 }
 
+/**
+ * A command-line value the operator must fix. Thrown by `parseOptions` and
+ * turned into exit code 2 by `main()`, so an invalid argument can never fall
+ * back to a default and silently collect evidence for a different target.
+ */
+export class OptionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OptionError';
+  }
+}
+
 export function parseOptions(argv: readonly string[]): Options {
   const opts: Options = {
     // No default: a default like 'gold' used to be a substring match that could
@@ -519,10 +535,19 @@ export function parseOptions(argv: readonly string[]): Options {
   };
   const strategy = read('--strategy');
   if (strategy) opts.strategy = strategy;
-  const version = read('--version');
-  if (version) {
-    const n = Number(version);
-    if (Number.isInteger(n) && n > 0) opts.version = n;
+  // `--version` is strict: digits only, greater than zero. `abc`, `9x`, `8.5`,
+  // `-3` and `0` are REFUSED (OptionError → exit 2). Falling back to the
+  // default 8 would collect evidence for a version the operator did not ask for,
+  // which is the same silent wrong-target failure the strategy selector removed.
+  if (argv.includes('--version')) {
+    const raw = read('--version');
+    if (raw === null || !/^[0-9]+$/.test(raw) || Number(raw) < 1) {
+      throw new OptionError(
+        '--version must be a whole number greater than zero (for example --version 8). ' +
+          'The given value was refused rather than replaced with the default. Nothing was attempted.',
+      );
+    }
+    opts.version = Number(raw);
   }
   const symbol = read('--symbol');
   if (symbol) opts.symbol = symbol.toUpperCase();
@@ -924,6 +949,24 @@ const Q_SCANNER_CURSORS = `
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * The refusal printed when a strategy has several versions with the requested
+ * number, so the operator can see exactly which rows collided. Kept as a pure
+ * function (and unit tested) because a wrong separator here silently collapses
+ * a multi-row refusal into one unreadable line.
+ */
+export function versionAmbiguityMessage(
+  strategyName: string,
+  version: number,
+  ids: readonly string[],
+): string {
+  return [
+    `[gold-diagnostic] refusing to continue: strategy '${strategyName}' has ${ids.length} versions numbered ${version}.`,
+    ...ids.map((id) => `  - ${id}`),
+    '  Nothing was read. Fix the data or select a version that is unique.',
+  ].join('\n');
+}
+
 export function isStrategyUuid(value: string): boolean {
   return UUID_PATTERN.test(value.trim());
 }
@@ -1089,7 +1132,20 @@ function num(value: unknown): number | null {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<number> {
-  const opts = parseOptions(process.argv.slice(2));
+  // An invalid argument is a refusal (exit 2), never a silent fall back to a
+  // default: collecting evidence for a target the operator did not ask for is
+  // worse than collecting none.
+  let opts: Options;
+  try {
+    opts = parseOptions(process.argv.slice(2));
+  } catch (err) {
+    if (err instanceof OptionError) {
+      console.error(`[gold-diagnostic] ${err.message}`);
+      return 2;
+    }
+    console.error('[gold-diagnostic] invalid command-line arguments. Nothing was attempted.');
+    return 2;
+  }
   const notes: string[] = [];
 
   const rawUrl = process.env['DATABASE_URL'];
@@ -1377,14 +1433,7 @@ async function main(): Promise<number> {
 
     const versionChoice = chooseVersion(evidence.versions, opts.version);
     if (versionChoice.kind === 'ambiguous') {
-      console.error(
-        [
-          `[gold-diagnostic] refusing to continue: strategy '${selectedStrategy.name}' has ${versionChoice.ids.length} ` +
-            `versions numbered ${opts.version}.`,
-          ...versionChoice.ids.map((id) => `  - ${id}`),
-          '  Nothing was read. Fix the data or select a version that is unique.',
-        ].join('\\n'),
-      );
+      console.error(versionAmbiguityMessage(selectedStrategy.name, opts.version, versionChoice.ids));
       await ro.end().catch(() => {});
       return 3;
     }
@@ -1692,7 +1741,16 @@ export function mdCell(value: unknown): string {
     .replace(/`/g, "'");
 }
 
-function renderMarkdown(e: Evidence): string {
+/**
+ * One Markdown table row. EVERY cell goes through `mdCell`, so a database value
+ * cannot inject a column separator, a newline or a code fence — there is no way
+ * to add a row and forget to escape it.
+ */
+export function mdRow(cells: readonly unknown[]): string {
+  return `| ${cells.map((cell) => mdCell(cell)).join(' | ')} |`;
+}
+
+export function renderMarkdown(e: Evidence): string {
   const out: string[] = [];
   out.push('# Production Gold diagnostics — v8/XAUUSD evidence (read-only)');
   out.push('');
@@ -1752,9 +1810,7 @@ function renderMarkdown(e: Evidence): string {
     out.push('| id | name | status | versions | created_at | matched because |');
     out.push('| --- | --- | --- | --- | --- | --- |');
     for (const s of e.candidateStrategies) {
-      out.push(
-        `| \`${s.id}\` | ${s.name} | ${s.status} | ${s.version_count} | ${isoOrNull(s.created_at) ?? ''} | ${s.match_reason} |`,
-      );
+      out.push(mdRow([s.id, s.name, s.status, s.version_count, isoOrNull(s.created_at) ?? '', s.match_reason]));
     }
   }
   out.push('');
@@ -1767,9 +1823,7 @@ function renderMarkdown(e: Evidence): string {
     out.push('| version | id | status | published_at | changelog |');
     out.push('| --- | --- | --- | --- | --- |');
     for (const v of e.versions) {
-      out.push(
-        `| ${v.version_number} | \`${v.id}\` | ${v.status} | ${v.published_at ?? '—'} | ${v.changelog ?? '—'} |`,
-      );
+      out.push(mdRow([v.version_number, v.id, v.status, v.published_at ?? '—', v.changelog ?? '—']));
     }
   }
   out.push('');
