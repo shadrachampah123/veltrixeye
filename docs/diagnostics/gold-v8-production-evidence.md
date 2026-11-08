@@ -170,10 +170,14 @@ they are never mistaken for measured evidence.
   the run aborts rather than producing a report when a condition fails.
 - Database text is rendered, never interpreted: table cells escape backslashes,
   pipes, newlines, backticks and HTML entities, inline code spans neutralise
-  backticks and newlines, ordinary text and bullets additionally escape `&`,
-  `<` and `>`, and structured payloads sit in a fence longer than any backtick
-  run they contain. A stored value can therefore read as itself, but it cannot
-  add a heading, a fence, a table row, a list item or an HTML element.
+  backticks and newlines, and ordinary text, bullets and table cells additionally
+  escape `&`, `<`, `>` plus the punctuation that starts an active inline
+  construct (`[`, `]`, `*`, `_`, `~`). Structured payloads sit in a fence longer
+  than any backtick run they contain. A stored value can therefore read as
+  itself, but it cannot add a heading, a fence, a table row, a list item, an HTML
+  element, or a link, image or emphasis through Markdown syntax. (A bare `http(s)`
+  URL inside a value may still be auto-linked by the renderer — that is the
+  viewer's behaviour, not markup the report emits.)
 
 ## Gold v8 is not modified by this script
 

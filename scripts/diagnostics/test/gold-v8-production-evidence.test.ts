@@ -1179,6 +1179,127 @@ describe('report rendering resists fence and table injection', () => {
     assert.equal(bullets(md), bullets(cleanMd), 'a hostile HTML value changed the bullet list');
   });
 
+  it('mdText and mdCell neutralise Markdown links, images and emphasis', () => {
+    // Links and images: the `[` and `]` are backslash-escaped, so nothing can
+    // pair with `](` to form a link or an image — whatever the scheme.
+    assert.equal(mdText('[label](https://example.com)'), '\\[label\\](https://example.com)');
+    assert.equal(mdText('[label](javascript:alert(1))'), '\\[label\\](javascript:alert(1))');
+    assert.equal(mdText('![image](https://example.com/image)'), '!\\[image\\](https://example.com/image)');
+    // Emphasis, strong and GFM strikethrough.
+    assert.equal(mdText('**bold text**'), '\\*\\*bold text\\*\\*');
+    assert.equal(mdText('_italic text_'), '\\_italic text\\_');
+    assert.equal(mdText('~~gone~~'), '\\~\\~gone\\~\\~');
+    // Table cells are inline Markdown too.
+    assert.equal(mdCell('[label](https://example.com)'), '\\[label\\](https://example.com)');
+    assert.equal(mdCell('![image](https://example.com/image) **bold text** _italic text_'), '!\\[image\\](https://example.com/image) \\*\\*bold text\\*\\* \\_italic text\\_');
+  });
+
+  it('a stored backslash cannot cancel the Markdown escapes', () => {
+    // The value ends in a backslash, which would otherwise pair with the one this
+    // escaping inserts and un-escape the bracket again. Literal backslashes are
+    // doubled first, so the rendered text is exactly what was stored.
+    assert.equal(mdText('\\[x](y)'), '\\\\\\[x\\](y)');
+    assert.equal(mdText('a\\*b'), 'a\\\\\\*b');
+    // A value that is only backslashes stays literal.
+    assert.equal(mdText('\\\\'), '\\\\\\\\');
+    // Same guarantee in a table cell, where the pipe escape also applies.
+    assert.equal(mdCell('\\[x](y)|z'), '\\\\\\[x\\](y)\\|z');
+  });
+
+  it('Markdown in database text cannot create a link, an image or emphasis', () => {
+    // Every active inline construct the review named, plus HTML, a pipe, a
+    // backtick and a newline, in one value.
+    const payload =
+      '[label](https://example.com) [js](javascript:alert(1)) ![image](https://example.com/image) ' +
+      '**bold text** _italic text_ ~~strike~~ <b>tag</b> | pipe `tick`\nsecond line';
+
+    const withValue = (v: string): Parameters<typeof renderMarkdown>[0] => {
+      const clean = evidenceWithCleanRows();
+      return {
+        ...clean,
+        connection: {
+          ...(clean.connection as NonNullable<Parameters<typeof renderMarkdown>[0]['connection']>),
+          database: v,
+          serverVersion: `PostgreSQL ${v}`,
+          statementTimeout: v,
+        },
+        v8: { found: true, id: v, status: v, publishedAt: v, changelog: null },
+        notes: [`PAYLOAD ${v}`],
+        declaredNotVerified: { triggersNothing: [`PAYLOAD ${v}`] },
+        migrations: [{ version: 1, name: `PAYLOAD ${v}`, applied_at: '2026-01-01T00:00:00.000Z' }],
+        candidateStrategies: [
+          {
+            id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+            name: `PAYLOAD ${v}`,
+            status: 'active',
+            created_at: '2026-01-01T00:00:00.000Z',
+            version_count: 1,
+            match_reason: `PAYLOAD ${v}`,
+          },
+        ],
+      } as unknown as Parameters<typeof renderMarkdown>[0];
+    };
+
+    const benign = renderMarkdown(withValue('benign value'));
+    const md = renderMarkdown(withValue(payload));
+
+    /** True when the character at `i` is escaped by an ODD run of backslashes. */
+    const escapedAt = (text: string, i: number): boolean => {
+      let n = 0;
+      for (let j = i - 1; j >= 0 && text[j] === '\\'; j--) n += 1;
+      return n % 2 === 1;
+    };
+    /** Every unescaped `[`, `]`, `*`, `_` or `~` in the given text. */
+    const activeMarkup = (text: string): string[] => {
+      const found: string[] = [];
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i]!;
+        if (!'[]*_~'.includes(ch)) continue;
+        if (!escapedAt(text, i)) found.push(`${ch} at ${i}: ${text.slice(Math.max(0, i - 20), i + 20)}`);
+      }
+      return found;
+    };
+
+    // Only the lines that carry the hostile value are inspected; the report's own
+    // prose legitimately uses `**bold**` for measured booleans.
+    const dataLines = md.split('\n').filter((l) => l.includes('PAYLOAD'));
+    assert.ok(dataLines.length >= 4, `expected the payload on several lines, got ${dataLines.length}`);
+
+    for (const line of dataLines) {
+      // A code span is literal text: its content is not Markdown and is skipped.
+      const outsideCodeSpans = line.replace(/`[^`]*`/g, '');
+      assert.deepEqual(activeMarkup(outsideCodeSpans), [], `active Markdown survived in: ${line}`);
+      assert.ok(!outsideCodeSpans.includes('<b>'), `raw HTML survived in: ${line}`);
+    }
+
+    // The values are still readable: the characters are there, only inert.
+    assert.ok(md.includes('\\[label\\](https://example.com)'), 'the link text stopped being readable');
+    assert.ok(md.includes('!\\[image\\](https://example.com/image)'), 'the image text stopped being readable');
+    assert.ok(md.includes('\\*\\*bold text\\*\\*'), 'the emphasis text stopped being readable');
+    assert.ok(md.includes('\\_italic text\\_'), 'the italic text stopped being readable');
+    assert.ok(md.includes('&lt;b&gt;tag&lt;/b&gt;'), 'the HTML tag stopped being readable');
+    // A code span (the database name is rendered in one) keeps the literal value.
+    assert.ok(md.includes("`[label](https://example.com) [js](javascript:alert(1))"), 'a code span lost its literal value');
+
+    // Structure is untouched: same headings, fences, tables and bullets.
+    const headings = (m: string): string[] => m.split('\n').filter((l) => /^#{1,6} /.test(l));
+    const fences = (m: string): string[] => m.split('\n').filter((l) => /^`{3,}/.test(l));
+    assert.deepEqual(headings(md), headings(benign), 'the payload changed the headings');
+    assert.deepEqual(fences(md), fences(benign), 'the payload changed the fences');
+    assert.equal(tableBlocks(md).length, tableBlocks(benign).length, 'the payload changed the tables');
+    assert.equal(
+      md.split('\n').filter((l) => /^[-*] /.test(l)).length,
+      benign.split('\n').filter((l) => /^[-*] /.test(l)).length,
+      'the payload changed the bullet list',
+    );
+    // The pipe in the payload is still escaped inside the table it lands in.
+    const tableLines = md.split('\n').filter((l) => l.startsWith('|')).join('\n');
+    assert.ok(
+      tableLines.includes("\\| pipe 'tick' second line"),
+      'the pipe in the payload was not escaped inside the table',
+    );
+  });
+
   it('escapes the privileges, migrations, coverage and by-state tables too', () => {
     const md = renderMarkdown(evidenceWithHostileRows());
     // privileges: a hostile key, migrations: a hostile name, coverage: a hostile

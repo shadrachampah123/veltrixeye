@@ -32,11 +32,15 @@
  *     escaped pipes, collapsed newlines, neutralised backticks, escaped HTML
  *     entities), `mdCode` (the inside of an inline code span: collapsed
  *     newlines, neutralised backticks) or `mdText` (`mdCode` plus escaped `&`,
- *     `<` and `>` for ordinary text and bullets); structured payloads use
- *     `jsonBlock`, whose fence is longer than any backtick run it contains. A
- *     database value therefore cannot add a heading, a fence, a table row, a
- *     list item or a raw HTML element to the report. Literal prose is never
- *     built from data.
+ *     `<` and `>`, and backslash-escaping the punctuation that starts an active
+ *     inline construct — `[`, `]`, `*`, `_` and `~` — for ordinary text, bullets
+ *     and table cells alike); structured payloads use `jsonBlock`, whose fence
+ *     is longer than any backtick run it contains. A database value therefore
+ *     cannot add a heading, a fence, a table row, a list item, a raw HTML
+ *     element, or a link, image or emphasis through Markdown syntax. (A bare
+ *     http(s) URL in a value may still be auto-linked by the renderer; that is
+ *     the renderer's own behaviour, not markup this report emits.) Literal prose
+ *     is never built from data.
  *
  *   - THE REPORT PROVES IT. The evidence records `transaction_read_only` and
  *     the connecting role's effective INSERT/UPDATE/DELETE privileges as
@@ -1988,6 +1992,24 @@ function escapeHtml(text: string): string {
 }
 
 /**
+ * Markdown punctuation that starts an ACTIVE inline construct rather than
+ * literal text: `[`/`]` (links, images, footnotes), `*` and `_` (emphasis,
+ * strong), `~` (strikethrough in GFM). Each is prefixed with a backslash, which
+ * makes it literal again. `!` alone is inert without `[`, `#`/`>` only matter at
+ * the start of a line (newlines are collapsed before this runs) and backticks
+ * are neutralised separately, so those are not in the set.
+ *
+ * This must run AFTER literal backslashes have been doubled: otherwise a value
+ * ending in `\` could pair with the backslash this inserts and un-escape the
+ * punctuation again (`x\` + `[` would render as a literal backslash followed by
+ * a live link opener).
+ */
+function escapeInlineMarkdown(text: string): string {
+  // The class is `[`, `]`, `*`, `_`, `~`: an unescaped `[` is literal inside it.
+  return text.replace(/[[\]*_~]/g, '\\$&');
+}
+
+/**
  * A database-derived value placed INSIDE an inline code span. Code spans are
  * literal: HTML is not parsed there and a pipe cannot split a cell, so only the
  * two characters that could end the span early are neutralised — newlines are
@@ -2008,19 +2030,21 @@ export function mdCode(value: unknown): string {
  * delimiter.
  */
 export function mdCell(value: unknown): string {
-  return escapeHtml(
-    String(value ?? '')
-      // Backslashes FIRST. Escaping `|` alone is not enough: a value that already
-      // contains `a\|b` would otherwise become `a\\|b`, where Markdown reads
-      // `\\` as an escaped backslash and lets the `|` act as a cell delimiter —
-      // an even number of backslashes un-escapes the pipe. Doubling first means
-      // the pipe always ends up behind an ODD number of backslashes, so it is
-      // always escaped.
-      .replace(/\\/g, '\\\\')
-      .replace(/\|/g, '\\|')
-      .replace(/[\r\n]+/g, ' ')
-      .replace(/`/g, "'"),
-  );
+  const body = String(value ?? '')
+    // Backslashes FIRST. Escaping `|` alone is not enough: a value that already
+    // contains `a\|b` would otherwise become `a\\|b`, where Markdown reads
+    // `\\` as an escaped backslash and lets the `|` act as a cell delimiter —
+    // an even number of backslashes un-escapes the pipe. Doubling first means
+    // the pipe always ends up behind an ODD number of backslashes, so it is
+    // always escaped. It is also what stops a literal backslash from cancelling
+    // the escapes added below.
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/`/g, "'");
+  // A cell is inline Markdown: a stored `[x](y)` or `**x**` would otherwise
+  // become a live link, image or emphasis inside the table.
+  return escapeHtml(escapeInlineMarkdown(body));
 }
 
 /**
@@ -2034,7 +2058,12 @@ export function mdCell(value: unknown): string {
  *
  * It then escapes `&`, `<` and `>`: Markdown renders raw HTML, so a database
  * value such as `<img src=x onerror=…>` would otherwise become a live element.
- * The escaped form still reads as the original text.
+ * Finally the punctuation that starts an ACTIVE inline construct — `[`, `]`, `*`,
+ * `_` and `~` — is backslash-escaped, so a stored `[label](https://…)`,
+ * `![image](…)`, `**bold**` or `_italic_` renders as those literal characters
+ * instead of a link, an image or emphasis. The escaped form still reads as the
+ * original text. A bare http(s) URL is left alone: auto-linking is a renderer
+ * feature, and mangling readable URLs would cost more than it prevents.
  *
  * Every interpolation of database-, server- or operator-derived text in
  * `renderMarkdown` goes through `mdCell` (table cells), `mdCode` (the inside of
@@ -2042,7 +2071,10 @@ export function mdCell(value: unknown): string {
  * Literal report prose is never built from data.
  */
 export function mdText(value: unknown): string {
-  return escapeHtml(mdCode(value));
+  // Doubling literal backslashes first keeps a stored `\` from cancelling the
+  // escapes `escapeInlineMarkdown` adds.
+  const body = mdCode(value).replace(/\\/g, '\\\\');
+  return escapeHtml(escapeInlineMarkdown(body));
 }
 
 /**
