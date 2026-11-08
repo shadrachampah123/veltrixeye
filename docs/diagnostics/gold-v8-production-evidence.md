@@ -49,6 +49,13 @@ another is reading. Nothing is deleted or renamed: move the old report aside, or
 pass a different `--out`. That way a refused or failed run can never be mistaken
 for a successful one, and no other file in the directory is touched.
 
+`--out` must be a directory (or a path that does not exist yet, which is created
+on write). A path that already exists as a file is refused with **exit 2** before
+anything is attempted. If writing the pair fails part-way — the JSON is written
+first and the Markdown second — the JSON **this attempt created** is removed
+again, so a failed run cannot leave a JSON-only report behind; a file that was
+already there is never deleted.
+
 ## There is deliberately no CI workflow for this
 
 No GitHub Actions workflow runs this script, and no repository or environment
@@ -85,9 +92,10 @@ DATABASE_URL='postgres://<ro-role>:<password>@<host>:5432/<db>?sslmode=verify-fu
 ```
 
 Exit codes: `0` evidence collected, `2` configuration refused (nothing
-attempted — including a report that already exists in `--out`), `3` a safety
-condition failed, a query failed, an ambiguous target was found, or the report
-could not be written (in every case: no new report).
+attempted — including a report that already exists in `--out`, and an `--out`
+path that exists but is not a directory), `3` a safety condition failed, a query
+failed, an ambiguous target was found, or the report could not be written (in
+every case: no new report).
 
 ### Connection requirements (enforced, not advisory)
 
@@ -160,6 +168,12 @@ they are never mistaken for measured evidence.
   declared lookback before concluding coverage is sufficient.
 - `safety.*` booleans are computed at runtime from what the server reported, and
   the run aborts rather than producing a report when a condition fails.
+- Database text is rendered, never interpreted: table cells escape backslashes,
+  pipes, newlines, backticks and HTML entities, inline code spans neutralise
+  backticks and newlines, ordinary text and bullets additionally escape `&`,
+  `<` and `>`, and structured payloads sit in a fence longer than any backtick
+  run they contain. A stored value can therefore read as itself, but it cannot
+  add a heading, a fence, a table row, a list item or an HTML element.
 
 ## Gold v8 is not modified by this script
 

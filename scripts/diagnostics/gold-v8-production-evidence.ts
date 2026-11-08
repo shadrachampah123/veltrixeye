@@ -27,6 +27,17 @@
  *     inside a READ ONLY transaction, so no future edit to a query string can
  *     turn this into a mutation.
  *
+ *   - DATABASE TEXT CANNOT BECOME MARKUP. Every value the report renders goes
+ *     through one of three helpers: `mdCell` (table cells: doubled backslashes,
+ *     escaped pipes, collapsed newlines, neutralised backticks, escaped HTML
+ *     entities), `mdCode` (the inside of an inline code span: collapsed
+ *     newlines, neutralised backticks) or `mdText` (`mdCode` plus escaped `&`,
+ *     `<` and `>` for ordinary text and bullets); structured payloads use
+ *     `jsonBlock`, whose fence is longer than any backtick run it contains. A
+ *     database value therefore cannot add a heading, a fence, a table row, a
+ *     list item or a raw HTML element to the report. Literal prose is never
+ *     built from data.
+ *
  *   - THE REPORT PROVES IT. The evidence records `transaction_read_only` and
  *     the connecting role's effective INSERT/UPDATE/DELETE privileges as
  *     BOOLEANS via `has_table_privilege(current_user, …)`. The role NAME is
@@ -138,12 +149,13 @@
  *   0  evidence collected (whether or not anything is found)
  *   2  DATABASE_URL missing, empty or incomplete, TLS or connection configuration
  *      refused, an ambient libpq variable set, a report already present in
- *      --out, or an invalid argument (for example a non-integer --version) —
- *      nothing attempted
+ *      --out, an --out path that exists but is not a directory, or an invalid
+ *      argument (for example a non-integer --version) — nothing attempted
  *   3  connection or query failure, ambiguous target, failed safety check, the
- *      output check failed, or the report could not be written — nothing written
+ *      output check failed, or the report could not be written (including an
+ *      --out that became un-writable after the pre-flight checks) — no new report
  */
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
@@ -1228,10 +1240,15 @@ async function main(): Promise<number> {
   }
   const notes: string[] = [];
 
-  // --- the output is never overwritten --------------------------------------
-  // Checked first, before the credential is looked at and before any connection:
+  // --- the output path must be usable, and is never overwritten --------------
+  // Both checks run before the credential is looked at and before any connection:
   // a report that already exists belongs to some other run, and this run must not
   // be able to leave it looking like fresh evidence. Nothing is deleted.
+  const outputProblem = outputPathProblem(opts.outDir);
+  if (outputProblem !== null) {
+    console.error(`[gold-diagnostic] refusing to run: ${outputProblem}`);
+    return 2;
+  }
   const staleOutput = existingReportProblem(opts.outDir);
   if (staleOutput !== null) {
     console.error(`[gold-diagnostic] refusing to run: ${staleOutput}`);
@@ -1819,6 +1836,28 @@ export function reportPaths(outDir: string): { jsonPath: string; mdPath: string 
 }
 
 /**
+ * Refuse an `--out` that exists but is not a directory. Without this check the
+ * run would connect, read the whole database and only then fail in `mkdirSync`
+ * with a bare `EEXIST`; a path that cannot hold the report is a configuration
+ * refusal (exit 2), decided before the credential is read and before any
+ * connection is opened. A path that does not exist yet is fine — it is created
+ * on write — and nothing is ever deleted or created here.
+ */
+export function outputPathProblem(outDir: string): string | null {
+  let stat;
+  try {
+    stat = statSync(outDir);
+  } catch {
+    return null; // missing: fine, the write creates it
+  }
+  if (stat.isDirectory()) return null;
+  return (
+    `--out '${outDir}' exists but is not a directory. Pass a directory path — it is created if it does not ` +
+    'exist, and the two report files are written inside it. Nothing was attempted and nothing was modified.'
+  );
+}
+
+/**
  * Refuse to write over an existing report. A refused or failed run must never be
  * mistakable for a successful one, so an earlier report is neither deleted nor
  * replaced: the operator moves it aside or passes another `--out`. Only the two
@@ -1851,27 +1890,61 @@ export class ReportWriteError extends Error {
   }
 }
 
+/** The two filesystem calls `writeReport` makes, injectable so a failing write is testable. */
+export interface ReportWriteIo {
+  writeFile?: (file: string, data: string, options: { encoding: 'utf8'; flag: 'wx' }) => void;
+  removeFile?: (file: string) => void;
+}
+
 /**
  * Render and write the report. This is the ONLY write path — `main()` uses it and
  * so do the tests — and it never replaces an existing report: the guard runs
  * again here, and both files are opened with the exclusive `wx` flag, so an
  * earlier report survives even if another run finished during this one.
+ *
+ * The pair is written JSON-first, Markdown-second. If the Markdown write fails,
+ * the JSON this attempt just created is removed again, so a failed run cannot
+ * leave a JSON-only report (with this run's `generatedAt`) behind. Nothing else
+ * is ever deleted: the guard and the `wx` flag together mean the JSON can only
+ * be this attempt's file, and a pre-existing report is refused before any write.
  */
 export function writeReport(
   outDir: string,
   evidence: Parameters<typeof renderMarkdown>[0],
+  io: ReportWriteIo = {},
 ): { jsonPath: string; mdPath: string } {
+  const writeFile = io.writeFile ?? ((file, data, options) => writeFileSync(file, data, options));
+  const removeFile = io.removeFile ?? ((file) => unlinkSync(file));
   const stale = existingReportProblem(outDir);
   if (stale !== null) throw new ReportWriteError(stale, true);
   const markdown = renderMarkdown(evidence);
-  mkdirSync(outDir, { recursive: true });
-  const { jsonPath, mdPath } = reportPaths(outDir);
   try {
-    writeFileSync(jsonPath, `${JSON.stringify(evidence, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
-    writeFileSync(mdPath, markdown, { encoding: 'utf8', flag: 'wx' });
+    mkdirSync(outDir, { recursive: true });
   } catch (err) {
     throw new ReportWriteError(
-      `could not be written (error code: ${errorCodeOf(err)}); no existing file was overwritten`,
+      `could not be written: the output directory could not be created (error code: ${errorCodeOf(err)}); nothing was written`,
+      false,
+    );
+  }
+  const { jsonPath, mdPath } = reportPaths(outDir);
+  let jsonCreated = false;
+  try {
+    writeFile(jsonPath, `${JSON.stringify(evidence, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    jsonCreated = true;
+    writeFile(mdPath, markdown, { encoding: 'utf8', flag: 'wx' });
+  } catch (err) {
+    // Only the JSON created by THIS attempt is removed; a pre-existing file is
+    // refused earlier and the `wx` flag forbids replacing one.
+    let cleanup = '';
+    if (jsonCreated) {
+      try {
+        removeFile(jsonPath);
+      } catch {
+        cleanup = `; the partial JSON at ${jsonPath} could not be removed and should be deleted by hand`;
+      }
+    }
+    throw new ReportWriteError(
+      `could not be written (error code: ${errorCodeOf(err)}); no existing file was overwritten${cleanup}`,
       false,
     );
   }
@@ -1905,14 +1978,37 @@ export function jsonBlock(value: unknown): string {
 }
 
 /**
+ * Escape the three HTML-sensitive characters, ampersand FIRST so the entities
+ * this inserts are not escaped again. Markdown passes raw HTML through, so a
+ * database value containing `<img …>` would otherwise become a live element in
+ * the report; `&lt;` renders as the character the operator needs to read.
+ */
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * A database-derived value placed INSIDE an inline code span. Code spans are
+ * literal: HTML is not parsed there and a pipe cannot split a cell, so only the
+ * two characters that could end the span early are neutralised — newlines are
+ * collapsed and backticks become apostrophes. The value stays byte-readable.
+ */
+export function mdCode(value: unknown): string {
+  return String(value ?? '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/`/g, "'");
+}
+
+/**
  * A value placed inside a Markdown table cell: backslashes are doubled first,
- * then pipes are escaped (they would split the row), newlines collapsed and
- * backticks neutralised. Doubling the backslashes first is what keeps the pipe
- * behind an ODD number of backslashes — otherwise `a\|b` would render as an
- * escaped backslash followed by a live cell delimiter.
+ * then pipes are escaped (they would split the row), newlines collapsed,
+ * backticks neutralised and HTML entities escaped. Doubling the backslashes
+ * first is what keeps the pipe behind an ODD number of backslashes — otherwise
+ * `a\|b` would render as an escaped backslash followed by a live cell
+ * delimiter.
  */
 export function mdCell(value: unknown): string {
-  return (
+  return escapeHtml(
     String(value ?? '')
       // Backslashes FIRST. Escaping `|` alone is not enough: a value that already
       // contains `a\|b` would otherwise become `a\\|b`, where Markdown reads
@@ -1923,7 +2019,7 @@ export function mdCell(value: unknown): string {
       .replace(/\\/g, '\\\\')
       .replace(/\|/g, '\\|')
       .replace(/[\r\n]+/g, ' ')
-      .replace(/`/g, "'")
+      .replace(/`/g, "'"),
   );
 }
 
@@ -1936,14 +2032,17 @@ export function mdCell(value: unknown): string {
  * value can never open or close a code span or a fence. The value stays
  * readable; only characters that are Markdown structure are neutralised.
  *
+ * It then escapes `&`, `<` and `>`: Markdown renders raw HTML, so a database
+ * value such as `<img src=x onerror=…>` would otherwise become a live element.
+ * The escaped form still reads as the original text.
+ *
  * Every interpolation of database-, server- or operator-derived text in
- * `renderMarkdown` goes through `mdCell` (table cells), `jsonBlock` (structured
- * payloads) or this function. Literal report prose is never built from data.
+ * `renderMarkdown` goes through `mdCell` (table cells), `mdCode` (the inside of
+ * an inline code span), `jsonBlock` (structured payloads) or this function.
+ * Literal report prose is never built from data.
  */
 export function mdText(value: unknown): string {
-  return String(value ?? '')
-    .replace(/[\r\n]+/g, ' ')
-    .replace(/`/g, "'");
+  return escapeHtml(mdCode(value));
 }
 
 /**
@@ -1959,9 +2058,9 @@ export function renderMarkdown(e: Evidence): string {
   const out: string[] = [];
   out.push('# Production Gold diagnostics — v8/XAUUSD evidence (read-only)');
   out.push('');
-  out.push(`Generated (UTC): \`${mdText(e.generatedAt)}\``);
+  out.push(`Generated (UTC): \`${mdCode(e.generatedAt)}\``);
   out.push('');
-  out.push(`Target: exact strategy selector \`${mdCell(e.target.strategy)}\`, version \`${e.target.version}\`, instrument \`${mdCell(e.target.assetClass)}/${mdCell(e.target.symbol)}\`.`);
+  out.push(`Target: exact strategy selector \`${mdCode(e.target.strategy)}\`, version \`${e.target.version}\`, instrument \`${mdCode(e.target.assetClass)}/${mdCode(e.target.symbol)}\`.`);
   out.push('');
   out.push('> This report is EVIDENCE ONLY. It changes nothing and recommends nothing.');
   out.push('');
@@ -1981,13 +2080,13 @@ export function renderMarkdown(e: Evidence): string {
   for (const line of e.declaredNotVerified.triggersNothing) out.push(`- ${mdText(line)}`);
   out.push('');
   if (e.connection) {
-    out.push(`- Database: \`${mdText(e.connection.database)}\` (role name intentionally not printed)`);
+    out.push(`- Database: \`${mdCode(e.connection.database)}\` (role name intentionally not printed)`);
     out.push(`- Server: ${mdText(e.connection.serverVersion.split(',').slice(0, 1).join(''))}`);
     out.push(`- TLS requested by this run: \`${e.connection.tlsRequestedMode}\` (configuration: certificate chain and hostname verified by the client)`);
     out.push(`- TLS observed for this session (\`pg_stat_ssl\`): ${e.connection.ssl === null ? 'unknown' : e.connection.ssl ? 'yes' : 'no'}`);
-    out.push(`- \`default_transaction_read_only\` = \`${mdText(e.connection.defaultTransactionReadOnly)}\``);
-    out.push(`- \`transaction_read_only\` (inside the txn) = \`${mdText(e.connection.transactionReadOnly)}\``);
-    out.push(`- \`statement_timeout\` = \`${mdText(e.connection.statementTimeout)}\``);
+    out.push(`- \`default_transaction_read_only\` = \`${mdCode(e.connection.defaultTransactionReadOnly)}\``);
+    out.push(`- \`transaction_read_only\` (inside the txn) = \`${mdCode(e.connection.transactionReadOnly)}\``);
+    out.push(`- \`statement_timeout\` = \`${mdCode(e.connection.statementTimeout)}\``);
     out.push('');
     out.push('Effective privileges of the connecting role (booleans via `has_table_privilege`):');
     out.push('');
@@ -2039,8 +2138,8 @@ export function renderMarkdown(e: Evidence): string {
     out.push(`_v${e.target.version} was not found — the configuration evidence below is ABSENT, not zero._`);
     out.push('');
   } else {
-    out.push(`- version id: \`${mdText(e.v8.id)}\``);
-    out.push(`- status: \`${mdText(e.v8.status)}\`${e.v8.status !== 'published' ? '  ⚠ not published — a non-published version is never scanned' : ''}`);
+    out.push(`- version id: \`${mdCode(e.v8.id)}\``);
+    out.push(`- status: \`${mdCode(e.v8.status)}\`${e.v8.status !== 'published' ? '  ⚠ not published — a non-published version is never scanned' : ''}`);
     out.push(`- published_at: ${e.v8.publishedAt === null ? '—' : mdText(e.v8.publishedAt)}`);
     out.push('');
     out.push('### 4.1 Role → timeframe');

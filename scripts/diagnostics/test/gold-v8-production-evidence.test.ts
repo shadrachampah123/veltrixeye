@@ -50,6 +50,8 @@ import {
   connectionUrlProblem,
   errorCodeOf,
   existingReportProblem,
+  mdCode,
+  outputPathProblem,
   reportPaths,
   writeReport,
   evaluateSafety,
@@ -1088,6 +1090,95 @@ describe('report rendering resists fence and table injection', () => {
     assert.equal(mdText('plain value'), 'plain value');
   });
 
+  it('mdCode keeps code-span content literal while neutralising the span delimiters', () => {
+    // Inside an inline code span HTML is not parsed and a pipe is not a separator,
+    // so nothing else is escaped — the value stays exactly readable.
+    assert.equal(mdCode('a`b'), "a'b");
+    assert.equal(mdCode('a\nb\r\nc'), 'a b c');
+    assert.equal(mdCode('<img src=x onerror=alert(1)>'), '<img src=x onerror=alert(1)>');
+    assert.equal(mdCode('A & B | C'), 'A & B | C');
+    assert.equal(mdCode(null), '');
+    assert.equal(mdCode(0), '0');
+  });
+
+  it('mdText and mdCell escape the three HTML-sensitive characters, ampersand first', () => {
+    // Ampersand first, so the entities this inserts are not escaped again.
+    assert.equal(mdText('a & b <c> d'), 'a &amp; b &lt;c&gt; d');
+    assert.equal(mdText('&lt;'), '&amp;lt;');
+    assert.equal(mdText('<img src=x onerror=alert(1)>'), '&lt;img src=x onerror=alert(1)&gt;');
+    // Table cells escape HTML too, without losing the pipe/backslash guarantees.
+    assert.equal(mdCell('<b>x</b> & y'), '&lt;b&gt;x&lt;/b&gt; &amp; y');
+    assert.equal(mdCell('a|b'), 'a\\|b');
+    assert.equal(mdCell('a\\|b'), 'a\\\\\\|b');
+  });
+
+  it('raw HTML in database text cannot become a live element', () => {
+    // The benign twin has IDENTICAL shapes, so any structural difference between
+    // the two renders comes from the hostile value and nothing else.
+    const withValue = (v: string): Parameters<typeof renderMarkdown>[0] => {
+      const clean = evidenceWithCleanRows();
+      return {
+        ...clean,
+        connection: {
+          ...(clean.connection as NonNullable<Parameters<typeof renderMarkdown>[0]['connection']>),
+          database: v,
+          serverVersion: `PostgreSQL ${v}`,
+          statementTimeout: v,
+        },
+        v8: { found: true, id: v, status: v, publishedAt: v, changelog: null },
+        notes: [`note ${v}`],
+        declaredNotVerified: { triggersNothing: [`intent ${v}`] },
+        migrations: [{ version: 1, name: v, applied_at: '2026-01-01T00:00:00.000Z' }],
+        candidateStrategies: [
+          {
+            id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+            name: v,
+            status: v,
+            created_at: '2026-01-01T00:00:00.000Z',
+            version_count: 1,
+            match_reason: v,
+          },
+        ],
+        versions: [
+          {
+            id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+            strategy_id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+            version_number: 8,
+            status: v,
+            published_at: v,
+            changelog: v,
+          },
+        ],
+      } as unknown as Parameters<typeof renderMarkdown>[0];
+    };
+
+    const hostileHtml = '<img src=x onerror=alert(1)>';
+    const cleanMd = renderMarkdown(withValue('benign'));
+    const md = renderMarkdown(withValue(hostileHtml));
+
+    // Nowhere in the report may a raw element appear: table cells and ordinary
+    // text are escaped; inline code spans keep the value literally, and a code
+    // span is not HTML, so that is safe.
+    const tableText = md.split('\n').filter((l) => l.startsWith('|')).join('\n');
+    const nonCodeText = md
+      .split('\n')
+      .map((l) => (l.startsWith('|') ? '' : l.replace(/`[^`]*`/g, '')))
+      .join('\n');
+    assert.ok(!tableText.includes('<img'), 'a raw element survived in a table row');
+    assert.ok(!nonCodeText.includes('<img'), 'a raw element survived in plain report text');
+    assert.ok(md.includes('&lt;img src=x onerror=alert(1)&gt;'), 'the value stopped being readable after escaping');
+    assert.ok(md.includes('`<img src=x onerror=alert(1)>`'), 'a code span lost its literal value');
+
+    // Structure is untouched: same headings, fences, tables and list items.
+    const headings = (m: string): string[] => m.split('\n').filter((l) => /^#{1,6} /.test(l));
+    const fences = (m: string): string[] => m.split('\n').filter((l) => /^`{3,}/.test(l));
+    const bullets = (m: string): number => m.split('\n').filter((l) => /^[-*] /.test(l)).length;
+    assert.deepEqual(headings(md), headings(cleanMd), 'a hostile HTML value changed the headings');
+    assert.deepEqual(fences(md), fences(cleanMd), 'a hostile HTML value changed the fences');
+    assert.equal(tableBlocks(md).length, tableBlocks(cleanMd).length, 'a hostile HTML value changed the tables');
+    assert.equal(bullets(md), bullets(cleanMd), 'a hostile HTML value changed the bullet list');
+  });
+
   it('escapes the privileges, migrations, coverage and by-state tables too', () => {
     const md = renderMarkdown(evidenceWithHostileRows());
     // privileges: a hostile key, migrations: a hostile name, coverage: a hostile
@@ -1109,8 +1200,12 @@ describe('report rendering resists fence and table injection', () => {
       'a fence was injected into a table row',
     );
     assert.ok(!md.includes('```json {"x":1}'), 'the hostile fence payload survived');
-    assert.ok(!md.includes('pipe|column'), 'an unescaped pipe reached the report');
-    assert.ok(md.includes('pipe\\|column'), 'the pipe was not escaped');
+    // Table rows must never contain a raw separator. The same value also appears
+    // in the Target line's inline code span, where a pipe is literal text and
+    // cannot split anything, so the assertion is scoped to the tables.
+    const tableLines = md.split('\n').filter((l) => l.startsWith('|')).join('\n');
+    assert.ok(!tableLines.includes('pipe|column'), 'an unescaped pipe reached a table row');
+    assert.ok(tableLines.includes('pipe\\|column'), 'the pipe was not escaped in the table');
 
     const strategyRow = lines.find((l) => l.includes('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'));
     const versionRow = lines.find((l) => l.includes('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'));
@@ -1273,6 +1368,160 @@ describe('an existing report is never overwritten', () => {
     assert.match(readFileSync(seeded.jsonPath, 'utf8'), /2026-01-01T00:00:00\.000Z/);
     assert.equal(readFileSync(seeded.mdPath, 'utf8'), mdBefore);
     assert.ok(second.stdout === '', 'a refused run prints nothing on stdout');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I2. An --out path that is not a directory is refused before any connection
+// ---------------------------------------------------------------------------
+
+describe('the output path must be a directory', () => {
+  it('accepts a missing path and an existing directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-outdir-'));
+    workDirs.push(dir);
+    assert.equal(outputPathProblem(dir), null);
+    assert.equal(outputPathProblem(join(dir, 'not-created-yet')), null);
+  });
+
+  it('refuses a path that exists as a file, and names it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-outfile-'));
+    workDirs.push(dir);
+    const file = join(dir, 'report.json');
+    writeFileSync(file, 'not a directory\n');
+
+    const problem = outputPathProblem(file);
+    assert.notEqual(problem, null);
+    assert.match(problem!, /is not a directory/);
+    assert.ok(problem!.includes(file), 'the refusal must name the path');
+    assert.equal(readFileSync(file, 'utf8'), 'not a directory\n', 'the existing file was modified');
+  });
+
+  it('the CLI refuses with exit 2 before connecting and leaves the file untouched', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-outfile-cli-'));
+    workDirs.push(dir);
+    const file = join(dir, 'not-a-directory');
+    writeFileSync(file, 'keep me\n');
+
+    // A perfectly acceptable credential: the refusal must come from --out.
+    const run = runCli({ DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db' }, DEFAULT_ARGS, file);
+
+    assert.equal(run.status, 2, `unexpected exit; stderr:\n${run.stderr}`);
+    assert.match(run.stderr, /refusing to run/);
+    assert.match(run.stderr, /is not a directory/);
+    assert.ok(!/cannot reach the database|query failed/i.test(run.stderr), 'it must refuse before connecting');
+    assert.equal(readFileSync(file, 'utf8'), 'keep me\n', 'the existing file was modified');
+    assert.deepEqual(readdirSync(dir), ['not-a-directory'], 'the run created something next to the file');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I3. A partially written report is cleaned up, and nothing else is deleted
+// ---------------------------------------------------------------------------
+
+describe('a partial report write is cleaned up', () => {
+  /** Writes for real, but throws when the Markdown file is attempted. */
+  function failingMarkdownWriter(seen: Array<{ file: string; options: unknown }>) {
+    return (file: string, data: string, options: { encoding: 'utf8'; flag: 'wx' }): void => {
+      seen.push({ file, options });
+      if (file.endsWith('.md')) {
+        throw Object.assign(new Error('simulated markdown failure'), { code: 'EIO' });
+      }
+      writeFileSync(file, data, options);
+    };
+  }
+
+  it('removes the JSON this attempt created when the Markdown write fails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-partial-'));
+    workDirs.push(dir);
+    writeFileSync(join(dir, 'unrelated.txt'), 'keep me\n');
+
+    const seen: Array<{ file: string; options: unknown }> = [];
+    assert.throws(
+      () => writeReport(dir, minimalEvidence('2026-01-01T00:00:00.000Z'), { writeFile: failingMarkdownWriter(seen) }),
+      (err: unknown) => err instanceof ReportWriteError && err.stale === false,
+    );
+
+    // The JSON really was written and then really was removed: only the
+    // unrelated file is left.
+    assert.equal(seen.length, 2, 'both writes should have been attempted');
+    assert.ok(seen[0]!.file.endsWith('gold-v8-production-evidence.json'));
+    assert.ok(seen[1]!.file.endsWith('gold-v8-production-evidence.md'));
+    assert.deepEqual(readdirSync(dir), ['unrelated.txt'], 'the partial report was left behind');
+    assert.equal(readFileSync(join(dir, 'unrelated.txt'), 'utf8'), 'keep me\n', 'an unrelated file was deleted');
+  });
+
+  it('opens both files exclusively, so nothing is ever replaced', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-flags-'));
+    workDirs.push(dir);
+    const seen: Array<{ file: string; options: unknown }> = [];
+    writeReport(dir, minimalEvidence('2026-01-01T00:00:00.000Z'), {
+      writeFile: (file, data, options) => {
+        seen.push({ file, options });
+        writeFileSync(file, data, options);
+      },
+    });
+    assert.equal(seen.length, 2);
+    for (const write of seen) {
+      assert.deepEqual(write.options, { encoding: 'utf8', flag: 'wx' }, `${write.file} was not opened exclusively`);
+    }
+  });
+
+  it('does not delete anything when the first (JSON) write fails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-firstfail-'));
+    workDirs.push(dir);
+    writeFileSync(join(dir, 'unrelated.txt'), 'keep me\n');
+    const removed: string[] = [];
+
+    assert.throws(
+      () =>
+        writeReport(dir, minimalEvidence('2026-01-01T00:00:00.000Z'), {
+          writeFile: (file, data, options) => {
+            if (file.endsWith('.json')) throw Object.assign(new Error('simulated json failure'), { code: 'EIO' });
+            writeFileSync(file, data, options);
+          },
+          removeFile: (file) => removed.push(file),
+        }),
+      (err: unknown) => err instanceof ReportWriteError && err.stale === false,
+    );
+
+    assert.deepEqual(removed, [], 'a file that was never created must not be removed');
+    assert.deepEqual(readdirSync(dir), ['unrelated.txt']);
+  });
+
+  it('says so when the partial JSON cannot be removed', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-cleanupfail-'));
+    workDirs.push(dir);
+
+    assert.throws(
+      () =>
+        writeReport(dir, minimalEvidence('2026-01-01T00:00:00.000Z'), {
+          writeFile: failingMarkdownWriter([]),
+          removeFile: () => {
+            throw new Error('simulated unlink failure');
+          },
+        }),
+      (err: unknown) => err instanceof ReportWriteError && /could not be removed/.test(err.message),
+    );
+  });
+
+  it('still refuses a pre-existing report before writing anything', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-preflight-'));
+    workDirs.push(dir);
+    const seeded = writeReport(dir, minimalEvidence('2026-01-01T00:00:00.000Z'));
+    const before = readFileSync(seeded.jsonPath, 'utf8');
+    let writes = 0;
+
+    assert.throws(
+      () =>
+        writeReport(dir, minimalEvidence('2026-02-02T00:00:00.000Z'), {
+          writeFile: () => {
+            writes += 1;
+          },
+        }),
+      (err: unknown) => err instanceof ReportWriteError && err.stale === true,
+    );
+    assert.equal(writes, 0, 'a refused write must not touch the filesystem');
+    assert.equal(readFileSync(seeded.jsonPath, 'utf8'), before);
   });
 });
 
