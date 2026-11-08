@@ -123,7 +123,16 @@
  *     `verify-full` in the URL, any other `ssl*` URL parameter (which would
  *     override the pool's TLS setting), `NODE_TLS_REJECT_UNAUTHORIZED=0`, or
  *     any libpq `PGSSL*` override in the environment each stop the run with
- *     exit 2 before any connection is attempted.
+ *     exit 2 before any connection is attempted. After connecting, the run also
+ *     proves the session on the CLIENT socket (encrypted, chain accepted, peer
+ *     certificate seen, DNS endpoint so SNI/hostname verification happened) and
+ *     refuses with exit 3 otherwise. `pg_stat_ssl` is reported separately and
+ *     labelled as the SERVER's view of its own backend connection: behind
+ *     anything that terminates TLS in front of the compute — a pooler (Neon
+ *     `-pooler`, PgBouncer) or a managed provider's front proxy (Neon uses one
+ *     for DIRECT hosts too, pooling or not) — it reads `false` while the client
+ *     session is verified. The report explains that, and fences the provider
+ *     architecture off from what this run actually measured.
  *
  *   - SAFETY FIELDS ARE MEASURED, NOT ASSERTED. The `safety.*` booleans in the
  *     report are computed at runtime (see `ReadOnlySession`, `evaluateSafety`
@@ -160,6 +169,7 @@
  *      --out that became un-writable after the pre-flight checks) — no new report
  */
 import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
@@ -465,11 +475,375 @@ export function connectionTargetEnvProblem(env: Record<string, string | undefine
   return null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* TLS — what the CLIENT observed, which is the only trustworthy statement     */
+/* -------------------------------------------------------------------------- */
+
 /**
- * The safety verdict for the session, computed from what the server reported.
- * Pure and exhaustive: every fact that is not explicitly safe is a violation, so
- * a missing or unexpected value fails closed.
+ * The client-side facts of a TLS session, read from the socket that actually
+ * carries the connection.
+ *
+ * WHY THIS EXISTS. `pg_stat_ssl.ssl` is the SERVER's view of its own backend
+ * connection. When the endpoint is a connection pooler (Neon's `-pooler` host,
+ * PgBouncer, most managed proxies), the pooler terminates the client's TLS and
+ * opens its own connection to PostgreSQL — so the backend row says
+ * `ssl = false` even though the client session is encrypted and verified. The
+ * previous report printed "TLS requested: verify-full" next to
+ * "TLS observed (pg_stat_ssl): no", which reads as a verification failure when
+ * it is a *pooling* artefact. These fields make the two views distinguishable.
  */
+export interface ClientTlsObservation {
+  /** `socket.encrypted` — true only for a real TLS socket. */
+  encrypted: boolean | null;
+  /** `socket.authorized` — Node's verdict on the peer certificate chain. */
+  authorized: boolean | null;
+  /** `socket.authorizationError` — why the chain was refused, when it was. */
+  authorizationError: string | null;
+  /** `TLSv1.3`, `TLSv1.2`, … — null when the socket is not TLS. */
+  protocol: string | null;
+  cipher: string | null;
+  /** SNI/hostname the certificate was matched against (null when absent). */
+  servername: string | null;
+  /** SHA-256 fingerprint of the peer (server) certificate. Not a secret. */
+  peerCertificateSha256: string | null;
+  peerCertificateSubject: string | null;
+  peerCertificateIssuer: string | null;
+  peerCertificateValidTo: string | null;
+}
+
+/** Structural view of the bits of a TLS socket this script reads. */
+interface TlsSocketLike {
+  encrypted?: unknown;
+  authorized?: unknown;
+  authorizationError?: unknown;
+  servername?: unknown;
+  getProtocol?: () => unknown;
+  getCipher?: () => unknown;
+  getPeerCertificate?: () => unknown;
+}
+
+function shortText(value: unknown, max = 200): string | null {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  return value.length > max ? `${value.slice(0, max)}…` : value;
+}
+
+/** `{ CN: 'x', O: 'y' }` → `CN=x, O=y`; strings pass through. Truncated. */
+function describeDistinguishedName(dn: unknown): string | null {
+  if (dn === null || dn === undefined) return null;
+  if (typeof dn === 'string') return shortText(dn);
+  if (typeof dn !== 'object') return null;
+  const record = dn as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const key of ['CN', 'O', 'OU', 'C']) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim() !== '') parts.push(`${key}=${value.trim()}`);
+  }
+  return parts.length > 0 ? shortText(parts.join(', ')) : null;
+}
+
+/**
+ * Read the TLS state off a connection socket.
+ *
+ * Duck-typed on purpose: a plain `net.Socket` has none of these members, so
+ * every field stays `null` and the caller refuses the run. Nothing here reads a
+ * credential, and none of these values can carry one.
+ */
+export function readClientTlsState(socket: unknown): ClientTlsObservation {
+  const empty: ClientTlsObservation = {
+    encrypted: null,
+    authorized: null,
+    authorizationError: null,
+    protocol: null,
+    cipher: null,
+    servername: null,
+    peerCertificateSha256: null,
+    peerCertificateSubject: null,
+    peerCertificateIssuer: null,
+    peerCertificateValidTo: null,
+  };
+  if (socket === null || typeof socket !== 'object') return empty;
+  const s = socket as TlsSocketLike;
+  const encrypted = typeof s.encrypted === 'boolean' ? s.encrypted : null;
+
+  let protocol: string | null = null;
+  let cipher: string | null = null;
+  if (typeof s.getProtocol === 'function') {
+    try {
+      protocol = shortText(s.getProtocol());
+    } catch {
+      protocol = null;
+    }
+  }
+  if (typeof s.getCipher === 'function') {
+    try {
+      const c = s.getCipher();
+      if (c !== null && typeof c === 'object' && typeof (c as { name?: unknown }).name === 'string') {
+        cipher = shortText((c as { name: string }).name);
+      }
+    } catch {
+      cipher = null;
+    }
+  }
+
+  let cert: Record<string, unknown> | null = null;
+  if (typeof s.getPeerCertificate === 'function') {
+    try {
+      const raw = s.getPeerCertificate();
+      if (raw !== null && typeof raw === 'object' && Object.keys(raw as object).length > 0) {
+        cert = raw as Record<string, unknown>;
+      }
+    } catch {
+      cert = null;
+    }
+  }
+
+  return {
+    encrypted,
+    authorized: typeof s.authorized === 'boolean' ? s.authorized : null,
+    authorizationError: shortText(s.authorizationError),
+    protocol: encrypted === true ? protocol : null,
+    cipher: encrypted === true ? cipher : null,
+    servername: shortText(s.servername),
+    peerCertificateSha256: cert === null ? null : shortText(cert['fingerprint256']),
+    peerCertificateSubject: cert === null ? null : describeDistinguishedName(cert['subject']),
+    peerCertificateIssuer: cert === null ? null : describeDistinguishedName(cert['issuer']),
+    peerCertificateValidTo: cert === null ? null : shortText(cert['valid_to']),
+  };
+}
+
+/**
+ * Canonical form of an endpoint name, for COMPARISON ONLY.
+ *
+ * `new URL(...).hostname` lower-cases the host and keeps IPv6 brackets
+ * (`[2001:db8::1]`) while `pg-connection-string` also keeps them, and a trailing
+ * dot is legal in DNS. Comparing raw strings would therefore refuse legitimate
+ * targets and, worse, would miss an IPv6 literal entirely: `net.isIP('[::1]')`
+ * is 0, so the bracket form would have slipped past the IP guard and only been
+ * stopped later by a generic handshake failure. Normalising here makes the guard
+ * explicit for IPv4 AND IPv6.
+ */
+export function normaliseEndpointHost(host: string): string {
+  let value = host.trim().toLowerCase();
+  if (value.startsWith('[') && value.endsWith(']')) value = value.slice(1, -1);
+  if (value.endsWith('.')) value = value.slice(0, -1);
+  return value;
+}
+
+/**
+ * Everything that must be true before this script may call a session
+ * "verify-full". Empty array = the client really did verify the server.
+ *
+ * The rules are deliberately strict, and they never fall back to a weaker mode:
+ *  - the socket must be encrypted (a plaintext session is refused, not reported);
+ *  - Node must have ACCEPTED the chain (`authorized === true`);
+ *  - a peer certificate must have been seen;
+ *  - the endpoint must be a DNS name, because `pg` only sets SNI for DNS hosts —
+ *    an IPv4 or IPv6 literal endpoint would silently degrade `verify-full` to
+ *    chain-only verification, which is a different (weaker) promise;
+ *  - the hostname the certificate was verified against must be the host in
+ *    DATABASE_URL, otherwise the chain was checked for a name this run does not
+ *    claim to have reached.
+ *
+ * Each rule reports its own message, so an operator sees exactly which promise
+ * could not be kept instead of a generic TLS error.
+ */
+export function tlsVerificationProblems(tls: ClientTlsObservation, host: string): string[] {
+  const problems: string[] = [];
+  if (tls.encrypted !== true) {
+    problems.push('the client socket is not encrypted — this session is plaintext, not TLS');
+    return problems;
+  }
+  if (tls.authorized !== true) {
+    problems.push(
+      `the client did not accept the server certificate (${tls.authorizationError ?? 'no reason reported'})`,
+    );
+  }
+  if (tls.peerCertificateSha256 === null) {
+    problems.push('the client saw no peer certificate');
+  }
+  const endpoint = normaliseEndpointHost(host);
+  if (endpoint === '') {
+    problems.push(
+      'the endpoint host could not be read from DATABASE_URL, so hostname verification cannot be confirmed',
+    );
+  } else if (net.isIP(endpoint) !== 0) {
+    problems.push(
+      `the endpoint is an IP address literal (${net.isIP(endpoint) === 6 ? 'IPv6' : 'IPv4'}), so the certificate cannot be matched against a hostname — connect by the provider's DNS name instead`,
+    );
+  } else if (tls.servername === null) {
+    problems.push('no SNI/hostname was sent, so hostname verification cannot have happened');
+  } else if (normaliseEndpointHost(tls.servername) !== endpoint) {
+    problems.push(
+      `the certificate was verified against "${normaliseEndpointHost(tls.servername)}" but DATABASE_URL names "${endpoint}" — the two must match`,
+    );
+  }
+  return problems;
+}
+
+/**
+ * A connection-pooler endpoint. Neon exposes `<project>-pooler.<region>.aws.neon.tech`
+ * and PgBouncer deployments conventionally name the host `…-pooler…`. This is a
+ * naming heuristic used ONLY to explain the `pg_stat_ssl` mismatch — never to
+ * relax a check.
+ */
+export function isPooledEndpointHost(host: string): boolean {
+  return /(^|[-.])pooler([-.]|$)|pgbouncer/i.test(host.trim());
+}
+
+/**
+ * Managed providers whose DOCUMENTED architecture puts a TLS-terminating front
+ * proxy between the client and the PostgreSQL compute — so `pg_stat_ssl` reports
+ * the proxy-to-compute connection, not the client's, whether or not connection
+ * pooling is switched on.
+ *
+ * This is provider documentation, NOT something this collector measures. It is
+ * used only to explain an observation; it never changes a check.
+ */
+export type ManagedProvider = 'neon';
+
+export function managedProviderFor(host: string): ManagedProvider | null {
+  const endpoint = normaliseEndpointHost(host);
+  return endpoint === 'neon.tech' || endpoint.endsWith('.neon.tech') ? 'neon' : null;
+}
+
+/**
+ * Plain-language explanation of the `pg_stat_ssl` value, or null when there is
+ * nothing surprising to say.
+ *
+ * Every branch separates what THIS RUN MEASURED (the client socket is encrypted
+ * and its certificate was accepted for this hostname; the server reports its own
+ * backend connection as non-TLS) from what it did NOT measure (whatever
+ * terminates TLS in front of the compute, and the hop beyond it).
+ */
+export function backendSslExplanation(args: {
+  clientVerified: boolean;
+  backendSsl: boolean | null;
+  pooledEndpoint: boolean;
+  provider?: ManagedProvider | null;
+}): string | null {
+  if (!args.clientVerified) return null;
+  if (args.backendSsl === true) return null;
+  if (args.backendSsl === null) {
+    return 'MEASURED: this client session is TLS and its certificate was accepted. NOT MEASURED: `pg_stat_ssl` could not be read, so the server-side view of its own backend connection is unknown.';
+  }
+  const measured =
+    'MEASURED by this run: the client socket is encrypted and the certificate was accepted for this hostname. NOT MEASURED: everything beyond that socket — the hop that terminates it and whatever connects to the compute.';
+  if (args.pooledEndpoint) {
+    return `The "no" above is the SERVER's view of its own backend connection, not of this session. A pooled endpoint (\u2026-pooler\u2026) terminates the client's TLS and opens its own connection to PostgreSQL, so \`pg_stat_ssl\` describes that inner connection. ${measured} Not a downgrade, and not evidence of plaintext access.`;
+  }
+  if (args.provider === 'neon') {
+    return `The "no" above is the SERVER's view of its own backend connection, not of this session. PROVIDER ARCHITECTURE, not a measurement: Neon puts a front proxy in front of the compute for every client connection, pooled or direct — the client's TLS ends at that proxy, and the proxy reaches the compute over Neon's internal network. A direct (non-pooler) hostname is therefore expected to show \`ssl = false\` on the compute exactly like a pooled one. ${measured} The proxy-to-compute hop cannot be observed from the client; the client-visible guarantee is the verified TLS session reported above.`;
+  }
+  return `The "no" above is the SERVER's view of its own backend connection, not of this session, and the endpoint is not a recognised pooler or managed-provider name. ${measured} Identify what sits between this client and PostgreSQL — a proxy, load balancer or private gateway — before drawing a conclusion.`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Notification delivery evidence — summarise, never expose                    */
+/* -------------------------------------------------------------------------- */
+
+/** The columns this summary needs. `recipient` is deliberately NOT among them. */
+export interface DeliveryRowForSummary {
+  channel: string;
+  status: string;
+  attempts: number;
+  max_attempts: number;
+  failure_category: string;
+  delivered_at: string | null;
+  provider?: string | null;
+  provider_response_code?: string | null;
+}
+
+export interface DeliveryFailureSummary {
+  total: number;
+  delivered: number;
+  neverDelivered: number;
+  /** Rows that used their whole attempt budget without delivering. */
+  exhausted: number;
+  /** Rows that failed with no SMTP/HTTP reply at all (timeout or bare transport fault). */
+  failedWithoutProviderResponse: number;
+  byStatus: Record<string, number>;
+  byCategory: Record<string, number>;
+  byChannel: Record<string, number>;
+  byProvider: Record<string, number>;
+}
+
+function bump(counts: Record<string, number>, key: string): void {
+  counts[key] = (counts[key] ?? 0) + 1;
+}
+
+/**
+ * Aggregate the outbox rows into counts an operator can act on.
+ *
+ * Counts only: no recipient, no message id, no free-text error. The historical
+ * rows are read, never modified.
+ */
+export function summariseNotificationDeliveries(
+  rows: readonly DeliveryRowForSummary[],
+): DeliveryFailureSummary {
+  const summary: DeliveryFailureSummary = {
+    total: rows.length,
+    delivered: 0,
+    neverDelivered: 0,
+    exhausted: 0,
+    failedWithoutProviderResponse: 0,
+    byStatus: {},
+    byCategory: {},
+    byChannel: {},
+    byProvider: {},
+  };
+  for (const row of rows) {
+    const status = String(row.status ?? 'unknown') || 'unknown';
+    const category = String(row.failure_category ?? 'none') || 'none';
+    const channel = String(row.channel ?? 'unknown') || 'unknown';
+    const provider = String(row.provider ?? 'unknown') || 'unknown';
+    bump(summary.byStatus, status);
+    bump(summary.byCategory, category);
+    bump(summary.byChannel, channel);
+    bump(summary.byProvider, provider);
+    const delivered = status === 'delivered';
+    if (delivered) summary.delivered += 1;
+    else summary.neverDelivered += 1;
+    const attempts = Number(row.attempts ?? 0);
+    const max = Number(row.max_attempts ?? 0);
+    if (!delivered && max > 0 && attempts >= max) summary.exhausted += 1;
+    if (!delivered && (row.provider_response_code ?? null) === null) {
+      if (category === 'timeout' || category === 'transient' || category === 'unknown') {
+        summary.failedWithoutProviderResponse += 1;
+      }
+    }
+  }
+  return summary;
+}
+
+/**
+ * One actionable sentence for the dominant failure signature, or null when
+ * nothing needs saying. Static interpretation of counts — it never quotes a
+ * row, a recipient or a provider message.
+ */
+export function deliveryFailureHint(summary: DeliveryFailureSummary): string | null {
+  if (summary.total === 0) return null;
+  if (summary.neverDelivered === 0) return null;
+
+  const has = (category: string): boolean => (summary.byCategory[category] ?? 0) > 0;
+
+  if (has('configuration')) {
+    return 'At least one delivery was refused by the provider as a CONFIGURATION failure (rejected credentials, or a From/sender the provider will not accept). Retrying cannot fix it: correct the deployment environment first. These rows are terminal until an operator recovers them deliberately; the worker does not replay them.';
+  }
+  if (has('permanent')) {
+    return 'At least one delivery was rejected by the provider as PERMANENT (bad recipient address or refused message content). It was dead-lettered on the first attempt instead of burning the retry budget; the address or the message must change.';
+  }
+  if (has('stale')) {
+    return 'At least one row was recovered from a worker that did not finish inside its lease (a crash, a deploy or a forced stop mid-send). The outcome of that send is UNKNOWN — the stable Message-Id is what lets a receiver collapse a duplicate, not a guarantee.';
+  }
+  if (summary.failedWithoutProviderResponse > 0 && summary.exhausted > 0) {
+    return 'Every attempt of at least one delivery failed with NO reply from the provider at all (timeout / bare transport fault), and the retry budget is exhausted. That is a reachability problem — wrong host or port, or the platform blocking outbound traffic — not a credential problem. On Render\'s free plan outbound SMTP ports are blocked (see render.yaml and docs/notification-delivery.md), so the supported path there is Resend over HTTPS (the RESEND_API_KEY variable). Nothing was accepted for delivery; if a late attempt did land, the stable Message-Id is what lets the receiver collapse the duplicate.';
+  }
+  if (has('timeout') || has('transient')) {
+    return 'At least one delivery hit a transient or timeout condition. The worker retries with exponential backoff up to the attempt budget; a row that is still `pending` is expected to be retried, and only an exhausted row is terminal.';
+  }
+  return null;
+}
+
 export interface SessionFacts {
   defaultTransactionReadOnly: string;
   transactionReadOnly: string;
@@ -521,6 +895,11 @@ export function factsFromConnectionRow(row: Record<string, unknown>): SessionFac
   };
 }
 
+/**
+ * The safety verdict for the session, computed from what the server reported.
+ * Pure and exhaustive: every fact that is not explicitly safe is a violation, so
+ * a missing or unexpected value fails closed.
+ */
 export function evaluateSafety(facts: SessionFacts): { ok: boolean; violations: string[] } {
   const violations: string[] = [];
 
@@ -663,8 +1042,21 @@ interface ConnectionEvidence {
   serverVersion: string;
   /** Requested by this run (configuration, not observed). */
   tlsRequestedMode: 'verify-full';
-  /** Observed from pg_stat_ssl for this session. */
+  /** Observed on the CLIENT socket that carries this session. */
+  tlsClient: ClientTlsObservation;
+  /** True only when `tlsVerificationProblems()` returned nothing. */
+  tlsVerified: boolean;
+  /** Endpoint name looks like a connection pooler (`…-pooler…`). */
+  pooledEndpoint: boolean;
+  /**
+   * SERVER-side view: `pg_stat_ssl.ssl` for `pg_backend_pid()`.
+   *
+   * NOT a statement about the client session. Behind a pooler this describes
+   * the pooler-to-server connection and is normally false.
+   */
   ssl: boolean | null;
+  /** Explains a client-TLS / backend-SSL mismatch. Null when they agree. */
+  tlsNote: string | null;
   defaultTransactionReadOnly: string;
   transactionReadOnly: string;
   /** `on` when the connecting role is a superuser — always a refusal. */
@@ -1013,6 +1405,7 @@ const Q_ALERT_DELIVERIES = `
 
 const Q_NOTIFICATION_DELIVERIES = `
   SELECT d.alert_id, d.channel, d.template, d.status, d.attempts, d.max_attempts,
+         d.provider, d.provider_response_code,
          d.failure_category, d.last_error, d.next_attempt_at, d.delivered_at, d.created_at
   FROM notification_deliveries d
   JOIN alerts a ON a.id = d.alert_id
@@ -1197,6 +1590,9 @@ interface Evidence {
     alert_id: string;
     channel: string;
     template: string;
+    /** The adapter that handled the attempt: `smtp`, `resend`, `webhook`, `push`. */
+    provider: string | null;
+    provider_response_code: string | null;
     status: string;
     attempts: number;
     max_attempts: number;
@@ -1402,6 +1798,38 @@ async function main(): Promise<number> {
     return 3;
   }
 
+  // --- TLS: prove it on the socket that actually carries this session --------
+  // `pg_stat_ssl` (read further down) is the server's view of its own backend
+  // connection; behind a pooler that connection belongs to the pooler. The
+  // client socket is the only thing that can prove THIS session is encrypted
+  // and that the certificate chain and hostname were verified.
+  const endpointHost = (() => {
+    try {
+      return new URL(rawUrl).hostname;
+    } catch {
+      return '';
+    }
+  })();
+  const tlsClient = readClientTlsState(
+    (client as unknown as { connection?: { stream?: unknown } }).connection?.stream,
+  );
+  const tlsProblems = tlsVerificationProblems(tlsClient, endpointHost);
+  if (tlsProblems.length > 0) {
+    console.error(
+      [
+        '[gold-diagnostic] refusing to continue: this session is not a verified TLS session.',
+        ...tlsProblems.map((v) => `  - ${v}`),
+        '  Certificate and hostname verification are never relaxed; nothing was read and no report was written.',
+      ].join('\n'),
+    );
+    client.release();
+    await pool.end().catch(() => {});
+    return 3;
+  }
+  const tlsVerified = true;
+  const pooledEndpoint = isPooledEndpointHost(endpointHost);
+  const provider = managedProviderFor(endpointHost);
+
   const ro = new ReadOnlySession(client);
   try {
     // One explicit read-only transaction for the whole session: nothing this
@@ -1446,7 +1874,11 @@ async function main(): Promise<number> {
       database: String(c['database'] ?? ''),
       serverVersion: redact(String(versionRes.rows[0]?.server_version ?? '')),
       tlsRequestedMode: 'verify-full',
+      tlsClient,
+      tlsVerified,
+      pooledEndpoint,
       ssl: sslValue,
+      tlsNote: backendSslExplanation({ clientVerified: tlsVerified, backendSsl: sslValue, pooledEndpoint, provider }),
       defaultTransactionReadOnly: facts.defaultTransactionReadOnly,
       transactionReadOnly: facts.transactionReadOnly,
       isSuperuser: facts.isSuperuser,
@@ -1740,6 +2172,11 @@ async function main(): Promise<number> {
           alert_id: String(r['alert_id'] ?? ''),
           channel: String(r['channel'] ?? ''),
           template: String(r['template'] ?? ''),
+          provider: r['provider'] === null || r['provider'] === undefined ? null : String(r['provider']),
+          provider_response_code:
+            r['provider_response_code'] === null || r['provider_response_code'] === undefined
+              ? null
+              : String(r['provider_response_code']),
           status: String(r['status'] ?? ''),
           attempts: Number(r['attempts'] ?? 0),
           max_attempts: Number(r['max_attempts'] ?? 0),
@@ -2114,8 +2551,33 @@ export function renderMarkdown(e: Evidence): string {
   if (e.connection) {
     out.push(`- Database: \`${mdCode(e.connection.database)}\` (role name intentionally not printed)`);
     out.push(`- Server: ${mdText(e.connection.serverVersion.split(',').slice(0, 1).join(''))}`);
-    out.push(`- TLS requested by this run: \`${e.connection.tlsRequestedMode}\` (configuration: certificate chain and hostname verified by the client)`);
-    out.push(`- TLS observed for this session (\`pg_stat_ssl\`): ${e.connection.ssl === null ? 'unknown' : e.connection.ssl ? 'yes' : 'no'}`);
+    out.push(`- TLS requested by this run (configuration, not evidence): \`${e.connection.tlsRequestedMode}\` — the client verifies the certificate chain AND the hostname, and never falls back`);
+    // Tolerate a report rendered from an older JSON: absence is reported as
+    // `not recorded`, never as a pass.
+    const tlsKnown = typeof e.connection.tlsVerified === 'boolean';
+    const tls = e.connection.tlsClient ?? readClientTlsState(null);
+    out.push(`- TLS established by THIS client (observed on the socket): ${
+      !tlsKnown ? '_not recorded in this report_' : e.connection.tlsVerified ? '**yes — verified**' : '**NO**'
+    }`);
+    if (tls.encrypted === true) {
+      const bits = [
+        tls.protocol === null ? null : `protocol \`${mdCode(tls.protocol)}\``,
+        tls.cipher === null ? null : `cipher \`${mdCode(tls.cipher)}\``,
+        tls.servername === null ? null : `SNI/hostname \`${mdCode(tls.servername)}\``,
+        tls.peerCertificateSubject === null ? null : `server cert subject ${mdText(tls.peerCertificateSubject)}`,
+        tls.peerCertificateIssuer === null ? null : `issuer ${mdText(tls.peerCertificateIssuer)}`,
+        tls.peerCertificateValidTo === null ? null : `valid to ${mdText(tls.peerCertificateValidTo)}`,
+        tls.peerCertificateSha256 === null ? null : `SHA-256 \`${mdCode(tls.peerCertificateSha256)}\``,
+      ].filter((v): v is string => v !== null);
+      if (bits.length > 0) out.push(`  - ${bits.join('; ')}`);
+    }
+    out.push(`- Server-side view (\`pg_stat_ssl.ssl\` for \`pg_backend_pid()\`): ${e.connection.ssl === null ? 'unknown' : e.connection.ssl ? 'yes' : 'no'} — the SERVER's view of its own backend connection, not of this client session`);
+    if (e.connection.pooledEndpoint) {
+      out.push('- Endpoint: pooled (`…-pooler…`). The pooler terminates this client\'s TLS and opens its own connection to PostgreSQL.');
+    }
+    if (e.connection.tlsNote !== null) {
+      out.push(`- TLS note: ${mdText(e.connection.tlsNote)}`);
+    }
     out.push(`- \`default_transaction_read_only\` = \`${mdCode(e.connection.defaultTransactionReadOnly)}\``);
     out.push(`- \`transaction_read_only\` (inside the txn) = \`${mdCode(e.connection.transactionReadOnly)}\``);
     out.push(`- \`statement_timeout\` = \`${mdCode(e.connection.statementTimeout)}\``);
@@ -2312,7 +2774,32 @@ export function renderMarkdown(e: Evidence): string {
   out.push('');
   out.push('### 7.6 `notification_deliveries` (M7.3 outbox — recipient omitted)');
   out.push('');
-  out.push(e.notificationDeliveries.length > 0 ? jsonBlock(e.notificationDeliveries) : '_None._');
+  if (e.notificationDeliveries.length === 0) {
+    out.push('_None._');
+  } else {
+    // Counts first: they are what an operator triages on. No recipient, no
+    // message id and no free-text provider message is summarised here.
+    const summary = summariseNotificationDeliveries(e.notificationDeliveries);
+    out.push('Delivery summary (counts only):');
+    out.push('');
+    out.push('| dimension | value | count |');
+    out.push('| --- | --- | --- |');
+    for (const [k, v] of Object.entries(summary.byStatus)) out.push(mdRow(['status', k, v]));
+    for (const [k, v] of Object.entries(summary.byCategory)) out.push(mdRow(['failure_category', k, v]));
+    for (const [k, v] of Object.entries(summary.byChannel)) out.push(mdRow(['channel', k, v]));
+    for (const [k, v] of Object.entries(summary.byProvider)) out.push(mdRow(['provider', k, v]));
+    out.push(mdRow(['attempts', 'exhausted the attempt budget', summary.exhausted]));
+    out.push(mdRow(['attempts', 'failed with no provider reply at all', summary.failedWithoutProviderResponse]));
+    out.push('');
+    const hint = deliveryFailureHint(summary);
+    if (hint !== null) {
+      out.push(`Interpretation (static text, derived from the counts above): ${mdText(hint)}`);
+      out.push('');
+    }
+    out.push('Rows (as recorded; this run read them and changed nothing):');
+    out.push('');
+    out.push(jsonBlock(e.notificationDeliveries));
+  }
   out.push('');
 
   out.push('## 8. Scanner evidence');
@@ -2326,7 +2813,28 @@ export function renderMarkdown(e: Evidence): string {
   out.push(e.scannerRuns.length > 0 ? jsonBlock(e.scannerRuns) : '_No scanner run has ever been recorded._');
   out.push('');
 
-  out.push('## 9. Notes recorded while collecting');
+  out.push('## 9. What the recorded statuses mean (static — NOT measured by this run)');
+  out.push('');
+  out.push('This section is fixed text, not evidence. It is here because `active` and `published` are routinely misread as "live".');
+  out.push('');
+  out.push('| Field | What it means in this codebase | What it does NOT mean |');
+  out.push('| --- | --- | --- |');
+  out.push(mdRow(["strategies.status = 'active'", "the strategy is eligible for the SCANNER, together with a published version, the owner's scanner entitlement and its three role timeframes (packages/core/src/scanner/service.ts, getEligibleStrategies)", 'not trading, not automation, not live execution']));
+  out.push(mdRow(["strategies.status = 'paused'", "excluded from scanner eligibility — the same query requires 'active'", '—']));
+  out.push(mdRow(["strategies.status = 'draft' or 'archived'", 'not eligible for scanning', '—']));
+  out.push(mdRow(["strategy_versions.status = 'published'", 'the version the scanner reads; published versions and their configuration are immutable (packages/core/src/strategies/strategies.ts)', 'not an execution switch, and not evidence that a scan has ever run']));
+  out.push('');
+  out.push('Execution is governed by a chain that this report does not read:');
+  out.push('');
+  out.push(`- ${mdText('users.automation_enabled AND an automation entitlement — no plan grants automation in this version, so the entitlement is false for every account (packages/core/src/execution/automation.ts)')}`);
+  out.push(`- ${mdText('an execution profile that is enabled, plus 13 ordered gates (authorization, entitlement, automation, profile, kill switches, risk verdict, exposure, provider health, ...) that fail closed on anything unproven (packages/core/src/execution/gates.ts)')}`);
+  out.push(`- ${mdText('kill switches at global, user, strategy and profile scope; EXECUTION_GLOBAL_KILL_SWITCH=true pins the global one on')}`);
+  out.push(`- ${mdText('live execution is refused outright by the profile service, and no broker-account grant mechanism exists (packages/core/src/execution/profiles.ts, composition-fence.ts)')}`);
+  out.push('');
+  out.push(`Consequence: ${mdText("'active' + 'published' can make a strategy SCANNABLE. It cannot place an order by itself. To stop scanning, set strategies.status = 'paused' (or SCANNER_ENABLED=false for the whole deployment); publication status is not a pause switch.")}`);
+  out.push('');
+
+  out.push('## 10. Notes recorded while collecting');
   out.push('');
   if (e.notes.length === 0) {
     out.push('_None._');

@@ -183,6 +183,29 @@ Retry loops are impossible by construction: the claim itself requires
 `attempts < max_attempts`, and `unavailable` is terminal until configuration
 changes.
 
+### Diagnosing a `timeout` dead letter (`attempts = max_attempts`, no reply code)
+
+A row that ends `failed` with `failure_category = 'timeout'`,
+`provider_response_code = NULL` and `delivered_at = NULL` never got a single
+byte back from the provider: the TCP connection (or the TLS handshake, or the
+greeting) did not complete inside `NOTIFICATION_PROVIDER_TIMEOUT_MS` (15 s by
+default), on every attempt. That is **reachability**, not credentials:
+
+1. Outbound SMTP blocked — on Render's free plan ports 25/465/587 are not
+   reachable, which is why the blueprint comments say to use Resend over HTTPS
+   (port 443) there.
+2. Wrong host/port, or `SMTP_SECURE`/port mismatch (implicit TLS on a STARTTLS
+   port): the peer accepts the socket and then never completes the handshake.
+3. A network policy/firewall silently dropping the SYN (a refused connection
+   fails fast with `ECONNREFUSED`; a *dropped* one can only time out).
+
+Check `provider` on the row first: if it is `resend`, the failure is HTTPS and
+the cause is different (see the 401/403 section above). Fix the transport, then
+let the next alert create a new job — dead-lettered rows are not replayed
+automatically, and the diagnostic collector
+(`npm run diagnostics:gold-v8`) summarises these counts without printing a
+recipient.
+
 ## 6. Provider abstraction
 
 `NotificationProvider` (`packages/core/src/notifications/provider.ts`) is the
