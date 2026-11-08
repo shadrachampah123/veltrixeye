@@ -39,6 +39,16 @@ the driver message, the stack, or the connection string.
 Retention is the operator's file system. There is no public copy: a short
 artifact retention period is not an access control, so no artifact exists.
 
+**An existing report is never overwritten.** Before anything else — before the
+credential is read and before any connection is attempted — the script checks
+whether `gold-v8-production-evidence.json` or `gold-v8-production-evidence.md`
+already exists in `--out`. If either does, the run **refuses with exit 2** and
+writes nothing. The check is repeated at write time and both files are opened
+exclusively, so an earlier report also survives a run that finishes while
+another is reading. Nothing is deleted or renamed: move the old report aside, or
+pass a different `--out`. That way a refused or failed run can never be mistaken
+for a successful one, and no other file in the directory is touched.
+
 ## There is deliberately no CI workflow for this
 
 No GitHub Actions workflow runs this script, and no repository or environment
@@ -75,7 +85,9 @@ DATABASE_URL='postgres://<ro-role>:<password>@<host>:5432/<db>?sslmode=verify-fu
 ```
 
 Exit codes: `0` evidence collected, `2` configuration refused (nothing
-attempted), `3` a safety condition failed or a query failed (no report written).
+attempted — including a report that already exists in `--out`), `3` a safety
+condition failed, a query failed, an ambiguous target was found, or the report
+could not be written (in every case: no new report).
 
 ### Connection requirements (enforced, not advisory)
 
@@ -91,6 +103,14 @@ attempted), `3` a safety condition failed or a query failed (no report written).
   never falls back to the default 8, because that would collect evidence for a
   version the operator did not ask for. Omitting the flag altogether means
   version 8.
+- **The URL must name the role and the database.** `postgres://user:password@host:5432/database`
+  is the expected shape; a URL without a user, or without a database path, is
+  refused with exit 2. `pg` fills a missing user, password, host, port or database
+  from the environment (`val()` in `pg/lib/connection-parameters.js`), so an
+  incomplete URL would silently describe a target the operator never named.
+  `PGUSER`, `PGDATABASE`, `PGPASSWORD`, `PGHOST`, `PGPORT` and `PGSERVICE` are
+  refused outright for the same reason: the target comes from `DATABASE_URL`
+  only, and nothing from a credential is printed.
 - **TLS is `verify-full` and nothing else.** `DATABASE_SSL_MODE` may only be
   `verify-full` (the default). The URL may carry exactly one query parameter,
   once: `sslmode=verify-full`. Every other parameter is refused — `options`,
@@ -111,6 +131,11 @@ attempted), `3` a safety condition failed or a query failed (no report written).
   privilege and is not a superuser. A writable role is a refusal, not a warning.
   If production needs a custom CA, that is a configuration blocker to report —
   not a reason to relax verification here.
+  The probe is answered by `has_table_privilege(current_user, …)` for the tables
+  it touches. If one of those tables does not exist in the connected database,
+  that query itself fails (SQLSTATE `42P01`), and the run **refuses with exit 3
+  and writes no report** — a missing table is a fail-closed refusal, never an
+  assumed privilege.
 
 ### What it can never do
 

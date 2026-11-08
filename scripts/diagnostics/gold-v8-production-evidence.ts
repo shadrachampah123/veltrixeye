@@ -41,9 +41,11 @@
  *     invented, guessed or defaulted.
  *
  *   - NO REPORT ON STDOUT OR STDERR. The evidence is written to the JSON and
- *     Markdown files only. stdout carries a one-line completion status. Errors
- *     print a machine-readable code (SQLSTATE or Node TLS code), never the
- *     driver message, stack or connection string.
+ *     Markdown files only. On success stdout carries three status lines: the
+ *     completion line with the output directory, the `secretsRedacted` result,
+ *     and a reminder that nothing is uploaded. Errors print a machine-readable
+ *     code (SQLSTATE or Node TLS code), never the driver message, stack or
+ *     connection string.
  *
  *   - NOTHING IS TRIGGERED. This file imports `pg` and `node:*` ONLY. It never
  *     constructs `ScannerService`, `AlertService`, `NotificationWorker`,
@@ -57,8 +59,26 @@
  *     columns (`scanner_runs.error`, `notification_deliveries.last_error`)
  *     pass through `redact()` and are truncated.
  *
- *   - READ COST IS BOUNDED. `statement_timeout` is set for the session and
- *     every row-returning query is `LIMIT`ed.
+ *   - READ COST IS BOUNDED. `SET LOCAL statement_timeout = '30s'` applies to the
+ *     whole read-only transaction (transaction-local, not session-wide). The
+ *     open-ended, row-returning queries carry a `LIMIT` (`Q_MIGRATIONS` 5,
+ *     `Q_LATEST_SETUPS` 10, `Q_ALERTS` 25, the two delivery queries 100,
+ *     `Q_SETUP_EVENTS` 200, `Q_SCANNER_RUNS` 5); the rest are bounded by their
+ *     predicate and shape — one row per strategy, role or timeframe, and single
+ *     rows for `Q_CONNECTION`, `Q_SERVER_VERSION` and `Q_SSL` — so not every
+ *     query needs a LIMIT to be bounded.
+ *
+ *   - THE TARGET IS EXPLICIT. `DATABASE_URL` must name the connecting role AND
+ *     the database. `pg` fills a missing user, password, host, port or database
+ *     from the environment, so an incomplete URL would silently describe a
+ *     target nobody named; `PGUSER`, `PGDATABASE`, `PGPASSWORD`, `PGHOST`,
+ *     `PGPORT` and `PGSERVICE` are refused for the same reason. The target is
+ *     exactly what the operator typed, or the run stops (exit 2).
+ *
+ *   - AN EARLIER REPORT IS NEVER OVERWRITTEN. If `--out` already holds a report,
+ *     the run refuses with exit 2 before the credential is even read, and the
+ *     write itself is exclusive (`wx`). A refused or failed run can therefore
+ *     never be mistaken for a successful one, and nothing is deleted.
  *
  *   - FAIL CLOSED ON CONFIGURATION. `DATABASE_URL` may carry ONE query
  *     parameter: `sslmode=verify-full`. Every other parameter is refused before
@@ -112,12 +132,14 @@
  *
  * EXIT CODES
  *   0  evidence collected (whether or not anything is found)
- *   2  DATABASE_URL missing/empty, TLS configuration refused, or an invalid
- *      argument (for example a non-integer --version) — nothing attempted
- *   3  connection or query failure, ambiguous target, failed safety check, or
- *      the output check failed — nothing written
+ *   2  DATABASE_URL missing, empty or incomplete, TLS or connection configuration
+ *      refused, an ambient libpq variable set, a report already present in
+ *      --out, or an invalid argument (for example a non-integer --version) —
+ *      nothing attempted
+ *   3  connection or query failure, ambiguous target, failed safety check, the
+ *      output check failed, or the report could not be written — nothing written
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
@@ -308,6 +330,24 @@ export function connectionUrlProblem(rawUrl: string): string | null {
   } catch {
     return 'DATABASE_URL could not be parsed as a URL (URL-encode special characters in the password). Nothing was attempted.';
   }
+  // The target must be EXPLICIT. `pg` resolves every missing piece of the target
+  // from the environment (`val()` in `pg/lib/connection-parameters.js`), so a URL
+  // without a user or without a database would silently take PGUSER / PGDATABASE
+  // or the operating-system user name. The evidence must describe the database
+  // and role the operator named, so both parts are required and neither is
+  // defaulted. No value from the URL is ever echoed.
+  if (url.username === '') {
+    return (
+      'DATABASE_URL does not name the connecting role. Use postgres://user:password@host:5432/database — ' +
+      'without a user, pg falls back to PGUSER or the operating-system user name. Nothing was attempted.'
+    );
+  }
+  if (url.pathname.replace(/^\//, '') === '') {
+    return (
+      'DATABASE_URL does not name the database. Use postgres://user:password@host:5432/database — ' +
+      'without a database path, pg falls back to PGDATABASE or the user name. Nothing was attempted.'
+    );
+  }
   // Every occurrence is checked, and a repeated key is refused outright: a
   // duplicate could hide a weaker value behind an acceptable first one
   // (`sslmode=verify-full&sslmode=disable`), and even a benign-looking
@@ -369,6 +409,37 @@ export function tlsEnvProblem(env: Record<string, string | undefined>): string |
     const value = env[name];
     if (value !== undefined && value !== '') {
       return `${name} is set. TLS and the connection are configured by this script only (verify-full); unset it. Nothing was attempted.`;
+    }
+  }
+  return null;
+}
+
+/**
+ * libpq connection variables that `pg` honours from the environment for the parts
+ * of the target DATABASE_URL already states. Since the URL must name the role and
+ * the database (`connectionUrlProblem`), any of these being set can only mean the
+ * operator meant a different target than the one passed — so they are refused
+ * instead of merged. Nothing here reads or prints a value.
+ */
+export const REFUSED_CONNECTION_ENV_VARS: readonly string[] = [
+  'PGUSER',
+  'PGDATABASE',
+  'PGPASSWORD',
+  'PGHOST',
+  'PGPORT',
+  'PGSERVICE',
+];
+
+/**
+ * Returns a message when the environment carries a libpq connection variable
+ * that could silently retarget the connection, otherwise null. Pure: takes the
+ * environment explicitly, like `tlsEnvProblem`.
+ */
+export function connectionTargetEnvProblem(env: Record<string, string | undefined>): string | null {
+  for (const name of REFUSED_CONNECTION_ENV_VARS) {
+    const value = env[name];
+    if (value !== undefined && value !== '') {
+      return `${name} is set. The connection target comes from DATABASE_URL only — this script never merges an ambient libpq variable; unset it. Nothing was attempted.`;
     }
   }
   return null;
@@ -1153,13 +1224,25 @@ async function main(): Promise<number> {
   }
   const notes: string[] = [];
 
+  // --- the output is never overwritten --------------------------------------
+  // Checked first, before the credential is looked at and before any connection:
+  // a report that already exists belongs to some other run, and this run must not
+  // be able to leave it looking like fresh evidence. Nothing is deleted.
+  const staleOutput = existingReportProblem(opts.outDir);
+  if (staleOutput !== null) {
+    console.error(`[gold-diagnostic] refusing to run: ${staleOutput}`);
+    return 2;
+  }
+
   const rawUrl = process.env['DATABASE_URL'];
   if (!rawUrl || rawUrl.trim() === '') {
     console.error(
       [
         '[gold-diagnostic] DATABASE_URL is not set — nothing was attempted.',
         '',
-        '  This diagnostic needs a repository secret named exactly:',
+        '  Supply it yourself in your local shell. It is never read from a',
+        '  repository or environment secret — no workflow is wired to it. The',
+        '  variable must be named exactly:',
         '',
         '      DATABASE_URL',
         '',
@@ -1215,6 +1298,11 @@ async function main(): Promise<number> {
   const envProblem = tlsEnvProblem(process.env as Record<string, string | undefined>);
   if (envProblem !== null) {
     console.error(`[gold-diagnostic] ${envProblem}`);
+    return 2;
+  }
+  const targetEnvProblem = connectionTargetEnvProblem(process.env as Record<string, string | undefined>);
+  if (targetEnvProblem !== null) {
+    console.error(`[gold-diagnostic] ${targetEnvProblem}`);
     return 2;
   }
   const urlProblem = connectionUrlProblem(rawUrl);
@@ -1693,12 +1781,18 @@ async function main(): Promise<number> {
   }
 
   // --- write report ---------------------------------------------------------
-  const markdown = renderMarkdown(finalEvidence);
-  mkdirSync(opts.outDir, { recursive: true });
-  const jsonPath = path.join(opts.outDir, 'gold-v8-production-evidence.json');
-  const mdPath = path.join(opts.outDir, 'gold-v8-production-evidence.md');
-  writeFileSync(jsonPath, `${JSON.stringify(finalEvidence, null, 2)}\n`, 'utf8');
-  writeFileSync(mdPath, markdown, 'utf8');
+  // `writeReport` re-checks for an existing report and opens both files
+  // exclusively, so an earlier report is never replaced — even if another run
+  // finished while this one was reading.
+  try {
+    writeReport(opts.outDir, finalEvidence);
+  } catch (err) {
+    if (err instanceof ReportWriteError) {
+      console.error(`[gold-diagnostic] ${err.stale ? 'refusing to write' : 'report'} ${err.message}`);
+      return 3;
+    }
+    throw err;
+  }
 
   // stdout carries a status line only. The report is never printed and never
   // uploaded: it stays in the two local files above, inside a gitignored
@@ -1707,6 +1801,77 @@ async function main(): Promise<number> {
   console.info(`[gold-diagnostic] output check: secretsRedacted=${finalEvidence.safety.secretsRedacted}.`);
   console.info('[gold-diagnostic] The report is NOT printed here and is NOT uploaded anywhere. It stays local.');
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Output files: a previous report is never overwritten
+// ---------------------------------------------------------------------------
+
+export const REPORT_JSON_NAME = 'gold-v8-production-evidence.json';
+export const REPORT_MD_NAME = 'gold-v8-production-evidence.md';
+
+export function reportPaths(outDir: string): { jsonPath: string; mdPath: string } {
+  return { jsonPath: path.join(outDir, REPORT_JSON_NAME), mdPath: path.join(outDir, REPORT_MD_NAME) };
+}
+
+/**
+ * Refuse to write over an existing report. A refused or failed run must never be
+ * mistakable for a successful one, so an earlier report is neither deleted nor
+ * replaced: the operator moves it aside or passes another `--out`. Only the two
+ * report file names are ever considered — nothing else in the directory is
+ * touched.
+ */
+export function existingReportProblem(outDir: string): string | null {
+  const { jsonPath, mdPath } = reportPaths(outDir);
+  const present = [jsonPath, mdPath].filter((file) => existsSync(file));
+  if (present.length === 0) return null;
+  return [
+    `a report already exists in ${outDir}/:`,
+    ...present.map((file) => `  - ${file}`),
+    "  An earlier run wrote it, so this run writes nothing and the old report cannot be",
+    "  mistaken for this run's evidence. Move it aside (or pass a different --out).",
+  ].join('\n');
+}
+
+/**
+ * Thrown when the report cannot be written: either a report is already there
+ * (`stale`, a refusal) or the write itself failed. `main()` maps both to exit 3.
+ */
+export class ReportWriteError extends Error {
+  constructor(
+    message: string,
+    readonly stale: boolean,
+  ) {
+    super(message);
+    this.name = 'ReportWriteError';
+  }
+}
+
+/**
+ * Render and write the report. This is the ONLY write path — `main()` uses it and
+ * so do the tests — and it never replaces an existing report: the guard runs
+ * again here, and both files are opened with the exclusive `wx` flag, so an
+ * earlier report survives even if another run finished during this one.
+ */
+export function writeReport(
+  outDir: string,
+  evidence: Parameters<typeof renderMarkdown>[0],
+): { jsonPath: string; mdPath: string } {
+  const stale = existingReportProblem(outDir);
+  if (stale !== null) throw new ReportWriteError(stale, true);
+  const markdown = renderMarkdown(evidence);
+  mkdirSync(outDir, { recursive: true });
+  const { jsonPath, mdPath } = reportPaths(outDir);
+  try {
+    writeFileSync(jsonPath, `${JSON.stringify(evidence, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+    writeFileSync(mdPath, markdown, { encoding: 'utf8', flag: 'wx' });
+  } catch (err) {
+    throw new ReportWriteError(
+      `could not be written (error code: ${errorCodeOf(err)}); no existing file was overwritten`,
+      false,
+    );
+  }
+  return { jsonPath, mdPath };
 }
 
 // ---------------------------------------------------------------------------
@@ -1759,6 +1924,25 @@ export function mdCell(value: unknown): string {
 }
 
 /**
+ * A database-derived value rendered as ordinary Markdown TEXT — a heading, a
+ * bullet line or the inside of an inline code span. `mdCell` cannot be used here
+ * (it escapes table separators), so this does the other half of the job:
+ * newlines are collapsed, so a value can never begin a new Markdown line (a
+ * heading, a fence, a table row or a list item), and backticks are removed, so a
+ * value can never open or close a code span or a fence. The value stays
+ * readable; only characters that are Markdown structure are neutralised.
+ *
+ * Every interpolation of database-, server- or operator-derived text in
+ * `renderMarkdown` goes through `mdCell` (table cells), `jsonBlock` (structured
+ * payloads) or this function. Literal report prose is never built from data.
+ */
+export function mdText(value: unknown): string {
+  return String(value ?? '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/`/g, "'");
+}
+
+/**
  * One Markdown table row. EVERY cell goes through `mdCell`, so a database value
  * cannot inject a column separator, a newline or a code fence — there is no way
  * to add a row and forget to escape it.
@@ -1771,7 +1955,7 @@ export function renderMarkdown(e: Evidence): string {
   const out: string[] = [];
   out.push('# Production Gold diagnostics — v8/XAUUSD evidence (read-only)');
   out.push('');
-  out.push(`Generated (UTC): \`${e.generatedAt}\``);
+  out.push(`Generated (UTC): \`${mdText(e.generatedAt)}\``);
   out.push('');
   out.push(`Target: exact strategy selector \`${mdCell(e.target.strategy)}\`, version \`${e.target.version}\`, instrument \`${mdCell(e.target.assetClass)}/${mdCell(e.target.symbol)}\`.`);
   out.push('');
@@ -1790,16 +1974,16 @@ export function renderMarkdown(e: Evidence): string {
   out.push('');
   out.push('These describe what the code is written not to do. They are not runtime evidence.');
   out.push('');
-  for (const line of e.declaredNotVerified.triggersNothing) out.push(`- ${line}`);
+  for (const line of e.declaredNotVerified.triggersNothing) out.push(`- ${mdText(line)}`);
   out.push('');
   if (e.connection) {
-    out.push(`- Database: \`${e.connection.database}\` (role name intentionally not printed)`);
-    out.push(`- Server: ${e.connection.serverVersion.split(',').slice(0, 1).join('')}`);
+    out.push(`- Database: \`${mdText(e.connection.database)}\` (role name intentionally not printed)`);
+    out.push(`- Server: ${mdText(e.connection.serverVersion.split(',').slice(0, 1).join(''))}`);
     out.push(`- TLS requested by this run: \`${e.connection.tlsRequestedMode}\` (configuration: certificate chain and hostname verified by the client)`);
     out.push(`- TLS observed for this session (\`pg_stat_ssl\`): ${e.connection.ssl === null ? 'unknown' : e.connection.ssl ? 'yes' : 'no'}`);
-    out.push(`- \`default_transaction_read_only\` = \`${e.connection.defaultTransactionReadOnly}\``);
-    out.push(`- \`transaction_read_only\` (inside the txn) = \`${e.connection.transactionReadOnly}\``);
-    out.push(`- \`statement_timeout\` = \`${e.connection.statementTimeout}\``);
+    out.push(`- \`default_transaction_read_only\` = \`${mdText(e.connection.defaultTransactionReadOnly)}\``);
+    out.push(`- \`transaction_read_only\` (inside the txn) = \`${mdText(e.connection.transactionReadOnly)}\``);
+    out.push(`- \`statement_timeout\` = \`${mdText(e.connection.statementTimeout)}\``);
     out.push('');
     out.push('Effective privileges of the connecting role (booleans via `has_table_privilege`):');
     out.push('');
@@ -1851,9 +2035,9 @@ export function renderMarkdown(e: Evidence): string {
     out.push(`_v${e.target.version} was not found — the configuration evidence below is ABSENT, not zero._`);
     out.push('');
   } else {
-    out.push(`- version id: \`${e.v8.id}\``);
-    out.push(`- status: \`${e.v8.status}\`${e.v8.status !== 'published' ? '  ⚠ not published — a non-published version is never scanned' : ''}`);
-    out.push(`- published_at: ${e.v8.publishedAt ?? '—'}`);
+    out.push(`- version id: \`${mdText(e.v8.id)}\``);
+    out.push(`- status: \`${mdText(e.v8.status)}\`${e.v8.status !== 'published' ? '  ⚠ not published — a non-published version is never scanned' : ''}`);
+    out.push(`- published_at: ${e.v8.publishedAt === null ? '—' : mdText(e.v8.publishedAt)}`);
     out.push('');
     out.push('### 4.1 Role → timeframe');
     out.push('');
@@ -2012,7 +2196,7 @@ export function renderMarkdown(e: Evidence): string {
   if (e.notes.length === 0) {
     out.push('_None._');
   } else {
-    for (const n of e.notes) out.push(`- ${n}`);
+    for (const n of e.notes) out.push(`- ${mdText(n)}`);
   }
   out.push('');
 

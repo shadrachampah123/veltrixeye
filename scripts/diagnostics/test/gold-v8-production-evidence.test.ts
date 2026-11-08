@@ -25,7 +25,7 @@
  * against the real server rather than going through `main()`.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,13 +38,20 @@ import { startEmbeddedPostgres, stopEmbeddedPostgres } from '../../db/embedded.m
 import {
   ALLOWED_URL_PARAMS,
   Q_CONNECTION,
+  REFUSED_CONNECTION_ENV_VARS,
+  REFUSED_TLS_ENV_VARS,
+  ReportWriteError,
   WRITE_PRIVILEGE_COLUMNS,
   ReadOnlySession,
   anyStringLeaks,
   chooseStrategy,
   chooseVersion,
+  connectionTargetEnvProblem,
   connectionUrlProblem,
   errorCodeOf,
+  existingReportProblem,
+  reportPaths,
+  writeReport,
   evaluateSafety,
   factsFromConnectionRow,
   OptionError,
@@ -53,6 +60,7 @@ import {
   mapStrings,
   mdCell,
   mdRow,
+  mdText,
   parseOptions,
   renderMarkdown,
   versionAmbiguityMessage,
@@ -99,21 +107,29 @@ interface CliRun {
  * clean base (PATH/HOME only), so an ambient DATABASE_URL or PGSSL* in the CI
  * runner can never change the outcome of a case.
  */
+const DEFAULT_ARGS: readonly string[] = [
+  '--strategy',
+  'Gold Break & Retest Test Pro VI',
+  '--version',
+  '8',
+  '--symbol',
+  'XAUUSD',
+  '--asset-class',
+  'commodity',
+];
+
 function runCli(
   env: Record<string, string | undefined>,
-  args: readonly string[] = [
-    '--strategy',
-    'Gold Break & Retest Test Pro VI',
-    '--version',
-    '8',
-    '--symbol',
-    'XAUUSD',
-    '--asset-class',
-    'commodity',
-  ],
+  args: readonly string[] = DEFAULT_ARGS,
+  existingOutDir?: string,
 ): CliRun {
-  const outDir = mkdtempSync(join(tmpdir(), 'gold-diag-test-'));
-  workDirs.push(outDir);
+  let outDir: string;
+  if (existingOutDir === undefined) {
+    outDir = mkdtempSync(join(tmpdir(), 'gold-diag-test-'));
+    workDirs.push(outDir);
+  } else {
+    outDir = existingOutDir;
+  }
 
   const baseEnv: Record<string, string> = {
     PATH: process.env['PATH'] ?? '',
@@ -225,6 +241,79 @@ describe('connection URL parameters are allowlisted', () => {
     assert.match(problem!, /could not be parsed/);
     assert.ok(!problem!.includes(MARKER), 'the URL text leaked into the message');
   });
+
+  it('refuses a URL that does not name the role', () => {
+    // Without a user, pg falls back to PGUSER or the operating-system user name.
+    const problem = connectionUrlProblem('postgres://db.internal:5432/app');
+    assert.notEqual(problem, null);
+    assert.match(problem!, /does not name the connecting role/);
+    // …and the message never echoes the URL or a user name: this URL names a
+    // (marker) role but no database, so it is refused for the database only.
+    const withUser = connectionUrlProblem(`postgres://${MARKER}@db.internal`);
+    assert.match(withUser!, /does not name the database/);
+    assert.ok(!withUser!.includes(MARKER), 'the role leaked into the message');
+  });
+
+  it('refuses a URL that does not name the database', () => {
+    for (const url of [
+      'postgres://u:p@db.internal:5432',
+      'postgres://u:p@db.internal:5432/',
+      'postgres://u:p@db.internal',
+    ]) {
+      const problem = connectionUrlProblem(url);
+      assert.notEqual(problem, null, `expected a refusal for ${url}`);
+      assert.match(problem!, /does not name the database/);
+    }
+  });
+
+  it('accepts only a URL that names role, database and nothing else', () => {
+    assert.equal(connectionUrlProblem('postgres://u:p@h:5432/db'), null);
+    assert.equal(connectionUrlProblem('postgres://u:p@h:5432/db?sslmode=verify-full'), null);
+    // A password is still optional in the URL (peer/`.pgpass`-style auth), but the
+    // user and the database are not.
+    assert.equal(connectionUrlProblem('postgres://u@h:5432/db'), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. Ambient libpq connection variables cannot retarget the connection (pure)
+// ---------------------------------------------------------------------------
+
+describe('libpq connection variables are refused', () => {
+  it('accepts a clean environment', () => {
+    assert.equal(connectionTargetEnvProblem({ PATH: '/usr/bin', HOME: '/root' }), null);
+    assert.equal(connectionTargetEnvProblem({ DATABASE_URL: 'postgres://u:p@h/db' }), null);
+  });
+
+  it('refuses every variable that pg would fall back to', () => {
+    for (const variable of REFUSED_CONNECTION_ENV_VARS) {
+      const problem = connectionTargetEnvProblem({ [variable]: 'x' });
+      assert.notEqual(problem, null, `expected a refusal for ${variable}`);
+      assert.match(problem!, new RegExp(variable));
+      assert.ok(!problem!.includes('x'), 'the variable value leaked into the message');
+    }
+  });
+
+  it('names the five libpq fallbacks the review asked for', () => {
+    for (const required of ['PGUSER', 'PGDATABASE', 'PGPASSWORD', 'PGHOST', 'PGPORT']) {
+      assert.ok(
+        REFUSED_CONNECTION_ENV_VARS.includes(required),
+        `${required} must stay in REFUSED_CONNECTION_ENV_VARS`,
+      );
+    }
+  });
+
+  it('accepts an empty variable', () => {
+    for (const variable of REFUSED_CONNECTION_ENV_VARS) {
+      assert.equal(connectionTargetEnvProblem({ [variable]: '' }), null);
+    }
+  });
+
+  it('never prints a credential-looking value', () => {
+    const problem = connectionTargetEnvProblem({ PGPASSWORD: `${MARKER}-pw`, PGUSER: `${MARKER}-user` });
+    assert.notEqual(problem, null);
+    assert.ok(!problem!.includes(MARKER));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -237,24 +326,32 @@ describe('TLS environment overrides are refused', () => {
     assert.equal(tlsEnvProblem({ NODE_TLS_REJECT_UNAUTHORIZED: '1' }), null);
   });
 
-  const refused: Array<[string, string]> = [
-    ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'NODE_TLS_REJECT_UNAUTHORIZED'],
-    ['PGSSLMODE=disable', 'PGSSLMODE'],
-    ['PGSSLROOTCERT', 'PGSSLROOTCERT'],
-    ['PGSSLCERT', 'PGSSLCERT'],
-    ['PGSSLKEY', 'PGSSLKEY'],
-    ['PGSSLCRL', 'PGSSLCRL'],
-    ['PGSSLNEGOTIATION', 'PGSSLNEGOTIATION'],
-    ['PGREQUIRESSL', 'PGREQUIRESSL'],
-  ];
-
-  for (const [name, variable] of refused) {
-    it(`refuses ${name}`, () => {
-      const problem = tlsEnvProblem({ [variable]: variable === 'NODE_TLS_REJECT_UNAUTHORIZED' ? '0' : 'x' });
-      assert.notEqual(problem, null, `expected a refusal for ${name}`);
+  // Driven from the exported constant, so a name added to the refusal list can
+  // never be silently untested.
+  for (const variable of REFUSED_TLS_ENV_VARS) {
+    it(`refuses ${variable}`, () => {
+      const value = variable === 'NODE_TLS_REJECT_UNAUTHORIZED' ? '0' : 'x';
+      const problem = tlsEnvProblem({ [variable]: value });
+      assert.notEqual(problem, null, `expected a refusal for ${variable}`);
       assert.match(problem!, new RegExp(variable));
     });
   }
+
+  it('covers every libpq TLS override, including the password and CRL directory', () => {
+    // Named explicitly: these two were missing from the hand-written matrix.
+    for (const required of ['PGSSLMODE', 'PGSSLROOTCERT', 'PGSSLCERT', 'PGSSLKEY', 'PGSSLPASSWORD', 'PGSSLCRL', 'PGSSLCRLDIR', 'PGSSLNEGOTIATION', 'PGREQUIRESSL', 'NODE_TLS_REJECT_UNAUTHORIZED']) {
+      assert.ok(REFUSED_TLS_ENV_VARS.includes(required), `${required} must stay in REFUSED_TLS_ENV_VARS`);
+    }
+    assert.notEqual(tlsEnvProblem({ PGSSLPASSWORD: 'x' }), null);
+    assert.notEqual(tlsEnvProblem({ PGSSLCRLDIR: '/tmp' }), null);
+  });
+
+  it('accepts these variables when they are empty', () => {
+    for (const variable of REFUSED_TLS_ENV_VARS) {
+      if (variable === 'NODE_TLS_REJECT_UNAUTHORIZED') continue;
+      assert.equal(tlsEnvProblem({ [variable]: '' }), null, `an empty ${variable} is not an override`);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -930,6 +1027,67 @@ describe('report rendering resists fence and table injection', () => {
     });
   });
 
+  /**
+   * The clean fixture with hostile text in every NON-table position: the
+   * connection bullets, the inline code spans, the v8 bullets, the notes and the
+   * declared-intent list. These are rendered as ordinary Markdown text, not as
+   * table cells, so they were the remaining place a value could restructure the
+   * report.
+   */
+  function evidenceWithInjectedText(): Parameters<typeof renderMarkdown>[0] {
+    const injected = 'x`\n## 9. INJECTED SECTION\n# INJECTED HEADING\n```\n`y';
+    const clean = evidenceWithCleanRows();
+    return {
+      ...clean,
+      connection: {
+        ...(clean.connection as NonNullable<Parameters<typeof renderMarkdown>[0]['connection']>),
+        database: injected,
+        serverVersion: `PostgreSQL 16 ${injected}`,
+        statementTimeout: injected,
+      },
+      v8: { found: true, id: injected, status: injected, publishedAt: injected, changelog: null },
+      notes: [`note ${injected}`],
+      declaredNotVerified: { triggersNothing: [`intent ${injected}`] },
+    } as unknown as Parameters<typeof renderMarkdown>[0];
+  }
+
+  it('database text cannot add a heading, a fence or a new line', () => {
+    const clean = renderMarkdown(evidenceWithCleanRows());
+    const hostile = renderMarkdown(evidenceWithInjectedText());
+
+    const headings = (md: string): string[] => md.split('\n').filter((l) => /^#{1,6} /.test(l));
+    const fences = (md: string): string[] => md.split('\n').filter((l) => /^`{3,}/.test(l));
+
+    assert.deepEqual(headings(hostile), headings(clean), 'a database value added or removed a Markdown heading');
+    assert.deepEqual(fences(hostile), fences(clean), 'a database value added or removed a fence');
+    assert.equal(tableBlocks(hostile).length, tableBlocks(clean).length, 'a database value added a table');
+
+    const lines = hostile.split('\n');
+    // Fences are compared above; these two are the headings the value tried to
+    // create. Neither may appear at the start of any line.
+    for (const injectedLine of ['## 9. INJECTED SECTION', '# INJECTED HEADING']) {
+      assert.ok(
+        !lines.some((line) => line.startsWith(injectedLine)),
+        `an injected value began a line with ${JSON.stringify(injectedLine)}`,
+      );
+    }
+    // The value is still readable: the text survives, only the markup does not.
+    assert.ok(
+      hostile.includes("- Database: `x' ## 9. INJECTED SECTION"),
+      'the database name stopped being readable after neutralisation',
+    );
+  });
+
+  it('mdText neutralises backticks and newlines and keeps the value readable', () => {
+    assert.equal(mdText('a`b'), "a'b");
+    assert.equal(mdText('a\nb\r\nc'), 'a b c');
+    assert.equal(mdText('```json\n{"x":1}\n```'), "'''json {\"x\":1} '''");
+    assert.equal(mdText(null), '');
+    assert.equal(mdText(undefined), '');
+    assert.equal(mdText(0), '0');
+    assert.equal(mdText('plain value'), 'plain value');
+  });
+
   it('escapes the privileges, migrations, coverage and by-state tables too', () => {
     const md = renderMarkdown(evidenceWithHostileRows());
     // privileges: a hostile key, migrations: a hostile name, coverage: a hostile
@@ -1001,6 +1159,124 @@ describe('report rendering resists fence and table injection', () => {
 });
 
 // ---------------------------------------------------------------------------
+// An earlier report is never overwritten (a refused run cannot look successful)
+// ---------------------------------------------------------------------------
+
+/** A minimal but complete evidence object for the writer. */
+function minimalEvidence(generatedAt: string): Parameters<typeof renderMarkdown>[0] {
+  return {
+    generatedAt,
+    target: { strategy: 's', version: 8, symbol: 'XAUUSD', assetClass: 'commodity', outDir: 'o' },
+    safety: {
+      connectionOpenedWithDefaultTransactionReadOnly: true,
+      everyQueryRanInsideBeginReadOnly: true,
+      secretsRedacted: true,
+    },
+    declaredNotVerified: { triggersNothing: ['no ScannerService'] },
+    connection: null,
+    migrations: [],
+    candidateStrategies: [],
+    versions: [],
+    v8: null,
+    timeframes: [],
+    risk: null,
+    marketScope: null,
+    conditions: [],
+    conditionRoleResolution: [],
+    liquiditySweepFocus: { count: 0, entries: [] },
+    sessionFilters: [],
+    filters: [],
+    instrument: null,
+    candleCoverage: [],
+    setups: { total: 0, byState: [], latest: [], scores: [], stateEvents: [] },
+    alerts: [],
+    alertDeliveries: [],
+    notificationDeliveries: [],
+    scannerRuns: [],
+    scannerCursors: [],
+    notes: [],
+  } as unknown as Parameters<typeof renderMarkdown>[0];
+}
+
+describe('an existing report is never overwritten', () => {
+  it('finds nothing in an empty or missing directory', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-empty-'));
+    workDirs.push(dir);
+    assert.equal(existingReportProblem(dir), null);
+    assert.equal(existingReportProblem(join(dir, 'does-not-exist')), null);
+  });
+
+  it('names only the report files that are present', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-partial-'));
+    workDirs.push(dir);
+    const { jsonPath, mdPath } = reportPaths(dir);
+    writeFileSync(mdPath, 'old markdown\n');
+
+    const problem = existingReportProblem(dir);
+    assert.notEqual(problem, null);
+    assert.ok(problem!.includes(mdPath), 'the existing file must be named');
+    assert.ok(!problem!.includes(jsonPath), 'a file that is not there must not be named');
+    assert.match(problem!, /already exists/);
+    // The other file may still be written by a run that owns the directory.
+    writeFileSync(jsonPath, 'old json\n');
+    assert.ok(existingReportProblem(dir)!.includes(jsonPath));
+  });
+
+  it('writes once and then refuses, leaving the report byte-identical', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-write-'));
+    workDirs.push(dir);
+    writeFileSync(join(dir, 'unrelated.txt'), 'keep me\n');
+
+    const first = writeReport(dir, minimalEvidence('2026-01-01T00:00:00.000Z'));
+    const jsonBefore = readFileSync(first.jsonPath, 'utf8');
+    const mdBefore = readFileSync(first.mdPath, 'utf8');
+
+    assert.throws(
+      () => writeReport(dir, minimalEvidence('2026-02-02T00:00:00.000Z')),
+      (err: unknown) => err instanceof ReportWriteError && err.stale === true,
+    );
+    assert.equal(readFileSync(first.jsonPath, 'utf8'), jsonBefore, 'the first report was overwritten');
+    assert.equal(readFileSync(first.mdPath, 'utf8'), mdBefore, 'the first report was overwritten');
+    assert.ok(!readFileSync(first.jsonPath, 'utf8').includes('2026-02-02'), 'the second run leaked into the report');
+    assert.equal(readFileSync(join(dir, 'unrelated.txt'), 'utf8'), 'keep me\n', 'an unrelated file was touched');
+  });
+
+  it('refuses the CLI before connecting when a report already exists', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-cli-stale-'));
+    workDirs.push(dir);
+    const seeded = writeReport(dir, minimalEvidence('2026-01-01T00:00:00.000Z'));
+    const jsonBefore = readFileSync(seeded.jsonPath, 'utf8');
+
+    // A perfectly acceptable configuration: the refusal must come from the
+    // output guard, not from the credential or the socket.
+    const run = runCli({ DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db' }, DEFAULT_ARGS, dir);
+
+    assert.equal(run.status, 2, `unexpected exit; stderr:\n${run.stderr}`);
+    assert.match(run.stderr, /refusing to run/);
+    assert.match(run.stderr, /already exists/);
+    assert.ok(!/cannot reach the database|query failed/i.test(run.stderr), 'it must refuse before connecting');
+    assert.equal(readFileSync(seeded.jsonPath, 'utf8'), jsonBefore, 'the earlier report was modified');
+    assert.deepEqual(filesUnder(dir).sort(), [seeded.jsonPath, seeded.mdPath].sort(), 'the run created a file');
+  });
+
+  it('a successful run leaves a report that blocks the next run', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-cli-stale2-'));
+    workDirs.push(dir);
+    const seeded = writeReport(dir, minimalEvidence('2026-01-01T00:00:00.000Z'));
+    const mdBefore = readFileSync(seeded.mdPath, 'utf8');
+    assert.match(readFileSync(seeded.jsonPath, 'utf8'), /2026-01-01T00:00:00\.000Z/);
+
+    const second = runCli({ DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db' }, DEFAULT_ARGS, dir);
+
+    assert.equal(second.status, 2);
+    // The old report still says it is the OLD one — the refused run changed nothing.
+    assert.match(readFileSync(seeded.jsonPath, 'utf8'), /2026-01-01T00:00:00\.000Z/);
+    assert.equal(readFileSync(seeded.mdPath, 'utf8'), mdBefore);
+    assert.ok(second.stdout === '', 'a refused run prints nothing on stdout');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5 + 6. The real CLI: configuration refusals (no connection attempted)
 // ---------------------------------------------------------------------------
 
@@ -1055,6 +1331,20 @@ describe('CLI refuses unsafe configuration before connecting', () => {
       2,
       /repeats a query parameter/,
     ],
+    // The target must come from DATABASE_URL alone: an ambient libpq variable
+    // could otherwise redirect the connection to another role/database/host.
+    ['PGUSER set', { DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db', PGUSER: 'someone-else' }, 2, /PGUSER/],
+    ['PGDATABASE set', { DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db', PGDATABASE: 'other' }, 2, /PGDATABASE/],
+    ['PGPASSWORD set', { DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db', PGPASSWORD: 'other' }, 2, /PGPASSWORD/],
+    ['PGHOST set', { DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db', PGHOST: 'attacker.invalid' }, 2, /PGHOST/],
+    ['PGPORT set', { DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db', PGPORT: '6543' }, 2, /PGPORT/],
+    [
+      'URL that does not name the role',
+      { DATABASE_URL: 'postgres://127.0.0.1:1/db' },
+      2,
+      /does not name the connecting role/,
+    ],
+    ['URL that does not name the database', { DATABASE_URL: 'postgres://u:p@127.0.0.1:1' }, 2, /does not name the database/],
   ];
 
   for (const [name, env, expectedStatus, message] of cases) {
@@ -1070,6 +1360,14 @@ describe('CLI refuses unsafe configuration before connecting', () => {
       );
     });
   }
+
+  it('never prints the value of a refused libpq variable', () => {
+    const run = runCli({ DATABASE_URL: 'postgres://u:p@127.0.0.1:1/db', PGPASSWORD: MARKER, PGUSER: MARKER });
+    assert.equal(run.status, 2, `unexpected exit; stderr:\n${run.stderr}`);
+    assert.match(run.stderr, /PGUSER|PGPASSWORD/);
+    assertNoMarker(run);
+    assert.deepEqual(filesUnder(run.outDir), [], 'a refused run must not write a report');
+  });
 
   it('refuses an invalid --version with exit 2, before connecting', () => {
     for (const value of ['abc', '9x', '0', '-3', '8.5', '9007199254740992', '99999999999999999999']) {
