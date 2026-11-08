@@ -62,11 +62,15 @@
  *   - READ COST IS BOUNDED. `SET LOCAL statement_timeout = '30s'` applies to the
  *     whole read-only transaction (transaction-local, not session-wide). The
  *     open-ended, row-returning queries carry a `LIMIT` (`Q_MIGRATIONS` 5,
- *     `Q_LATEST_SETUPS` 10, `Q_ALERTS` 25, the two delivery queries 100,
- *     `Q_SETUP_EVENTS` 200, `Q_SCANNER_RUNS` 5); the rest are bounded by their
- *     predicate and shape — one row per strategy, role or timeframe, and single
- *     rows for `Q_CONNECTION`, `Q_SERVER_VERSION` and `Q_SSL` — so not every
- *     query needs a LIMIT to be bounded.
+ *     `Q_LATEST_SETUPS` 10, `Q_SETUP_EVENTS` 200, `Q_ALERTS` 25, the two delivery
+ *     queries 100, `Q_SCANNER_RUNS` 5); the rest are bounded by their predicate
+ *     and shape — one row per strategy, role or timeframe, and single rows for
+ *     `Q_CONNECTION`, `Q_SERVER_VERSION` and `Q_SSL`. `Q_SETUP_SCORES` is the one
+ *     row-returning query with no LIMIT and no one-row shape: its predicate
+ *     restricts it to the at most ten setups selected above, and its per-setup
+ *     row count is bounded only by the 30 s statement timeout. So not every
+ *     query needs a LIMIT to be bounded, and the exception is named here rather
+ *     than glossed over.
  *
  *   - THE TARGET IS EXPLICIT. `DATABASE_URL` must name the connecting role AND
  *     the database. `pg` fills a missing user, password, host, port or database
