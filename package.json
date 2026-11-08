@@ -24,15 +24,18 @@
     "billing:provision:live": "tsx scripts/billing/provision-live.ts",
     "billing:provision:sandbox": "tsx scripts/billing/provision-sandbox.ts",
     "billing:remediate:legacy-free-row": "tsx scripts/billing/remediate-legacy-free-row.ts",
+    "diagnostics:gold-v8": "tsx scripts/diagnostics/gold-v8-production-evidence.ts",
     "api:dev": "npm run dev --workspace @veltrixeye/api",
     "api:build": "npm run build --workspace @veltrixeye/api",
     "api:start": "npm run start --workspace @veltrixeye/api",
     "web:dev": "npm run dev --workspace @veltrixeye/web",
     "web:build": "npm run build --workspace @veltrixeye/web",
-    "test": "npm run test --workspace @veltrixeye/contracts && npm run test --workspace @veltrixeye/core && npm run test --workspace @veltrixeye/provider-twelve-data && npm run test --workspace @veltrixeye/provider-paystack && npm run test --workspace @veltrixeye/provider-bank-of-ghana && npm run test --workspace @veltrixeye/api && npm run test --workspace @veltrixeye/web",
-    "typecheck": "npm run typecheck --workspace @veltrixeye/contracts && npm run typecheck --workspace @veltrixeye/core && npm run typecheck --workspace @veltrixeye/provider-twelve-data && npm run typecheck --workspace @veltrixeye/provider-paystack && npm run typecheck --workspace @veltrixeye/provider-bank-of-ghana && npm run typecheck --workspace @veltrixeye/api && npm run typecheck --workspace @veltrixeye/web",
+    "test": "npm run test --workspace @veltrixeye/contracts && npm run test --workspace @veltrixeye/core && npm run test --workspace @veltrixeye/provider-twelve-data && npm run test --workspace @veltrixeye/provider-paystack && npm run test --workspace @veltrixeye/provider-bank-of-ghana && npm run test --workspace @veltrixeye/api && npm run test --workspace @veltrixeye/web && npm run test:diagnostics",
+    "typecheck": "npm run typecheck --workspace @veltrixeye/contracts && npm run typecheck --workspace @veltrixeye/core && npm run typecheck --workspace @veltrixeye/provider-twelve-data && npm run typecheck --workspace @veltrixeye/provider-paystack && npm run typecheck --workspace @veltrixeye/provider-bank-of-ghana && npm run typecheck --workspace @veltrixeye/api && npm run typecheck --workspace @veltrixeye/web && npm run typecheck:diagnostics",
     "lint": "eslint .",
-    "build": "npm run api:build && npm run web:build"
+    "build": "npm run api:build && npm run web:build",
+    "test:diagnostics": "node --import tsx --test scripts/diagnostics/test/*.test.ts",
+    "typecheck:diagnostics": "tsc -p scripts/diagnostics/tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
@@ -40,6 +43,7 @@
     "embedded-postgres": "^18.4.0-beta.17",
     "eslint": "^9.17.0",
     "fastify": "^5.12.7",
+    "pg": "^8.13.1",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.18.0"
