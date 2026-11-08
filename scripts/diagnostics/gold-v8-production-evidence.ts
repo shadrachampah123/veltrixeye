@@ -122,7 +122,7 @@
  *     satisfied by this change, so no CI job can reach production.
  *
  * USAGE
- *   DATABASE_URL='postgres://…/db?sslmode=verify-full' \
+ *   DATABASE_URL='postgres://user:password@host:5432/db?sslmode=verify-full' \
  *     npx tsx scripts/diagnostics/gold-v8-production-evidence.ts \
  *       --strategy <uuid|exact strategy name> [--version 8] \
  *       [--symbol XAUUSD] [--asset-class commodity] [--out <dir>]
