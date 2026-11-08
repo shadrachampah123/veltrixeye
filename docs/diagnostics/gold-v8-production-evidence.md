@@ -175,9 +175,12 @@ they are never mistaken for measured evidence.
   construct (`[`, `]`, `*`, `_`, `~`). Structured payloads sit in a fence longer
   than any backtick run they contain. A stored value can therefore read as
   itself, but it cannot add a heading, a fence, a table row, a list item, an HTML
-  element, or a link, image or emphasis through Markdown syntax. (A bare `http(s)`
-  URL inside a value may still be auto-linked by the renderer — that is the
-  viewer's behaviour, not markup the report emits.)
+  element, or a link, image or emphasis through Markdown syntax. In the raw `.md`
+  file those five characters carry a leading backslash (a migration called
+  `0001_init` appears as `0001\_init`), so a `grep` over the file has to expect
+  the escape; rendered, the value reads exactly as stored. (A bare `http(s)` URL
+  inside a value may still be auto-linked by the renderer — that is the viewer's
+  behaviour, not markup the report emits.)
 
 ## Gold v8 is not modified by this script
 
