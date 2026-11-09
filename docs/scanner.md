@@ -290,6 +290,52 @@ Rules:
 - A cursor-skipped run still reports its loaded candles (the fetch precedes the cursor check) **and** `duplicateCandleSkips ≥ 1`, which is what makes a skip distinguishable from a failed evaluation.
 - These counters are non-identifying, so they survive tenant metadata redaction (unlike `errors`/`strategyId`/`triggeredBy`).
 
+### Per-pair evaluation outcomes (Phase B)
+
+Cursor skips and evaluations used to be indistinguishable in the ledger: a run
+that skipped every pair (because no new setup candle had closed) looked exactly
+like a run that evaluated every strategy and found nothing. Phase B records one
+**mutually exclusive** outcome per (strategy, instrument) pair in
+`scanner_runs.metadata.pairs`, so "nothing was evaluated" can never be reported
+as "everything was evaluated and nothing matched".
+
+| Outcome | Meaning | Carries condition counts? |
+|---|---|---|
+| `evaluated` | The pair reached M3 (`setups.detect`) for both directions | **Yes** |
+| `cursor_skipped` | The closed setup candle at `cursorMs` was already processed for this pair (`scanner_cursors` hit). An idempotent no-op — **not** an evaluation | No |
+| `stale` | Rejected before evaluation: `mtf_invalid`, a `{htf,setup,entry}_stale_candle` freshness reason, or `no_closed_candle` | No |
+| `failed` | An error aborted the pair; `reason` is a bounded cause code (`rate_limited`, `provider_unavailable`, a domain error code, or `error`) | No |
+
+Shape (additive jsonb, `v: 1`):
+
+```json
+"pairs": {
+  "v": 1,
+  "totals":     { "pairs": 10, "evaluated": 0, "cursor_skipped": 10, "stale": 0, "failed": 0 },
+  "conditions": { "satisfied": 0, "unsatisfied": 0, "insufficient_data": 0, "unsupported": 0 },
+  "truncated": false,
+  "items": [
+    { "strategyId": "…", "assetClass": "commodity", "symbol": "XAUUSD", "timeframe": "1h",
+      "outcome": "cursor_skipped", "cursorMs": 1762711200000, "anchorMs": 1762714800000,
+      "reason": "cursor_hit" }
+  ]
+}
+```
+
+Rules:
+
+- **Mutually exclusive, always reconciled.** Exactly one observation is recorded per pair walked, on every exit path (including a throw), so `evaluated + cursor_skipped + stale + failed === totals.pairs`. `metadata.duplicateCandleSkips` is now **derived** from `totals.cursor_skipped` rather than counted separately, so the historical counter and the per-pair detail cannot drift.
+- **Totals are never computed from `items`.** `items` is a bounded sample (≤ `SCANNER_RUN_PAIR_ITEMS_MAX` = 200); `totals`/`conditions` always cover **every** pair, and `truncated` says whether the sample is partial.
+- **The sample is deterministic**: the first 200 observations ordered by `(assetClass, symbol, timeframe, strategyId, outcome)` — a content-derived order, independent of strategy iteration order, so the same run always persists the same sample.
+- **`conditions` covers evaluated pairs only.** A skip, a stale rejection and a failure contribute nothing; summing them would misreport an unevaluated pair as an evaluated one. The four counters come from the engine's per-condition statuses, aggregated across both directions, and are only collected when the scanner calls `setups.detect({ includeDiagnostics: true })` — the M4 HTTP endpoint does not, so its response is unchanged.
+- **`failureReasons` is `evaluated`-only** (max 2 per pair, 160 chars each) and is sanitized with `sanitizeScannerError(..., redactUuids = true)` before storage: no strategy UUIDs, keys, tokens or URLs.
+- **Redaction is recursive.** `redactScannerRunMetadata` now strips `triggeredBy`, `strategyId`, `versionId`, `errors` and `failureReasons` **at any depth**, so the owner sees which strategy produced each pair while every other viewer (including anyone reading a system run through `getHealth`) sees counts only.
+
+**Runs recorded before Phase B:** they carry no `metadata.pairs` key at all.
+`readScannerRunPairs(metadata)` returns `null` for them (and for a malformed or
+future-version block) — render "detail unavailable", never "zero pairs". No
+backfill is performed.
+
 **Runs recorded before Phase A (historical metadata):** rows written before these counters existed carry **no** `metadata.candles` object and no `metadata.duplicateCandleSkips`. Their `scanner_runs.candles_fetched` values keep their historical, provider-only meaning; nothing is rewritten or backfilled. Treat a missing `metadata.candles` key — not a zero — as the marker of a pre-Phase-A run, and note that `metadata.candles.total === candles_fetched` only holds for runs recorded after this change.
 
 ## API / UI
@@ -322,6 +368,7 @@ All session endpoints check `canAccessScanner` entitlement server-side (free →
 - Users cannot select arbitrary unsupported provider symbols to bypass market universe: `normalizeSymbol` + `instruments` table check, 400 on unsupported
 - Scanner endpoints remain authenticated/authorized: session auth required, 401 unauthenticated, 403 free users, strategy ownership check for filtered scans
 - Scanner run ledger is tenant-private (M7 audit finding F4): `scanner_runs` is a single global table whose `metadata` holds `triggeredBy` (user UUID) and `strategyId` (strategy UUID), so `ScannerService.listRuns(query, viewerUserId)` filters rows to the caller's own runs, and `ScannerService.getHealth(viewerUserId)` — which stays global because the scanner is one shared pipeline — runs the embedded `lastRun`/`lastSuccessfulRun` DTOs through `redactScannerRunMetadata`, dropping `triggeredBy`, `strategyId` and `errors` (entries embed `strategy <uuid>: …`) unless the run belongs to the viewer. System runs (`triggeredBy = 'system'`) belong to no tenant and are never returned to one. Omitting `viewerUserId` keeps the previous unscoped behaviour for trusted in-process/operator callers; no HTTP route does so, and the architecture defines no admin role.
+- Redaction is **recursive** (Phase B): `metadata.pairs.items[]` carries a `strategyId` and the engine's `failureReasons` for that strategy, so a top-level-only filter would have leaked them through `getHealth` (global) and the operator/scheduler responses. `redactScannerRunMetadata` walks the whole metadata tree (bounded depth, array-safe, never mutating its input) and drops `triggeredBy`, `strategyId`, `versionId`, `errors` and `failureReasons` at any depth for anyone who does not own the run. Non-identifying counts (`totals`, `conditions`, `candles`, `symbols`, `timeframes`) survive, which is what makes a system run shareable at all.
 - Subscription limits remain server-authoritative: `getEntitlements(plan, status)` checked in scanner service and API routes, `maxSavedSetups` enforced in `SetupService`, `maxAlerts` etc. enforced
 - No client-controlled signal generation is trusted: scanner generates signals server-side only from validated, fresh, normalized production data; alert payload rendered from persisted alert + published version config, never from request input
 
@@ -345,6 +392,22 @@ Comprehensive tests added:
   - F4 tenant privacy (`describe('F4: Scanner tenant privacy')`): `redactScannerRunMetadata` pure unit tests (own run passes through, other-tenant and system runs drop `triggeredBy`/`strategyId`/`errors`, input not mutated), `listRuns(query, viewerUserId)` owner scoping (own run visible, other tenant's run + their user/strategy UUIDs absent, system runs hidden, `status` filter composes with scoping, unscoped read still returns the whole ledger), `getHealth(viewerUserId)` redaction (global last run kept, tenant identifiers dropped, own identifiers preserved), and a real `triggerScan` run being visible to its owner only
   - F5 advisory unlock reliability (`describe('F5: Advisory unlock reliability')`): `sanitizeScannerUnlockError` pure unit tests (preserves safe message/code, redacts URL credentials, bearer tokens, key-value secrets and tenant/strategy UUIDs, bounds length), clean unlock returns pooled client intact without error logs, thrown unlock query error and native PostgreSQL `25P02` aborted-transaction unlock error and `unlocked: false` response are logged safely without secrets or tenant UUIDs, evict/destroy the pooled connection (`release(true)`), clear the session-level advisory lock in `pg_locks`, allow immediate subsequent scans to recover, and preserve single-instance advisory-lock skipping when held
   - F14 MTF anchor alignment (`describe('F14: MTF anchor alignment (no lookahead)')`): forming tail setup candle is excluded so detection anchors at the close (`time + period`) of the latest fully-closed setup candle (`<= nowMs`, never a future close), cursor stores the open of that closed candle and re-arms on roll, and all-closed setup batches anchor at the latest candle's close matching backtest semantics
+
+- `packages/contracts/test/scanner-pairs.test.ts` — Phase B contract:
+  - the four pair outcomes are mutually exclusive and must sum to `totals.pairs` (a disagreement is rejected);
+  - an unknown outcome, a future `v`, and a malformed block are rejected; `readScannerRunPairs` returns `null` (never a throw, never "zero pairs") for historical/absent/malformed metadata;
+  - a truncated run keeps `totals.pairs = 250` with exactly `min(cap, pairs)` items, and a short sample is rejected;
+  - `conditionSummary` is an optional addition: a detection item without it still validates, so the M4 response shape is unchanged.
+
+- `packages/core/test/scanner-observability.test.ts` — Phase B integration (own embedded database):
+  - B1 a cursor skip records `cursor_skipped` with **no** condition counts and **no** engine reasons, and `metadata.duplicateCandleSkips` is derived from `totals.cursor_skipped`; a no-op run stays `completed` with 0 detections;
+  - B2 an evaluated pair aggregates both directions' condition statuses and caps reasons at 2 per pair; engine reasons are sanitized before storage (a strategy UUID and a `sk_live_…` key never reach metadata text);
+  - B3 a freshness rejection records `stale` with the role-prefixed cause code and no condition counts (MTF tolerates the lag, freshness does not);
+  - B4 a provider failure records `failed` with the bounded `rate_limited` cause, while `providerFailures`/`instrumentsScanned` keep their existing values;
+  - B5 250 observations ⇒ totals over all pairs, `items` capped at 200, `truncated: true`, identical sample under a reversed input order, and the block round-trips through the published schema;
+  - B6 recursive redaction: the owner keeps `strategyId` inside `items[]`, non-owner and operator views drop it at any depth together with `failureReasons`, counts survive, and the input is never mutated;
+  - B7 a legacy run without the block parses as "detail unavailable".
+  - Phase A (A1–A3) still passes unmodified, proving scanning behaviour and idempotency are unchanged.
 
 - `apps/api/test/scanner.test.ts` — API integration:
   - Unauthenticated 401, free user 403, pro user can access health (real state), list runs, trigger scanner with advisory locking, validates strategy ownership, rejects unsupported instruments, health does not expose secrets, rate limited

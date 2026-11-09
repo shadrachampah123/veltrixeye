@@ -22,6 +22,9 @@ import { startEmbeddedPostgres } from '../../../scripts/db/embedded.mjs';
 import {
   ProviderError,
   TIMEFRAMES,
+  SCANNER_RUN_PAIR_ITEMS_MAX,
+  readScannerRunPairs,
+  scannerRunPairsSchema,
   type Candle,
   type MarketDataProvider,
   type NormalizedInstrument,
@@ -32,6 +35,7 @@ import {
 import {
   AlertService,
   AuditService,
+  buildScannerRunPairs,
   CandleStore,
   EvaluationService,
   IngestionService,
@@ -47,8 +51,12 @@ import {
   createPool,
   createProviderRegistry,
   hashPassword,
+  redactScannerRunMetadata,
   runMigrations,
 } from '../src/index.js';
+
+/** Structural alias for the core observation type (not exported by name). */
+type PairObservationLike = Parameters<typeof buildScannerRunPairs>[0][number];
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DB_PORT = 5483; // unique across the suite (5442 = notification-outbox, 5497 = billing-sync)
@@ -104,6 +112,8 @@ class PhaseAProvider implements MarketDataProvider {
   readonly capabilities = { historical: true, realtime: false, timeframes: TIMEFRAMES, maxLookbackDays: 2190 };
   public calls: Timeframe[] = [];
   public failWith: ProviderError | null = null;
+  /** Phase B: shift a timeframe's batches into the past to force staleness. */
+  public lagByTimeframe: Partial<Record<string, number>> = {};
 
   async getSymbols() {
     return [];
@@ -112,7 +122,7 @@ class PhaseAProvider implements MarketDataProvider {
   async getHistoricalCandles(request: { timeframe: Timeframe; to: number }): Promise<Candle[]> {
     this.calls.push(request.timeframe);
     if (this.failWith) throw this.failWith;
-    return roleBatch(request.timeframe, request.to);
+    return roleBatch(request.timeframe, request.to - (this.lagByTimeframe[request.timeframe] ?? 0));
   }
 
   subscribeRealtime(_sub: RealtimeSubscription): RealtimeCandleStream {
@@ -260,8 +270,19 @@ interface Harness {
 }
 
 /** Build a scanner whose only stub is `setups.detect`; store, ingestion and scoring are real. */
-function makeHarness(options: { providerFails?: boolean; maxRetries?: number } = {}): Harness {
+function makeHarness(
+  options: {
+    providerFails?: boolean;
+    maxRetries?: number;
+    /** Phase B: push selected role batches into the past so freshness rejects them. */
+    providerLagByTimeframe?: Partial<Record<'4h' | '1h' | '15m', number>>;
+    /** Phase B: what the stubbed detector reports for each direction. */
+    detectSummary?: { satisfied: number; unsatisfied: number; insufficient_data: number; unsupported: number };
+    detectReasons?: string[];
+  } = {},
+): Harness {
   const provider = new PhaseAProvider();
+  provider.lagByTimeframe = options.providerLagByTimeframe ?? {};
   if (options.providerFails) provider.failWith = new ProviderError('rate_limited', 'phase a: provider rate limited');
 
   const registry = createProviderRegistry();
@@ -289,7 +310,18 @@ function makeHarness(options: { providerFails?: boolean; maxRetries?: number } =
   const stubSetups = {
     detect: async (args: { versionId: string; asOf: number; direction: 'long' | 'short' }) => {
       detectCalls.push({ versionId: args.versionId, asOf: args.asOf, direction: args.direction });
-      return { detections: [{ direction: args.direction, qualified: false, setup: null, created: false }] };
+      return {
+        detections: [
+          {
+            direction: args.direction,
+            qualified: false,
+            setup: null,
+            created: false,
+            failureReasons: options.detectReasons ?? [],
+            ...(options.detectSummary ? { conditionSummary: options.detectSummary } : {}),
+          },
+        ],
+      };
     },
   } as unknown as SetupService;
 
@@ -487,5 +519,243 @@ describe('Phase A — candle source observability', () => {
     }
     assert.equal(skipsOf(first.run), 0);
     assert.equal(skipsOf(second.run), 0, 'force=true never reports a skip');
+  });
+});
+
+/**
+ * Phase B — per-pair evaluation observability.
+ *
+ * The invariants these tests exist to protect:
+ *  - every walked pair produces EXACTLY ONE mutually exclusive outcome, so
+ *    totals always reconcile with the run's own counters;
+ *  - `cursor_skipped` is never presented as an evaluation (no condition counts,
+ *    no engine reasons) — the dashboard bug this phase exists to kill;
+ *  - totals come from all pairs while `items` is a bounded, deterministic sample;
+ *  - nested strategy identifiers and strategy-derived text are redacted at any
+ *    depth for anyone who does not own the run;
+ *  - historical runs (no `pairs` key) stay readable and are never mistaken for
+ *    "zero pairs".
+ */
+describe('Phase B — per-pair evaluation outcomes', () => {
+  const nowMs = () => Math.floor(Date.now() / HOUR_MS) * HOUR_MS + 25 * 60_000;
+  const pairsOf = (run: { metadata: Record<string, unknown> }) => readScannerRunPairs(run.metadata);
+
+  test('B1: a cursor skip is recorded as cursor_skipped and never as an evaluation', async () => {
+    const now = nowMs();
+    const { userId, strategyId } = await createScopedStrategy('commodity', 'XAUUSD');
+    const instrument = await candleStore.resolveInstrument('commodity', 'XAUUSD');
+    assert.ok(instrument);
+    await seedStore(instrument.id, now);
+
+    const harness = makeHarness();
+    const first = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const firstPairs = pairsOf(first.run);
+    assert.ok(firstPairs, 'a run always records the pairs block');
+    assert.deepEqual(firstPairs.totals, { pairs: 1, evaluated: 1, cursor_skipped: 0, stale: 0, failed: 0 });
+    assert.equal(firstPairs.items[0]?.outcome, 'evaluated');
+    assert.ok(firstPairs.items[0]?.conditions, 'an evaluated pair carries condition counts');
+    assert.ok((firstPairs.items[0]?.cursorMs ?? 0) > 0, 'the evaluated pair records the candle it processed');
+    assert.equal(firstPairs.items[0]?.anchorMs, (firstPairs.items[0]?.cursorMs ?? 0) + HOUR_MS);
+
+    const second = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const secondPairs = pairsOf(second.run);
+    assert.ok(secondPairs);
+    assert.deepEqual(secondPairs.totals, { pairs: 1, evaluated: 0, cursor_skipped: 1, stale: 0, failed: 0 });
+
+    const skipped = secondPairs.items[0];
+    assert.equal(skipped?.outcome, 'cursor_skipped');
+    assert.equal(skipped?.reason, 'cursor_hit');
+    assert.equal(skipped?.conditions, undefined, 'a skip is not an evaluation: no condition counts');
+    assert.equal(skipped?.failureReasons, undefined, 'a skip never carries engine reasons');
+    assert.deepEqual(secondPairs.conditions, { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 });
+
+    // Reconciliation: the historical counter is DERIVED from the pair block.
+    assert.equal(second.run.metadata.duplicateCandleSkips, secondPairs.totals.cursor_skipped);
+    assert.equal(first.run.metadata.duplicateCandleSkips, 0);
+    assert.equal(second.run.status, 'completed', 'a no-op run is still a healthy run');
+    assert.equal(second.run.setupsDetected, 0);
+  });
+
+  test('B2: an evaluated pair aggregates both directions’ condition outcomes', async () => {
+    const now = nowMs();
+    const { userId, strategyId } = await createScopedStrategy('commodity', 'XAUUSD');
+    const instrument = await candleStore.resolveInstrument('commodity', 'XAUUSD');
+    assert.ok(instrument);
+    await seedStore(instrument.id, now);
+
+    const harness = makeHarness({
+      detectSummary: { satisfied: 1, unsatisfied: 2, insufficient_data: 3, unsupported: 4 },
+      detectReasons: ['rule group "Structure" (AND) is not satisfied'],
+    });
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const pairs = pairsOf(result.run);
+    assert.ok(pairs);
+
+    assert.equal(pairs.totals.evaluated, 1);
+    // Both directions are evaluated, so every count doubles.
+    assert.deepEqual(pairs.conditions, { satisfied: 2, unsatisfied: 4, insufficient_data: 6, unsupported: 8 });
+    assert.deepEqual(pairs.items[0]?.conditions, { satisfied: 2, unsatisfied: 4, insufficient_data: 6, unsupported: 8 });
+    assert.equal(pairs.items[0]?.failureReasons?.length, 2, 'reasons are capped per pair, one per direction');
+    assert.match(pairs.items[0]?.failureReasons?.[0] ?? '', /rule group/);
+    assert.equal(result.run.setupsDetected, 0);
+  });
+
+  test('B2: engine reasons are sanitized before they are stored', async () => {
+    const now = nowMs();
+    const { userId, strategyId } = await createScopedStrategy('commodity', 'XAUUSD');
+    const instrument = await candleStore.resolveInstrument('commodity', 'XAUUSD');
+    assert.ok(instrument);
+    await seedStore(instrument.id, now);
+
+    const harness = makeHarness({
+      detectReasons: [
+        'strategy 11111111-1111-4111-8111-111111111111 leaked a strategy reference',
+        'api_key=sk_live_abcdef123456 appeared in a reason',
+      ],
+    });
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    // Only the reason TEXT is under test: `items[].strategyId` is the owner's own
+    // identifier and is expected to be present in their own run metadata.
+    const stored = (pairsOf(result.run)?.items[0]?.failureReasons ?? []).join(' | ');
+    assert.equal(
+      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(stored),
+      false,
+      'a strategy UUID must never reach stored metadata text',
+    );
+    assert.equal(stored.includes('sk_live_'), false, 'a provider key must never reach stored metadata text');
+  });
+
+  test('B3: stale data is recorded as stale, not as a failed or an evaluated pair', async () => {
+    const now = nowMs();
+    const { userId, strategyId } = await createScopedStrategy('forex', 'EURUSD');
+
+    // The fixture clock is 25 minutes past the hour, so a 1h lag puts the newest
+    // closed setup bar ~2h25m old: within MTF recency (≤ 3 × 1h) but older than
+    // the 1h freshness threshold (2h), so the freshness branch is exercised
+    // rather than the MTF one.
+    const harness = makeHarness({ providerLagByTimeframe: { '1h': HOUR_MS } });
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const pairs = pairsOf(result.run);
+    assert.ok(pairs);
+
+    assert.equal(result.run.staleRejections, 1);
+    assert.deepEqual(pairs.totals, { pairs: 1, evaluated: 0, cursor_skipped: 0, stale: 1, failed: 0 });
+    assert.match(pairs.items[0]?.reason ?? '', /stale_candle$/);
+    assert.equal(pairs.items[0]?.conditions, undefined);
+    assert.equal(pairs.items[0]?.failureReasons, undefined);
+    assert.deepEqual(pairs.conditions, { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 });
+  });
+
+  test('B4: a provider failure is recorded as failed with a bounded cause code', async () => {
+    const now = nowMs();
+    const { userId, strategyId } = await createScopedStrategy('forex', 'EURUSD');
+
+    const harness = makeHarness({ providerFails: true, maxRetries: 0 });
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const pairs = pairsOf(result.run);
+    assert.ok(pairs);
+
+    assert.deepEqual(pairs.totals, { pairs: 1, evaluated: 0, cursor_skipped: 0, stale: 0, failed: 1 });
+    assert.equal(pairs.items[0]?.outcome, 'failed');
+    assert.equal(pairs.items[0]?.reason, 'rate_limited', 'the provider failure kind, not a free-text message');
+    assert.equal(pairs.items[0]?.conditions, undefined);
+    // Existing counters are untouched by the new block.
+    assert.equal(result.run.providerFailures, 1);
+    assert.equal(result.run.staleRejections, 0);
+    assert.equal(result.run.instrumentsScanned, 0, 'the pair never completed its fetches');
+  });
+
+  test('B5: totals cover every pair while items are a bounded, deterministic sample', () => {
+    const observation = (index: number): PairObservationLike => ({
+      strategyId: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+      assetClass: 'crypto',
+      symbol: `SYM${index % 7}`,
+      timeframe: '1h',
+      outcome: index % 4 === 0 ? 'cursor_skipped' : index % 4 === 1 ? 'evaluated' : index % 4 === 2 ? 'stale' : 'failed',
+      cursorMs: 1_700_000_000_000 + index,
+      anchorMs: 1_700_003_600_000 + index,
+      reason: null,
+      ...(index % 4 === 1
+        ? { conditions: { satisfied: 1, unsatisfied: 0, insufficient_data: 0, unsupported: 0 } }
+        : {}),
+    });
+    const observations = Array.from({ length: 250 }, (_, index) => observation(index));
+
+    const block = buildScannerRunPairs(observations as never);
+
+    assert.equal(block.totals.pairs, 250, 'totals are computed over ALL pairs');
+    assert.equal(
+      block.totals.evaluated + block.totals.cursor_skipped + block.totals.stale + block.totals.failed,
+      block.totals.pairs,
+      'outcomes are mutually exclusive',
+    );
+    assert.equal(block.items.length, SCANNER_RUN_PAIR_ITEMS_MAX);
+    assert.equal(block.truncated, true);
+    assert.equal(block.conditions.satisfied, block.totals.evaluated, 'conditions are summed over evaluated pairs only');
+
+    // Determinism: the same observations in a different order persist the same sample.
+    const shuffled = [...observations].reverse();
+    assert.deepEqual(buildScannerRunPairs(shuffled as never).items, block.items);
+
+    // The block round-trips through the published contract.
+    assert.equal(scannerRunPairsSchema.safeParse(block).success, true);
+  });
+
+  test('B6: nested strategy identifiers are redacted for non-owners at any depth', () => {
+    const strategyId = '22222222-2222-4222-8222-222222222222';
+    const owner = '33333333-3333-4333-8333-333333333333';
+    const metadata = {
+      triggeredBy: owner,
+      force: false,
+      candles: { store: 300, provider: 0, total: 300 },
+      duplicateCandleSkips: 1,
+      pairs: buildScannerRunPairs([
+        {
+          strategyId,
+          assetClass: 'crypto',
+          symbol: 'BTCUSD',
+          timeframe: '1h',
+          outcome: 'evaluated',
+          cursorMs: 1_700_000_000_000,
+          anchorMs: 1_700_003_600_000,
+          reason: null,
+          conditions: { satisfied: 1, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+          failureReasons: ['rule group "Structure" (AND) is not satisfied'],
+        },
+      ] as never),
+    };
+
+    const asOwner = JSON.stringify(redactScannerRunMetadata(metadata, owner));
+    assert.ok(asOwner.includes(strategyId), 'the owner still sees which strategy produced the pair');
+
+    for (const viewer of ['not-the-owner', '']) {
+      const redacted = JSON.stringify(redactScannerRunMetadata(metadata, viewer));
+      assert.equal(redacted.includes(strategyId), false, 'a strategy UUID must never reach another viewer');
+      assert.equal(redacted.includes('failureReasons'), false, 'strategy-derived text is dropped for non-owners');
+      assert.equal(redacted.includes('"triggeredBy"'), false);
+    }
+
+    // Non-identifying operational detail survives redaction.
+    const shared = redactScannerRunMetadata(metadata, 'not-the-owner');
+    assert.deepEqual(
+      (shared.pairs as { totals: unknown }).totals,
+      { pairs: 1, evaluated: 1, cursor_skipped: 0, stale: 0, failed: 0 },
+      'counts stay visible: they identify no tenant',
+    );
+    assert.deepEqual(shared.candles, { store: 300, provider: 0, total: 300 });
+
+    // The input is never mutated by redaction.
+    assert.equal(metadata.pairs.items[0]!.strategyId, strategyId);
+  });
+
+  test('B7: a historical run without the block parses as "detail unavailable", never as zero', () => {
+    assert.equal(readScannerRunPairs({ triggeredBy: 'system', candles: { store: 0, provider: 0, total: 0 } }), null);
+    assert.equal(readScannerRunPairs({}), null);
+    assert.equal(readScannerRunPairs({ pairs: { v: 2 } } as never), null, 'an unknown version is not guessed');
+    assert.equal(
+      readScannerRunPairs({ pairs: { v: 1, totals: { pairs: 1 }, conditions: {}, truncated: false, items: [] } } as never),
+      null,
+      'a malformed block never throws',
+    );
   });
 });

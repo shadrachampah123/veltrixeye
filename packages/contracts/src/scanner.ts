@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { conditionSummarySchema } from './detection.js';
 
 /**
  * Live scanner contracts (M7.5) — production market-data and scanner pipeline.
@@ -54,6 +55,119 @@ export const scannerRunDtoSchema = z
   })
   .strict();
 export type ScannerRunDto = z.infer<typeof scannerRunDtoSchema>;
+
+/* ------------------------------------------------------------------------- */
+/* Phase B — per-pair evaluation observability                                */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Why one (strategy, instrument) pair ended where it did.
+ *
+ * The four outcomes are MUTUALLY EXCLUSIVE: every pair that the scanner walks
+ * produces exactly one, so `totals.pairs` always equals their sum.
+ *
+ *  - `evaluated`      — the pair reached the M3 engine; `conditions` is set.
+ *  - `cursor_skipped` — the closed setup candle at `cursorMs` was already
+ *                       processed for this pair (`scanner_cursors` hit).
+ *                       This is an idempotent no-op, NOT an evaluation.
+ *  - `stale`          — rejected before evaluation (MTF validation, freshness,
+ *                       or no closed setup candle at the anchor).
+ *  - `failed`         — an error aborted the pair (fetch, provider, detect).
+ */
+export const SCANNER_PAIR_OUTCOMES = ['evaluated', 'cursor_skipped', 'stale', 'failed'] as const;
+export type ScannerPairOutcome = (typeof SCANNER_PAIR_OUTCOMES)[number];
+export const scannerPairOutcomeSchema = z.enum(SCANNER_PAIR_OUTCOMES);
+
+/** Bounded detail sample stored on a run. Totals are NEVER derived from it. */
+export const SCANNER_RUN_PAIR_ITEMS_MAX = 200;
+/** Short machine-ish cause codes (`cursor_hit`, `stale_candle`, …). */
+export const SCANNER_RUN_PAIR_REASON_MAX_CHARS = 64;
+/** Sanitized engine reasons kept per evaluated pair. */
+export const SCANNER_RUN_PAIR_REASONS_MAX = 2;
+export const SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS = 160;
+
+const scannerPairTotalsSchema = z
+  .object({
+    pairs: z.number().int().min(0),
+    evaluated: z.number().int().min(0),
+    cursor_skipped: z.number().int().min(0),
+    stale: z.number().int().min(0),
+    failed: z.number().int().min(0),
+  })
+  .strict();
+
+const scannerPairItemSchema = z
+  .object({
+    /** Owner-scrubbed by `redactScannerRunMetadata` for non-owners. */
+    strategyId: z.string().guid(),
+    assetClass: z.string().min(1).max(24),
+    symbol: z.string().min(1).max(32),
+    /** The cursor/setup timeframe this pair is keyed by. */
+    timeframe: z.string().min(1).max(8),
+    outcome: scannerPairOutcomeSchema,
+    /** Closed setup-candle open time (ms) the cursor compares; null when none. */
+    cursorMs: z.number().int().positive().nullable(),
+    /** MTF anchor = cursorMs + setup period (ms); null when none. */
+    anchorMs: z.number().int().positive().nullable(),
+    reason: z.string().max(SCANNER_RUN_PAIR_REASON_MAX_CHARS).nullable(),
+    conditions: conditionSummarySchema.optional(),
+    /** Sanitized M3 reasons for `evaluated` pairs only (never for skips). */
+    failureReasons: z
+      .array(z.string().max(SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS))
+      .max(SCANNER_RUN_PAIR_REASONS_MAX)
+      .optional(),
+  })
+  .strict();
+
+/**
+ * `scanner_runs.metadata.pairs` (Phase B). Additive: runs recorded before this
+ * block existed carry no `pairs` key at all, so every reader must treat a null
+ * parse as "detail unavailable" — never as zero.
+ */
+export const scannerRunPairsSchema = z
+  .object({
+    v: z.literal(1),
+    /** Computed over ALL pairs, including those beyond the item cap. */
+    totals: scannerPairTotalsSchema,
+    /** Summed over `evaluated` pairs only (skips/stale/failed contribute 0). */
+    conditions: conditionSummarySchema,
+    /** True when `items` is a bounded sample of `totals.pairs`. */
+    truncated: z.boolean(),
+    items: z.array(scannerPairItemSchema).max(SCANNER_RUN_PAIR_ITEMS_MAX),
+  })
+  .strict()
+  .superRefine((block, ctx) => {
+    const sum = block.totals.evaluated + block.totals.cursor_skipped + block.totals.stale + block.totals.failed;
+    if (sum !== block.totals.pairs) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['totals'],
+        message: 'pair outcomes are mutually exclusive: their sum must equal totals.pairs',
+      });
+    }
+    if (block.items.length !== Math.min(SCANNER_RUN_PAIR_ITEMS_MAX, block.totals.pairs)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['items'],
+        message: 'items must be exactly min(cap, totals.pairs)',
+      });
+    }
+  });
+export type ScannerRunPairs = z.infer<typeof scannerRunPairsSchema>;
+export type ScannerPairItem = z.infer<typeof scannerPairItemSchema>;
+
+/**
+ * Read `metadata.pairs` without throwing.
+ *
+ * Returns null for historical runs (no key), malformed blocks, or a future
+ * schema version — callers render "detail unavailable" instead of guessing.
+ */
+export function readScannerRunPairs(metadata: Record<string, unknown> | null | undefined): ScannerRunPairs | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const parsed = scannerRunPairsSchema.safeParse((metadata as Record<string, unknown>).pairs);
+  return parsed.success ? parsed.data : null;
+}
+
 
 /** Per-cursor state (last processed candle). */
 export const scannerCursorDtoSchema = z

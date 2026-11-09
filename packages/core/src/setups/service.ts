@@ -3,6 +3,7 @@ import {
   DETECTOR_VERSION,
   SETUP_INITIAL_STATE,
   type CandidateLevels,
+  type ConditionSummary,
   type DetectionItemDto,
   type DetectionResponseDto,
   type SetupDetailDto,
@@ -10,6 +11,7 @@ import {
   type SetupDto,
   type SetupListQuery,
   type SetupState,
+  type DirectionEvaluation,
   type SetupStateEventDto,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
@@ -66,6 +68,13 @@ export class SetupService {
     symbol: string;
     direction?: SetupDirection;
     asOf: number;
+    /**
+     * Phase B observability: attach per-condition status counts to each
+     * detection item. Off by default so the M4 HTTP endpoint's response shape
+     * and size are unchanged; the live scanner opts in because the counts are
+     * the only evidence of *why* a scanned pair produced no setup.
+     */
+    includeDiagnostics?: boolean;
   }): Promise<DetectionResponseDto> {
     const symbol = args.symbol.toUpperCase();
     const instrument = await this.store.resolveInstrument(args.assetClass, symbol);
@@ -93,6 +102,7 @@ export class SetupService {
     const detections: DetectionItemDto[] = [];
     for (const direction of directions) {
       const dirEval = item.directions[direction];
+      const diagnostics = args.includeDiagnostics ? { conditionSummary: summariseConditions(dirEval) } : {};
       if (!dirEval.passed) {
         detections.push({
           direction,
@@ -100,6 +110,7 @@ export class SetupService {
           setup: null,
           created: false,
           failureReasons: dirEval.failureReasons,
+          ...diagnostics,
         });
         continue;
       }
@@ -112,7 +123,7 @@ export class SetupService {
         engineVersion: result.engineVersion,
         candidate: dirEval.candidate,
       });
-      detections.push({ direction, qualified: true, setup, created, failureReasons: [] });
+      detections.push({ direction, qualified: true, setup, created, failureReasons: [], ...diagnostics });
     }
 
     return {
@@ -485,4 +496,25 @@ function toNumberOrNull(value: string | null): number | null {
   if (value === null || value === undefined) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Aggregate one direction's per-condition statuses (Phase B observability).
+ *
+ * Pure and total: every condition the engine walked lands in exactly one of the
+ * four buckets, so the counts sum to the number of conditions in the version's
+ * rule groups. Session filters are NOT conditions and are excluded — they are
+ * reported separately in the evaluation result.
+ *
+ * This never influences qualification; `DirectionEvaluation.passed` remains the
+ * only rule (the engine already decided it).
+ */
+export function summariseConditions(direction: Pick<DirectionEvaluation, 'groups'>): ConditionSummary {
+  const summary: ConditionSummary = { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 };
+  for (const group of direction.groups) {
+    for (const condition of group.conditions) {
+      summary[condition.status] += 1;
+    }
+  }
+  return summary;
 }

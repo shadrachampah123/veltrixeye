@@ -166,6 +166,24 @@ export const setupDetailDtoSchema = z
   .strict();
 export type SetupDetailDto = z.infer<typeof setupDetailDtoSchema>;
 
+/**
+ * Aggregated M3 condition outcomes for one evaluated direction.
+ *
+ * Observability only: it never changes a qualification decision. The four
+ * counters always sum to the number of conditions the engine actually walked,
+ * so a strategy that "evaluates but never qualifies" is distinguishable from
+ * one that cannot be evaluated at all (`insufficient_data`/`unsupported`).
+ */
+export const conditionSummarySchema = z
+  .object({
+    satisfied: z.number().int().min(0),
+    unsatisfied: z.number().int().min(0),
+    insufficient_data: z.number().int().min(0),
+    unsupported: z.number().int().min(0),
+  })
+  .strict();
+export type ConditionSummary = z.infer<typeof conditionSummarySchema>;
+
 /** Per-direction detection outcome. */
 export const detectionItemDtoSchema = z
   .object({
@@ -178,6 +196,15 @@ export const detectionItemDtoSchema = z
     created: z.boolean(),
     /** M3 failure reasons (empty when qualified) — deterministic strings. */
     failureReasons: z.array(z.string()).max(200),
+    /**
+     * Per-condition status counts for this direction.
+     *
+     * Populated only when the caller asks for diagnostics
+     * (`SetupsService.detect({ includeDiagnostics: true })`, used by the live
+     * scanner). The M4 HTTP endpoint does not request it, so its response shape
+     * is unchanged. Optional because historical/other callers omit it.
+     */
+    conditionSummary: conditionSummarySchema.optional(),
   })
   .strict()
   .superRefine((item, ctx) => {
