@@ -223,6 +223,19 @@ export interface ScanTriggerArgs {
 export const SCANNER_TENANT_SENSITIVE_METADATA_KEYS = ['triggeredBy', 'strategyId', 'errors'] as const;
 
 /**
+ * Options for {@link redactScannerRunMetadata}. Omitting them yields the
+ * tenant-facing projection, which is the safe default.
+ */
+export interface ScannerRunMetadataRedactionOptions {
+  /**
+   * Keep `metadata.pairs.items[]` (the per-pair observations). Only trusted
+   * internal/operator reads set this; tenant-facing reads never do, because a
+   * single observation fingerprints one tenant's strategy activity.
+   */
+  keepPairObservations?: boolean;
+}
+
+/**
  * Strip tenant-identifying scanner-run metadata unless the run belongs to
  * `viewerUserId`. Pure and deterministic — no I/O.
  *
@@ -231,13 +244,50 @@ export const SCANNER_TENANT_SENSITIVE_METADATA_KEYS = ['triggeredBy', 'strategyI
  * for every tenant viewer. Everything non-identifying (status-bearing counts,
  * `force`, and any future non-sensitive key) is preserved so the run stays
  * operationally useful for triage.
+ *
+ * For a run the viewer does not own, `metadata.pairs` is reduced to its
+ * aggregate half: `v`, `totals`, `conditions` and `truncated` survive, while the
+ * individual observations in `items` are dropped. Those observations describe
+ * one `(strategy, instrument, timeframe)` each — `symbol`, `timeframe`,
+ * `outcome`, `cursorMs`/`anchorMs` and `reason` reveal tenant-specific strategy
+ * activity even with every strategy UUID stripped. System runs aggregate pairs
+ * from every tenant, so their observations are never tenant-facing. Operator
+ * reads pass `keepPairObservations` to retain the detail.
  */
 export function redactScannerRunMetadata(
   metadata: Record<string, unknown>,
   viewerUserId: string,
+  options: ScannerRunMetadataRedactionOptions = {},
 ): Record<string, unknown> {
   if (metadata.triggeredBy === viewerUserId) return { ...metadata };
-  return stripSensitiveMetadata(metadata, 0) as Record<string, unknown>;
+  const stripped = stripSensitiveMetadata(metadata, 0) as Record<string, unknown>;
+  return options.keepPairObservations === true ? stripped : dropPairObservations(stripped);
+}
+
+/**
+ * `metadata.pairs` keys that are safe for a tenant viewer: all four are summed
+ * over the whole pair set, so they identify no single strategy. This is an
+ * ALLOWLIST — a field added to the block later stays tenant-invisible until it
+ * is added here deliberately.
+ */
+const SCANNER_PAIR_AGGREGATE_KEYS = new Set<string>(['v', 'totals', 'conditions', 'truncated']);
+
+/**
+ * Reduce `metadata.pairs` to its aggregate half, dropping the per-pair
+ * observations. Deep-copies the surviving values so the caller cannot reach the
+ * dropped array through a shared reference. Never mutates the input, and never
+ * throws on a malformed block (a non-object `pairs` is left untouched — the
+ * contract parser rejects it downstream).
+ */
+function dropPairObservations(metadata: Record<string, unknown>): Record<string, unknown> {
+  const pairs = metadata.pairs;
+  if (pairs === null || typeof pairs !== 'object' || Array.isArray(pairs)) return { ...metadata };
+  const aggregate: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(pairs as Record<string, unknown>)) {
+    if (!SCANNER_PAIR_AGGREGATE_KEYS.has(key)) continue;
+    aggregate[key] = key === 'totals' || key === 'conditions' ? { ...(value as Record<string, unknown>) } : value;
+  }
+  return { ...metadata, pairs: aggregate };
 }
 
 /**
@@ -275,7 +325,13 @@ function stripSensitiveMetadata(value: unknown, depth: number): unknown {
   return out;
 }
 
-/** Redact a fully-mapped run DTO for a tenant viewer. Pure — no I/O. */
+/**
+ * Redact a fully-mapped run DTO for a tenant viewer. Pure — no I/O.
+ *
+ * This is the only shape that reaches a tenant: identifiers stripped, and for
+ * runs the viewer does not own (system runs, other tenants' runs) the per-pair
+ * observations are replaced by their aggregate totals.
+ */
 export function redactScannerRunForViewer(run: ScannerRunDto, viewerUserId: string): ScannerRunDto {
   const isOwner = run.metadata.triggeredBy === viewerUserId;
   return {
@@ -294,9 +350,11 @@ export function redactScannerRunForViewer(run: ScannerRunDto, viewerUserId: stri
  * Redact a fully-mapped run DTO for operator/scheduler consumption
  * (e.g. `POST /api/internal/scanner/run`).
  *
- * Strips all tenant-identifying metadata (`triggeredBy`, `strategyId`, `errors`)
- * and sanitizes `error` so no tenant/strategy UUIDs or secrets are returned.
- * Pure and deterministic — no I/O.
+ * Strips all tenant-identifying metadata (`triggeredBy`, `strategyId`, `errors`,
+ * `versionId`, `failureReasons`) and sanitizes `error` so no tenant/strategy
+ * UUIDs or secrets are returned. This is a trusted path, so the per-pair
+ * observations (`metadata.pairs.items[]`) are preserved for triage — only the
+ * identifiers inside them are removed. Pure and deterministic — no I/O.
  */
 export function redactScannerRunForOperator(
   run: ScannerRunDto,
@@ -305,7 +363,8 @@ export function redactScannerRunForOperator(
   return {
     ...run,
     error: run.error === null ? null : sanitizeScannerError(run.error, redact, SCANNER_RUN_ERROR_MAX_CHARS, true),
-    metadata: redactScannerRunMetadata(run.metadata, ''),
+    // Operator read: keep the per-pair observations (identifiers already gone).
+    metadata: redactScannerRunMetadata(run.metadata, '', { keepPairObservations: true }),
   };
 }
 
@@ -804,6 +863,11 @@ export class ScannerService {
     // tenant identifiers. Redaction therefore does not depend on the WHERE
     // clause being right — a future scope that widens the selection cannot leak
     // by accident.
+    //
+    // For system rows this also drops `metadata.pairs.items[]` (see
+    // `redactScannerRunMetadata`): those observations are per-strategy, and a
+    // system run mixes every tenant's strategies. The caller's own rows keep
+    // them, and `pairs.totals`/`conditions` stay visible for every row.
     const runs = res.rows.map((row) => {
       const dto = toScannerRunDto(row);
       return viewerUserId === undefined ? dto : redactScannerRunForViewer(dto, viewerUserId);

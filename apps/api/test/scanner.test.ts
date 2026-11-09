@@ -20,6 +20,8 @@ import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 import {
   TIMEFRAMES,
   SCANNER_ADVISORY_LOCK_KEY,
+  readScannerRunPairAggregate,
+  readScannerRunPairs,
   scannerInternalRunResponseSchema,
   scannerInternalMaintenanceResponseSchema,
   type Candle,
@@ -398,7 +400,27 @@ describe('M7.5: Scanner API', () => {
     const shown = runs.find((r) => r.id === system) as unknown as { metadata: Record<string, unknown> };
     assert.deepEqual(shown.metadata.candles, { store: 294, provider: 0, total: 294 }, 'counts stay visible');
     assert.equal(shown.metadata.duplicateCandleSkips, 1);
-    assert.equal((shown.metadata.pairs as { totals: { pairs: number } }).totals.pairs, 1);
+
+    // The per-pair sample is withheld from tenant-facing system rows: `symbol`,
+    // `timeframe`, `outcome` and the candle timings identify one tenant's
+    // strategy activity even with every UUID stripped.
+    assert.equal(
+      (shown.metadata.pairs as { items?: unknown }).items,
+      undefined,
+      'scope=system must not expose metadata.pairs.items',
+    );
+    const shownPairs = JSON.stringify(shown.metadata.pairs);
+    for (const marker of ['BTCUSD', 'cursorMs', 'anchorMs', 'timeframe', 'outcome', 'items']) {
+      assert.equal(shownPairs.includes(marker), false, `per-pair field ${marker} must not leak`);
+    }
+
+    // Aggregate operational metrics stay available, and stay reconciled.
+    const aggregate = readScannerRunPairAggregate(shown.metadata);
+    assert.ok(aggregate, 'the aggregate half of the block is still readable');
+    assert.deepEqual(aggregate.totals, { pairs: 1, evaluated: 0, cursor_skipped: 1, stale: 0, failed: 0 });
+    assert.deepEqual(aggregate.conditions, { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 });
+    assert.equal(aggregate.truncated, false);
+    assert.equal(readScannerRunPairs(shown.metadata), null, 'there is no detail sample to read');
   });
 
   test('scope=all returns own + system runs and never another tenant’s', async () => {
@@ -407,9 +429,44 @@ describe('M7.5: Scanner API', () => {
     const strategyA = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
     const strategyB = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 
-    const own = await insertRun({ triggeredBy: a.user.id, strategyId: strategyA, force: true });
-    const other = await insertRun({ triggeredBy: b.user.id, strategyId: strategyB, force: false });
-    const system = await insertRun({ triggeredBy: 'system', strategyId: null, force: false });
+    const pairBlock = (strategyId: string, symbol: string) => ({
+      v: 1,
+      totals: { pairs: 1, evaluated: 1, cursor_skipped: 0, stale: 0, failed: 0 },
+      conditions: { satisfied: 1, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+      truncated: false,
+      items: [
+        {
+          strategyId,
+          assetClass: 'forex',
+          symbol,
+          timeframe: '1h',
+          outcome: 'evaluated',
+          cursorMs: 1_700_000_000_000,
+          anchorMs: 1_700_003_600_000,
+          reason: null,
+          conditions: { satisfied: 1, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+        },
+      ],
+    });
+
+    const own = await insertRun({
+      triggeredBy: a.user.id,
+      strategyId: strategyA,
+      force: true,
+      pairs: pairBlock(strategyA, 'EURUSD'),
+    });
+    const other = await insertRun({
+      triggeredBy: b.user.id,
+      strategyId: strategyB,
+      force: false,
+      pairs: pairBlock(strategyB, 'GBPUSD'),
+    });
+    const system = await insertRun({
+      triggeredBy: 'system',
+      strategyId: null,
+      force: false,
+      pairs: pairBlock(strategyB, 'GBPUSD'),
+    });
 
     const res = await app.inject({
       method: 'GET',
@@ -429,6 +486,62 @@ describe('M7.5: Scanner API', () => {
     // The owner keeps their own identifiers; the system row keeps none.
     assert.ok(payload.includes(strategyA));
     assert.ok(!payload.includes('"triggeredBy":"system"'), 'system metadata is redacted even in scope=all');
+
+    // Detail follows ownership inside a single response: own row keeps the
+    // sample, the system row carries aggregates only.
+    const ownRun = runs.find((r) => r.id === own) as unknown as { metadata: Record<string, unknown> };
+    assert.equal(readScannerRunPairs(ownRun.metadata)?.items[0]?.symbol, 'EURUSD', 'owner detail is preserved');
+    assert.equal(readScannerRunPairAggregate(ownRun.metadata)?.totals.evaluated, 1);
+
+    const systemRun = runs.find((r) => r.id === system) as unknown as { metadata: Record<string, unknown> };
+    assert.equal(
+      (systemRun.metadata.pairs as { items?: unknown }).items,
+      undefined,
+      'scope=all must not expose system pair observations',
+    );
+    assert.equal(readScannerRunPairs(systemRun.metadata), null);
+    assert.equal(readScannerRunPairAggregate(systemRun.metadata)?.totals.pairs, 1, 'aggregates remain available');
+    assert.equal(JSON.stringify(systemRun.metadata).includes('GBPUSD'), false, 'no per-pair instrument leaks');
+  });
+
+  test("scope=mine keeps the owner's own per-pair observations", async () => {
+    const a = await registerUser('pro');
+    const run = await insertRun({
+      triggeredBy: a.user.id,
+      strategyId: null,
+      force: false,
+      pairs: {
+        v: 1,
+        totals: { pairs: 1, evaluated: 1, cursor_skipped: 0, stale: 0, failed: 0 },
+        conditions: { satisfied: 2, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+        truncated: false,
+        items: [
+          {
+            strategyId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+            assetClass: 'commodity',
+            symbol: 'XAUUSD',
+            timeframe: '4h',
+            outcome: 'evaluated',
+            cursorMs: 1_700_000_000_000,
+            anchorMs: 1_700_014_400_000,
+            reason: null,
+            conditions: { satisfied: 2, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+          },
+        ],
+      },
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100&scope=mine',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const shown = (res.json().runs as ScannerRunLike[]).find((r) => r.id === run) as unknown as {
+      metadata: Record<string, unknown>;
+    };
+    assert.equal(readScannerRunPairs(shown.metadata)?.items[0]?.symbol, 'XAUUSD', 'own detail is untouched');
+    assert.equal(readScannerRunPairAggregate(shown.metadata)?.totals.evaluated, 1);
   });
 
   test('scope defaults to mine, and an unknown scope is a 400', async () => {
@@ -736,6 +849,13 @@ describe('F3: Internal scanner worker endpoints & ticker', () => {
       assert.equal('triggeredBy' in body.run.metadata, false);
       assert.equal('strategyId' in body.run.metadata, false);
       assert.equal('errors' in body.run.metadata, false);
+
+      // This is the trusted operator path, so unlike the tenant-facing
+      // projection it keeps the per-pair observations (identifiers removed).
+      const operatorPairs = body.run.metadata.pairs as { items?: unknown; totals?: unknown } | undefined;
+      assert.ok(operatorPairs, 'operator response keeps the pairs block');
+      assert.equal(Array.isArray(operatorPairs.items), true, 'operator response keeps per-pair observations');
+      assert.ok(operatorPairs.totals, 'operator response keeps the aggregate totals');
 
       // Verify stale row in DB was marked failed
       const dbStale = await pool.query<{ status: string; error: string | null }>(

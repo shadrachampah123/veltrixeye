@@ -18,6 +18,9 @@ import {
   type RealtimeCandleStream,
   TIMEFRAMES,
   SCANNER_ADVISORY_LOCK_KEY,
+  readScannerRunPairAggregate,
+  readScannerRunPairs,
+  type ScannerRunDto,
 } from '@veltrixeye/contracts';
 import {
   createPool,
@@ -615,6 +618,115 @@ describe('F4: Scanner tenant privacy', () => {
     test('sensitive keys are covered by the exported constant', () => {
       assert.deepEqual([...SCANNER_TENANT_SENSITIVE_METADATA_KEYS], ['triggeredBy', 'strategyId', 'errors']);
     });
+
+    // A pair observation names one strategy's instrument, timeframe, candle
+    // timings and outcome. Stripping `strategyId` does not anonymize that, so a
+    // run the viewer does not own must not carry the observations at all.
+    const withPairs = () => ({
+      triggeredBy: 'system',
+      force: false,
+      candles: { store: 294, provider: 0, total: 294 },
+      duplicateCandleSkips: 0,
+      pairs: {
+        v: 1,
+        totals: { pairs: 2, evaluated: 1, cursor_skipped: 0, stale: 1, failed: 0 },
+        conditions: { satisfied: 2, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+        truncated: false,
+        items: [
+          {
+            strategyId: STRATEGY_B,
+            assetClass: 'crypto',
+            symbol: 'BTCUSD',
+            timeframe: '1h',
+            outcome: 'evaluated',
+            cursorMs: 1_700_000_000_000,
+            anchorMs: 1_700_003_600_000,
+            reason: null,
+            conditions: { satisfied: 2, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+            failureReasons: ['rule group "Structure" (AND) is not satisfied'],
+          },
+          {
+            strategyId: STRATEGY_B,
+            assetClass: 'commodity',
+            symbol: 'XAUUSD',
+            timeframe: '4h',
+            outcome: 'stale',
+            cursorMs: 1_700_000_000_000,
+            anchorMs: 1_700_014_400_000,
+            reason: 'setup_stale_candle',
+          },
+        ],
+      },
+    });
+
+    test("another tenant's run keeps pair aggregates but no per-pair observations", () => {
+      const metadata = withPairs();
+      const out = redactScannerRunMetadata(metadata, USER_A);
+
+      assert.deepEqual(out.pairs, {
+        v: 1,
+        totals: { pairs: 2, evaluated: 1, cursor_skipped: 0, stale: 1, failed: 0 },
+        conditions: { satisfied: 2, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+        truncated: false,
+      });
+      // Aggregate operational metrics survive: no single strategy is identifiable.
+      assert.equal(out.duplicateCandleSkips, 0);
+      assert.deepEqual(out.candles, { store: 294, provider: 0, total: 294 });
+
+      // Nothing per-pair survives — not even the symbols, timeframes or timings.
+      const payload = JSON.stringify(out);
+      for (const marker of ['BTCUSD', 'XAUUSD', '"cursorMs"', '"anchorMs"', '"timeframe"', '"strategyId"', 'failureReasons', '"items"']) {
+        assert.equal(payload.includes(marker), false, `per-pair field ${marker} must not survive`);
+      }
+
+      // The aggregate half is still readable through the contract; there is no
+      // per-pair sample to read.
+      assert.equal(readScannerRunPairAggregate(out)?.totals.pairs, 2);
+      assert.equal(readScannerRunPairs(out), null);
+
+      // The caller's object is never mutated.
+      assert.equal(metadata.pairs.items.length, 2);
+      assert.equal(metadata.pairs.items[0]!.strategyId, STRATEGY_B);
+    });
+
+    test('the owner keeps their own per-pair observations', () => {
+      const metadata = { ...withPairs(), triggeredBy: USER_A, strategyId: STRATEGY_A };
+      const out = redactScannerRunMetadata(metadata, USER_A);
+      assert.deepEqual(out, metadata);
+      assert.equal(readScannerRunPairs(out)?.items.length, 2);
+    });
+
+    test('trusted operator reads keep the per-pair observations with identifiers removed', () => {
+      const run = {
+        id: 'c3c3c3c3-3333-4333-8333-333333333333',
+        status: 'completed',
+        providerSlug: 'twelve-data',
+        startedAt: '2026-11-03T10:00:00.000Z',
+        finishedAt: '2026-11-03T10:00:02.000Z',
+        strategiesScanned: 1,
+        instrumentsScanned: 2,
+        candlesFetched: 294,
+        setupsDetected: 0,
+        setupsCreated: 0,
+        alertsCreated: 0,
+        staleRejections: 1,
+        providerFailures: 0,
+        symbolsProcessed: ['BTCUSD', 'XAUUSD'],
+        timeframesProcessed: ['1h', '4h'],
+        error: null,
+        metadata: { ...withPairs(), triggeredBy: USER_B, strategyId: STRATEGY_B },
+        createdAt: '2026-11-03T10:00:00.000Z',
+        updatedAt: '2026-11-03T10:00:02.000Z',
+      } satisfies ScannerRunDto;
+
+      const out = redactScannerRunForOperator(run);
+      const pairs = out.metadata.pairs as { items: { symbol: string; strategyId?: string }[] };
+      assert.equal(pairs.items.length, 2, 'operator detail is preserved');
+      assert.deepEqual(pairs.items.map((item) => item.symbol), ['BTCUSD', 'XAUUSD']);
+      assert.ok(pairs.items.every((item) => item.strategyId === undefined), 'identifiers stay stripped');
+      assert.equal(JSON.stringify(out).includes(USER_B), false);
+      assert.equal(JSON.stringify(out).includes(STRATEGY_B), false);
+    });
   });
 
   describe('listRuns owner scoping', () => {
@@ -716,11 +828,35 @@ describe('F4: Scanner tenant privacy', () => {
       assert.ok(!payload.includes(USER_B));
       assert.ok(!payload.includes(STRATEGY_B), 'the nested pair strategy id is redacted at depth');
       assert.ok(!payload.includes('"failureReasons"'));
+
+      const shown = systemScope.runs.find((r) => r.id === systemRun)!;
       assert.equal(
-        (systemScope.runs.find((r) => r.id === systemRun)?.metadata.duplicateCandleSkips as number),
-        1,
-        'non-identifying counters survive redaction',
+        (shown.metadata.pairs as { items?: unknown }).items,
+        undefined,
+        'per-pair observations never reach a tenant-facing system row',
       );
+      assert.deepEqual(
+        (shown.metadata.pairs as { totals: unknown }).totals,
+        { pairs: 1, evaluated: 0, cursor_skipped: 1, stale: 0, failed: 0 },
+        'aggregate totals survive so the outcome breakdown still works',
+      );
+      assert.deepEqual((shown.metadata.pairs as { conditions: unknown }).conditions, {
+        satisfied: 0,
+        unsatisfied: 0,
+        insufficient_data: 0,
+        unsupported: 0,
+      });
+      assert.equal((shown.metadata.pairs as { truncated: unknown }).truncated, false);
+      assert.equal(shown.metadata.duplicateCandleSkips, 1, 'non-identifying counters survive redaction');
+
+      // No per-pair identifier — not even the symbol/timeframe/timing — leaks.
+      const shownPayload = JSON.stringify(shown.metadata);
+      for (const marker of ['XAUUSD', '"cursorMs"', '"anchorMs"', '"timeframe"', '"outcome"', '"items"']) {
+        assert.equal(shownPayload.includes(marker), false, `per-pair field ${marker} must not leak`);
+      }
+      // The aggregate half is readable; the detail half is gone.
+      assert.equal(readScannerRunPairAggregate(shown.metadata)?.totals.cursor_skipped, 1);
+      assert.equal(readScannerRunPairs(shown.metadata), null);
     });
 
     test('scope=all returns own + system runs and never another tenant’s', async () => {
@@ -733,9 +869,44 @@ describe('F4: Scanner tenant privacy', () => {
         return res.rows[0]!.id;
       };
 
-      const own = await insertRun({ triggeredBy: USER_A, strategyId: STRATEGY_A, force: false });
-      const other = await insertRun({ triggeredBy: USER_B, strategyId: STRATEGY_B, force: false });
-      const system = await insertRun({ triggeredBy: 'system', strategyId: null, force: false });
+      const pairBlock = (strategyId: string, symbol: string) => ({
+        v: 1,
+        totals: { pairs: 1, evaluated: 1, cursor_skipped: 0, stale: 0, failed: 0 },
+        conditions: { satisfied: 1, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+        truncated: false,
+        items: [
+          {
+            strategyId,
+            assetClass: 'crypto',
+            symbol,
+            timeframe: '1h',
+            outcome: 'evaluated',
+            cursorMs: 1_700_000_000_000,
+            anchorMs: 1_700_003_600_000,
+            reason: null,
+            conditions: { satisfied: 1, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+          },
+        ],
+      });
+
+      const own = await insertRun({
+        triggeredBy: USER_A,
+        strategyId: STRATEGY_A,
+        force: false,
+        pairs: pairBlock(STRATEGY_A, 'BTCUSD'),
+      });
+      const other = await insertRun({
+        triggeredBy: USER_B,
+        strategyId: STRATEGY_B,
+        force: false,
+        pairs: pairBlock(STRATEGY_B, 'XAUUSD'),
+      });
+      const system = await insertRun({
+        triggeredBy: 'system',
+        strategyId: null,
+        force: false,
+        pairs: pairBlock(STRATEGY_B, 'XAUUSD'),
+      });
 
       const forA = await scanner.listRuns({ limit: 100, scope: 'all' }, USER_A);
       const ids = forA.runs.map((r) => r.id);
@@ -751,6 +922,64 @@ describe('F4: Scanner tenant privacy', () => {
         forA.runs.filter((r) => r.id === system).every((r) => r.metadata.triggeredBy === undefined),
         'system rows stay redacted inside scope=all',
       );
+
+      // The owner's own row keeps its detailed observations…
+      const ownRun = forA.runs.find((r) => r.id === own)!;
+      assert.equal((ownRun.metadata.pairs as { items: unknown[] }).items.length, 1);
+      assert.equal(readScannerRunPairs(ownRun.metadata)?.items[0]?.symbol, 'BTCUSD');
+
+      // …the system row does not, and its aggregate counters are intact.
+      const systemRun = forA.runs.find((r) => r.id === system)!;
+      assert.equal(
+        (systemRun.metadata.pairs as { items?: unknown }).items,
+        undefined,
+        'scope=all never leaks system pair observations',
+      );
+      assert.equal(
+        (systemRun.metadata.pairs as { totals: { evaluated: number } }).totals.evaluated,
+        1,
+        'system aggregates remain available inside scope=all',
+      );
+      assert.equal(JSON.stringify(systemRun.metadata).includes('XAUUSD'), false);
+    });
+
+    test("scope=mine keeps the owner's own per-pair observations", async () => {
+      const symbol = 'USDJPY';
+      const res = await pool.query<{ id: string }>(
+        `INSERT INTO scanner_runs (status, provider_slug, metadata)
+         VALUES ('completed', 'twelve-data', $1::jsonb) RETURNING id`,
+        [
+          JSON.stringify({
+            triggeredBy: USER_A,
+            strategyId: STRATEGY_A,
+            force: false,
+            pairs: {
+              v: 1,
+              totals: { pairs: 1, evaluated: 0, cursor_skipped: 0, stale: 1, failed: 0 },
+              conditions: { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+              truncated: false,
+              items: [
+                {
+                  strategyId: STRATEGY_A,
+                  assetClass: 'forex',
+                  symbol,
+                  timeframe: '1h',
+                  outcome: 'stale',
+                  cursorMs: 1_700_000_000_000,
+                  anchorMs: 1_700_003_600_000,
+                  reason: 'setup_stale_candle',
+                },
+              ],
+            },
+          }),
+        ],
+      );
+      const runId = res.rows[0]!.id;
+
+      const mine = await scanner.listRuns({ limit: 100, scope: 'mine' }, USER_A);
+      const run = mine.runs.find((r) => r.id === runId)!;
+      assert.equal(readScannerRunPairs(run.metadata)?.items[0]?.symbol, symbol, 'owner detail is preserved');
+      assert.equal(readScannerRunPairAggregate(run.metadata)?.totals.stale, 1);
     });
 
     test('scope composes with the status filter, and an operator can narrow to system runs', async () => {

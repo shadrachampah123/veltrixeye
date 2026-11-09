@@ -120,6 +120,26 @@ const scannerPairItemSchema = z
   .strict();
 
 /**
+ * The reconciliation every reader relies on: the four outcomes are mutually
+ * exclusive, so they must add up to `totals.pairs`. Shared by the full block
+ * and the aggregate-only projection so both refuse a corrupt ledger value.
+ */
+function assertPairTotalsReconcile(
+  block: { totals: { pairs: number; evaluated: number; cursor_skipped: number; stale: number; failed: number } },
+  ctx: z.RefinementCtx,
+): void {
+  const { totals } = block;
+  const sum = totals.evaluated + totals.cursor_skipped + totals.stale + totals.failed;
+  if (sum !== totals.pairs) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['totals'],
+      message: 'pair outcomes are mutually exclusive: their sum must equal totals.pairs',
+    });
+  }
+}
+
+/**
  * `scanner_runs.metadata.pairs` (Phase B). Additive: runs recorded before this
  * block existed carry no `pairs` key at all, so every reader must treat a null
  * parse as "detail unavailable" — never as zero.
@@ -137,14 +157,7 @@ export const scannerRunPairsSchema = z
   })
   .strict()
   .superRefine((block, ctx) => {
-    const sum = block.totals.evaluated + block.totals.cursor_skipped + block.totals.stale + block.totals.failed;
-    if (sum !== block.totals.pairs) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['totals'],
-        message: 'pair outcomes are mutually exclusive: their sum must equal totals.pairs',
-      });
-    }
+    assertPairTotalsReconcile(block, ctx);
     if (block.items.length !== Math.min(SCANNER_RUN_PAIR_ITEMS_MAX, block.totals.pairs)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -157,14 +170,59 @@ export type ScannerRunPairs = z.infer<typeof scannerRunPairsSchema>;
 export type ScannerPairItem = z.infer<typeof scannerPairItemSchema>;
 
 /**
+ * The aggregate half of `metadata.pairs`: counters, condition totals and the
+ * truncation flag — no per-pair observations.
+ *
+ * This is everything a tenant viewer may see for a run they do not own. A single
+ * `items[]` entry names one strategy's instrument, timeframe, candle timings and
+ * outcome, which is enough to fingerprint a tenant's strategy activity even
+ * after `strategyId`/`versionId`/`failureReasons` are stripped. System runs mix
+ * pairs from every tenant, so tenant-facing responses publish this projection
+ * only (see `redactScannerRunForViewer`); operator reads keep the full block.
+ */
+export const scannerRunPairAggregateSchema = z
+  .object({
+    v: z.literal(1),
+    totals: scannerPairTotalsSchema,
+    conditions: conditionSummarySchema,
+    truncated: z.boolean(),
+  })
+  .strict()
+  .superRefine(assertPairTotalsReconcile);
+export type ScannerRunPairAggregate = z.infer<typeof scannerRunPairAggregateSchema>;
+
+/**
  * Read `metadata.pairs` without throwing.
  *
  * Returns null for historical runs (no key), malformed blocks, or a future
  * schema version — callers render "detail unavailable" instead of guessing.
+ * Also null for the aggregate-only projection tenants receive for runs they do
+ * not own: there is no per-pair sample to read. Use
+ * {@link readScannerRunPairAggregate} for the counters.
  */
 export function readScannerRunPairs(metadata: Record<string, unknown> | null | undefined): ScannerRunPairs | null {
   if (!metadata || typeof metadata !== 'object') return null;
   const parsed = scannerRunPairsSchema.safeParse((metadata as Record<string, unknown>).pairs);
+  return parsed.success ? parsed.data : null;
+}
+
+/**
+ * Read the aggregate half of `metadata.pairs` without throwing.
+ *
+ * Accepts both shapes: a complete block (owner and operator reads) and the
+ * aggregate-only projection a tenant receives for a run they do not own, where
+ * `items` is absent by design rather than corrupt. Returns null when there is no
+ * usable block — historical run, unknown version, malformed or unreconciled
+ * counters — so callers render "unavailable" instead of zeros.
+ */
+export function readScannerRunPairAggregate(
+  metadata: Record<string, unknown> | null | undefined,
+): ScannerRunPairAggregate | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const pairs = (metadata as Record<string, unknown>).pairs;
+  if (pairs === null || typeof pairs !== 'object' || Array.isArray(pairs)) return null;
+  const { v, totals, conditions, truncated } = pairs as Record<string, unknown>;
+  const parsed = scannerRunPairAggregateSchema.safeParse({ v, totals, conditions, truncated });
   return parsed.success ? parsed.data : null;
 }
 
@@ -222,6 +280,14 @@ export type ScannerHealthDto = z.infer<typeof scannerHealthDtoSchema>;
  *
  * Every scope is available only to a scanner-entitled caller: the route rejects
  * free users before the query is even parsed.
+ *
+ * Tenant-facing responses never carry `metadata.pairs.items[]` for a run the
+ * caller does not own — system runs mix pairs from every tenant, and one
+ * observation fingerprints a strategy's instrument, timeframe and timing even
+ * without its UUID. The aggregate half of the block (`v`, `totals`,
+ * `conditions`, `truncated`) is preserved, so outcome breakdowns stay available;
+ * read it with `readScannerRunPairAggregate`. Owner runs and trusted operator
+ * reads keep the per-pair detail.
  */
 export const SCANNER_RUN_SCOPES = ['mine', 'system', 'all'] as const;
 export type ScannerRunScope = (typeof SCANNER_RUN_SCOPES)[number];

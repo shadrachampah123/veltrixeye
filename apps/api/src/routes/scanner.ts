@@ -23,7 +23,7 @@ import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from '../
  * | Route | Auth | Notes |
  * |---|---|---|
  * | GET /api/scanner/health | session | Real production state: provider availability, last run, last successful, active runs, data freshness. Never mock/static. |
- * | GET /api/scanner/runs | session | List recent scanner runs (observability). `scope=mine` (default) = own runs, `scope=system` = the automatic scan cycle's runs, `scope=all` = own + system. Never another tenant's. |
+ * | GET /api/scanner/runs | session | List recent scanner runs (observability). `scope=mine` (default) = own runs, `scope=system` = the automatic scan cycle's runs, `scope=all` = own + system. Never another tenant's, and never another tenant's per-pair observations: runs the caller does not own carry `metadata.pairs` aggregates only (no `items[]`). |
  * | POST /api/scanner/trigger | session | Manual trigger (entitlement-gated). Uses advisory locking to prevent overlapping. |
  * | POST /api/internal/scanner/run | worker token | Sleep-safe external scheduler trigger: recovers stale runs, drains one bounded notification-delivery batch, then executes one system scan under advisory lock. 404 when no token is configured. |
  * | POST /api/internal/scanner/maintenance | worker token | Stale-run recovery + bounded operational status. 404 when no token is configured. |
@@ -151,7 +151,10 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
     // own runs, system runs, or both — never another tenant's. The service
     // applies `redactScannerRunForViewer` to every returned row regardless of
     // scope, so this route cannot leak metadata even if a future scope widens
-    // the WHERE clause.
+    // the WHERE clause. That redactor also strips `metadata.pairs.items[]` from
+    // every run the caller does not own (all system rows), keeping only the
+    // aggregate half of the block — a single observation names one strategy's
+    // instrument, timeframe and candle timings.
     return ctx.scanner.listRuns(parsed.data, user.id);
   });
 
