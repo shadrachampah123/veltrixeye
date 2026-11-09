@@ -343,7 +343,12 @@ backfill is performed.
 **API (session-authenticated, entitlement-gated):**
 
 - `GET /api/scanner/health` — real production state: status `idle|running|degraded|unavailable`, lastRun, lastSuccessfulRun, provider, isProviderAvailable, expectedIntervalMs, activeRuns, recentFailures, dataFreshness (newestCandleTime, staleRejectionCount)
-- `GET /api/scanner/runs?status=&limit=` — list recent runs (observability), **owner-scoped**: only runs the session user initiated
+- `GET /api/scanner/runs?status=&limit=&scope=` — list recent runs (observability). `scope` selects the slice of the shared ledger:
+  - `mine` (**default**) — only runs the session user initiated. Omitting `scope` is exactly `scope=mine`, so a client written before scopes existed sees the same rows it always did;
+  - `system` — only automatic (5-minute cycle) runs, `metadata.triggeredBy = 'system'`. They belong to no tenant, and every row is still passed through `redactScannerRunForViewer`;
+  - `all` — the caller's own runs **plus** system runs. Never another tenant's.
+
+  All three scopes sit behind the same `canAccessScanner` gate (free → 403), and the value is a closed enum validated by the query schema (an unknown scope is a 400, never a silently ignored filter)
 - `POST /api/scanner/trigger` — manual trigger with optional `strategyId`, `instruments` (validated against universe), `force` boolean; uses advisory locking, returns 201 created or 200 skipped; rate limited 10/min; audited as `scanner.triggered` / `scanner.trigger_skipped`
 
 All session endpoints check `canAccessScanner` entitlement server-side (free → 403).
@@ -368,6 +373,7 @@ All session endpoints check `canAccessScanner` entitlement server-side (free →
 - Users cannot select arbitrary unsupported provider symbols to bypass market universe: `normalizeSymbol` + `instruments` table check, 400 on unsupported
 - Scanner endpoints remain authenticated/authorized: session auth required, 401 unauthenticated, 403 free users, strategy ownership check for filtered scans
 - Scanner run ledger is tenant-private (M7 audit finding F4): `scanner_runs` is a single global table whose `metadata` holds `triggeredBy` (user UUID) and `strategyId` (strategy UUID), so `ScannerService.listRuns(query, viewerUserId)` filters rows to the caller's own runs, and `ScannerService.getHealth(viewerUserId)` — which stays global because the scanner is one shared pipeline — runs the embedded `lastRun`/`lastSuccessfulRun` DTOs through `redactScannerRunMetadata`, dropping `triggeredBy`, `strategyId` and `errors` (entries embed `strategy <uuid>: …`) unless the run belongs to the viewer. System runs (`triggeredBy = 'system'`) belong to no tenant and are never returned to one. Omitting `viewerUserId` keeps the previous unscoped behaviour for trusted in-process/operator callers; no HTTP route does so, and the architecture defines no admin role.
+- System-run visibility (`scope=system|all`) does not widen what a tenant can learn about another tenant. The rows it adds are the automatic cycle's, whose metadata carries no tenant identifiers; the only fields they expose — status, provider, timestamps, counters, symbols/timeframes, pair counts — are already published to every entitled user through the global `getHealth`. Redaction runs on **every** returned row regardless of scope, so the safety of the endpoint does not depend on the WHERE clause staying correct: a future scope that widened the selection would still be scrubbed by `redactScannerRunForViewer`.
 - Redaction is **recursive** (Phase B): `metadata.pairs.items[]` carries a `strategyId` and the engine's `failureReasons` for that strategy, so a top-level-only filter would have leaked them through `getHealth` (global) and the operator/scheduler responses. `redactScannerRunMetadata` walks the whole metadata tree (bounded depth, array-safe, never mutating its input) and drops `triggeredBy`, `strategyId`, `versionId`, `errors` and `failureReasons` at any depth for anyone who does not own the run. Non-identifying counts (`totals`, `conditions`, `candles`, `symbols`, `timeframes`) survive, which is what makes a system run shareable at all.
 - Subscription limits remain server-authoritative: `getEntitlements(plan, status)` checked in scanner service and API routes, `maxSavedSetups` enforced in `SetupService`, `maxAlerts` etc. enforced
 - No client-controlled signal generation is trusted: scanner generates signals server-side only from validated, fresh, normalized production data; alert payload rendered from persisted alert + published version config, never from request input
@@ -412,6 +418,7 @@ Comprehensive tests added:
 - `apps/api/test/scanner.test.ts` — API integration:
   - Unauthenticated 401, free user 403, pro user can access health (real state), list runs, trigger scanner with advisory locking, validates strategy ownership, rejects unsupported instruments, health does not expose secrets, rate limited
   - F4 tenant privacy (HTTP): `GET /api/scanner/runs` returns only the session user's runs and never another tenant's user/strategy UUID; `GET /api/scanner/health` keeps the global last-run view but redacts other tenants' identifiers while preserving the viewer's own; a run triggered via `POST /api/scanner/trigger` is listed for its owner and invisible to another tenant
+  - Run scopes (HTTP): `scope=system` returns the automatic run and never a manual one, with `triggeredBy`/`strategyId` (including a nested `pairs.items[].strategyId`) and `failureReasons` absent from the payload while `candles`/`duplicateCandleSkips`/`pairs.totals` survive; `scope=all` returns own + system and never the other tenant's row or UUIDs, with the owner's own identifiers preserved; omitting `scope` returns exactly `scope=mine`; `scope=everything` is a 400; a free-tier user gets 403 for `scope=system` and `scope=all`
 
 **Results:**
 

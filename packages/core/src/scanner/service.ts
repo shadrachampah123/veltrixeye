@@ -15,7 +15,7 @@ import {
   type Timeframe,
   type ScannerRunDto,
   type ScannerHealthDto,
-  type ScannerRunListQuery,
+  type ScannerRunListQueryInput,
   type ScannerInternalRunResponse,
   type ScannerInternalMaintenanceResponse,
   type AssetClass,
@@ -745,22 +745,49 @@ export class ScannerService {
    * so an unscoped read would expose other tenants' identifiers to any
    * entitled caller (M7 final verification audit, finding F4).
    *
-   * Pass `viewerUserId` for every tenant-facing read: the result is restricted
-   * to runs that user initiated, which is both the privacy boundary and the
-   * only meaningful subset for them. System runs (`triggeredBy = 'system'`)
-   * belong to no tenant and are therefore not returned to any tenant viewer —
-   * global operational state remains visible via `getHealth`.
+   * Pass `viewerUserId` for every tenant-facing read. `query.scope` decides the
+   * slice, and it defaults to `mine`, which is the original privacy boundary:
+   *
+   *  - `mine`   — only runs that user initiated;
+   *  - `system` — system runs only (`triggeredBy = 'system'`), which belong to no
+   *               tenant and are the automatic 5-minute scan cycle;
+   *  - `all`    — the caller's own runs plus system runs, never another tenant's.
+   *
+   * Whatever the scope, every returned row is passed through
+   * `redactScannerRunForViewer`, so `triggeredBy`/`strategyId`/`versionId`/
+   * `errors`/`failureReasons` are stripped (at any depth) from any run the
+   * viewer does not own — including every system run.
    *
    * Omit `viewerUserId` only for trusted internal/operator reads that must see
    * the whole ledger (ops scripts, diagnostics).
    */
-  async listRuns(query: ScannerRunListQuery, viewerUserId?: string): Promise<{ runs: ScannerRunDto[] }> {
+  async listRuns(query: ScannerRunListQueryInput, viewerUserId?: string): Promise<{ runs: ScannerRunDto[] }> {
     const values: unknown[] = [];
     const where: string[] = [];
+    // Default `mine` reproduces the pre-scope behaviour exactly: an old client
+    // that never sends `scope` keeps seeing precisely what it saw before.
+    const scope = query.scope ?? 'mine';
+
     if (viewerUserId !== undefined) {
-      values.push(viewerUserId);
-      where.push(`metadata->>'triggeredBy' = $${values.length}`);
+      switch (scope) {
+        case 'mine':
+          values.push(viewerUserId);
+          where.push(`metadata->>'triggeredBy' = $${values.length}`);
+          break;
+        case 'system':
+          // A literal, never caller-supplied: system runs belong to no tenant.
+          where.push(`metadata->>'triggeredBy' = 'system'`);
+          break;
+        case 'all':
+          values.push(viewerUserId);
+          where.push(`(metadata->>'triggeredBy' = $${values.length} OR metadata->>'triggeredBy' = 'system')`);
+          break;
+      }
+    } else if (scope === 'system') {
+      // Trusted in-process/operator callers may narrow the whole ledger too.
+      where.push(`metadata->>'triggeredBy' = 'system'`);
     }
+
     if (query.status) {
       values.push(query.status);
       where.push(`status = $${values.length}`);
@@ -771,7 +798,17 @@ export class ScannerService {
       `SELECT * FROM scanner_runs ${whereClause} ORDER BY started_at DESC LIMIT $${values.length}`,
       values,
     );
-    return { runs: res.rows.map(toScannerRunDto) };
+
+    // Defence in depth: every tenant-facing row goes through the redactor, even
+    // the caller's own (`mine`) rows and even system rows that already carry no
+    // tenant identifiers. Redaction therefore does not depend on the WHERE
+    // clause being right — a future scope that widens the selection cannot leak
+    // by accident.
+    const runs = res.rows.map((row) => {
+      const dto = toScannerRunDto(row);
+      return viewerUserId === undefined ? dto : redactScannerRunForViewer(dto, viewerUserId);
+    });
+    return { runs };
   }
 
   /**

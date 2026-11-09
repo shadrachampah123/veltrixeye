@@ -223,3 +223,21 @@ test('api.getBillingVerifiedPaymentRecords() — rejects provider/row identifier
 
   await assert.rejects(() => api.getBillingVerifiedPaymentRecords());
 });
+
+test('api.listScannerRuns() — the pre-scope URL is unchanged when no scope is asked for', async () => {
+  await api.listScannerRuns({ limit: 20 });
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0]!.url,
+    '/api/scanner/runs?limit=20',
+    'an old caller must emit exactly the URL it emitted before scopes existed',
+  );
+});
+
+test('api.listScannerRuns() — forwards the requested scope verbatim', async () => {
+  for (const scope of ['mine', 'system', 'all'] as const) {
+    calls = [];
+    await api.listScannerRuns({ limit: 10, scope });
+    assert.equal(calls[0]!.url, `/api/scanner/runs?limit=10&scope=${scope}`);
+  }
+});

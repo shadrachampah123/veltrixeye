@@ -205,14 +205,45 @@ export const scannerHealthDtoSchema = z
   .strict();
 export type ScannerHealthDto = z.infer<typeof scannerHealthDtoSchema>;
 
+/**
+ * Which slice of the run ledger a tenant read may see.
+ *
+ * `scanner_runs` is a single global table: automatic runs carry
+ * `metadata.triggeredBy = 'system'` and belong to no tenant, while manual runs
+ * carry the UUID of the user who triggered them.
+ *
+ *  - `mine`   — only the caller's own runs (the pre-existing behaviour, and the
+ *               default, so an old client keeps exactly what it had).
+ *  - `system` — only system-triggered runs. They contain no tenant identifiers,
+ *               but their metadata is still passed through
+ *               `redactScannerRunForViewer` so the safety does not depend on
+ *               that remaining true.
+ *  - `all`    — the caller's own runs plus system runs. Never another tenant's.
+ *
+ * Every scope is available only to a scanner-entitled caller: the route rejects
+ * free users before the query is even parsed.
+ */
+export const SCANNER_RUN_SCOPES = ['mine', 'system', 'all'] as const;
+export type ScannerRunScope = (typeof SCANNER_RUN_SCOPES)[number];
+export const scannerRunScopeSchema = z.enum(SCANNER_RUN_SCOPES);
+
 /** List runs query. */
 export const scannerRunListQuerySchema = z
   .object({
     status: scannerRunStatusSchema.optional(),
     limit: z.coerce.number().int().min(1).max(100).default(20),
+    scope: scannerRunScopeSchema.default('mine'),
   })
   .strict();
 export type ScannerRunListQuery = z.infer<typeof scannerRunListQuerySchema>;
+/**
+ * The same query with `scope` optional.
+ *
+ * HTTP callers always parse through `scannerRunListQuerySchema` (so they carry
+ * the default), but in-process callers that predate scopes — and tests written
+ * before them — keep compiling against the pre-scope shape.
+ */
+export type ScannerRunListQueryInput = Omit<ScannerRunListQuery, 'scope'> & { scope?: ScannerRunScope };
 
 /** Trigger request (manual scan). */
 export const scannerTriggerRequestSchema = z

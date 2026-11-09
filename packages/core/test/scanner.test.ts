@@ -666,6 +666,121 @@ describe('F4: Scanner tenant privacy', () => {
       assert.ok(failed.runs.every((r) => r.status === 'failed' && r.metadata.triggeredBy === USER_A));
     });
 
+    test('scope=system returns only automatic runs, with metadata redacted', async () => {
+      const insertRun = async (metadata: Record<string, unknown>, status = 'completed') => {
+        const res = await pool.query<{ id: string }>(
+          `INSERT INTO scanner_runs (status, provider_slug, metadata)
+           VALUES ($1, 'twelve-data', $2::jsonb) RETURNING id`,
+          [status, JSON.stringify(metadata)],
+        );
+        return res.rows[0]!.id;
+      };
+
+      const mine = await insertRun({ triggeredBy: USER_A, strategyId: STRATEGY_A, force: true });
+      const systemRun = await insertRun({
+        triggeredBy: 'system',
+        strategyId: null,
+        force: false,
+        duplicateCandleSkips: 1,
+        pairs: {
+          v: 1,
+          totals: { pairs: 1, evaluated: 0, cursor_skipped: 1, stale: 0, failed: 0 },
+          conditions: { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+          truncated: false,
+          items: [
+            {
+              strategyId: STRATEGY_B,
+              assetClass: 'commodity',
+              symbol: 'XAUUSD',
+              timeframe: '1h',
+              outcome: 'cursor_skipped',
+              cursorMs: 1_700_000_000_000,
+              anchorMs: 1_700_003_600_000,
+              reason: 'cursor_hit',
+            },
+          ],
+        },
+      });
+
+      const systemScope = await scanner.listRuns({ limit: 100, scope: 'system' }, USER_A);
+      const ids = systemScope.runs.map((r) => r.id);
+      assert.ok(ids.includes(systemRun), 'the automatic run is visible in the system scope');
+      assert.ok(!ids.includes(mine), 'a manual run is not part of the system scope');
+      assert.ok(
+        systemScope.runs.every((r) => r.metadata.triggeredBy === undefined),
+        'system runs are redacted for a tenant viewer',
+      );
+
+      const payload = JSON.stringify(systemScope.runs);
+      assert.ok(!payload.includes(USER_A));
+      assert.ok(!payload.includes(USER_B));
+      assert.ok(!payload.includes(STRATEGY_B), 'the nested pair strategy id is redacted at depth');
+      assert.ok(!payload.includes('"failureReasons"'));
+      assert.equal(
+        (systemScope.runs.find((r) => r.id === systemRun)?.metadata.duplicateCandleSkips as number),
+        1,
+        'non-identifying counters survive redaction',
+      );
+    });
+
+    test('scope=all returns own + system runs and never another tenant’s', async () => {
+      const insertRun = async (metadata: Record<string, unknown>) => {
+        const res = await pool.query<{ id: string }>(
+          `INSERT INTO scanner_runs (status, provider_slug, metadata)
+           VALUES ('completed', 'twelve-data', $1::jsonb) RETURNING id`,
+          [JSON.stringify(metadata)],
+        );
+        return res.rows[0]!.id;
+      };
+
+      const own = await insertRun({ triggeredBy: USER_A, strategyId: STRATEGY_A, force: false });
+      const other = await insertRun({ triggeredBy: USER_B, strategyId: STRATEGY_B, force: false });
+      const system = await insertRun({ triggeredBy: 'system', strategyId: null, force: false });
+
+      const forA = await scanner.listRuns({ limit: 100, scope: 'all' }, USER_A);
+      const ids = forA.runs.map((r) => r.id);
+      assert.ok(ids.includes(own));
+      assert.ok(ids.includes(system));
+      assert.ok(!ids.includes(other), "another tenant's run is never returned");
+
+      const payload = JSON.stringify(forA.runs);
+      assert.ok(!payload.includes(USER_B));
+      assert.ok(!payload.includes(STRATEGY_B));
+      assert.ok(payload.includes(STRATEGY_A), 'the owner still sees their own strategy id');
+      assert.ok(
+        forA.runs.filter((r) => r.id === system).every((r) => r.metadata.triggeredBy === undefined),
+        'system rows stay redacted inside scope=all',
+      );
+    });
+
+    test('scope composes with the status filter, and an operator can narrow to system runs', async () => {
+      const insertRun = async (metadata: Record<string, unknown>, status: string) => {
+        const res = await pool.query<{ id: string }>(
+          `INSERT INTO scanner_runs (status, provider_slug, metadata)
+           VALUES ($1, 'twelve-data', $2::jsonb) RETURNING id`,
+          [status, JSON.stringify(metadata)],
+        );
+        return res.rows[0]!.id;
+      };
+
+      const systemFailed = await insertRun({ triggeredBy: 'system', strategyId: null, force: false }, 'failed');
+      const systemCompleted = await insertRun({ triggeredBy: 'system', strategyId: null, force: true }, 'completed');
+
+      const failedOnly = await scanner.listRuns({ limit: 100, status: 'failed', scope: 'system' }, USER_A);
+      const ids = failedOnly.runs.map((r) => r.id);
+      assert.ok(ids.includes(systemFailed));
+      assert.ok(!ids.includes(systemCompleted));
+      assert.ok(failedOnly.runs.every((r) => r.status === 'failed'));
+
+      // Trusted internal caller (no viewer): still able to narrow to system runs.
+      const operator = await scanner.listRuns({ limit: 500, scope: 'system' });
+      assert.ok(operator.runs.length > 0);
+      assert.ok(
+        operator.runs.every((r) => r.metadata.triggeredBy === 'system'),
+        'an unscoped operator read with scope=system returns system runs only',
+      );
+    });
+
     test('unscoped read still returns the whole ledger (trusted internal callers)', async () => {
       const all = await scanner.listRuns({ limit: 500 });
       const tenantRun = all.runs.find((r) => r.metadata.triggeredBy === USER_A);

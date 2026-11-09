@@ -23,7 +23,7 @@ import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from '../
  * | Route | Auth | Notes |
  * |---|---|---|
  * | GET /api/scanner/health | session | Real production state: provider availability, last run, last successful, active runs, data freshness. Never mock/static. |
- * | GET /api/scanner/runs | session | List recent scanner runs (observability), owner-scoped. |
+ * | GET /api/scanner/runs | session | List recent scanner runs (observability). `scope=mine` (default) = own runs, `scope=system` = the automatic scan cycle's runs, `scope=all` = own + system. Never another tenant's. |
  * | POST /api/scanner/trigger | session | Manual trigger (entitlement-gated). Uses advisory locking to prevent overlapping. |
  * | POST /api/internal/scanner/run | worker token | Sleep-safe external scheduler trigger: recovers stale runs, drains one bounded notification-delivery batch, then executes one system scan under advisory lock. 404 when no token is configured. |
  * | POST /api/internal/scanner/maintenance | worker token | Stale-run recovery + bounded operational status. 404 when no token is configured. |
@@ -38,7 +38,16 @@ import { recordWorkerFailure, recordWorkerStart, recordWorkerSuccess } from '../
  * Tenant privacy (M7 audit finding F4):
  *  - `scanner_runs` is a global ledger whose `metadata` carries `triggeredBy`
  *    (user UUID) and `strategyId` (strategy UUID), so it is never read globally
- *    on behalf of a tenant: `listRuns` is owner-scoped to the session user.
+ *    on behalf of a tenant: `listRuns` is scoped to the session user.
+ *  - `scope=system|all` widens the selection to system runs (`triggeredBy =
+ *    'system'`), which belong to no tenant and are the automatic 5-minute scan
+ *    cycle. They add breadth of *operational* rows, not a new class of
+ *    disclosure: `getHealth` already exposes the newest such run to every
+ *    entitled user. Every returned row is passed through
+ *    `redactScannerRunForViewer`, so tenant identifiers and strategy-derived
+ *    text are stripped at any depth from any run the viewer does not own.
+ *  - All three scopes sit behind the same `canAccessScanner` gate, so a free
+ *    user cannot read the ledger by changing the query string.
  *  - `getHealth` stays global (the scanner is one shared pipeline) but redacts
  *    tenant-identifying metadata from the embedded last-run DTOs.
  *  - Internal worker endpoints strip all tenant/strategy identifiers and
@@ -138,8 +147,11 @@ export async function scannerRoutes(app: FastifyInstance, ctx: AppContext, confi
       return;
     }
 
-    // Tenant read: owner-scoped. The run ledger is global and its metadata
-    // carries `triggeredBy`/`strategyId`, so it is never listed across tenants.
+    // Tenant read. `scope` (default `mine`, enforced by the contract) selects
+    // own runs, system runs, or both — never another tenant's. The service
+    // applies `redactScannerRunForViewer` to every returned row regardless of
+    // scope, so this route cannot leak metadata even if a future scope widens
+    // the WHERE clause.
     return ctx.scanner.listRuns(parsed.data, user.id);
   });
 

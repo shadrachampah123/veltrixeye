@@ -336,6 +336,147 @@ describe('M7.5: Scanner API', () => {
     assert.ok(!JSON.stringify(runsB).includes(strategyA));
   });
 
+  test('scope=system returns automatic runs only, fully redacted', async () => {
+    const a = await registerUser('pro');
+    const b = await registerUser('pro');
+
+    const own = await insertRun({ triggeredBy: a.user.id, strategyId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', force: true });
+    const other = await insertRun({ triggeredBy: b.user.id, strategyId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', force: false });
+    // A system run carrying BOTH a nested pair strategy id and engine reasons:
+    // the redactor must remove them at any depth.
+    const system = await insertRun(
+      {
+        triggeredBy: 'system',
+        strategyId: null,
+        force: false,
+        candles: { store: 294, provider: 0, total: 294 },
+        duplicateCandleSkips: 1,
+        pairs: {
+          v: 1,
+          totals: { pairs: 1, evaluated: 0, cursor_skipped: 1, stale: 0, failed: 0 },
+          conditions: { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+          truncated: false,
+          items: [
+            {
+              strategyId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+              assetClass: 'crypto',
+              symbol: 'BTCUSD',
+              timeframe: '1h',
+              outcome: 'cursor_skipped',
+              cursorMs: 1_700_000_000_000,
+              anchorMs: 1_700_003_600_000,
+              reason: 'cursor_hit',
+            },
+          ],
+        },
+      },
+    );
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100&scope=system',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const runs: ScannerRunLike[] = res.json().runs;
+
+    assert.ok(runs.some((r) => r.id === system), 'the automatic run is visible to an entitled tenant');
+    assert.ok(!runs.some((r) => r.id === own), 'a manual run is not part of the system scope');
+    assert.ok(!runs.some((r) => r.id === other), 'another tenant run is never part of any scope');
+    assert.ok(
+      runs.every((r) => r.metadata?.triggeredBy === undefined),
+      'the system run carries no triggeredBy after redaction',
+    );
+
+    const payload = JSON.stringify(runs);
+    assert.ok(!payload.includes(a.user.id));
+    assert.ok(!payload.includes(b.user.id));
+    assert.ok(!payload.includes('cccccccc-cccc-4ccc-8ccc-cccccccccccc'), 'nested pair strategy id must be redacted');
+    assert.ok(!payload.includes('"strategyId"'));
+    assert.ok(!payload.includes('"failureReasons"'));
+
+    const shown = runs.find((r) => r.id === system) as unknown as { metadata: Record<string, unknown> };
+    assert.deepEqual(shown.metadata.candles, { store: 294, provider: 0, total: 294 }, 'counts stay visible');
+    assert.equal(shown.metadata.duplicateCandleSkips, 1);
+    assert.equal((shown.metadata.pairs as { totals: { pairs: number } }).totals.pairs, 1);
+  });
+
+  test('scope=all returns own + system runs and never another tenant’s', async () => {
+    const a = await registerUser('pro');
+    const b = await registerUser('pro');
+    const strategyA = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const strategyB = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+
+    const own = await insertRun({ triggeredBy: a.user.id, strategyId: strategyA, force: true });
+    const other = await insertRun({ triggeredBy: b.user.id, strategyId: strategyB, force: false });
+    const system = await insertRun({ triggeredBy: 'system', strategyId: null, force: false });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100&scope=all',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const runs: ScannerRunLike[] = res.json().runs;
+
+    assert.ok(runs.some((r) => r.id === own), 'own manual run is included');
+    assert.ok(runs.some((r) => r.id === system), 'system run is included');
+    assert.ok(!runs.some((r) => r.id === other), 'another tenant run is never included');
+
+    const payload = JSON.stringify(runs);
+    assert.ok(!payload.includes(b.user.id), 'other tenant user UUID must not appear');
+    assert.ok(!payload.includes(strategyB), 'other tenant strategy UUID must not appear');
+    // The owner keeps their own identifiers; the system row keeps none.
+    assert.ok(payload.includes(strategyA));
+    assert.ok(!payload.includes('"triggeredBy":"system"'), 'system metadata is redacted even in scope=all');
+  });
+
+  test('scope defaults to mine, and an unknown scope is a 400', async () => {
+    const a = await registerUser('pro');
+    const own = await insertRun({ triggeredBy: a.user.id, strategyId: null, force: false });
+    const system = await insertRun({ triggeredBy: 'system', strategyId: null, force: false });
+
+    const implicit = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    const explicit = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100&scope=mine',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(implicit.statusCode, 200, implicit.body);
+    assert.equal(explicit.statusCode, 200, explicit.body);
+    assert.deepEqual(
+      implicit.json().runs.map((r: ScannerRunLike) => r.id),
+      explicit.json().runs.map((r: ScannerRunLike) => r.id),
+      'omitting scope is exactly scope=mine',
+    );
+    const ids = implicit.json().runs.map((r: ScannerRunLike) => r.id);
+    assert.ok(ids.includes(own));
+    assert.ok(!ids.includes(system), 'the default scope still hides system runs');
+
+    const bogus = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=10&scope=everything',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(bogus.statusCode, 400, bogus.body);
+  });
+
+  test('scope=all and scope=system stay behind the scanner entitlement', async () => {
+    const free = await registerUser('free');
+    for (const scope of ['system', 'all']) {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/scanner/runs?limit=10&scope=${scope}`,
+        headers: { cookie: free.cookie, 'x-forwarded-for': freshIp() },
+      });
+      assert.equal(res.statusCode, 403, `free user must not read scope=${scope}: ${res.body}`);
+    }
+  });
+
   test('GET /api/scanner/health keeps global state but redacts other tenants run identifiers', async () => {
     const a = await registerUser('pro');
     const b = await registerUser('pro');
