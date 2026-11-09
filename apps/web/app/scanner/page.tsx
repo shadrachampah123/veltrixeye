@@ -6,15 +6,26 @@ import { AppShell, PageHeader } from '@/components/app-shell';
 import { RequireAuth } from '@/components/auth-context';
 import { api } from '@/lib/api';
 import { Card, CardHeader, Badge, Button, Spinner } from '@/components/ui';
-import type { ScannerHealthDto, ScannerRunDto, SetupDto } from '@veltrixeye/contracts';
+import type { ScannerHealthDto, SetupDto } from '@veltrixeye/contracts';
 import type { MarketInstrument } from '@/lib/api';
 import { WatchlistPanel } from '@/components/watchlist';
 import { SetupCardGrid } from '@/components/setup-card';
 import { BRAND } from '@/lib/brand';
+import { ScannerRunOutcomes, ScannerRunsCard } from '@/components/scanner-observability';
+import {
+  buildScannerRunsRequest,
+  describeScannerRunsError,
+  initialScannerRunsState,
+  isSystemRun,
+  readScannerPairSummary,
+  scannerRunsReducer,
+} from '@/lib/scanner-observability';
 
 function ScannerContent() {
   const [health, setHealth] = React.useState<ScannerHealthDto | null>(null);
-  const [runs, setRuns] = React.useState<ScannerRunDto[] | null>(null);
+  // The run list has its own scope-aware state machine; switching scope must not
+  // refetch health/setups, and a superseded response must not paint stale rows.
+  const [runState, dispatchRuns] = React.useReducer(scannerRunsReducer, 'mine', initialScannerRunsState);
   const [setups, setSetups] = React.useState<SetupDto[] | null>(null);
   const [instruments, setInstruments] = React.useState<MarketInstrument[] | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -24,14 +35,12 @@ function ScannerContent() {
   const load = React.useCallback(async () => {
     try {
       setLoading(true);
-      const [h, r, s, i] = await Promise.all([
+      const [h, s, i] = await Promise.all([
         api.getScannerHealth(),
-        api.listScannerRuns({ limit: 20 }),
         api.listSetups({ limit: 12 }).then((res) => res.setups),
         api.listInstruments().then((res) => res.instruments).catch(() => []),
       ]);
       setHealth(h);
-      setRuns(r.runs);
       setSetups(s);
       setInstruments(i as any);
       setError(null);
@@ -46,10 +55,30 @@ function ScannerContent() {
     load();
   }, [load]);
 
+  // Runs are fetched separately, keyed on the selected scope. `requestId` guards
+  // against a slow response for a scope the user has already left.
+  React.useEffect(() => {
+    if (!runState.loading) return;
+    const { requestId, scope } = runState;
+    let cancelled = false;
+    api
+      .listScannerRuns(buildScannerRunsRequest(scope))
+      .then((res) => {
+        if (!cancelled) dispatchRuns({ type: 'loaded', requestId, runs: res.runs });
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) dispatchRuns({ type: 'failed', requestId, error: describeScannerRunsError(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [runState.loading, runState.requestId, runState.scope]);
+
   const handleTrigger = async () => {
     try {
       setTriggering(true);
       await api.triggerScanner({ force: false });
+      dispatchRuns({ type: 'refresh' });
       await load();
     } catch (e: any) {
       setError(e?.message ?? 'Failed to trigger scanner');
@@ -178,6 +207,18 @@ function ScannerContent() {
                   </div>
                 )}
                 {health.lastRun.error && <div className="mt-3 rounded bg-red-500/10 px-3 py-2 text-xs text-red-400">{health.lastRun.error}</div>}
+                <div className="mt-4 border-t border-ink-700 pt-3">
+                  <div className="mb-2 flex flex-wrap items-center gap-2">
+                    <span className="text-[11px] uppercase tracking-wider text-ink-400">Pair outcomes</span>
+                    {isSystemRun(health.lastRun) && <Badge tone="neutral">System</Badge>}
+                  </div>
+                  <ScannerRunOutcomes
+                    summary={readScannerPairSummary(health.lastRun.metadata, {
+                      allowDetail: !isSystemRun(health.lastRun),
+                    })}
+                    systemRun={isSystemRun(health.lastRun)}
+                  />
+                </div>
               </div>
             </Card>
           )}
@@ -192,34 +233,12 @@ function ScannerContent() {
             </Card>
           )}
 
-          {/* Runs list */}
-          <Card>
-            <CardHeader title="Recent Scanner Runs" subtitle="Observability — full pipeline: start/completion, provider health, detection, alert creation" />
-            <div className="divide-y divide-ink-700">
-              {runs === null ? (
-                <div className="px-5 py-6 text-sm text-ink-400">Loading...</div>
-              ) : runs.length === 0 ? (
-                <div className="px-5 py-6 text-sm text-ink-400">No scanner runs yet. Trigger a scan to start processing real market data through HTF→setup→entry workflow.</div>
-              ) : (
-                runs.map((run) => (
-                  <div key={run.id} className="px-5 py-3.5 transition-colors hover:bg-ink-750/50">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Badge tone={run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : run.status === 'running' ? 'info' : 'warning'}>{run.status}</Badge>
-                      <span className="font-mono text-sm text-ink-100">{run.id.slice(0, 8)}</span>
-                      <span className="text-xs text-ink-400">{new Date(run.startedAt).toLocaleString()}</span>
-                      <span className="text-xs text-ink-500">· {run.providerSlug}</span>
-                    </div>
-                    <div className="mt-2 grid gap-1 text-xs text-ink-400 sm:grid-cols-2 lg:grid-cols-4">
-                      <span>{run.strategiesScanned} strategies · {run.instrumentsScanned} instruments</span>
-                      <span>{run.candlesFetched} candles · {run.setupsDetected} detections</span>
-                      <span>{run.setupsCreated} created · {run.alertsCreated} alerts</span>
-                      <span>{run.staleRejections} stale · {run.providerFailures} failures</span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </Card>
+          {/* Runs list — scope switch, per-pair outcomes, privacy-aware detail */}
+          <ScannerRunsCard
+            state={runState}
+            onScopeChange={(scope) => dispatchRuns({ type: 'scope', scope })}
+            onRetry={() => dispatchRuns({ type: 'refresh' })}
+          />
         </div>
       )}
     </AppShell>

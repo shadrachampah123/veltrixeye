@@ -367,6 +367,57 @@ All session endpoints check `canAccessScanner` entitlement server-side (free →
 - Dashboard banner updated? No — preserved existing M2 banner, scanner UI is separate page
 - Scanner status reflects real production state, not mock/static
 
+### Live Scanner observability UI (PR 3/3)
+
+The runs list is now scope-aware and outcome-aware. All of it lives in
+`apps/web/lib/scanner-observability.ts` (pure view model) and
+`apps/web/components/scanner-observability.tsx` (presentational), so every state
+is renderable and testable without a browser; `app/scanner/page.tsx` only wires
+API calls to it.
+
+- **Scope controls** — `My runs` / `System` / `All runs`, a `role="group"` of real
+  buttons with `aria-pressed` on the active one. Switching issues
+  `GET /api/scanner/runs?limit=20&scope=…`; the previous scope's rows are cleared
+  immediately (they would otherwise be labelled with the wrong scope), and a
+  response whose `requestId` is superseded is discarded, so fast switching can
+  never paint another scope's runs. Re-selecting the active scope does not
+  refetch. Refresh keeps the rows visible while in flight.
+- **Per-pair outcomes** — a stacked bar plus a legend with counts for
+  `evaluated`, `cursor_skipped`, `stale` and `failed`, in that fixed order. The
+  bar carries a `role="img"` label with every count, and only non-zero outcomes
+  are drawn (no misleading zero-width segments). Counts always come from
+  `readScannerRunPairAggregate`; they are never derived from the item sample.
+- **No-op explanation** — a run where every pair was skipped at its cursor reads
+  "10 of 10 pairs already evaluated this setup bar." with a `No-op` badge and an
+  explicit sentence that nothing was re-evaluated and nothing failed. A run that
+  walked no pairs says so, and a run where pairs went stale/failed names those
+  counts instead of implying success.
+- **Aggregates for system runs, with the privacy notice** — a run the viewer does
+  not own (`metadata.triggeredBy` is redacted away for every such row) is tagged
+  `System`, shows its aggregate outcomes, and displays "Per-pair details withheld
+  — this run … mixes pairs from every account". No `pairs.items[]` entry is ever
+  rendered for it. As defence in depth the client decides this itself
+  (`allowDetail: false`), so a server-side redaction regression cannot become a
+  client-side leak even if a full block arrives.
+- **Detailed owner runs** — the caller's own rows render their observations
+  (symbol, timeframe, outcome, reason, setup-candle time) inside a native
+  `<details>` element, with "Showing N of M pairs" and an explicit note when the
+  stored sample is capped. `readScannerRunPairs` is used **only** for this path.
+- **Historical and malformed runs** — no readable pair block renders "Pair
+  outcomes unavailable" and **no counts at all** (no bar, no legend, no zeros):
+  a missing measurement is never displayed as `0`. The copy distinguishes a run
+  recorded before per-pair observability (`missing`) from one whose block could
+  not be read (`malformed`).
+- **States** — loading announces itself (`role="status"` with a label), an empty
+  scope explains itself per scope rather than looking like a failure, a first-load
+  failure shows an `role="alert"` error with Retry, and a failed refresh keeps the
+  previous rows readable under a retry banner. A 403 is surfaced with the API's
+  own entitlement message.
+- **Responsive/consistent** — existing `Card`/`CardHeader`/`Badge`/`Alert`/
+  `Button`/`Spinner` primitives and dark-theme classes; counters and the legend
+  reflow from one column on mobile to four on desktop, and scope buttons wrap
+  rather than overflowing.
+
 ## Security
 
 - Provider credentials remain server-side: `TWELVE_DATA_API_KEY` never logged, never returned by any route, only used in provider client
@@ -416,6 +467,13 @@ Comprehensive tests added:
   - B6 recursive redaction: the owner keeps `strategyId` inside `items[]`, non-owner views drop the whole `items[]` array (PR #147 review) so no `symbol`/`timeframe`/`outcome`/timing leaks, trusted operator views keep the array with identifiers removed at any depth together with `failureReasons`, counts survive, and the input is never mutated;
   - B7 a legacy run without the block parses as "detail unavailable".
   - Phase A (A1–A3) still passes unmodified, proving scanning behaviour and idempotency are unchanged.
+
+- `apps/web/test/scanner-observability.test.ts` — Live Scanner UI (pure + rendered, 40 tests):
+  - **outcome copy**: a pure cursor-skip run reads "10 of 10 pairs already evaluated this setup bar." with `noOp`, a fully evaluated run says so, a mixed run names the skipped/stale/failed remainder, a zero-pair run says no pairs were walked, and an all-failed run never implies success;
+  - **readers**: `readScannerPairSummary` returns `detail` (owner), `aggregate` with `detailWithheld` (system projection), `missing` (no block) or `malformed` (array/primitive/number/`null`/bad counters) — including `allowDetail: false` turning a complete block into a withheld aggregate, so the client defends privacy independently of the API;
+  - **scope switching**: the reducer clears the previous scope's rows, bumps `requestId`, ignores a superseded response, keeps rows during refresh, and ignores a stale failure; `buildScannerRunsRequest` always names the scope the control shows;
+  - **rendering**: the scope group marks exactly one `aria-pressed` button of three; the outcome bar is a labelled `role="img"` with only non-zero segments; a system no-op shows aggregates + the no-op badge + "Per-pair details withheld" and **no** `pair-items`; an owner run renders its observations; a historical run renders "Pair outcomes unavailable" with no bar, no legend and no `0 of 0`; a malformed block is reported as unreadable;
+  - **list states**: loading announces itself, empty copy is scope-specific, first-load failure is an alert with Retry, a failed refresh keeps the rows, and a mixed list shows owner detail beside a withheld system row without leaking its symbols.
 
 - `apps/api/test/scanner.test.ts` — API integration:
   - Unauthenticated 401, free user 403, pro user can access health (real state), list runs, trigger scanner with advisory locking, validates strategy ownership, rejects unsupported instruments, health does not expose secrets, rate limited
