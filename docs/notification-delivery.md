@@ -183,6 +183,37 @@ Retry loops are impossible by construction: the claim itself requires
 `attempts < max_attempts`, and `unavailable` is terminal until configuration
 changes.
 
+### Diagnosing a `timeout` dead letter (`attempts = max_attempts`, no reply code)
+
+A row that ends `failed` with `failure_category = 'timeout'`,
+`provider_response_code = NULL` and `delivered_at = NULL` recorded no complete
+provider response on any attempt: the client could not finish a conversation
+with the provider — the TCP connection, the TLS handshake, or the greeting did
+not complete inside `NOTIFICATION_PROVIDER_TIMEOUT_MS` (15 s by default) — on
+every attempt. That points at **reachability**, not credentials:
+
+1. Outbound SMTP blocked — on Render's free plan ports 25/465/587 are not
+   reachable, which is why the blueprint comments say to use Resend over HTTPS
+   (port 443) there.
+2. Wrong host/port, or `SMTP_SECURE`/port mismatch (implicit TLS on a STARTTLS
+   port): the peer accepts the socket and then never completes the handshake.
+3. A network policy/firewall silently dropping the SYN (a refused connection
+   fails fast with `ECONNREFUSED`; a *dropped* one can only time out).
+
+What the absence of a response does **not** prove: that the provider received
+nothing. An attempt can time out after the remote end accepted the message and
+before its reply arrived, so a **late delivery may already have happened** and a
+resent alert can arrive twice. The stable `Message-Id` is what lets a receiver
+collapse the duplicate; treat any manual resend as a possible duplicate.
+
+Check `provider` on the row first: if it is `resend`, the failure is HTTPS and
+the cause is different (see the 401/403 section above). Fix the transport, then
+let the next alert create a new job — dead-lettered rows are not replayed
+automatically, and the diagnostic collector
+(`npm run diagnostics:gold-v8`) summarises these counts without printing a
+recipient. Only `status = 'failed'` rows are counted as failures; `pending`,
+`processing` and `unavailable` rows are work in flight or parked, not damage.
+
 ## 6. Provider abstraction
 
 `NotificationProvider` (`packages/core/src/notifications/provider.ts`) is the

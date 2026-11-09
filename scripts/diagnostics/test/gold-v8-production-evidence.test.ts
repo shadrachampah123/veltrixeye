@@ -26,7 +26,9 @@
  */
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
+import tls from 'node:tls';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -59,6 +61,16 @@ import {
   OptionError,
   isStrategyUuid,
   jsonBlock,
+  isPooledEndpointHost,
+  managedProviderFor,
+  normaliseEndpointHost,
+  readClientTlsState,
+  tlsVerificationProblems,
+  backendSslExplanation,
+  summariseNotificationDeliveries,
+  deliveryFailureHint,
+  isFailedDeliveryStatus,
+  FAILED_DELIVERY_STATUSES,
   mapStrings,
   mdCell,
   mdRow,
@@ -720,6 +732,21 @@ describe('report rendering resists fence and table injection', () => {
         database: 'db',
         serverVersion: 'PostgreSQL 16',
         tlsRequestedMode: 'verify-full',
+        tlsClient: {
+          encrypted: true,
+          authorized: true,
+          authorizationError: null,
+          protocol: 'TLSv1.3',
+          cipher: 'TLS_AES_256_GCM_SHA384',
+          servername: 'db.example.test',
+          peerCertificateSha256: 'AA:BB',
+          peerCertificateSubject: 'CN=db.example.test',
+          peerCertificateIssuer: 'CN=test-ca',
+          peerCertificateValidTo: 'Jan  1 00:00:00 2030 GMT',
+        },
+        tlsVerified: true,
+        pooledEndpoint: false,
+        tlsNote: null,
         ssl: true,
         defaultTransactionReadOnly: 'on',
         transactionReadOnly: 'on',
@@ -844,6 +871,21 @@ describe('report rendering resists fence and table injection', () => {
         database: 'db',
         serverVersion: 'PostgreSQL 16',
         tlsRequestedMode: 'verify-full',
+        tlsClient: {
+          encrypted: true,
+          authorized: true,
+          authorizationError: null,
+          protocol: 'TLSv1.3',
+          cipher: 'TLS_AES_256_GCM_SHA384',
+          servername: 'db.example.test',
+          peerCertificateSha256: 'AA:BB',
+          peerCertificateSubject: 'CN=db.example.test',
+          peerCertificateIssuer: 'CN=test-ca',
+          peerCertificateValidTo: 'Jan  1 00:00:00 2030 GMT',
+        },
+        tlsVerified: true,
+        pooledEndpoint: false,
+        tlsNote: null,
         ssl: true,
         defaultTransactionReadOnly: 'on',
         transactionReadOnly: 'on',
@@ -938,7 +980,8 @@ describe('report rendering resists fence and table injection', () => {
     const md = renderMarkdown(evidenceWithHostileRows());
     const blocks = tableBlocks(md);
 
-    assert.equal(blocks.length, 9, `expected 9 tables, got ${blocks.length}`);
+    // 9 data/summary tables + the static status-semantics table (section 9).
+    assert.equal(blocks.length, 10, `expected 10 tables, got ${blocks.length}`);
     for (const block of blocks) {
       const header = block[0]!;
       const expected = columnCount(header);
@@ -2056,5 +2099,688 @@ describe('post-connect safety enforcement (real Postgres)', () => {
       await cleanup.query(`REVOKE UPDATE ON strategies FROM ${RO_USER}`);
       await cleanup.end();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 1 — TLS: what the client can prove, and what pg_stat_ssl means
+// ---------------------------------------------------------------------------
+
+describe('TLS observation (TLS-terminating front ends and fail-closed verification)', () => {
+  it('refuses a plaintext session', async () => {
+    // The embedded server speaks plaintext; a client that asks for no TLS must
+    // never be describable as verified.
+    const client = await connect();
+    try {
+      const state = readClientTlsState(
+        (client as unknown as { connection?: { stream?: unknown } }).connection?.stream,
+      );
+      assert.equal(state.encrypted, null, 'a plain socket reported an encryption state');
+      assert.equal(state.authorized, null);
+      assert.equal(state.peerCertificateSha256, null);
+      const problems = tlsVerificationProblems(state, 'localhost');
+      assert.equal(problems.length, 1);
+      assert.match(problems[0]!, /not encrypted/);
+    } finally {
+      await client.end();
+    }
+  });
+
+  /**
+   * Start a TLS-terminating proxy in front of the plaintext test server — the
+   * shape of any endpoint that ends TLS before PostgreSQL (Neon's front proxy,
+   * PgBouncer, a load balancer) — and hand `fn` a connected client plus the
+   * throwaway certificate path.
+   *
+   * The proxy answers the PostgreSQL `SSLRequest` with `'S'` and destroys any
+   * socket that does not speak TLS first, so a successful query proves the
+   * connection really is the TLS one.
+   *
+   * Returns false (after skipping) when `openssl` is unavailable.
+   */
+  async function withTerminatingProxy(
+    t: { skip: (message: string) => void },
+    proxyPort: number,
+    fn: (client: pg.Client, certPath: string) => Promise<void>,
+  ): Promise<boolean> {
+    const dir = mkdtempSync(join(tmpdir(), 'gold-diag-tls-'));
+    workDirs.push(dir);
+    const certPath = join(dir, 'cert.pem');
+    const keyPath = join(dir, 'key.pem');
+    const generated = spawnSync(
+      'openssl',
+      ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', keyPath, '-out', certPath,
+        '-days', '2', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost'],
+      { encoding: 'utf8' },
+    );
+    if (generated.status !== 0) {
+      t.skip('openssl is unavailable — cannot mint a throwaway certificate for this test');
+      return false;
+    }
+
+    const secureContext = tls.createSecureContext({
+      key: readFileSync(keyPath),
+      cert: readFileSync(certPath),
+    });
+    const sockets: net.Socket[] = [];
+    const proxy = net.createServer((socket) => {
+      sockets.push(socket);
+      socket.once('data', (buf) => {
+        // PostgreSQL SSLRequest: int32 length 8, int32 code 80877103.
+        if (buf.length < 8 || buf.readInt32BE(4) !== 80877103) {
+          socket.destroy();
+          return;
+        }
+        socket.write('S');
+        const tlsSocket = new tls.TLSSocket(socket, { isServer: true, secureContext });
+        const upstream = net.connect(DB_PORT, '127.0.0.1');
+        sockets.push(upstream);
+        tlsSocket.pipe(upstream).pipe(tlsSocket);
+        const kill = (): void => {
+          upstream.destroy();
+          tlsSocket.destroy();
+        };
+        tlsSocket.on('error', kill);
+        upstream.on('error', kill);
+      });
+    });
+    await new Promise<void>((resolve) => proxy.listen(proxyPort, '127.0.0.1', resolve));
+
+    let client: pg.Client | undefined;
+    try {
+      client = new pg.Client(
+        clientConfig({ host: 'localhost', port: proxyPort, ssl: { rejectUnauthorized: true, ca: readFileSync(certPath) } }),
+      );
+      await client.connect();
+      await fn(client, certPath);
+    } finally {
+      await client?.end().catch(() => {});
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+      for (const socket of sockets) socket.destroy();
+    }
+    return true;
+  }
+
+  it('a verified client session still reads ssl = false from pg_stat_ssl behind a TLS-terminating front end', async (t) => {
+    // Reproduces what any TLS-terminating front end does to this observation
+    // (Neon's front proxy does it for pooled AND direct hosts; PgBouncer does it
+    // for pooled ones): the client session is encrypted and verified, the
+    // backend's pg_stat_ssl row is not.
+    await withTerminatingProxy(t, 5642, async (client) => {
+      const state = readClientTlsState(
+        (client as unknown as { connection?: { stream?: unknown } }).connection?.stream,
+      );
+      // THE CLIENT SESSION IS TLS AND VERIFIED.
+      assert.equal(state.encrypted, true);
+      assert.equal(state.authorized, true);
+      assert.match(state.protocol ?? '', /^TLSv1\.[23]$/);
+      assert.ok(state.cipher !== null);
+      assert.equal(state.servername, 'localhost');
+      assert.match(state.peerCertificateSha256 ?? '', /^[0-9A-F]{2}(:[0-9A-F]{2})+$/);
+      assert.equal(state.peerCertificateSubject, 'CN=localhost');
+      assert.deepEqual(tlsVerificationProblems(state, 'localhost'), []);
+
+      // …AND THE SERVER STILL SAYS ITS BACKEND CONNECTION IS NOT TLS.
+      const backend = await client.query<{ ssl: boolean }>(
+        'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()',
+      );
+      assert.equal(backend.rows[0]?.ssl, false, 'the terminating-proxy topology did not reproduce');
+
+      // The pooled explanation describes the inner connection and separates the
+      // measurement from the architecture; it never claims a downgrade.
+      const note = backendSslExplanation({
+        clientVerified: true,
+        backendSsl: backend.rows[0]?.ssl ?? null,
+        pooledEndpoint: isPooledEndpointHost('ep-x-123-pooler.eu-central-1.aws.neon.tech'),
+        provider: managedProviderFor('ep-x-123-pooler.eu-central-1.aws.neon.tech'),
+      });
+      assert.ok(note !== null);
+      assert.match(note!, /pooled endpoint/);
+      assert.match(note!, /MEASURED by this run/);
+      assert.match(note!, /Not a downgrade/);
+    });
+  });
+
+  it('observes TLS on the same pg client whose queries are executed', async (t) => {
+    // The TLS facts are only meaningful if they describe the socket that carries
+    // the queries. This pins that down against a real connection:
+    //  1. the inspected socket is the one dialled to the endpoint (remote port);
+    //  2. pg has not replaced it between inspection and the queries;
+    //  3. the queries that follow run on that same client;
+    //  4. the backend row read afterwards belongs to the pid those queries see;
+    //  5. a plaintext client cannot even reach the server through this endpoint.
+    const proxyPort = 5643;
+    await withTerminatingProxy(t, proxyPort, async (client) => {
+      const connection = (client as unknown as {
+        connection?: { stream?: net.Socket & { encrypted?: boolean } };
+      }).connection;
+      const inspected = connection?.stream;
+      assert.ok(inspected, 'the client exposes no connection stream');
+
+      // 1. same endpoint: this is the socket dialled to the proxy, not another.
+      assert.equal(inspected!.remotePort, proxyPort);
+      assert.equal(inspected!.encrypted, true);
+
+      // 2. + 3. queries travel over that very socket; pg never reconnects.
+      const pidRow = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      const pid = pidRow.rows[0]?.pid;
+      assert.equal(connection?.stream, inspected, 'pg replaced the connection stream');
+      assert.equal(connection?.stream?.encrypted, true);
+
+      // 4. the backend whose ssl flag we read is the backend that answered.
+      const backend = await client.query<{ ssl: boolean }>(
+        'SELECT ssl FROM pg_stat_ssl WHERE pid = $1',
+        [pid],
+      );
+      assert.equal(backend.rows[0]?.ssl, false);
+      assert.equal(readClientTlsState(inspected).encrypted, true);
+
+      // 5. the proxy rejects anything that is not TLS, so reaching the database
+      //    above proves the inspected socket is the connection path.
+      const plaintext = new pg.Client(clientConfig({ host: 'localhost', port: proxyPort }));
+      try {
+        await assert.rejects(() => plaintext.connect(), 'a plaintext client reached the server through the TLS endpoint');
+      } finally {
+        await plaintext.end().catch(() => {});
+      }
+    });
+  });
+
+  it('reads no TLS state from a socket that is not TLS at all', () => {
+    const state = readClientTlsState({});
+    assert.deepEqual(state, {
+      encrypted: null,
+      authorized: null,
+      authorizationError: null,
+      protocol: null,
+      cipher: null,
+      servername: null,
+      peerCertificateSha256: null,
+      peerCertificateSubject: null,
+      peerCertificateIssuer: null,
+      peerCertificateValidTo: null,
+    });
+    assert.equal(readClientTlsState(null).encrypted, null);
+    assert.equal(readClientTlsState('not a socket').encrypted, null);
+  });
+
+  it('refuses every way a TLS promise can be weaker than verify-full', () => {
+    const verified = {
+      encrypted: true,
+      authorized: true,
+      authorizationError: null,
+      protocol: 'TLSv1.3',
+      cipher: 'TLS_AES_256_GCM_SHA384',
+      servername: 'db.example.test',
+      peerCertificateSha256: 'AA:BB',
+      peerCertificateSubject: 'CN=db.example.test',
+      peerCertificateIssuer: 'CN=ca',
+      peerCertificateValidTo: 'Jan  1 00:00:00 2030 GMT',
+    };
+
+    // The good case has nothing to report.
+    assert.deepEqual(tlsVerificationProblems(verified, 'db.example.test'), []);
+
+    // Unaccepted chain: refused, with the reason.
+    const untrusted = tlsVerificationProblems(
+      { ...verified, authorized: false, authorizationError: 'SELF_SIGNED_CERT_IN_CHAIN' },
+      'db.example.test',
+    );
+    assert.equal(untrusted.length, 1);
+    assert.match(untrusted[0]!, /SELF_SIGNED_CERT_IN_CHAIN/);
+
+    // No peer certificate: refused.
+    assert.match(
+      tlsVerificationProblems({ ...verified, peerCertificateSha256: null }, 'db.example.test')[0]!,
+      /no peer certificate/,
+    );
+
+    // An IPv4 endpoint cannot be hostname-verified by this driver: refused.
+    assert.match(tlsVerificationProblems(verified, '10.0.0.5')[0]!, /IPv4/);
+
+    // An IPv6 literal must be refused EXPLICITLY, not left to a generic failure.
+    // `net.isIP('[2001:db8::1]')` is 0, so the brackets have to be normalised
+    // before the check or the guard silently misses it.
+    const ipv6 = tlsVerificationProblems(verified, '[2001:db8::1]');
+    assert.equal(ipv6.length, 1);
+    assert.match(ipv6[0]!, /IP address literal \(IPv6\)/);
+    assert.match(tlsVerificationProblems(verified, '::1')[0]!, /IPv6/);
+
+    // An unreadable host is its own explicit error, not a silent pass.
+    assert.match(
+      tlsVerificationProblems(verified, '')[0]!,
+      /endpoint host could not be read from DATABASE_URL/,
+    );
+
+    // The certificate must have been verified for the host in DATABASE_URL.
+    assert.match(
+      tlsVerificationProblems({ ...verified, servername: 'other.example.test' }, 'db.example.test')[0]!,
+      /verified against "other\.example\.test" but DATABASE_URL names "db\.example\.test"/,
+    );
+    // Case and a trailing dot are not a mismatch.
+    assert.deepEqual(tlsVerificationProblems({ ...verified, servername: 'DB.Example.Test.' }, 'db.example.test'), []);
+
+    // No SNI: hostname verification cannot have happened.
+    assert.match(
+      tlsVerificationProblems({ ...verified, servername: null }, 'db.example.test')[0]!,
+      /no SNI/,
+    );
+
+    // Plaintext short-circuits: nothing else is even considered.
+    assert.deepEqual(tlsVerificationProblems({ ...verified, encrypted: false }, 'db.example.test'), [
+      'the client socket is not encrypted — this session is plaintext, not TLS',
+    ]);
+  });
+
+  it('recognises pooled endpoint names without ever relaxing a check', () => {
+    assert.equal(isPooledEndpointHost('ep-cool-name-123456-pooler.eu-central-1.aws.neon.tech'), true);
+    assert.equal(isPooledEndpointHost('ep-cool-name-123456.eu-central-1.aws.neon.tech'), false);
+    assert.equal(isPooledEndpointHost('pgbouncer.internal'), true);
+    assert.equal(isPooledEndpointHost('pooler.example.test'), true);
+    assert.equal(isPooledEndpointHost('db.example.test'), false);
+    assert.equal(isPooledEndpointHost(''), false);
+  });
+
+  it('explains the mismatch only when the client really verified the server', () => {
+    // Client not verified → no comforting explanation.
+    assert.equal(backendSslExplanation({ clientVerified: false, backendSsl: false, pooledEndpoint: true }), null);
+    // Agreement → nothing to say.
+    assert.equal(backendSslExplanation({ clientVerified: true, backendSsl: true, pooledEndpoint: true }), null);
+    // Unreadable server-side view → unknown, not silence.
+    assert.match(
+      backendSslExplanation({ clientVerified: true, backendSsl: null, pooledEndpoint: true })!,
+      /could not be read/,
+    );
+    // Pooled → the pooler explanation.
+    assert.match(
+      backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: true })!,
+      /pooled endpoint/,
+    );
+    // Not pooled and not a known provider → do not blame a pooler never detected.
+    const notPooled = backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: false })!;
+    assert.match(notPooled, /not a recognised pooler or managed-provider name/);
+    assert.ok(!notPooled.includes('pooled endpoint ('));
+  });
+
+  it('explains a DIRECT Neon endpoint by provider architecture, and says so is not measured', () => {
+    const note = backendSslExplanation({
+      clientVerified: true,
+      backendSsl: false,
+      pooledEndpoint: false,
+      provider: 'neon',
+    })!;
+    // The provider explanation is present, and attributed to the provider's
+    // documentation rather than to this run …
+    assert.match(note, /DOCUMENTED PROVIDER ARCHITECTURE, not a measurement/);
+    assert.match(note, /Neon's published documentation/);
+    assert.match(note, /front proxy/);
+    assert.match(note, /direct \(non-pooler\) hostname/);
+    // … and it is fenced off from what the collector measured.
+    assert.match(note, /MEASURED by this run/);
+    assert.match(note, /NOT MEASURED/);
+    assert.match(note, /cannot be observed from the client/);
+    // The proxy-to-compute hop is explicitly outside this diagnostic's reach:
+    // no claim that it is encrypted, and none that it is plaintext either.
+    assert.match(note, /does not observe or verify the proxy-to-compute connection/);
+    assert.match(note, /UNVERIFIED/);
+    assert.match(note, /neither confirmed encrypted nor confirmed plaintext/);
+    // The removed claim must not creep back (see the source-level guard below).
+    assert.ok(!/internal network/i.test(note), 'the unsupported internal-network claim is back');
+    // A direct host must not be described as a pooler.
+    assert.ok(!/pooled endpoint \(/.test(note));
+    // Unknown provider + not pooled → the neutral explanation, never Neon's.
+    const generic = backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: false, provider: null })!;
+    assert.ok(!generic.includes('front proxy'));
+  });
+
+  it('never claims to know how the proxy reaches the compute', () => {
+    // None of the three explanations may assert a security property for a hop
+    // this process cannot see. "Unverified" is the accurate state for all of
+    // them, on a direct host and on a pooled one alike.
+    const branches: Array<[string, string]> = [
+      ['pooled', backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: true, provider: 'neon' })!],
+      ['direct neon', backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: false, provider: 'neon' })!],
+      ['unnamed front end', backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: false, provider: null })!],
+    ];
+    for (const [label, note] of branches) {
+      assert.ok(!/internal network/i.test(note), `${label}: unsupported internal-network claim`);
+      assert.ok(!/proxy-to-compute hop (?:is|was) (?:encrypted|verified)/i.test(note), `${label}: claims the hop is secure`);
+      assert.ok(!/(?:proxy|pooler) reaches the compute over/i.test(note), `${label}: describes an unobserved path`);
+      // Every branch keeps the separation this report exists to make.
+      assert.match(note, /MEASURED/, `${label}: lost the measured/not-measured fence`);
+      assert.match(note, /server's view of its own backend connection/i, `${label}: lost the pg_stat_ssl distinction`);
+    }
+    // A direct Neon host may not be described as pooled, and a pooled one must
+    // still say so, so the two endpoints keep their own explanations.
+    assert.ok(!/pooled endpoint \(/.test(branches[1]![1]));
+    assert.match(branches[0]![1], /pooled endpoint \(/);
+  });
+
+  it('keeps the unsupported internal-network wording out of the collector source', () => {
+    // A wording-level regression can hide in a string literal no test reads;
+    // this reads the file the wording lives in.
+    const source = readFileSync(SCRIPT, 'utf8');
+    assert.ok(
+      !/internal network/i.test(source),
+      'the collector source still contains an internal-network claim about the proxy',
+    );
+    assert.ok(!/reaches the compute over/i.test(source), 'the collector still describes an unobserved path');
+  });
+
+  it('recognises managed-provider hosts without treating look-alikes as Neon', () => {
+    assert.equal(managedProviderFor('ep-long-voice-b2gw2tal.c-6.eu-central-1.aws.neon.tech'), 'neon');
+    assert.equal(managedProviderFor('ep-x-123-pooler.eu-central-1.aws.neon.tech'), 'neon');
+    assert.equal(managedProviderFor('NEON.TECH'), 'neon');
+    assert.equal(managedProviderFor('neon.tech.'), 'neon');
+    assert.equal(managedProviderFor('neon.tech.attacker.test'), null);
+    assert.equal(managedProviderFor('notneon.tech'), null);
+    assert.equal(managedProviderFor('db.example.test'), null);
+    assert.equal(managedProviderFor(''), null);
+  });
+
+  it('normalises IPv6 brackets, case and a trailing dot before comparing hosts', () => {
+    assert.equal(normaliseEndpointHost('[2001:db8::1]'), '2001:db8::1');
+    assert.equal(normaliseEndpointHost('[::1]'), '::1');
+    assert.equal(normaliseEndpointHost('DB.Example.Test.'), 'db.example.test');
+    assert.equal(normaliseEndpointHost('  ep-x.eu-central-1.aws.neon.tech  '), 'ep-x.eu-central-1.aws.neon.tech');
+    assert.equal(normaliseEndpointHost(''), '');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Documentation an operator copies verbatim (a dropped hyphen must not ship)
+// ---------------------------------------------------------------------------
+
+describe('documented strategy id', () => {
+  const doc = readFileSync(
+    join(REPO_ROOT, 'docs/diagnostics/gold-v8-production-evidence.md'),
+    'utf8',
+  );
+  const GOLD_V8_ID = '92821cf1-5f28-459d-9ade-08f078b58134';
+
+  it('quotes the Gold v8 id in canonical 8-4-4-4-12 form, everywhere it appears', () => {
+    assert.ok(doc.includes(GOLD_V8_ID), 'the canonical strategy id is missing from the doc');
+    // Every hex-and-dash cluster in the doc must be a well-formed UUID, so a
+    // merged group (the `...-459d9ade-...` typo) fails here instead of at the
+    // operator's prompt, where it would be rejected as "not a strategy id".
+    const clusters = doc.match(/\b[0-9a-f]{8}(?:-[0-9a-f]+)+\b/gi) ?? [];
+    assert.ok(clusters.length >= 4, `expected several id references, found ${clusters.length}`);
+    for (const cluster of clusters) {
+      assert.ok(isStrategyUuid(cluster), `malformed strategy id in the doc: ${cluster}`);
+    }
+    assert.ok(
+      !doc.includes('92821cf1-5f28-459d9ade-08f078b58134'),
+      'the 4-group typo (a dropped hyphen) is back in the doc',
+    );
+  });
+
+  it('passes the id through the same validation the CLI applies to --strategy', () => {
+    assert.equal(isStrategyUuid(GOLD_V8_ID), true);
+    assert.equal(isStrategyUuid('92821cf1-5f28-459d9ade-08f078b58134'), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 — notification delivery evidence
+// ---------------------------------------------------------------------------
+
+describe('notification delivery evidence (counts, never recipients)', () => {
+  /** The shape the staging snapshot reported: 5/5 attempts, timeouts, no reply. */
+  const stagingRows = [
+    {
+      channel: 'email',
+      provider: 'smtp',
+      provider_response_code: null,
+      status: 'failed',
+      attempts: 5,
+      max_attempts: 5,
+      failure_category: 'timeout',
+      delivered_at: null,
+      alert_id: 'a',
+    },
+    {
+      channel: 'email',
+      provider: 'smtp',
+      provider_response_code: null,
+      status: 'failed',
+      attempts: 5,
+      max_attempts: 5,
+      failure_category: 'timeout',
+      delivered_at: null,
+      alert_id: 'b',
+    },
+  ];
+
+  it('summarises exhausted, reply-less failures without quoting a row', () => {
+    const summary = summariseNotificationDeliveries(stagingRows);
+    assert.equal(summary.total, 2);
+    assert.equal(summary.delivered, 0);
+    assert.equal(summary.neverDelivered, 2);
+    assert.equal(summary.exhausted, 2);
+    assert.equal(summary.failedWithoutProviderResponse, 2);
+    assert.deepEqual(summary.byStatus, { failed: 2 });
+    assert.deepEqual(summary.byCategory, { timeout: 2 });
+    assert.deepEqual(summary.byProvider, { smtp: 2 });
+    assert.deepEqual(summary.byChannel, { email: 2 });
+  });
+
+  it('turns the timeout signature into an actionable, non-sensitive hint', () => {
+    const hint = deliveryFailureHint(summariseNotificationDeliveries(stagingRows));
+    assert.ok(hint !== null);
+    assert.match(hint!, /no complete provider response recorded/i);
+    assert.match(hint!, /Render/);
+    assert.match(hint!, /Resend/);
+    // The evidence boundary: silence on the wire is not proof of non-delivery.
+    assert.match(hint!, /LATE DELIVERY MAY ALREADY HAVE HAPPENED/);
+    assert.match(hint!, /duplicate/);
+    assert.ok(!/NO reply from the provider/i.test(hint!), 'the hint claims the provider never replied');
+    assert.ok(!/Nothing was accepted/i.test(hint!), 'the hint claims nothing was accepted');
+    assert.match(hint!, /does not prove the provider received nothing/);
+    // No address, no credential, no provider message text.
+    assert.ok(!hint!.includes('@'), 'the hint echoed something address-like');
+  });
+
+  it('distinguishes configuration, permanent and stale failures', () => {
+    const config = deliveryFailureHint(
+      summariseNotificationDeliveries([
+        { ...stagingRows[0]!, provider: 'resend', provider_response_code: '401', failure_category: 'configuration', attempts: 1, max_attempts: 5 },
+      ]),
+    );
+    assert.match(config!, /CONFIGURATION failure/);
+
+    const permanent = deliveryFailureHint(
+      summariseNotificationDeliveries([
+        { ...stagingRows[0]!, provider_response_code: '550', failure_category: 'permanent', attempts: 1, max_attempts: 5 },
+      ]),
+    );
+    assert.match(permanent!, /PERMANENT/);
+
+    const stale = deliveryFailureHint(
+      summariseNotificationDeliveries([
+        { ...stagingRows[0]!, failure_category: 'stale', attempts: 2, max_attempts: 5 },
+      ]),
+    );
+    assert.match(stale!, /UNKNOWN/);
+  });
+
+  it('says nothing when everything was delivered', () => {
+    const summary = summariseNotificationDeliveries([
+      {
+        channel: 'email',
+        provider: 'resend',
+        provider_response_code: '200',
+        status: 'delivered',
+        attempts: 1,
+        max_attempts: 5,
+        failure_category: 'none',
+        delivered_at: '2026-01-01T00:00:00.000Z',
+      },
+    ]);
+    assert.equal(summary.delivered, 1);
+    assert.equal(summary.exhausted, 0);
+    assert.equal(deliveryFailureHint(summary), null);
+    assert.equal(deliveryFailureHint(summariseNotificationDeliveries([])), null);
+  });
+
+  /**
+   * Only the dead letter counts as failed. `pending`/`processing` are work in
+   * flight, `unavailable` is parked until the channel is configured (and is
+   * re-queued automatically), `delivered` succeeded. A reviewer caught the
+   * earlier version counting in-flight rows: they carry a null response code and
+   * a `timeout` category too, so the status is the only thing that separates
+   * them from a real failure.
+   */
+  it('counts only dead-lettered rows as failed, never pending, processing or unavailable work', () => {
+    const rows = [
+      { channel: 'email', provider: 'smtp', provider_response_code: null, status: 'pending', attempts: 1, max_attempts: 5, failure_category: 'timeout', delivered_at: null },
+      { channel: 'email', provider: 'smtp', provider_response_code: null, status: 'processing', attempts: 2, max_attempts: 5, failure_category: 'transient', delivered_at: null },
+      { channel: 'email', provider: null, provider_response_code: null, status: 'unavailable', attempts: 0, max_attempts: 5, failure_category: 'configuration', delivered_at: null },
+    ];
+    const summary = summariseNotificationDeliveries(rows);
+    assert.equal(summary.total, 3);
+    assert.equal(summary.neverDelivered, 3, 'none of these is delivered');
+    assert.equal(summary.failedWithoutProviderResponse, 0, 'in-flight rows were counted as failed');
+    assert.equal(summary.exhausted, 0);
+    assert.deepEqual(summary.byStatus, { pending: 1, processing: 1, unavailable: 1 });
+    const hint = deliveryFailureHint(summary);
+    // Nothing is dead-lettered, so the interpretation may only be the retry note.
+    assert.ok(
+      hint === null || /only a `failed` row is terminal/.test(hint),
+      `in-flight work was described as a dead letter: ${hint}`,
+    );
+    assert.ok(!/CONFIGURATION failure/.test(hint ?? ''), 'a parked (`unavailable`) row is not a refusal');
+  });
+
+  it('counts a dead letter that exhausted its budget, and not a one-attempt rejection', () => {
+    const summary = summariseNotificationDeliveries([
+      // dead letter, budget exhausted, no response code ever recorded
+      { ...stagingRows[0]! },
+      // dead letter on the first attempt, provider answered 550
+      { ...stagingRows[0]!, status: 'failed', attempts: 1, max_attempts: 5, failure_category: 'permanent', provider_response_code: '550' },
+    ]);
+    assert.equal(summary.failedWithoutProviderResponse, 1);
+    assert.equal(summary.exhausted, 1);
+    assert.deepEqual(summary.byStatus, { failed: 2 });
+  });
+
+  it('keeps a delivered row out of every failure count even with no response code', () => {
+    const summary = summariseNotificationDeliveries([
+      { channel: 'email', provider: 'smtp', provider_response_code: null, status: 'delivered', attempts: 3, max_attempts: 5, failure_category: 'none', delivered_at: '2026-01-01T00:00:00.000Z' },
+    ]);
+    assert.equal(summary.delivered, 1);
+    assert.equal(summary.neverDelivered, 0);
+    assert.equal(summary.failedWithoutProviderResponse, 0);
+    assert.equal(summary.exhausted, 0);
+    assert.equal(deliveryFailureHint(summary), null);
+  });
+
+  it('does not call an unfinished row terminal even at its last allowed attempt', () => {
+    // `pending` at attempts = max_attempts cannot be claimed again, but it is not
+    // a dead letter until the worker writes `failed`; it must not inflate the count.
+    const summary = summariseNotificationDeliveries([
+      { channel: 'email', provider: 'smtp', provider_response_code: null, status: 'pending', attempts: 5, max_attempts: 5, failure_category: 'timeout', delivered_at: null },
+    ]);
+    assert.equal(summary.exhausted, 0);
+    assert.equal(summary.failedWithoutProviderResponse, 0);
+  });
+
+  it('names exactly one terminal failure status', () => {
+    assert.deepEqual([...FAILED_DELIVERY_STATUSES], ['failed']);
+    assert.equal(isFailedDeliveryStatus('failed'), true);
+    for (const status of ['pending', 'processing', 'delivered', 'unavailable', 'unknown', '']) {
+      assert.equal(isFailedDeliveryStatus(status), false, `${status || '(empty)'} must not count as failed`);
+    }
+  });
+
+  /** Minimal complete Evidence, so this case does not depend on another block. */
+  function minimalEvidence(): Parameters<typeof renderMarkdown>[0] {
+    return {
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      target: { strategy: 's', version: 8, symbol: 'XAUUSD', assetClass: 'commodity', outDir: 'o' },
+      safety: {
+        connectionOpenedWithDefaultTransactionReadOnly: true,
+        everyQueryRanInsideBeginReadOnly: true,
+        secretsRedacted: true,
+      },
+      declaredNotVerified: { triggersNothing: ['no ScannerService'] },
+      connection: {
+        database: 'db',
+        serverVersion: 'PostgreSQL 16',
+        tlsRequestedMode: 'verify-full',
+        tlsClient: {
+          encrypted: true,
+          authorized: true,
+          authorizationError: null,
+          protocol: 'TLSv1.3',
+          cipher: 'TLS_AES_256_GCM_SHA384',
+          servername: 'db.example.test',
+          peerCertificateSha256: 'AA:BB',
+          peerCertificateSubject: 'CN=db.example.test',
+          peerCertificateIssuer: 'CN=test-ca',
+          peerCertificateValidTo: 'Jan  1 00:00:00 2030 GMT',
+        },
+        tlsVerified: true,
+        pooledEndpoint: false,
+        ssl: true,
+        tlsNote: null,
+        defaultTransactionReadOnly: 'on',
+        transactionReadOnly: 'on',
+        isSuperuser: 'off',
+        statementTimeout: '30s',
+        privileges: { 'INSERT on setups': false },
+      },
+      migrations: [],
+      candidateStrategies: [],
+      versions: [],
+      v8: { found: false, id: null, status: null, publishedAt: null, changelog: null },
+      timeframes: [],
+      risk: null,
+      marketScope: null,
+      conditions: [],
+      conditionRoleResolution: [],
+      liquiditySweepFocus: { count: 0, entries: [] },
+      sessionFilters: [],
+      filters: [],
+      instrument: null,
+      candleCoverage: [],
+      setups: { total: 0, byState: [], latest: [], scores: [], stateEvents: [] },
+      alerts: [],
+      alertDeliveries: [],
+      notificationDeliveries: [],
+      scannerRuns: [],
+      scannerCursors: [],
+      notes: [],
+    } as unknown as Parameters<typeof renderMarkdown>[0];
+  }
+
+  it('renders the summary and the hint into the report without a recipient', () => {
+    const base = minimalEvidence();
+    const md = renderMarkdown({
+      ...base,
+      notificationDeliveries: stagingRows.map((r) => ({
+        alert_id: r.alert_id,
+        channel: r.channel,
+        template: 'alert.confirmed.v1',
+        provider: r.provider,
+        provider_response_code: r.provider_response_code,
+        status: r.status,
+        attempts: r.attempts,
+        max_attempts: r.max_attempts,
+        failure_category: r.failure_category,
+        last_error: 'Timeout',
+        next_attempt_at: '2026-01-01T00:00:00.000Z',
+        delivered_at: r.delivered_at,
+        created_at: '2026-01-01T00:00:00.000Z',
+      })),
+    } as unknown as Parameters<typeof renderMarkdown>[0]);
+
+    assert.match(md, /Delivery summary \(counts only\)/);
+    assert.match(md, /\| attempts \| exhausted the attempt budget \| 2 \|/);
+    assert.match(md, /Interpretation \(static text, derived from the counts above\)/);
+    assert.match(md, /dead-lettered with no complete provider response recorded/);
+    assert.match(md, /no complete provider response recorded/i);
+    assert.ok(!/NO reply from the provider/i.test(md), 'the report claims the provider never replied');
+    assert.ok(!/Nothing was accepted/i.test(md), 'the report claims nothing was accepted');
+    assert.ok(!md.includes('@'), 'the report contains something address-like');
   });
 });
