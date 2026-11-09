@@ -228,11 +228,16 @@ yields `encrypted: true`, `authorized: true`, `TLSv1.3` on the client and
 `pg_stat_ssl.ssl = false` on the backend, on the same client that runs the
 query.
 
-When the two disagree the report says so, in words, and names the cause:
-a recognised pooler host (`…-pooler…`, `pgbouncer…`) produces the pooler
-explanation; anything else produces "identify what sits between this client and
-PostgreSQL before drawing a conclusion". It never presents the mismatch as a
-verification failure, and it never treats it as a downgrade.
+When the two disagree the report says so, in words, and names the cause, in
+three branches: a recognised pooler host (`…-pooler…`, `pgbouncer…`) produces
+the pooler explanation; a managed-provider host (`*.neon.tech`) produces the
+provider explanation quoted above, which cites Neon's documentation, says the
+TLS session ends at that front end, and states in the same breath that **this
+diagnostic does not observe or verify the proxy-to-compute connection** (that hop
+is called unverified — neither confirmed encrypted nor confirmed plaintext);
+anything else produces "identify what sits between this client and PostgreSQL
+before drawing a conclusion". It never presents the mismatch as a verification
+failure, and it never treats it as a downgrade.
 
 **Fail-closed rules.** The run refuses with exit 3 — before any evidence query
 and before anything is written — unless, on the real socket: the session is

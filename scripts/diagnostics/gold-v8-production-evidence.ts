@@ -714,6 +714,12 @@ export function managedProviderFor(host: string): ManagedProvider | null {
  * and its certificate was accepted for this hostname; the server reports its own
  * backend connection as non-TLS) from what it did NOT measure (whatever
  * terminates TLS in front of the compute, and the hop beyond it).
+ *
+ * The Neon branch states provider architecture as DOCUMENTED behaviour (see
+ * `docs/diagnostics/gold-v8-production-evidence.md`, "Sources for the
+ * front-proxy claim") and says nothing about how the proxy reaches the compute:
+ * that hop is not documented and not observed here, so the text calls it
+ * unverified rather than guessing in either direction.
  */
 export function backendSslExplanation(args: {
   clientVerified: boolean;
@@ -732,7 +738,7 @@ export function backendSslExplanation(args: {
     return `The "no" above is the SERVER's view of its own backend connection, not of this session. A pooled endpoint (\u2026-pooler\u2026) terminates the client's TLS and opens its own connection to PostgreSQL, so \`pg_stat_ssl\` describes that inner connection. ${measured} Not a downgrade, and not evidence of plaintext access.`;
   }
   if (args.provider === 'neon') {
-    return `The "no" above is the SERVER's view of its own backend connection, not of this session. PROVIDER ARCHITECTURE, not a measurement: Neon puts a front proxy in front of the compute for every client connection, pooled or direct — the client's TLS ends at that proxy, and the proxy reaches the compute over Neon's internal network. A direct (non-pooler) hostname is therefore expected to show \`ssl = false\` on the compute exactly like a pooled one. ${measured} The proxy-to-compute hop cannot be observed from the client; the client-visible guarantee is the verified TLS session reported above.`;
+    return `The "no" above is the SERVER's view of its own backend connection, not of this session. DOCUMENTED PROVIDER ARCHITECTURE, not a measurement: Neon's published documentation puts a front proxy in front of the database, authenticating connections before they reach Postgres, and routes incoming connections by the compute domain name carried in the TLS SNI extension — so the TLS session this client verified ends at that front end, not at the backend. A direct (non-pooler) hostname is therefore expected to show \`ssl = false\` on the compute exactly like a pooled one. ${measured} This diagnostic does not observe or verify the proxy-to-compute connection, and the Neon documentation cited in docs/diagnostics/gold-v8-production-evidence.md does not describe it: that hop cannot be observed from the client and is UNVERIFIED — neither confirmed encrypted nor confirmed plaintext.`;
   }
   return `The "no" above is the SERVER's view of its own backend connection, not of this session, and the endpoint is not a recognised pooler or managed-provider name. ${measured} Identify what sits between this client and PostgreSQL — a proxy, load balancer or private gateway — before drawing a conclusion.`;
 }

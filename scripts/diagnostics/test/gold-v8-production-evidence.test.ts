@@ -2409,19 +2409,62 @@ describe('TLS observation (TLS-terminating front ends and fail-closed verificati
       pooledEndpoint: false,
       provider: 'neon',
     })!;
-    // The provider explanation is present …
-    assert.match(note, /PROVIDER ARCHITECTURE, not a measurement/);
+    // The provider explanation is present, and attributed to the provider's
+    // documentation rather than to this run …
+    assert.match(note, /DOCUMENTED PROVIDER ARCHITECTURE, not a measurement/);
+    assert.match(note, /Neon's published documentation/);
     assert.match(note, /front proxy/);
     assert.match(note, /direct \(non-pooler\) hostname/);
     // … and it is fenced off from what the collector measured.
     assert.match(note, /MEASURED by this run/);
     assert.match(note, /NOT MEASURED/);
     assert.match(note, /cannot be observed from the client/);
+    // The proxy-to-compute hop is explicitly outside this diagnostic's reach:
+    // no claim that it is encrypted, and none that it is plaintext either.
+    assert.match(note, /does not observe or verify the proxy-to-compute connection/);
+    assert.match(note, /UNVERIFIED/);
+    assert.match(note, /neither confirmed encrypted nor confirmed plaintext/);
+    // The removed claim must not creep back (see the source-level guard below).
+    assert.ok(!/internal network/i.test(note), 'the unsupported internal-network claim is back');
     // A direct host must not be described as a pooler.
     assert.ok(!/pooled endpoint \(/.test(note));
     // Unknown provider + not pooled → the neutral explanation, never Neon's.
     const generic = backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: false, provider: null })!;
     assert.ok(!generic.includes('front proxy'));
+  });
+
+  it('never claims to know how the proxy reaches the compute', () => {
+    // None of the three explanations may assert a security property for a hop
+    // this process cannot see. "Unverified" is the accurate state for all of
+    // them, on a direct host and on a pooled one alike.
+    const branches: Array<[string, string]> = [
+      ['pooled', backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: true, provider: 'neon' })!],
+      ['direct neon', backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: false, provider: 'neon' })!],
+      ['unnamed front end', backendSslExplanation({ clientVerified: true, backendSsl: false, pooledEndpoint: false, provider: null })!],
+    ];
+    for (const [label, note] of branches) {
+      assert.ok(!/internal network/i.test(note), `${label}: unsupported internal-network claim`);
+      assert.ok(!/proxy-to-compute hop (?:is|was) (?:encrypted|verified)/i.test(note), `${label}: claims the hop is secure`);
+      assert.ok(!/(?:proxy|pooler) reaches the compute over/i.test(note), `${label}: describes an unobserved path`);
+      // Every branch keeps the separation this report exists to make.
+      assert.match(note, /MEASURED/, `${label}: lost the measured/not-measured fence`);
+      assert.match(note, /server's view of its own backend connection/i, `${label}: lost the pg_stat_ssl distinction`);
+    }
+    // A direct Neon host may not be described as pooled, and a pooled one must
+    // still say so, so the two endpoints keep their own explanations.
+    assert.ok(!/pooled endpoint \(/.test(branches[1]![1]));
+    assert.match(branches[0]![1], /pooled endpoint \(/);
+  });
+
+  it('keeps the unsupported internal-network wording out of the collector source', () => {
+    // A wording-level regression can hide in a string literal no test reads;
+    // this reads the file the wording lives in.
+    const source = readFileSync(SCRIPT, 'utf8');
+    assert.ok(
+      !/internal network/i.test(source),
+      'the collector source still contains an internal-network claim about the proxy',
+    );
+    assert.ok(!/reaches the compute over/i.test(source), 'the collector still describes an unobserved path');
   });
 
   it('recognises managed-provider hosts without treating look-alikes as Neon', () => {
