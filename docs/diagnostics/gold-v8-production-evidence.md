@@ -162,18 +162,59 @@ pooler (Neon's `-pooler` host, PgBouncer), a managed provider's front proxy, a
 load balancer — the backend row describes *that* inner connection, so it reads
 `ssl = false` **while the client session is perfectly encrypted and verified**.
 
-**Direct (non-pooler) Neon endpoints behave the same way.** Neon documents a front
-proxy in front of every compute: the client's TLS ends at that proxy, and the
-proxy reaches the compute over Neon's internal network, so a direct hostname
-(`ep-….eu-central-1.aws.neon.tech`, pooling off) is expected to show
-`ssl = false` on the compute exactly like a `-pooler` one. **That is provider
-architecture, not something this collector measures.** The report keeps the two
-apart on purpose:
+**Direct (non-pooler) Neon endpoints are fronted the same way.** Neon's own
+documentation describes a proxy placed in front of the database, which
+authenticates connections *before they ever reach* Postgres, and it describes
+routing incoming connections by the compute domain name carried in the TLS SNI
+extension. A direct hostname (`ep-….eu-central-1.aws.neon.tech`, pooling off)
+is therefore expected to show `ssl = false` on the compute exactly like a
+`-pooler` one. **That is provider architecture — an expectation read from the
+provider's documentation — not something this collector measures.** The report
+keeps the two apart on purpose:
 
 - *Measured by this run*: the client socket is encrypted and its certificate was
   accepted for this hostname (protocol, cipher, SNI, certificate fingerprint).
 - *Not measured, and not visible from a client*: whatever terminates that socket
   and the hop from there to the compute.
+
+#### Sources for the front-proxy claim
+
+Every statement below is quoted from Neon's documentation (links checked
+2026-11-03); none of it is inferred from this repository's traffic.
+
+| Neon documents | Source | What it supports here |
+| --- | --- | --- |
+| "Neon places a proxy in front of your database… The Neon Proxy also allows us to authenticate connections before they ever reach your Postgres database." | [Security overview](https://neon.com/docs/security/security-overview) | a proxy sits between the client and the compute, and handles the connection before Postgres sees it |
+| "Neon uses compute domain names to route incoming connections. However, the Postgres wire protocol does not transfer the server domain name, so Neon relies on the Server Name Indication (SNI) extension of the TLS protocol to do this." | [Connect a GUI application](https://neon.com/docs/connect/connect-postgres-gui) | the routing layer reads the TLS ClientHello, so the TLS session is handled in front of the compute; it is also why the certificate the client verifies is the hostname it dialled |
+| "This works just fine when connecting to Neon's own Rust-based Postgres proxy." (on pipelining the `SSLRequest` with the Client Hello, which "is not applicable more widely, since Postgres itself can't handle it") | [Quicker serverless Postgres connections](https://neon.com/blog/quicker-serverless-postgres) | the TLS handshake is answered by Neon's proxy rather than by the Postgres backend |
+| "Neon requires that all connections use SSL/TLS encryption… Neon rejects connections that do not use SSL/TLS", and `verify-full` is supported for client connections | [Connect to Neon securely](https://neon.com/docs/connect/connect-securely) | the client session is expected to be TLS, and `verify-full` is a supported (recommended) mode, not a local invention |
+| "Neon uses PgBouncer to provide connection pooling… PgBouncer routes multiple client connections through a smaller pool of actual Postgres connections." | [Connection pooling](https://neon.com/docs/connect/connection-pooling) | a `-pooler` hostname puts another party in front of the compute as well |
+
+**What those sources do not establish — and this document therefore does not
+claim:**
+
+- They say nothing about how the proxy (or PgBouncer) connects onward to the
+  compute. The proxy-to-compute hop is **unmeasured** here: not on the client
+  socket, and not documented in the pages above. It is not described as
+  encrypted, and it must not be described as verified either.
+- They describe the provider in general, not this deployment or this endpoint.
+  Whether a given hostname is fronted by the proxy is an expectation, which is
+  why the report labels it *architecture* and never as an observation.
+- They are not a statement about `pg_stat_ssl` in particular. The link between
+  "a proxy is in front" and "the backend row can read `ssl = false`" is
+  demonstrated by this repository's own test with a real TLS-terminating proxy
+  (below), not asserted from the provider's documentation.
+
+**In one sentence each.**
+
+- *Documented architecture (not measured here):* Neon fronts client connections
+  with a proxy that answers the TLS handshake and routes by SNI, and pooled
+  hostnames add PgBouncer.
+- *Measured by this run:* the socket this process dialled is encrypted with a
+  certificate the client accepted for the hostname in `DATABASE_URL`, and the
+  backend's own `pg_stat_ssl` row says no TLS.
+- *Measured by neither:* the proxy-to-compute hop, and anything about a
+  different endpoint, deployment or time than the one this run connected to.
 
 The report therefore explains the mismatch, names the likely party (pooler,
 managed-provider front proxy, or an unidentified intermediary), and never claims
