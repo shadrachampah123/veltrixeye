@@ -19,6 +19,13 @@ import {
   type ScannerInternalRunResponse,
   type ScannerInternalMaintenanceResponse,
   type AssetClass,
+  type ConditionSummary,
+  type ScannerPairOutcome,
+  type ScannerRunPairs,
+  SCANNER_RUN_PAIR_ITEMS_MAX,
+  SCANNER_RUN_PAIR_REASONS_MAX,
+  SCANNER_RUN_PAIR_REASON_MAX_CHARS,
+  SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS,
   timeframeMinutes,
 } from '@veltrixeye/contracts';
 import { DomainError, Errors } from '../errors.js';
@@ -230,12 +237,42 @@ export function redactScannerRunMetadata(
   viewerUserId: string,
 ): Record<string, unknown> {
   if (metadata.triggeredBy === viewerUserId) return { ...metadata };
-  const redacted: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(metadata)) {
-    if ((SCANNER_TENANT_SENSITIVE_METADATA_KEYS as readonly string[]).includes(key)) continue;
-    redacted[key] = value;
+  return stripSensitiveMetadata(metadata, 0) as Record<string, unknown>;
+}
+
+/**
+ * Keys that must never reach a viewer who does not own the run, **at any
+ * depth**. Phase B added `metadata.pairs.items[]`, whose entries carry the
+ * strategy UUID and the engine's failure reasons for that strategy — both are
+ * tenant information, and a top-level-only filter would have leaked them into
+ * `getHealth` (which is global) and into the operator/scheduler responses.
+ *
+ * `errors` and `failureReasons` are dropped too: their strings describe one
+ * tenant's strategy internals even when no UUID appears in the text.
+ */
+const SCANNER_REDACTED_METADATA_KEYS = new Set<string>([
+  ...SCANNER_TENANT_SENSITIVE_METADATA_KEYS,
+  'versionId',
+  'failureReasons',
+]);
+
+/** Recursion bound: current metadata nests 3 levels (`pairs.items[]`). */
+const SCANNER_METADATA_MAX_DEPTH = 6;
+
+/**
+ * Deep-copy `value`, dropping every redacted key. Never mutates the input.
+ * Bounded depth and array-safe, so a malformed/oversized metadata blob cannot
+ * cause unbounded work.
+ */
+function stripSensitiveMetadata(value: unknown, depth: number): unknown {
+  if (depth > SCANNER_METADATA_MAX_DEPTH || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((entry) => stripSensitiveMetadata(entry, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (SCANNER_REDACTED_METADATA_KEYS.has(key)) continue;
+    out[key] = stripSensitiveMetadata(entry, depth + 1);
   }
-  return redacted;
+  return out;
 }
 
 /** Redact a fully-mapped run DTO for a tenant viewer. Pure — no I/O. */
@@ -270,6 +307,101 @@ export function redactScannerRunForOperator(
     error: run.error === null ? null : sanitizeScannerError(run.error, redact, SCANNER_RUN_ERROR_MAX_CHARS, true),
     metadata: redactScannerRunMetadata(run.metadata, ''),
   };
+}
+
+/**
+ * Bounded cause code for a pair that threw (Phase B).
+ *
+ * Reuses the domain error code when there is one, so a triage view can tell a
+ * provider outage from an invalid configuration without storing the message.
+ * Never returns free text, never contains tenant identifiers.
+ */
+function classifyPairFailure(err: unknown): string {
+  if (err instanceof DomainError) return String(err.code).slice(0, SCANNER_RUN_PAIR_REASON_MAX_CHARS);
+  // Provider failures carry a bounded `kind` (`rate_limited`, `unavailable`, …)
+  // rather than a domain code; it is exactly the triage signal we want.
+  if (err instanceof Error && err.name === 'ProviderError' && typeof (err as { kind?: unknown }).kind === 'string') {
+    return String((err as unknown as { kind: string }).kind).slice(0, SCANNER_RUN_PAIR_REASON_MAX_CHARS);
+  }
+  return 'error';
+}
+
+/**
+ * Build the persisted `metadata.pairs` block (Phase B).
+ *
+ * Guarantees, all covered by tests:
+ *  - **Mutually exclusive**: each observation contributes to exactly one of the
+ *    four outcome counters, so their sum is `totals.pairs`.
+ *  - **Totals are computed over ALL pairs**, never over the stored sample.
+ *  - **Deterministic sample**: `items` is the first `SCANNER_RUN_PAIR_ITEMS_MAX`
+ *    observations in a content-derived order (assetClass, symbol, timeframe,
+ *    strategyId, outcome) — independent of strategy iteration order, so the
+ *    same run always persists the same sample.
+ *  - **Bounded**: reasons are truncated, and `failureReasons` is only ever set
+ *    for `evaluated` pairs (a skip is not an evaluation and carries no engine
+ *    reasons).
+ *
+ * Pure and deterministic — no I/O, no clock, no input mutation.
+ */
+export function buildScannerRunPairs(observations: readonly PairObservation[]): ScannerRunPairs {
+  const totals: ScannerRunPairs['totals'] = {
+    pairs: observations.length,
+    evaluated: 0,
+    cursor_skipped: 0,
+    stale: 0,
+    failed: 0,
+  };
+  const conditions: ConditionSummary = { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 };
+
+  for (const observation of observations) {
+    totals[observation.outcome] += 1;
+    if (observation.outcome === 'evaluated' && observation.conditions) {
+      conditions.satisfied += observation.conditions.satisfied;
+      conditions.unsatisfied += observation.conditions.unsatisfied;
+      conditions.insufficient_data += observation.conditions.insufficient_data;
+      conditions.unsupported += observation.conditions.unsupported;
+    }
+  }
+
+  const ordered = [...observations].sort(comparePairObservations);
+  const sampled = ordered.slice(0, SCANNER_RUN_PAIR_ITEMS_MAX);
+
+  return {
+    v: 1,
+    totals,
+    conditions,
+    truncated: observations.length > sampled.length,
+    items: sampled.map((observation) => {
+      const item: ScannerRunPairs['items'][number] = {
+        strategyId: observation.strategyId,
+        assetClass: observation.assetClass,
+        symbol: observation.symbol,
+        timeframe: observation.timeframe,
+        outcome: observation.outcome,
+        cursorMs: observation.cursorMs,
+        anchorMs: observation.anchorMs,
+        reason: observation.reason === null ? null : observation.reason.slice(0, SCANNER_RUN_PAIR_REASON_MAX_CHARS),
+      };
+      if (observation.outcome === 'evaluated' && observation.conditions) item.conditions = observation.conditions;
+      if (observation.outcome === 'evaluated' && observation.failureReasons && observation.failureReasons.length > 0) {
+        item.failureReasons = observation.failureReasons
+          .slice(0, SCANNER_RUN_PAIR_REASONS_MAX)
+          .map((reason) => reason.slice(0, SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS));
+      }
+      return item;
+    }),
+  };
+}
+
+/** Content-derived total order: deterministic regardless of scan order. */
+function comparePairObservations(a: PairObservation, b: PairObservation): number {
+  return (
+    a.assetClass.localeCompare(b.assetClass) ||
+    a.symbol.localeCompare(b.symbol) ||
+    a.timeframe.localeCompare(b.timeframe) ||
+    a.strategyId.localeCompare(b.strategyId) ||
+    a.outcome.localeCompare(b.outcome)
+  );
 }
 
 const UNLOCK_ERROR_UUID_PATTERN = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
@@ -368,6 +500,34 @@ interface EligibleStrategy {
   marketScope: { mode: 'all' | 'instruments'; instruments?: { assetClass: AssetClass; symbol: string; instrumentId: string }[] };
 }
 
+/**
+ * Phase B observability: what happened to ONE (strategy, instrument) pair.
+ *
+ * Exactly one of these is produced per pair the scanner walks, and its
+ * `outcome` is one of four mutually exclusive values. The scanner's existing
+ * counters remain the source of truth for the run columns; these observations
+ * are the per-pair breakdown and are cross-checked against them (see
+ * `buildScannerRunPairs`).
+ */
+interface PairObservation {
+  strategyId: string;
+  assetClass: string;
+  symbol: string;
+  /** The cursor/setup timeframe this pair is keyed by. */
+  timeframe: Timeframe;
+  outcome: ScannerPairOutcome;
+  /** Closed setup-candle open (ms) compared against the cursor; null if none. */
+  cursorMs: number | null;
+  /** MTF anchor (ms) = cursorMs + setup period. */
+  anchorMs: number | null;
+  /** Short cause code: `cursor_hit`, `mtf_invalid`, `stale_candle`, … */
+  reason: string | null;
+  /** `evaluated` only: summed condition statuses across both directions. */
+  conditions?: ConditionSummary;
+  /** `evaluated` only: sanitized M3 reasons (bounded). Never set for skips. */
+  failureReasons?: string[];
+}
+
 interface ScanMetrics {
   strategiesScanned: number;
   instrumentsScanned: number;
@@ -389,12 +549,18 @@ interface ScanMetrics {
   setupsCreated: number;
   alertsCreated: number;
   staleRejections: number;
-  /** Evaluations skipped because the setup candle had already been processed (cursor hit). */
-  duplicateCandleSkips: number;
   providerFailures: number;
   symbolsProcessed: Set<string>;
   timeframesProcessed: Set<string>;
   errors: string[];
+  /**
+   * Phase B: one observation per (strategy, instrument) pair walked.
+   *
+   * Single source of truth for the cursor-skip count: `metadata.duplicateCandleSkips`
+   * is DERIVED from `pairs` (`totals.cursor_skipped`) when the run completes, so
+   * the per-pair detail and the historical counter cannot drift apart.
+   */
+  pairs: PairObservation[];
 }
 
 /**
@@ -1071,11 +1237,11 @@ export class ScannerService {
       setupsCreated: 0,
       alertsCreated: 0,
       staleRejections: 0,
-      duplicateCandleSkips: 0,
       providerFailures: 0,
       symbolsProcessed: new Set<string>(),
       timeframesProcessed: new Set<string>(),
       errors: [],
+      pairs: [],
     };
 
     let finalStatus: 'completed' | 'failed' | 'partial' = 'completed';
@@ -1202,6 +1368,14 @@ export class ScannerService {
     }
   }
 
+  /**
+   * Phase B: wrap the pair scan so EXACTLY ONE observation is recorded per
+   * pair, on every exit path (skip, stale, evaluated, throw).
+   *
+   * The observation starts as `failed` and is overwritten by the core path as
+   * soon as it decides otherwise, so an unexpected throw can never produce a
+   * pair that is silently missing from `metadata.pairs`.
+   */
   private async scanInstrument(
     strategy: EligibleStrategy,
     instrument: { assetClass: AssetClass; symbol: string; instrumentId: string },
@@ -1209,6 +1383,37 @@ export class ScannerService {
     nowMs: number,
     metrics: ScanMetrics,
     cycleCache: ScanCycleCache,
+  ): Promise<void> {
+    const setupTf = normalizeTimeframe(strategy.timeframes.setup);
+    const observation: PairObservation = {
+      strategyId: strategy.strategyId,
+      assetClass: instrument.assetClass,
+      symbol: instrument.symbol,
+      timeframe: setupTf ?? strategy.timeframes.setup,
+      outcome: 'failed',
+      cursorMs: null,
+      anchorMs: null,
+      reason: 'error',
+    };
+    try {
+      await this.scanPairCore(strategy, instrument, args, nowMs, metrics, cycleCache, observation);
+    } catch (err) {
+      observation.outcome = 'failed';
+      observation.reason = classifyPairFailure(err);
+      throw err;
+    } finally {
+      metrics.pairs.push(observation);
+    }
+  }
+
+  private async scanPairCore(
+    strategy: EligibleStrategy,
+    instrument: { assetClass: AssetClass; symbol: string; instrumentId: string },
+    args: ScanTriggerArgs,
+    nowMs: number,
+    metrics: ScanMetrics,
+    cycleCache: ScanCycleCache,
+    observation: PairObservation,
   ): Promise<void> {
     const { htf_bias, setup, entry } = strategy.timeframes;
 
@@ -1284,6 +1489,8 @@ export class ScannerService {
 
     if (!mtfValidation.valid) {
       metrics.staleRejections += 1;
+      observation.outcome = 'stale';
+      observation.reason = 'mtf_invalid';
       this.logger.info('multi-timeframe validation failed', {
         strategyId: strategy.strategyId,
         instrument: `${instrument.assetClass}/${instrument.symbol}`,
@@ -1306,6 +1513,10 @@ export class ScannerService {
 
     if (!freshness.fresh) {
       metrics.staleRejections += 1;
+      observation.outcome = 'stale';
+      // `checkMultiTimeframeFreshness` already role-prefixes the cause
+      // (`setup_stale_candle`), which is the exact code we want to store.
+      observation.reason = (freshness.reason ?? 'stale_candle').slice(0, SCANNER_RUN_PAIR_REASON_MAX_CHARS);
       this.logger.info('stale data rejected', {
         strategyId: strategy.strategyId,
         instrument: `${instrument.assetClass}/${instrument.symbol}`,
@@ -1339,6 +1550,8 @@ export class ScannerService {
 
     if (!latestClosedSetupCandle) {
       metrics.staleRejections += 1;
+      observation.outcome = 'stale';
+      observation.reason = 'no_closed_candle';
       this.logger.info('no closed setup candle at scan time', {
         strategyId: strategy.strategyId,
         instrument: `${instrument.assetClass}/${instrument.symbol}`,
@@ -1350,13 +1563,18 @@ export class ScannerService {
 
     const asOfMs = latestClosedSetupCandle.time + setupPeriodMs;
 
+    observation.cursorMs = latestClosedSetupCandle.time;
+    observation.anchorMs = asOfMs;
+
     // Cursor check: avoid re-processing same closed candle
     if (!args.force) {
       const cursor = await this.getCursor(strategy.versionId, instrument.instrumentId, setupTf);
       if (cursor && cursor.last_candle_time === latestClosedSetupCandle.time) {
-        // Phase A: make the de-duplication observable. The skip itself is
-        // unchanged — the cursor still prevents re-evaluating a processed bar.
-        metrics.duplicateCandleSkips += 1;
+        // Phase B: the skip is recorded as `cursor_skipped` — an idempotent
+        // no-op that is explicitly NOT an evaluation, so no `conditions` and no
+        // `failureReasons` are attached. The cursor semantics are unchanged.
+        observation.outcome = 'cursor_skipped';
+        observation.reason = 'cursor_hit';
         this.logger.info('skipping duplicate candle', {
           strategyId: strategy.strategyId,
           instrument: `${instrument.assetClass}/${instrument.symbol}`,
@@ -1373,8 +1591,13 @@ export class ScannerService {
     // S/R confirmation, order-block logic, etc. are all inside the evaluation engine.
     // We use SetupService.detect which internally calls EvaluationService.
 
-    // Detect long and short
+    // Detect long and short. `includeDiagnostics` asks M4 for per-condition
+    // status counts so this pair's outcome is explainable after the fact; the
+    // M4 HTTP endpoint does not request them, so its response is unchanged.
     const directions: ('long' | 'short')[] = ['long', 'short'];
+    const conditionTotals: ConditionSummary = { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 };
+    const engineReasons: string[] = [];
+    let directionsEvaluated = 0;
     for (const direction of directions) {
       try {
         const detection = await this.setups.detect({
@@ -1385,9 +1608,28 @@ export class ScannerService {
           symbol: instrument.symbol,
           direction,
           asOf: asOfMs,
+          includeDiagnostics: true,
         });
 
         const item = detection.detections.find((d) => d.direction === direction);
+        if (item) {
+          directionsEvaluated += 1;
+          const summary = item.conditionSummary;
+          if (summary) {
+            conditionTotals.satisfied += summary.satisfied;
+            conditionTotals.unsatisfied += summary.unsatisfied;
+            conditionTotals.insufficient_data += summary.insufficient_data;
+            conditionTotals.unsupported += summary.unsupported;
+          }
+          if (!item.qualified && engineReasons.length < SCANNER_RUN_PAIR_REASONS_MAX) {
+            // `failureReasons` is required by the DTO but is read defectively
+            // here: a third-party/stubbed detector must never break a scan.
+            for (const reason of item.failureReasons ?? []) {
+              if (engineReasons.length >= SCANNER_RUN_PAIR_REASONS_MAX) break;
+              engineReasons.push(sanitizeScannerError(reason, this.redact, SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS, true));
+            }
+          }
+        }
         if (!item?.qualified || !item.setup) {
           continue;
         }
@@ -1440,6 +1682,13 @@ export class ScannerService {
     // Update cursor — store OPEN of the latest closed setup candle so cursor
     // re-arms when the next setup candle closes.
     await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, latestClosedSetupCandle.time, nowMs);
+
+    // Reaching here means both directions ran through M3 (or were refused by an
+    // entitlement limit). That is an EVALUATION, distinct from a cursor skip.
+    observation.outcome = 'evaluated';
+    observation.reason = directionsEvaluated === directions.length ? null : 'partial_evaluation';
+    observation.conditions = conditionTotals;
+    if (engineReasons.length > 0) observation.failureReasons = engineReasons;
   }
 
   private async fetchValidatedCandles(args: {
@@ -1686,6 +1935,10 @@ export class ScannerService {
     const safeErrors = metrics.errors
       .slice(0, 10)
       .map((entry) => sanitizeScannerError(entry, this.redact, SCANNER_ERROR_MAX_CHARS, false));
+    // Phase B: build the bounded per-pair block once; it is the derivation
+    // source for `duplicateCandleSkips` as well as the stored detail.
+    const pairsBlock = buildScannerRunPairs(metrics.pairs);
+
     await this.pool.query(
       `UPDATE scanner_runs SET status = $2, finished_at = now(),
               strategies_scanned = $3, instruments_scanned = $4, candles_fetched = $5,
@@ -1719,7 +1972,10 @@ export class ScannerService {
             provider: metrics.candlesFromProvider,
             total: metrics.candlesFetched,
           },
-          duplicateCandleSkips: metrics.duplicateCandleSkips,
+          // Phase B: DERIVED from the pair observations, never from a second
+          // counter, so the skip count and the per-pair detail cannot disagree.
+          duplicateCandleSkips: pairsBlock.totals.cursor_skipped,
+          pairs: pairsBlock,
         }),
       ],
     );
