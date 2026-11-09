@@ -253,6 +253,11 @@ export interface ScannerRunMetadataRedactionOptions {
  * activity even with every strategy UUID stripped. System runs aggregate pairs
  * from every tenant, so their observations are never tenant-facing. Operator
  * reads pass `keepPairObservations` to retain the detail.
+ *
+ * Fails closed on an unexpected shape: if `pairs` is an array, a primitive,
+ * `null`, or an object whose aggregate fields are not numeric counters, the key
+ * is removed instead of being forwarded, so no malformed value can bypass the
+ * allowlist. A run with no `pairs` key at all (historical) is left as it is.
  */
 export function redactScannerRunMetadata(
   metadata: Record<string, unknown>,
@@ -264,30 +269,57 @@ export function redactScannerRunMetadata(
   return options.keepPairObservations === true ? stripped : dropPairObservations(stripped);
 }
 
+/** `{}`-style value: not `null` and not an array. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /**
- * `metadata.pairs` keys that are safe for a tenant viewer: all four are summed
- * over the whole pair set, so they identify no single strategy. This is an
- * ALLOWLIST — a field added to the block later stays tenant-invisible until it
- * is added here deliberately.
+ * A counters object — every value is a finite number. Rejects arrays, `null`,
+ * primitives and any nested payload, so the projection can never forward a shape
+ * it did not whitelist field by field.
  */
-const SCANNER_PAIR_AGGREGATE_KEYS = new Set<string>(['v', 'totals', 'conditions', 'truncated']);
+function isNumericRecord(value: unknown): value is Record<string, number> {
+  if (!isPlainRecord(value)) return false;
+  return Object.values(value).every((entry) => typeof entry === 'number' && Number.isFinite(entry));
+}
+
+/**
+ * Project `metadata.pairs` down to the aggregate half (`v`, `totals`,
+ * `conditions`, `truncated`) — an ALLOWLIST: a field added to the block later
+ * stays tenant-invisible until it is added here deliberately.
+ *
+ * **Fails closed.** Only a plain object carrying a finite numeric `v`,
+ * numeric-only `totals` and `conditions`, and a boolean `truncated` is accepted.
+ * An array, a primitive, `null`, or an object with any unexpected field type
+ * returns `null`, and the caller removes the key entirely. Returning such a
+ * value unchanged (or partially projected) would let an unexpected shape reach a
+ * tenant viewer without passing the allowlist; removing it makes readers render
+ * "unavailable" instead of guessing.
+ */
+function aggregatePairCounters(pairs: unknown): Record<string, unknown> | null {
+  if (!isPlainRecord(pairs)) return null;
+  const { v, totals, conditions, truncated } = pairs;
+  if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+  if (!isNumericRecord(totals) || !isNumericRecord(conditions)) return null;
+  if (typeof truncated !== 'boolean') return null;
+  // Deep-copies, so the caller cannot reach the dropped record through a shared
+  // reference (the input is never mutated).
+  return { v, totals: { ...totals }, conditions: { ...conditions }, truncated };
+}
 
 /**
  * Reduce `metadata.pairs` to its aggregate half, dropping the per-pair
- * observations. Deep-copies the surviving values so the caller cannot reach the
- * dropped array through a shared reference. Never mutates the input, and never
- * throws on a malformed block (a non-object `pairs` is left untouched — the
- * contract parser rejects it downstream).
+ * observations. Never mutates the input and never throws: a block that is not a
+ * valid aggregate projection is removed rather than forwarded (see
+ * {@link aggregatePairCounters}).
  */
 function dropPairObservations(metadata: Record<string, unknown>): Record<string, unknown> {
-  const pairs = metadata.pairs;
-  if (pairs === null || typeof pairs !== 'object' || Array.isArray(pairs)) return { ...metadata };
-  const aggregate: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(pairs as Record<string, unknown>)) {
-    if (!SCANNER_PAIR_AGGREGATE_KEYS.has(key)) continue;
-    aggregate[key] = key === 'totals' || key === 'conditions' ? { ...(value as Record<string, unknown>) } : value;
-  }
-  return { ...metadata, pairs: aggregate };
+  // No block at all is a historical run, not malformed data: leave the key absent.
+  if (!Object.prototype.hasOwnProperty.call(metadata, 'pairs')) return { ...metadata };
+  const { pairs, ...rest } = metadata;
+  const aggregate = aggregatePairCounters(pairs);
+  return aggregate === null ? rest : { ...rest, pairs: aggregate };
 }
 
 /**

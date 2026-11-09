@@ -199,5 +199,13 @@ test('the aggregate projection still refuses unreconciled or malformed counters'
   assert.equal(readScannerRunPairAggregate({}), null);
   assert.equal(readScannerRunPairAggregate(null), null);
   assert.equal(readScannerRunPairAggregate({ pairs: 'nope' }), null);
+  assert.equal(readScannerRunPairAggregate({ pairs: [] }), null, 'an array is not a block');
+  assert.equal(readScannerRunPairAggregate({ pairs: 7 }), null, 'a primitive is not a block');
+  assert.equal(readScannerRunPairAggregate({ pairs: null }), null);
+  assert.equal(
+    readScannerRunPairAggregate({ pairs: { ...withoutItems, totals: { ...withoutItems.totals, extra: { symbol: 'BTCUSD' } } } }),
+    null,
+    'nested payloads in the counters are refused',
+  );
   assert.equal(scannerRunPairAggregateSchema.safeParse({ v: 1, totals: withoutItems.totals }).success, false);
 });

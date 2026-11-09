@@ -423,6 +423,43 @@ describe('M7.5: Scanner API', () => {
     assert.equal(readScannerRunPairs(shown.metadata), null, 'there is no detail sample to read');
   });
 
+  test('malformed metadata.pairs on a system row fails closed over HTTP', async () => {
+    const a = await registerUser('pro');
+    const counters = { pairs: 1, evaluated: 0, cursor_skipped: 1, stale: 0, failed: 0 };
+    const conditions = { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 };
+    const malformed: [string, unknown][] = [
+      ['array', [{ strategyId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', symbol: 'BTCUSD', timeframe: '1h' }]],
+      ['string', 'BTCUSD 1h cursor_hit'],
+      ['number', 7],
+      ['null', null],
+      ['object without counters', { items: [{ symbol: 'BTCUSD' }] }],
+      ['array totals', { v: 1, totals: [], conditions, truncated: false }],
+      ['nested payload in totals', { v: 1, totals: { ...counters, extra: { symbol: 'BTCUSD' } }, conditions, truncated: false }],
+    ];
+
+    const runs: { id: string; label: string }[] = [];
+    for (const [label, pairs] of malformed) {
+      const id = await insertRun({ triggeredBy: 'system', strategyId: null, force: false, pairs });
+      runs.push({ id, label });
+    }
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/scanner/runs?limit=100&scope=system',
+      headers: { cookie: a.cookie, 'x-forwarded-for': freshIp() },
+    });
+    assert.equal(res.statusCode, 200, res.body);
+    const listed: ScannerRunLike[] = res.json().runs;
+
+    for (const { id, label } of runs) {
+      const shown = listed.find((r) => r.id === id) as unknown as { metadata: Record<string, unknown> };
+      assert.ok(shown, `${label}: the system run is still listed (operational metrics preserved)`);
+      assert.equal('pairs' in shown.metadata, false, `${label}: malformed pairs must be removed, not forwarded`);
+      assert.equal(JSON.stringify(shown.metadata).includes('BTCUSD'), false, `${label}: nothing per-pair leaks`);
+      assert.equal(shown.metadata.force, false, `${label}: the rest of the metadata is untouched`);
+    }
+  });
+
   test('scope=all returns own + system runs and never another tenant’s', async () => {
     const a = await registerUser('pro');
     const b = await registerUser('pro');

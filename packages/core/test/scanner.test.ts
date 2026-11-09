@@ -696,6 +696,77 @@ describe('F4: Scanner tenant privacy', () => {
       assert.equal(readScannerRunPairs(out)?.items.length, 2);
     });
 
+    test('malformed pair metadata fails closed: no shape bypasses the aggregate allowlist', () => {
+      const counters = { pairs: 1, evaluated: 0, cursor_skipped: 1, stale: 0, failed: 0 };
+      const conditions = { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 };
+      // Each entry is a shape that must never reach a tenant viewer unchanged.
+      const malformed: [string, unknown][] = [
+        ['an array', [{ strategyId: STRATEGY_B, symbol: 'BTCUSD', timeframe: '1h' }]],
+        ['an empty array', []],
+        ['a string', 'BTCUSD 1h evaluated'],
+        ['a number', 42],
+        ['a boolean', true],
+        ['null', null],
+        ['an object with no counters', { items: [{ symbol: 'BTCUSD' }] }],
+        ['a missing version', { totals: counters, conditions, truncated: false }],
+        ['a non-numeric version', { v: '1', totals: counters, conditions, truncated: false }],
+        ['an array of totals', { v: 1, totals: [], conditions, truncated: false }],
+        ['null totals', { v: 1, totals: null, conditions, truncated: false }],
+        ['string counters', { v: 1, totals: { ...counters, pairs: '1' }, conditions, truncated: false }],
+        ['a nested payload in totals', { v: 1, totals: { ...counters, extra: { symbol: 'BTCUSD' } }, conditions, truncated: false }],
+        ['an array of conditions', { v: 1, totals: counters, conditions: [], truncated: false }],
+        ['a non-boolean truncated', { v: 1, totals: counters, conditions, truncated: 'no' }],
+      ];
+
+      for (const [label, pairs] of malformed) {
+        const metadata = { triggeredBy: 'system', force: false, candles: { store: 3, provider: 0, total: 3 }, pairs };
+        const out = redactScannerRunMetadata(metadata, USER_A);
+        assert.equal('pairs' in out, false, `${label}: the malformed block must be removed, not forwarded`);
+        // Everything else that is safe still survives, and nothing per-pair leaks.
+        assert.equal(out.force, false, `${label}: unrelated metadata is untouched`);
+        assert.deepEqual(out.candles, { store: 3, provider: 0, total: 3 }, `${label}: aggregates survive`);
+        assert.equal(
+          JSON.stringify(out).includes('BTCUSD'),
+          false,
+          `${label}: no per-pair value may survive`,
+        );
+        // The readers see "unavailable", never zeros.
+        assert.equal(readScannerRunPairAggregate(out), null, `${label}: no aggregate to read`);
+        assert.equal(readScannerRunPairs(out), null, `${label}: no detail to read`);
+      }
+    });
+
+    test('a valid aggregate projection is preserved unchanged, and re-reducing is idempotent', () => {
+      const projection = {
+        v: 1,
+        totals: { pairs: 2, evaluated: 1, cursor_skipped: 0, stale: 1, failed: 0 },
+        conditions: { satisfied: 2, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+        truncated: false,
+      };
+      const out = redactScannerRunMetadata({ triggeredBy: 'system', force: false, pairs: projection }, USER_A);
+      assert.deepEqual(out.pairs, projection);
+      // Reducing the projection again changes nothing (tenant consumers may re-read).
+      const again = redactScannerRunMetadata(out, USER_A);
+      assert.deepEqual(again.pairs, projection);
+      assert.equal(readScannerRunPairAggregate(out)?.totals.stale, 1);
+    });
+
+    test('malformed pair metadata does not affect the owner or a trusted operator read', () => {
+      const raw = [{ strategyId: STRATEGY_B, symbol: 'BTCUSD', timeframe: '1h', outcome: 'evaluated' }];
+
+      const ownerView = redactScannerRunMetadata({ triggeredBy: USER_A, pairs: raw }, USER_A);
+      assert.deepEqual(ownerView.pairs, raw, 'the owner sees their own metadata as stored');
+
+      const operatorView = redactScannerRunMetadata({ triggeredBy: USER_B, pairs: raw }, '', {
+        keepPairObservations: true,
+      });
+      const operatorItems = operatorView.pairs as Record<string, unknown>[];
+      assert.equal(Array.isArray(operatorItems), true, 'trusted operator reads keep diagnostic detail');
+      assert.equal(operatorItems.length, 1);
+      assert.equal(operatorItems[0]!.symbol, 'BTCUSD');
+      assert.equal('strategyId' in operatorItems[0]!, false, 'identifiers are still stripped');
+    });
+
     test('trusted operator reads keep the per-pair observations with identifiers removed', () => {
       const run = {
         id: 'c3c3c3c3-3333-4333-8333-333333333333',
