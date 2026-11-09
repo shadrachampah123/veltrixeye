@@ -69,6 +69,8 @@ import {
   backendSslExplanation,
   summariseNotificationDeliveries,
   deliveryFailureHint,
+  isFailedDeliveryStatus,
+  FAILED_DELIVERY_STATUSES,
   mapStrings,
   mdCell,
   mdRow,
@@ -2443,6 +2445,39 @@ describe('TLS observation (TLS-terminating front ends and fail-closed verificati
 });
 
 // ---------------------------------------------------------------------------
+// Documentation an operator copies verbatim (a dropped hyphen must not ship)
+// ---------------------------------------------------------------------------
+
+describe('documented strategy id', () => {
+  const doc = readFileSync(
+    join(REPO_ROOT, 'docs/diagnostics/gold-v8-production-evidence.md'),
+    'utf8',
+  );
+  const GOLD_V8_ID = '92821cf1-5f28-459d-9ade-08f078b58134';
+
+  it('quotes the Gold v8 id in canonical 8-4-4-4-12 form, everywhere it appears', () => {
+    assert.ok(doc.includes(GOLD_V8_ID), 'the canonical strategy id is missing from the doc');
+    // Every hex-and-dash cluster in the doc must be a well-formed UUID, so a
+    // merged group (the `...-459d9ade-...` typo) fails here instead of at the
+    // operator's prompt, where it would be rejected as "not a strategy id".
+    const clusters = doc.match(/\b[0-9a-f]{8}(?:-[0-9a-f]+)+\b/gi) ?? [];
+    assert.ok(clusters.length >= 4, `expected several id references, found ${clusters.length}`);
+    for (const cluster of clusters) {
+      assert.ok(isStrategyUuid(cluster), `malformed strategy id in the doc: ${cluster}`);
+    }
+    assert.ok(
+      !doc.includes('92821cf1-5f28-459d9ade-08f078b58134'),
+      'the 4-group typo (a dropped hyphen) is back in the doc',
+    );
+  });
+
+  it('passes the id through the same validation the CLI applies to --strategy', () => {
+    assert.equal(isStrategyUuid(GOLD_V8_ID), true);
+    assert.equal(isStrategyUuid('92821cf1-5f28-459d9ade-08f078b58134'), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Finding 3 — notification delivery evidence
 // ---------------------------------------------------------------------------
 
@@ -2489,9 +2524,15 @@ describe('notification delivery evidence (counts, never recipients)', () => {
   it('turns the timeout signature into an actionable, non-sensitive hint', () => {
     const hint = deliveryFailureHint(summariseNotificationDeliveries(stagingRows));
     assert.ok(hint !== null);
-    assert.match(hint!, /NO reply from the provider/);
+    assert.match(hint!, /no complete provider response recorded/i);
     assert.match(hint!, /Render/);
     assert.match(hint!, /Resend/);
+    // The evidence boundary: silence on the wire is not proof of non-delivery.
+    assert.match(hint!, /LATE DELIVERY MAY ALREADY HAVE HAPPENED/);
+    assert.match(hint!, /duplicate/);
+    assert.ok(!/NO reply from the provider/i.test(hint!), 'the hint claims the provider never replied');
+    assert.ok(!/Nothing was accepted/i.test(hint!), 'the hint claims nothing was accepted');
+    assert.match(hint!, /does not prove the provider received nothing/);
     // No address, no credential, no provider message text.
     assert.ok(!hint!.includes('@'), 'the hint echoed something address-like');
   });
@@ -2536,6 +2577,76 @@ describe('notification delivery evidence (counts, never recipients)', () => {
     assert.equal(summary.exhausted, 0);
     assert.equal(deliveryFailureHint(summary), null);
     assert.equal(deliveryFailureHint(summariseNotificationDeliveries([])), null);
+  });
+
+  /**
+   * Only the dead letter counts as failed. `pending`/`processing` are work in
+   * flight, `unavailable` is parked until the channel is configured (and is
+   * re-queued automatically), `delivered` succeeded. A reviewer caught the
+   * earlier version counting in-flight rows: they carry a null response code and
+   * a `timeout` category too, so the status is the only thing that separates
+   * them from a real failure.
+   */
+  it('counts only dead-lettered rows as failed, never pending, processing or unavailable work', () => {
+    const rows = [
+      { channel: 'email', provider: 'smtp', provider_response_code: null, status: 'pending', attempts: 1, max_attempts: 5, failure_category: 'timeout', delivered_at: null },
+      { channel: 'email', provider: 'smtp', provider_response_code: null, status: 'processing', attempts: 2, max_attempts: 5, failure_category: 'transient', delivered_at: null },
+      { channel: 'email', provider: null, provider_response_code: null, status: 'unavailable', attempts: 0, max_attempts: 5, failure_category: 'configuration', delivered_at: null },
+    ];
+    const summary = summariseNotificationDeliveries(rows);
+    assert.equal(summary.total, 3);
+    assert.equal(summary.neverDelivered, 3, 'none of these is delivered');
+    assert.equal(summary.failedWithoutProviderResponse, 0, 'in-flight rows were counted as failed');
+    assert.equal(summary.exhausted, 0);
+    assert.deepEqual(summary.byStatus, { pending: 1, processing: 1, unavailable: 1 });
+    const hint = deliveryFailureHint(summary);
+    // Nothing is dead-lettered, so the interpretation may only be the retry note.
+    assert.ok(
+      hint === null || /only a `failed` row is terminal/.test(hint),
+      `in-flight work was described as a dead letter: ${hint}`,
+    );
+    assert.ok(!/CONFIGURATION failure/.test(hint ?? ''), 'a parked (`unavailable`) row is not a refusal');
+  });
+
+  it('counts a dead letter that exhausted its budget, and not a one-attempt rejection', () => {
+    const summary = summariseNotificationDeliveries([
+      // dead letter, budget exhausted, no response code ever recorded
+      { ...stagingRows[0]! },
+      // dead letter on the first attempt, provider answered 550
+      { ...stagingRows[0]!, status: 'failed', attempts: 1, max_attempts: 5, failure_category: 'permanent', provider_response_code: '550' },
+    ]);
+    assert.equal(summary.failedWithoutProviderResponse, 1);
+    assert.equal(summary.exhausted, 1);
+    assert.deepEqual(summary.byStatus, { failed: 2 });
+  });
+
+  it('keeps a delivered row out of every failure count even with no response code', () => {
+    const summary = summariseNotificationDeliveries([
+      { channel: 'email', provider: 'smtp', provider_response_code: null, status: 'delivered', attempts: 3, max_attempts: 5, failure_category: 'none', delivered_at: '2026-01-01T00:00:00.000Z' },
+    ]);
+    assert.equal(summary.delivered, 1);
+    assert.equal(summary.neverDelivered, 0);
+    assert.equal(summary.failedWithoutProviderResponse, 0);
+    assert.equal(summary.exhausted, 0);
+    assert.equal(deliveryFailureHint(summary), null);
+  });
+
+  it('does not call an unfinished row terminal even at its last allowed attempt', () => {
+    // `pending` at attempts = max_attempts cannot be claimed again, but it is not
+    // a dead letter until the worker writes `failed`; it must not inflate the count.
+    const summary = summariseNotificationDeliveries([
+      { channel: 'email', provider: 'smtp', provider_response_code: null, status: 'pending', attempts: 5, max_attempts: 5, failure_category: 'timeout', delivered_at: null },
+    ]);
+    assert.equal(summary.exhausted, 0);
+    assert.equal(summary.failedWithoutProviderResponse, 0);
+  });
+
+  it('names exactly one terminal failure status', () => {
+    assert.deepEqual([...FAILED_DELIVERY_STATUSES], ['failed']);
+    assert.equal(isFailedDeliveryStatus('failed'), true);
+    for (const status of ['pending', 'processing', 'delivered', 'unavailable', 'unknown', '']) {
+      assert.equal(isFailedDeliveryStatus(status), false, `${status || '(empty)'} must not count as failed`);
+    }
   });
 
   /** Minimal complete Evidence, so this case does not depend on another block. */
@@ -2623,7 +2734,10 @@ describe('notification delivery evidence (counts, never recipients)', () => {
     assert.match(md, /Delivery summary \(counts only\)/);
     assert.match(md, /\| attempts \| exhausted the attempt budget \| 2 \|/);
     assert.match(md, /Interpretation \(static text, derived from the counts above\)/);
-    assert.match(md, /NO reply from the provider/);
+    assert.match(md, /dead-lettered with no complete provider response recorded/);
+    assert.match(md, /no complete provider response recorded/i);
+    assert.ok(!/NO reply from the provider/i.test(md), 'the report claims the provider never replied');
+    assert.ok(!/Nothing was accepted/i.test(md), 'the report claims nothing was accepted');
     assert.ok(!md.includes('@'), 'the report contains something address-like');
   });
 });

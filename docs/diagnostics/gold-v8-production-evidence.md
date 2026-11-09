@@ -273,15 +273,26 @@ order on its own.
 ### Notification deliveries in the report
 
 Section 7.6 now shows, before the raw rows, a **counts-only** summary
-(status, failure category, channel, provider, how many exhausted their attempt
-budget, how many failed with no provider reply at all) and, when the counts point
-at a known signature, a static interpretation: configuration failures, permanent
-rejections, stale rows from a crashed worker, or exhausted attempts with **no
-reply at all** — which is a reachability problem (wrong host/port, or outbound
-SMTP blocked by the platform) rather than a credential problem. `recipient`,
-message ids and free-text provider messages are never summarised. The rows are
-read and never modified; the diagnostic never drains the outbox or re-sends
-anything.
+(status, failure category, channel, provider, how many dead-lettered rows
+exhausted their attempt budget, how many recorded no complete provider response)
+and, when the counts point at a known signature, a static interpretation:
+configuration failures, permanent rejections, stale rows from a crashed worker,
+or exhausted attempts where no complete provider response was ever recorded —
+a pattern consistent with reachability (wrong host/port, or outbound SMTP blocked
+by the platform) rather than a credential problem, though it does not prove the
+provider received nothing: a timed-out attempt may still have been accepted, and
+a late delivery may already have happened.
+
+Which statuses count as failed is defined in one place,
+`FAILED_DELIVERY_STATUSES` (`['failed']` — the dead letter). `pending` and
+`processing` are work in flight, `unavailable` is parked until the channel is
+configured and is re-queued automatically, and `delivered` succeeded; none of
+them can raise the failed or exhausted counts. The terminal verdicts
+(configuration, permanent) read `failure_category` **restricted to dead-lettered
+rows**; the stale warning reads every row, because a recovered row is `pending`
+again with an unknown send outcome. `recipient`, message ids and free-text
+provider messages are never summarised. The rows are read and never
+modified; the diagnostic never drains the outbox or re-sends anything.
 
 ## Verifying the intended paused state against production (safe procedure)
 
@@ -295,7 +306,7 @@ a copy of production:
 read -rs DATABASE_URL && export DATABASE_URL
 
 npm run diagnostics:gold-v8 -- \
-  --strategy 92821cf1-5f28-459d9ade-08f078b58134 \
+  --strategy 92821cf1-5f28-459d-9ade-08f078b58134 \
   --version 8 --symbol XAUUSD --asset-class commodity \
   --out ./evidence
 ```

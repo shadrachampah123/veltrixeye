@@ -753,16 +753,54 @@ export interface DeliveryRowForSummary {
   provider_response_code?: string | null;
 }
 
+/**
+ * The only terminal failure state of `notification_deliveries`
+ * (`0013_notification_outbox.sql`: `CHECK (status IN ('pending', 'processing',
+ * 'delivered', 'failed', 'unavailable'))`).
+ *
+ * - `pending` / `processing` are IN FLIGHT: a `pending` row is waiting for its
+ *   next attempt (or has never been attempted), a `processing` row is leased by
+ *   a worker. Neither is a failure.
+ * - `unavailable` is PARKED: the channel has no configured provider yet, the row
+ *   is re-queued automatically once one is configured. Not a failure, and it
+ *   burns no attempt.
+ * - `delivered` succeeded.
+ * - `failed` is the dead letter: the worker gave up, `delivered_at` stays null,
+ *   and nothing replays it automatically.
+ *
+ * Anything not in this list is therefore never counted as failed.
+ */
+export const FAILED_DELIVERY_STATUSES: readonly string[] = ['failed'];
+
+/** True only for the terminal, dead-lettered state — not for pending work. */
+export function isFailedDeliveryStatus(status: string): boolean {
+  return FAILED_DELIVERY_STATUSES.includes(status);
+}
+
 export interface DeliveryFailureSummary {
   total: number;
   delivered: number;
+  /** Rows that are not `delivered` — in flight, parked, or failed. Not a failure count. */
   neverDelivered: number;
-  /** Rows that used their whole attempt budget without delivering. */
+  /** Dead-lettered rows that used their whole attempt budget. */
   exhausted: number;
-  /** Rows that failed with no SMTP/HTTP reply at all (timeout or bare transport fault). */
+  /**
+   * Dead-lettered rows with no provider response code recorded. This is what
+   * the data supports: a NULL code means no COMPLETE response was recorded. A
+   * timeout or a NULL code does not prove the provider received nothing — an
+   * attempt can time out after the provider accepted the message.
+   */
   failedWithoutProviderResponse: number;
+  /** `status` over every row. */
   byStatus: Record<string, number>;
+  /** `failure_category` over every row, including work still in flight. */
   byCategory: Record<string, number>;
+  /**
+   * `failure_category` restricted to dead-lettered rows. This is what the
+   * terminal-verdict hints read: a `pending` timeout says nothing about damage,
+   * and an `unavailable` row carrying `configuration` is parked, not refused.
+   */
+  failedByCategory: Record<string, number>;
   byChannel: Record<string, number>;
   byProvider: Record<string, number>;
 }
@@ -776,6 +814,11 @@ function bump(counts: Record<string, number>, key: string): void {
  *
  * Counts only: no recipient, no message id, no free-text error. The historical
  * rows are read, never modified.
+ *
+ * Only rows in a `FAILED_DELIVERY_STATUSES` state can contribute to
+ * `exhausted` or `failedWithoutProviderResponse`; a `pending`, `processing` or
+ * `unavailable` row is work that has not finished failing, and counting it as a
+ * failure would overstate the damage.
  */
 export function summariseNotificationDeliveries(
   rows: readonly DeliveryRowForSummary[],
@@ -788,6 +831,7 @@ export function summariseNotificationDeliveries(
     failedWithoutProviderResponse: 0,
     byStatus: {},
     byCategory: {},
+    failedByCategory: {},
     byChannel: {},
     byProvider: {},
   };
@@ -801,15 +845,18 @@ export function summariseNotificationDeliveries(
     bump(summary.byChannel, channel);
     bump(summary.byProvider, provider);
     const delivered = status === 'delivered';
+    const failed = isFailedDeliveryStatus(status);
+    if (failed) bump(summary.failedByCategory, category);
     if (delivered) summary.delivered += 1;
     else summary.neverDelivered += 1;
     const attempts = Number(row.attempts ?? 0);
     const max = Number(row.max_attempts ?? 0);
-    if (!delivered && max > 0 && attempts >= max) summary.exhausted += 1;
-    if (!delivered && (row.provider_response_code ?? null) === null) {
-      if (category === 'timeout' || category === 'transient' || category === 'unknown') {
-        summary.failedWithoutProviderResponse += 1;
-      }
+    if (failed && max > 0 && attempts >= max) summary.exhausted += 1;
+    // `provider_response_code` is the only receipt the row records. NULL means
+    // no complete response was recorded — it does not mean the provider
+    // received nothing, so the wording never claims that.
+    if (failed && (row.provider_response_code ?? null) === null && (row.delivered_at ?? null) === null) {
+      summary.failedWithoutProviderResponse += 1;
     }
   }
   return summary;
@@ -824,22 +871,28 @@ export function deliveryFailureHint(summary: DeliveryFailureSummary): string | n
   if (summary.total === 0) return null;
   if (summary.neverDelivered === 0) return null;
 
+  // Every row, dead-lettered or not.
   const has = (category: string): boolean => (summary.byCategory[category] ?? 0) > 0;
+  // Dead-lettered rows only: a terminal verdict must never be read off work in flight.
+  const failedHas = (category: string): boolean => (summary.failedByCategory[category] ?? 0) > 0;
 
-  if (has('configuration')) {
+  if (failedHas('configuration')) {
     return 'At least one delivery was refused by the provider as a CONFIGURATION failure (rejected credentials, or a From/sender the provider will not accept). Retrying cannot fix it: correct the deployment environment first. These rows are terminal until an operator recovers them deliberately; the worker does not replay them.';
   }
-  if (has('permanent')) {
+  if (failedHas('permanent')) {
     return 'At least one delivery was rejected by the provider as PERMANENT (bad recipient address or refused message content). It was dead-lettered on the first attempt instead of burning the retry budget; the address or the message must change.';
   }
+  // `stale` is deliberately read across every row: a recovered row is `pending`
+  // again and its send outcome is still unknown, so it is worth warning about
+  // even though it is not a dead letter.
   if (has('stale')) {
     return 'At least one row was recovered from a worker that did not finish inside its lease (a crash, a deploy or a forced stop mid-send). The outcome of that send is UNKNOWN — the stable Message-Id is what lets a receiver collapse a duplicate, not a guarantee.';
   }
   if (summary.failedWithoutProviderResponse > 0 && summary.exhausted > 0) {
-    return 'Every attempt of at least one delivery failed with NO reply from the provider at all (timeout / bare transport fault), and the retry budget is exhausted. That is a reachability problem — wrong host or port, or the platform blocking outbound traffic — not a credential problem. On Render\'s free plan outbound SMTP ports are blocked (see render.yaml and docs/notification-delivery.md), so the supported path there is Resend over HTTPS (the RESEND_API_KEY variable). Nothing was accepted for delivery; if a late attempt did land, the stable Message-Id is what lets the receiver collapse the duplicate.';
+    return 'At least one delivery was dead-lettered after using its whole attempt budget with no complete provider response recorded: no attempt produced a response code, which fits a timeout or a bare transport fault on every try. That pattern is consistent with a reachability problem (wrong host or port, or the platform blocking outbound traffic) more than with a bad credential, but it does not prove the provider received nothing. An attempt can time out after the provider accepted the message, so a LATE DELIVERY MAY ALREADY HAVE HAPPENED, and sending the alert again can produce a duplicate; the stable Message-Id is what lets a receiver collapse one. On Render\'s free plan outbound SMTP ports are blocked (see render.yaml and docs/notification-delivery.md), so the supported path there is Resend over HTTPS (the RESEND_API_KEY variable).';
   }
   if (has('timeout') || has('transient')) {
-    return 'At least one delivery hit a transient or timeout condition. The worker retries with exponential backoff up to the attempt budget; a row that is still `pending` is expected to be retried, and only an exhausted row is terminal.';
+    return 'At least one delivery hit a transient or timeout condition. The worker retries with exponential backoff up to the attempt budget; a row that is still `pending` is expected to be retried, and only a `failed` row is terminal.';
   }
   return null;
 }
@@ -2789,7 +2842,7 @@ export function renderMarkdown(e: Evidence): string {
     for (const [k, v] of Object.entries(summary.byChannel)) out.push(mdRow(['channel', k, v]));
     for (const [k, v] of Object.entries(summary.byProvider)) out.push(mdRow(['provider', k, v]));
     out.push(mdRow(['attempts', 'exhausted the attempt budget', summary.exhausted]));
-    out.push(mdRow(['attempts', 'failed with no provider reply at all', summary.failedWithoutProviderResponse]));
+    out.push(mdRow(['attempts', 'dead-lettered with no complete provider response recorded', summary.failedWithoutProviderResponse]));
     out.push('');
     const hint = deliveryFailureHint(summary);
     if (hint !== null) {
