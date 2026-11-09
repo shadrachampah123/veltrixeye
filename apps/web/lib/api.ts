@@ -54,6 +54,7 @@ import type {
   // M7.5 — live scanner
   ScannerHealthDto,
   ScannerRunDto,
+  ScannerRunScope,
   ScannerTriggerRequestInput,
   ScannerTriggerResponse,
   // M8.1 — execution architecture (read/status surface only)
@@ -516,12 +517,21 @@ export const api = {
   /** GET /api/scanner/health — real production scanner health/status. */
   getScannerHealth: () => request<ScannerHealthDto>('/scanner/health'),
 
-  /** GET /api/scanner/runs — recent scanner runs. */
-  listScannerRuns: (params: { status?: string; limit?: number } = {}) =>
+  /**
+   * GET /api/scanner/runs — recent scanner runs.
+   *
+   * `scope` is omitted unless asked for, so the request URL (and the response)
+   * is byte-identical to the pre-scope client:
+   *  - `mine`   — the caller's own runs (server default);
+   *  - `system` — the automatic scan cycle's runs (no tenant identifiers);
+   *  - `all`    — own runs plus system runs, never another tenant's.
+   */
+  listScannerRuns: (params: { status?: string; limit?: number; scope?: ScannerRunScope } = {}) =>
     request<{ runs: ScannerRunDto[] }>(
       `/scanner/runs${toQueryString({
         status: params.status,
         limit: params.limit,
+        scope: params.scope,
       })}`,
     ),
 

@@ -23,6 +23,7 @@ import {
   ProviderError,
   TIMEFRAMES,
   SCANNER_RUN_PAIR_ITEMS_MAX,
+  readScannerRunPairAggregate,
   readScannerRunPairs,
   scannerRunPairsSchema,
   type Candle,
@@ -743,6 +744,22 @@ describe('Phase B — per-pair evaluation outcomes', () => {
       'counts stay visible: they identify no tenant',
     );
     assert.deepEqual(shared.candles, { store: 300, provider: 0, total: 300 });
+
+    // Stripping the strategy UUID is not enough: a lone observation still names
+    // an instrument, a timeframe and a candle timing. The whole sample goes.
+    assert.equal(
+      (shared.pairs as { items?: unknown }).items,
+      undefined,
+      'per-pair observations are never tenant-facing',
+    );
+    assert.equal(JSON.stringify(shared).includes('BTCUSD'), false);
+    assert.equal(JSON.stringify(shared).includes('cursorMs'), false);
+    assert.equal(readScannerRunPairAggregate(shared)?.totals.evaluated, 1, 'aggregates stay readable');
+    assert.equal(readScannerRunPairs(shared), null, 'there is no detail sample to read');
+
+    // A trusted operator read keeps the sample (identifiers still stripped).
+    const operator = redactScannerRunMetadata(metadata, '', { keepPairObservations: true });
+    assert.equal((operator.pairs as { items: unknown[] }).items.length, 1);
 
     // The input is never mutated by redaction.
     assert.equal(metadata.pairs.items[0]!.strategyId, strategyId);

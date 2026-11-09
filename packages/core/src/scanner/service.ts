@@ -15,7 +15,7 @@ import {
   type Timeframe,
   type ScannerRunDto,
   type ScannerHealthDto,
-  type ScannerRunListQuery,
+  type ScannerRunListQueryInput,
   type ScannerInternalRunResponse,
   type ScannerInternalMaintenanceResponse,
   type AssetClass,
@@ -223,6 +223,19 @@ export interface ScanTriggerArgs {
 export const SCANNER_TENANT_SENSITIVE_METADATA_KEYS = ['triggeredBy', 'strategyId', 'errors'] as const;
 
 /**
+ * Options for {@link redactScannerRunMetadata}. Omitting them yields the
+ * tenant-facing projection, which is the safe default.
+ */
+export interface ScannerRunMetadataRedactionOptions {
+  /**
+   * Keep `metadata.pairs.items[]` (the per-pair observations). Only trusted
+   * internal/operator reads set this; tenant-facing reads never do, because a
+   * single observation fingerprints one tenant's strategy activity.
+   */
+  keepPairObservations?: boolean;
+}
+
+/**
  * Strip tenant-identifying scanner-run metadata unless the run belongs to
  * `viewerUserId`. Pure and deterministic — no I/O.
  *
@@ -231,13 +244,82 @@ export const SCANNER_TENANT_SENSITIVE_METADATA_KEYS = ['triggeredBy', 'strategyI
  * for every tenant viewer. Everything non-identifying (status-bearing counts,
  * `force`, and any future non-sensitive key) is preserved so the run stays
  * operationally useful for triage.
+ *
+ * For a run the viewer does not own, `metadata.pairs` is reduced to its
+ * aggregate half: `v`, `totals`, `conditions` and `truncated` survive, while the
+ * individual observations in `items` are dropped. Those observations describe
+ * one `(strategy, instrument, timeframe)` each — `symbol`, `timeframe`,
+ * `outcome`, `cursorMs`/`anchorMs` and `reason` reveal tenant-specific strategy
+ * activity even with every strategy UUID stripped. System runs aggregate pairs
+ * from every tenant, so their observations are never tenant-facing. Operator
+ * reads pass `keepPairObservations` to retain the detail.
+ *
+ * Fails closed on an unexpected shape: if `pairs` is an array, a primitive,
+ * `null`, or an object whose aggregate fields are not numeric counters, the key
+ * is removed instead of being forwarded, so no malformed value can bypass the
+ * allowlist. A run with no `pairs` key at all (historical) is left as it is.
  */
 export function redactScannerRunMetadata(
   metadata: Record<string, unknown>,
   viewerUserId: string,
+  options: ScannerRunMetadataRedactionOptions = {},
 ): Record<string, unknown> {
   if (metadata.triggeredBy === viewerUserId) return { ...metadata };
-  return stripSensitiveMetadata(metadata, 0) as Record<string, unknown>;
+  const stripped = stripSensitiveMetadata(metadata, 0) as Record<string, unknown>;
+  return options.keepPairObservations === true ? stripped : dropPairObservations(stripped);
+}
+
+/** `{}`-style value: not `null` and not an array. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A counters object — every value is a finite number. Rejects arrays, `null`,
+ * primitives and any nested payload, so the projection can never forward a shape
+ * it did not whitelist field by field.
+ */
+function isNumericRecord(value: unknown): value is Record<string, number> {
+  if (!isPlainRecord(value)) return false;
+  return Object.values(value).every((entry) => typeof entry === 'number' && Number.isFinite(entry));
+}
+
+/**
+ * Project `metadata.pairs` down to the aggregate half (`v`, `totals`,
+ * `conditions`, `truncated`) — an ALLOWLIST: a field added to the block later
+ * stays tenant-invisible until it is added here deliberately.
+ *
+ * **Fails closed.** Only a plain object carrying a finite numeric `v`,
+ * numeric-only `totals` and `conditions`, and a boolean `truncated` is accepted.
+ * An array, a primitive, `null`, or an object with any unexpected field type
+ * returns `null`, and the caller removes the key entirely. Returning such a
+ * value unchanged (or partially projected) would let an unexpected shape reach a
+ * tenant viewer without passing the allowlist; removing it makes readers render
+ * "unavailable" instead of guessing.
+ */
+function aggregatePairCounters(pairs: unknown): Record<string, unknown> | null {
+  if (!isPlainRecord(pairs)) return null;
+  const { v, totals, conditions, truncated } = pairs;
+  if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+  if (!isNumericRecord(totals) || !isNumericRecord(conditions)) return null;
+  if (typeof truncated !== 'boolean') return null;
+  // Deep-copies, so the caller cannot reach the dropped record through a shared
+  // reference (the input is never mutated).
+  return { v, totals: { ...totals }, conditions: { ...conditions }, truncated };
+}
+
+/**
+ * Reduce `metadata.pairs` to its aggregate half, dropping the per-pair
+ * observations. Never mutates the input and never throws: a block that is not a
+ * valid aggregate projection is removed rather than forwarded (see
+ * {@link aggregatePairCounters}).
+ */
+function dropPairObservations(metadata: Record<string, unknown>): Record<string, unknown> {
+  // No block at all is a historical run, not malformed data: leave the key absent.
+  if (!Object.prototype.hasOwnProperty.call(metadata, 'pairs')) return { ...metadata };
+  const { pairs, ...rest } = metadata;
+  const aggregate = aggregatePairCounters(pairs);
+  return aggregate === null ? rest : { ...rest, pairs: aggregate };
 }
 
 /**
@@ -275,7 +357,13 @@ function stripSensitiveMetadata(value: unknown, depth: number): unknown {
   return out;
 }
 
-/** Redact a fully-mapped run DTO for a tenant viewer. Pure — no I/O. */
+/**
+ * Redact a fully-mapped run DTO for a tenant viewer. Pure — no I/O.
+ *
+ * This is the only shape that reaches a tenant: identifiers stripped, and for
+ * runs the viewer does not own (system runs, other tenants' runs) the per-pair
+ * observations are replaced by their aggregate totals.
+ */
 export function redactScannerRunForViewer(run: ScannerRunDto, viewerUserId: string): ScannerRunDto {
   const isOwner = run.metadata.triggeredBy === viewerUserId;
   return {
@@ -294,9 +382,11 @@ export function redactScannerRunForViewer(run: ScannerRunDto, viewerUserId: stri
  * Redact a fully-mapped run DTO for operator/scheduler consumption
  * (e.g. `POST /api/internal/scanner/run`).
  *
- * Strips all tenant-identifying metadata (`triggeredBy`, `strategyId`, `errors`)
- * and sanitizes `error` so no tenant/strategy UUIDs or secrets are returned.
- * Pure and deterministic — no I/O.
+ * Strips all tenant-identifying metadata (`triggeredBy`, `strategyId`, `errors`,
+ * `versionId`, `failureReasons`) and sanitizes `error` so no tenant/strategy
+ * UUIDs or secrets are returned. This is a trusted path, so the per-pair
+ * observations (`metadata.pairs.items[]`) are preserved for triage — only the
+ * identifiers inside them are removed. Pure and deterministic — no I/O.
  */
 export function redactScannerRunForOperator(
   run: ScannerRunDto,
@@ -305,7 +395,8 @@ export function redactScannerRunForOperator(
   return {
     ...run,
     error: run.error === null ? null : sanitizeScannerError(run.error, redact, SCANNER_RUN_ERROR_MAX_CHARS, true),
-    metadata: redactScannerRunMetadata(run.metadata, ''),
+    // Operator read: keep the per-pair observations (identifiers already gone).
+    metadata: redactScannerRunMetadata(run.metadata, '', { keepPairObservations: true }),
   };
 }
 
@@ -745,22 +836,49 @@ export class ScannerService {
    * so an unscoped read would expose other tenants' identifiers to any
    * entitled caller (M7 final verification audit, finding F4).
    *
-   * Pass `viewerUserId` for every tenant-facing read: the result is restricted
-   * to runs that user initiated, which is both the privacy boundary and the
-   * only meaningful subset for them. System runs (`triggeredBy = 'system'`)
-   * belong to no tenant and are therefore not returned to any tenant viewer —
-   * global operational state remains visible via `getHealth`.
+   * Pass `viewerUserId` for every tenant-facing read. `query.scope` decides the
+   * slice, and it defaults to `mine`, which is the original privacy boundary:
+   *
+   *  - `mine`   — only runs that user initiated;
+   *  - `system` — system runs only (`triggeredBy = 'system'`), which belong to no
+   *               tenant and are the automatic 5-minute scan cycle;
+   *  - `all`    — the caller's own runs plus system runs, never another tenant's.
+   *
+   * Whatever the scope, every returned row is passed through
+   * `redactScannerRunForViewer`, so `triggeredBy`/`strategyId`/`versionId`/
+   * `errors`/`failureReasons` are stripped (at any depth) from any run the
+   * viewer does not own — including every system run.
    *
    * Omit `viewerUserId` only for trusted internal/operator reads that must see
    * the whole ledger (ops scripts, diagnostics).
    */
-  async listRuns(query: ScannerRunListQuery, viewerUserId?: string): Promise<{ runs: ScannerRunDto[] }> {
+  async listRuns(query: ScannerRunListQueryInput, viewerUserId?: string): Promise<{ runs: ScannerRunDto[] }> {
     const values: unknown[] = [];
     const where: string[] = [];
+    // Default `mine` reproduces the pre-scope behaviour exactly: an old client
+    // that never sends `scope` keeps seeing precisely what it saw before.
+    const scope = query.scope ?? 'mine';
+
     if (viewerUserId !== undefined) {
-      values.push(viewerUserId);
-      where.push(`metadata->>'triggeredBy' = $${values.length}`);
+      switch (scope) {
+        case 'mine':
+          values.push(viewerUserId);
+          where.push(`metadata->>'triggeredBy' = $${values.length}`);
+          break;
+        case 'system':
+          // A literal, never caller-supplied: system runs belong to no tenant.
+          where.push(`metadata->>'triggeredBy' = 'system'`);
+          break;
+        case 'all':
+          values.push(viewerUserId);
+          where.push(`(metadata->>'triggeredBy' = $${values.length} OR metadata->>'triggeredBy' = 'system')`);
+          break;
+      }
+    } else if (scope === 'system') {
+      // Trusted in-process/operator callers may narrow the whole ledger too.
+      where.push(`metadata->>'triggeredBy' = 'system'`);
     }
+
     if (query.status) {
       values.push(query.status);
       where.push(`status = $${values.length}`);
@@ -771,7 +889,22 @@ export class ScannerService {
       `SELECT * FROM scanner_runs ${whereClause} ORDER BY started_at DESC LIMIT $${values.length}`,
       values,
     );
-    return { runs: res.rows.map(toScannerRunDto) };
+
+    // Defence in depth: every tenant-facing row goes through the redactor, even
+    // the caller's own (`mine`) rows and even system rows that already carry no
+    // tenant identifiers. Redaction therefore does not depend on the WHERE
+    // clause being right — a future scope that widens the selection cannot leak
+    // by accident.
+    //
+    // For system rows this also drops `metadata.pairs.items[]` (see
+    // `redactScannerRunMetadata`): those observations are per-strategy, and a
+    // system run mixes every tenant's strategies. The caller's own rows keep
+    // them, and `pairs.totals`/`conditions` stay visible for every row.
+    const runs = res.rows.map((row) => {
+      const dto = toScannerRunDto(row);
+      return viewerUserId === undefined ? dto : redactScannerRunForViewer(dto, viewerUserId);
+    });
+    return { runs };
   }
 
   /**

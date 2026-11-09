@@ -19,7 +19,9 @@ import {
   SCANNER_RUN_PAIR_ITEMS_MAX,
   conditionSummarySchema,
   detectionItemDtoSchema,
+  readScannerRunPairAggregate,
   readScannerRunPairs,
+  scannerRunPairAggregateSchema,
   scannerRunPairsSchema,
 } from '../src/index.js';
 
@@ -157,4 +159,53 @@ test('a detection item is unchanged when diagnostics are not requested', () => {
     conditionSummary: { satisfied: 0, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
   });
   assert.equal(withDiagnostics.success, true, 'the scanner may opt in to the summary');
+});
+
+/*
+ * Tenant-facing projection.
+ *
+ * A run the caller does not own (every system run, every other tenant's run)
+ * must not carry `pairs.items[]`: one observation identifies a strategy's
+ * instrument, timeframe, candle timing and outcome even without its UUID. The
+ * aggregate half must remain readable so outcome breakdowns still work.
+ */
+test('the aggregate projection parses a full block, ignoring its item sample', () => {
+  const full = block();
+  const aggregate = readScannerRunPairAggregate({ pairs: full });
+  assert.ok(aggregate);
+  assert.equal(aggregate.totals.pairs, full.totals.pairs);
+  assert.deepEqual(aggregate.conditions, full.conditions);
+  assert.equal(aggregate.truncated, full.truncated);
+  assert.equal('items' in aggregate, false, 'the projection has no item sample');
+});
+
+test('the aggregate projection parses an items-less block — withheld detail is not corruption', () => {
+  const { items: _items, ...withoutItems } = block();
+  const metadata = { pairs: withoutItems };
+  assert.equal(readScannerRunPairs(metadata), null, 'there is no detail to read');
+  const aggregate = readScannerRunPairAggregate(metadata);
+  assert.ok(aggregate);
+  assert.deepEqual(aggregate.totals, { pairs: 2, evaluated: 1, cursor_skipped: 1, stale: 0, failed: 0 });
+});
+
+test('the aggregate projection still refuses unreconciled or malformed counters', () => {
+  const { items: _items, ...withoutItems } = block();
+  assert.equal(
+    readScannerRunPairAggregate({ pairs: { ...withoutItems, totals: { pairs: 5, evaluated: 1, cursor_skipped: 0, stale: 0, failed: 0 } } }),
+    null,
+    'outcomes must still sum to totals.pairs',
+  );
+  assert.equal(readScannerRunPairAggregate({ pairs: { ...withoutItems, v: 2 } }), null);
+  assert.equal(readScannerRunPairAggregate({}), null);
+  assert.equal(readScannerRunPairAggregate(null), null);
+  assert.equal(readScannerRunPairAggregate({ pairs: 'nope' }), null);
+  assert.equal(readScannerRunPairAggregate({ pairs: [] }), null, 'an array is not a block');
+  assert.equal(readScannerRunPairAggregate({ pairs: 7 }), null, 'a primitive is not a block');
+  assert.equal(readScannerRunPairAggregate({ pairs: null }), null);
+  assert.equal(
+    readScannerRunPairAggregate({ pairs: { ...withoutItems, totals: { ...withoutItems.totals, extra: { symbol: 'BTCUSD' } } } }),
+    null,
+    'nested payloads in the counters are refused',
+  );
+  assert.equal(scannerRunPairAggregateSchema.safeParse({ v: 1, totals: withoutItems.totals }).success, false);
 });
