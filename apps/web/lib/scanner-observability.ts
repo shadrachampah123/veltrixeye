@@ -221,6 +221,62 @@ export function describeScannerOutcomes(totals: ScannerPairTotals): ScannerOutco
 }
 
 /* ------------------------------------------------------------------------- */
+/* Per-pair evaluation diagnostics (PR A)                                    */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Human wording for a direction's evaluation state. Closed vocabulary — the
+ * server sends one of five values, and anything else renders as the raw value
+ * rather than being silently dropped.
+ */
+const DIRECTION_STATE_LABELS: Record<string, string> = {
+  qualified: 'qualified',
+  not_qualified: 'not qualified',
+  blocked: 'blocked by limit',
+  error: 'error',
+  not_run: 'not run',
+};
+
+/** Cap for the rendered line, so one pair cannot distort the table. */
+export const PAIR_DIAGNOSTIC_TEXT_MAX = 240;
+
+/**
+ * One bounded sentence explaining what a pair actually did, or `null` when the
+ * run predates PR A diagnostics (or the pair simply has none).
+ *
+ * It reads, in order: the stage the pair reached, the pair-level cause codes,
+ * each direction's state (with the failing condition codes that explain a
+ * rejection), and the per-role candle counts. Every value comes from a closed
+ * vocabulary or is a count, so this never renders tenant text — and it is only
+ * ever reached for a run the viewer owns, because the observation sample is
+ * withheld for every other run.
+ */
+export function describePairDiagnostics(item: Pick<ScannerPairItem, 'diagnostics'>): string | null {
+  const diagnostics = item.diagnostics;
+  if (!diagnostics) return null;
+
+  const parts: string[] = [`Stage: ${diagnostics.stage}`];
+  if (diagnostics.codes && diagnostics.codes.length > 0) {
+    parts.push(`codes: ${diagnostics.codes.join(', ')}`);
+  }
+
+  for (const direction of ['long', 'short'] as const) {
+    const entry = diagnostics.directions?.[direction];
+    if (!entry) continue;
+    const label = DIRECTION_STATE_LABELS[entry.state] ?? entry.state;
+    const failing = entry.failing && entry.failing.length > 0 ? ` (${entry.failing.join(', ')})` : '';
+    parts.push(`${direction} ${label}${failing}`);
+  }
+
+  if (diagnostics.data) {
+    const { htf, setup, entry } = diagnostics.data;
+    parts.push(`candles ${htf.candles}/${setup.candles}/${entry.candles}`);
+  }
+
+  return parts.join(' · ').slice(0, PAIR_DIAGNOSTIC_TEXT_MAX);
+}
+
+/* ------------------------------------------------------------------------- */
 /* Pair summary (aggregate vs detail vs unavailable)                          */
 /* ------------------------------------------------------------------------- */
 

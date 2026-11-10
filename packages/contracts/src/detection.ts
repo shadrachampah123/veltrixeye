@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { assetClassSchema, instrumentSymbolSchema } from './assets.js';
+import { EVALUATION_OUTCOME_STATUSES } from './evaluation.js';
 
 /**
  * Setup detection contracts (M4).
@@ -184,6 +185,33 @@ export const conditionSummarySchema = z
   .strict();
 export type ConditionSummary = z.infer<typeof conditionSummarySchema>;
 
+/**
+ * Bounded list of the conditions a direction did NOT satisfy.
+ *
+ * This is the missing link between "the counts say three conditions were
+ * unsatisfied" and "the liquidity sweep is the one that blocked it": the counts
+ * in `conditionSummary` aggregate away *which* condition failed, and
+ * `failureReasons` only carries rule-group-level sentences. The scanner stores
+ * these as `metadata.pairs.items[].diagnostics.directions[<dir>].failing`.
+ *
+ * Bounded by construction — the engine walks the version's rule groups in
+ * config order, so the first `DETECTION_CONDITION_OUTCOMES_MAX` entries are
+ * deterministic. Never includes `satisfied` conditions (they explain nothing
+ * about a failure) and never includes free text: the type comes from
+ * `CONDITION_TYPE_REGISTRY`, which the config write path validates against.
+ */
+export const DETECTION_CONDITION_OUTCOMES_MAX = 4;
+
+export const detectionConditionOutcomeSchema = z
+  .object({
+    /** A registered condition type (`liquidity_sweep`, `news_filter`, …). */
+    conditionType: z.string().min(1).max(64),
+    /** Why it failed: `unsatisfied`, `insufficient_data` or `unsupported`. */
+    status: z.enum(EVALUATION_OUTCOME_STATUSES),
+  })
+  .strict();
+export type DetectionConditionOutcome = z.infer<typeof detectionConditionOutcomeSchema>;
+
 /** Per-direction detection outcome. */
 export const detectionItemDtoSchema = z
   .object({
@@ -205,6 +233,15 @@ export const detectionItemDtoSchema = z
      * is unchanged. Optional because historical/other callers omit it.
      */
     conditionSummary: conditionSummarySchema.optional(),
+    /**
+     * Which conditions blocked this direction, bounded and in config order.
+     *
+     * Like `conditionSummary`, populated only when the caller asks for
+     * diagnostics, so the M4 HTTP response shape is unchanged. Optional because
+     * historical callers and stubbed detectors omit it; the scanner treats a
+     * missing value as "no per-condition detail" rather than as a failure.
+     */
+    conditionOutcomes: z.array(detectionConditionOutcomeSchema).max(DETECTION_CONDITION_OUTCOMES_MAX).optional(),
   })
   .strict()
   .superRefine((item, ctx) => {

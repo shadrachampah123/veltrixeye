@@ -26,6 +26,14 @@ import {
   SCANNER_RUN_PAIR_REASONS_MAX,
   SCANNER_RUN_PAIR_REASON_MAX_CHARS,
   SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS,
+  SCANNER_RUN_PAIR_CODE_MAX_CHARS,
+  SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX,
+  SCANNER_RUN_PAIR_FAILING_MAX,
+  type ScannerPairData,
+  type ScannerPairDiagnostics,
+  type ScannerPairDirectionDiagnostic,
+  type ScannerPairRoleData,
+  type ScannerPairStage,
   timeframeMinutes,
 } from '@veltrixeye/contracts';
 import { DomainError, Errors } from '../errors.js';
@@ -458,7 +466,9 @@ export function buildScannerRunPairs(observations: readonly PairObservation[]): 
   const sampled = ordered.slice(0, SCANNER_RUN_PAIR_ITEMS_MAX);
 
   return {
-    v: 1,
+    // PR A writes block version 2: the item shape gained the optional
+    // `diagnostics` object. Version 1 blocks stay readable.
+    v: 2,
     totals,
     conditions,
     truncated: observations.length > sampled.length,
@@ -479,6 +489,10 @@ export function buildScannerRunPairs(observations: readonly PairObservation[]): 
           .slice(0, SCANNER_RUN_PAIR_REASONS_MAX)
           .map((reason) => reason.slice(0, SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS));
       }
+      // Normalised here too, so a caller-built observation can never persist a
+      // block that violates the contract's bounds.
+      const diagnostics = normalisePairDiagnostics(observation.diagnostics);
+      if (diagnostics) item.diagnostics = diagnostics;
       return item;
     }),
   };
@@ -493,6 +507,91 @@ function comparePairObservations(a: PairObservation, b: PairObservation): number
     a.strategyId.localeCompare(b.strategyId) ||
     a.outcome.localeCompare(b.outcome)
   );
+}
+
+/**
+ * PR A — bound and canonicalise one pair's diagnostics.
+ *
+ * Pure, total and deterministic. Applied twice on purpose: once where the
+ * observation is built (`scanPairCore`) and once where it is persisted
+ * (`buildScannerRunPairs`), so a caller-built observation can never write a
+ * block the contract would reject. Bounds match `scannerPairDiagnosticsSchema`:
+ * codes are trimmed, de-duplicated, order-preserving and capped; empty arrays
+ * are dropped rather than stored as noise.
+ */
+export function normalisePairDiagnostics(
+  diagnostics: ScannerPairDiagnostics | undefined,
+): ScannerPairDiagnostics | undefined {
+  if (!diagnostics) return undefined;
+
+  const codes = uniqueBoundedCodes(diagnostics.codes, SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX);
+  const directions = normaliseDirections(diagnostics.directions);
+
+  return {
+    stage: diagnostics.stage,
+    ...(codes.length > 0 ? { codes } : {}),
+    ...(diagnostics.data ? { data: diagnostics.data } : {}),
+    ...(directions ? { directions } : {}),
+  };
+}
+
+function normaliseDirections(
+  directions: ScannerPairDiagnostics['directions'],
+): ScannerPairDiagnostics['directions'] | undefined {
+  if (!directions) return undefined;
+  const out: NonNullable<ScannerPairDiagnostics['directions']> = {};
+  for (const direction of ['long', 'short'] as const) {
+    const entry = directions[direction];
+    if (!entry) continue;
+    const failing = uniqueBoundedCodes(entry.failing, SCANNER_RUN_PAIR_FAILING_MAX);
+    out[direction] = {
+      state: entry.state,
+      ...(entry.conditions ? { conditions: { ...entry.conditions } } : {}),
+      ...(failing.length > 0 ? { failing } : {}),
+    };
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Trim, drop empties, truncate, de-duplicate and cap — order preserved. */
+function uniqueBoundedCodes(codes: readonly string[] | undefined, max: number): string[] {
+  const out: string[] = [];
+  for (const raw of codes ?? []) {
+    if (typeof raw !== 'string' || out.length >= max) continue;
+    const code = raw.trim().slice(0, SCANNER_RUN_PAIR_CODE_MAX_CHARS);
+    if (code.length === 0 || out.includes(code)) continue;
+    out.push(code);
+  }
+  return out;
+}
+
+/** One role's candle volume: the count handed to validation and its newest open. */
+function roleDataOf(candles: readonly { time: number }[]): ScannerPairRoleData {
+  const newest = candles[candles.length - 1];
+  const newestMs = newest && Number.isInteger(newest.time) && newest.time > 0 ? newest.time : null;
+  return { candles: candles.length, newestMs };
+}
+
+/**
+ * Turn M4's bounded condition diagnostics into `<type>:<status>` codes.
+ *
+ * The status suffix is kept inside the 64-character budget so a long-but-legal
+ * condition type is truncated rather than producing a code the contract would
+ * reject. Closed vocabulary: the type comes from the condition registry and the
+ * status from the engine, so no user or provider text can reach run metadata.
+ */
+function failingConditionCodes(outcomes: readonly { conditionType: string; status: string }[] | undefined): string[] {
+  const codes: string[] = [];
+  for (const outcome of outcomes ?? []) {
+    if (codes.length >= SCANNER_RUN_PAIR_FAILING_MAX) break;
+    const status = String(outcome.status);
+    const room = Math.max(0, SCANNER_RUN_PAIR_CODE_MAX_CHARS - status.length - 1);
+    const conditionType = String(outcome.conditionType).slice(0, room);
+    if (conditionType.length === 0) continue;
+    const code = `${conditionType}:${status}`;
+    if (!codes.includes(code)) codes.push(code);
+  }
+  return codes;
 }
 
 const UNLOCK_ERROR_UUID_PATTERN = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
@@ -617,6 +716,16 @@ interface PairObservation {
   conditions?: ConditionSummary;
   /** `evaluated` only: sanitized M3 reasons (bounded). Never set for skips. */
   failureReasons?: string[];
+  /**
+   * PR A: bounded evaluation evidence — the stage the pair stopped at, cause
+   * codes, per-role candle counts and per-direction states.
+   *
+   * Set on every exit path (see `flushDiagnostics` in `scanPairCore`), so a
+   * pair that never reached the detector is distinguishable from one the
+   * detector rejected. Optional for backward compatibility with observations
+   * built by older callers and tests.
+   */
+  diagnostics?: ScannerPairDiagnostics;
 }
 
 interface ScanMetrics {
@@ -1548,6 +1657,48 @@ export class ScannerService {
     cycleCache: ScanCycleCache,
     observation: PairObservation,
   ): Promise<void> {
+    /* --------------------------------------------------------------------- *
+     * PR A — evaluation diagnostics.
+     *
+     * Tracked locally and flushed on every exit path, so the stored evidence
+     * always describes the stage the pair actually reached. Nothing here
+     * changes a decision: qualification, counters, cursor advancement and
+     * persistence policy are untouched. The values are bounded (see
+     * `normalisePairDiagnostics`) and drawn from closed vocabularies, so they
+     * can never carry tenant text.
+     * --------------------------------------------------------------------- */
+    // One mutable holder keeps the tracker readable: every field is final by
+    // the time `flushDiagnostics()` copies it onto the observation.
+    const tracker: {
+      stage: ScannerPairStage;
+      codes: string[];
+      data?: ScannerPairData;
+      directions: { long?: ScannerPairDirectionDiagnostic; short?: ScannerPairDirectionDiagnostic };
+    } = { stage: 'candles', codes: [], directions: {} };
+
+    /** Record one bounded cause code (sanitized, de-duplicated, capped). */
+    const addCode = (raw: string | null | undefined): void => {
+      if (tracker.codes.length >= SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX) return;
+      const code = sanitizeScannerError(raw ?? '', this.redact, SCANNER_RUN_PAIR_CODE_MAX_CHARS, true).trim();
+      if (code.length === 0 || tracker.codes.includes(code)) return;
+      tracker.codes.push(code);
+    };
+
+    /** Persist the evidence gathered so far onto the observation. */
+    const flushDiagnostics = (): void => {
+      observation.diagnostics = normalisePairDiagnostics({
+        stage: tracker.stage,
+        ...(tracker.codes.length > 0 ? { codes: [...tracker.codes] } : {}),
+        ...(tracker.data ? { data: tracker.data } : {}),
+        ...(Object.keys(tracker.directions).length > 0 ? { directions: { ...tracker.directions } } : {}),
+      });
+    };
+
+    // Baseline: a pair that fails before it can gather any other evidence (a
+    // provider error on the very first fetch, for example) still records that
+    // it never got past `candles`, rather than carrying no diagnostics at all.
+    flushDiagnostics();
+
     const { htf_bias, setup, entry } = strategy.timeframes;
 
     // Normalize timeframes
@@ -1609,6 +1760,15 @@ export class ScannerService {
     metrics.timeframesProcessed.add(setupTf);
     metrics.timeframesProcessed.add(entryTf);
 
+    // PR A: how much history each role actually handed to validation. These are
+    // the numbers that make "insufficient history" distinguishable from
+    // "conditions not met" without storing a single candle.
+    tracker.data = {
+      htf: roleDataOf(htfCandles),
+      setup: roleDataOf(setupCandles),
+      entry: roleDataOf(entryCandles),
+    };
+
     // Multi-timeframe validation
     const mtfValidation = validateMultiTimeframe({
       htf: htfCandles,
@@ -1624,6 +1784,14 @@ export class ScannerService {
       metrics.staleRejections += 1;
       observation.outcome = 'stale';
       observation.reason = 'mtf_invalid';
+      tracker.stage = 'validation';
+      // `validateMultiTimeframe` returns a bounded reason of its own
+      // (`setup_missing_candles`, `htf_context_missing`, …). The stable
+      // `reason` code stays `mtf_invalid` for historical readers; the specific
+      // cause goes to diagnostics, with a category the UI can group on.
+      if (mtfValidation.reason) addCode(mtfValidation.reason);
+      if (mtfValidation.reason === 'insufficient_candles_for_correlation') addCode('insufficient_history');
+      flushDiagnostics();
       this.logger.info('multi-timeframe validation failed', {
         strategyId: strategy.strategyId,
         instrument: `${instrument.assetClass}/${instrument.symbol}`,
@@ -1650,6 +1818,9 @@ export class ScannerService {
       // `checkMultiTimeframeFreshness` already role-prefixes the cause
       // (`setup_stale_candle`), which is the exact code we want to store.
       observation.reason = (freshness.reason ?? 'stale_candle').slice(0, SCANNER_RUN_PAIR_REASON_MAX_CHARS);
+      tracker.stage = 'freshness';
+      addCode(freshness.reason ?? 'stale_candle');
+      flushDiagnostics();
       this.logger.info('stale data rejected', {
         strategyId: strategy.strategyId,
         instrument: `${instrument.assetClass}/${instrument.symbol}`,
@@ -1685,6 +1856,9 @@ export class ScannerService {
       metrics.staleRejections += 1;
       observation.outcome = 'stale';
       observation.reason = 'no_closed_candle';
+      tracker.stage = 'anchor';
+      addCode('no_closed_candle');
+      flushDiagnostics();
       this.logger.info('no closed setup candle at scan time', {
         strategyId: strategy.strategyId,
         instrument: `${instrument.assetClass}/${instrument.symbol}`,
@@ -1708,6 +1882,9 @@ export class ScannerService {
         // `failureReasons` are attached. The cursor semantics are unchanged.
         observation.outcome = 'cursor_skipped';
         observation.reason = 'cursor_hit';
+        tracker.stage = 'cursor';
+        addCode('cursor_hit');
+        flushDiagnostics();
         this.logger.info('skipping duplicate candle', {
           strategyId: strategy.strategyId,
           instrument: `${instrument.assetClass}/${instrument.symbol}`,
@@ -1731,6 +1908,9 @@ export class ScannerService {
     const conditionTotals: ConditionSummary = { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 };
     const engineReasons: string[] = [];
     let directionsEvaluated = 0;
+    /** PR A: directions the engine qualified but a limit refused to persist. */
+    let directionsBlocked = 0;
+    tracker.stage = 'detection';
     for (const direction of directions) {
       try {
         const detection = await this.setups.detect({
@@ -1745,62 +1925,84 @@ export class ScannerService {
         });
 
         const item = detection.detections.find((d) => d.direction === direction);
-        if (item) {
-          directionsEvaluated += 1;
-          const summary = item.conditionSummary;
-          if (summary) {
-            conditionTotals.satisfied += summary.satisfied;
-            conditionTotals.unsatisfied += summary.unsatisfied;
-            conditionTotals.insufficient_data += summary.insufficient_data;
-            conditionTotals.unsupported += summary.unsupported;
-          }
-          if (!item.qualified && engineReasons.length < SCANNER_RUN_PAIR_REASONS_MAX) {
-            // `failureReasons` is required by the DTO but is read defectively
-            // here: a third-party/stubbed detector must never break a scan.
-            for (const reason of item.failureReasons ?? []) {
-              if (engineReasons.length >= SCANNER_RUN_PAIR_REASONS_MAX) break;
-              engineReasons.push(sanitizeScannerError(reason, this.redact, SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS, true));
-            }
-          }
-        }
-        if (!item?.qualified || !item.setup) {
+        if (!item) {
+          // PR A: the detector ran but returned nothing for this direction, so
+          // this direction was NOT evaluated. Recorded as `not_run` rather than
+          // being folded into an `evaluated` pair.
+          tracker.directions[direction] = { state: 'not_run' };
           continue;
         }
-
-        metrics.setupsDetected += 1;
-        if (item.created) metrics.setupsCreated += 1;
-
-        // Scoring — deterministic quality score, preserves M5 requirements
-        await this.scoring.scoreSetup({
-          userId: strategy.userId,
-          setupId: item.setup.id,
-          asOf: asOfMs,
-        });
-
-        // Risk/Quality validation: minQualityScore gate is enforced in AlertService
-        // Preserve existing quality/RR requirements
-
-        // Alert generation
-        const alertResult = await this.alerts.generateAlert({
-          userId: strategy.userId,
-          setupId: item.setup.id,
-          triggerState: 'confirmed',
-        });
-
-        if (alertResult.alert && alertResult.created) {
-          metrics.alertsCreated += 1;
-          this.logger.info('alert created from live scan', {
-            strategyId: strategy.strategyId,
-            setupId: item.setup.id,
-            alertId: alertResult.alert.id,
-            instrument: `${instrument.assetClass}/${instrument.symbol}`,
-            direction,
-            qualityScore: alertResult.alert.qualityScore,
-          });
+        directionsEvaluated += 1;
+        const summary = item.conditionSummary;
+        const failing = failingConditionCodes(item.conditionOutcomes);
+        tracker.directions[direction] = {
+          state: item.qualified ? 'qualified' : 'not_qualified',
+          ...(summary ? { conditions: { ...summary } } : {}),
+          ...(failing.length > 0 ? { failing } : {}),
+        };
+        if (summary) {
+          conditionTotals.satisfied += summary.satisfied;
+          conditionTotals.unsatisfied += summary.unsatisfied;
+          conditionTotals.insufficient_data += summary.insufficient_data;
+          conditionTotals.unsupported += summary.unsupported;
         }
+        if (!item.qualified && engineReasons.length < SCANNER_RUN_PAIR_REASONS_MAX) {
+          // `failureReasons` is required by the DTO but is read defectively
+          // here: a third-party/stubbed detector must never break a scan.
+          for (const reason of item.failureReasons ?? []) {
+            if (engineReasons.length >= SCANNER_RUN_PAIR_REASONS_MAX) break;
+            engineReasons.push(sanitizeScannerError(reason, this.redact, SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS, true));
+          }
+        }
+
+      if (!item?.qualified || !item.setup) {
+        continue;
+      }
+
+      metrics.setupsDetected += 1;
+      if (item.created) metrics.setupsCreated += 1;
+
+      // Scoring — deterministic quality score, preserves M5 requirements
+      await this.scoring.scoreSetup({
+        userId: strategy.userId,
+        setupId: item.setup.id,
+        asOf: asOfMs,
+      });
+
+      // Risk/Quality validation: minQualityScore gate is enforced in AlertService
+      // Preserve existing quality/RR requirements
+
+      // Alert generation
+      const alertResult = await this.alerts.generateAlert({
+        userId: strategy.userId,
+        setupId: item.setup.id,
+        triggerState: 'confirmed',
+      });
+
+      if (alertResult.alert && alertResult.created) {
+        metrics.alertsCreated += 1;
+        this.logger.info('alert created from live scan', {
+          strategyId: strategy.strategyId,
+          setupId: item.setup.id,
+          alertId: alertResult.alert.id,
+          instrument: `${instrument.assetClass}/${instrument.symbol}`,
+          direction,
+          qualityScore: alertResult.alert.qualityScore,
+        });
+      }
       } catch (err) {
-        // Entitlement limits: if max setups reached, skip
+        // Entitlement limits: if max setups reached, skip.
+        //
+        // PR A: a limit is a persistence decision, not a strategy outcome. The
+        // direction is recorded as `blocked` and the pair carries
+        // `setup_limit_reached`, so a capped account no longer looks like a
+        // strategy that simply never qualifies. The skip itself — and therefore
+        // cursor advancement below — is unchanged.
         if (err instanceof Error && err.message.includes('limit reached')) {
+          directionsBlocked += 1;
+          tracker.directions[direction] = { state: 'blocked' };
+          tracker.stage = 'persistence';
+          addCode('setup_limit_reached');
           this.logger.warn('entitlement limit reached', {
             strategyId: strategy.strategyId,
             userId: strategy.userId,
@@ -1808,6 +2010,9 @@ export class ScannerService {
           });
           continue;
         }
+        tracker.directions[direction] = { state: 'error' };
+        addCode(classifyPairFailure(err));
+        flushDiagnostics();
         throw err;
       }
     }
@@ -1816,12 +2021,34 @@ export class ScannerService {
     // re-arms when the next setup candle closes.
     await this.upsertCursor(strategy.versionId, instrument.instrumentId, setupTf, latestClosedSetupCandle.time, nowMs);
 
-    // Reaching here means both directions ran through M3 (or were refused by an
-    // entitlement limit). That is an EVALUATION, distinct from a cursor skip.
+    if (directionsEvaluated === 0) {
+      // PR A: no direction produced a detector item, so nothing was evaluated.
+      // Reporting this as `evaluated` (the pre-PR-A behaviour) made a refused
+      // evaluation indistinguishable from a completed one.
+      //
+      // The cursor above has already advanced, exactly as before: PR A records
+      // this state, it does not change cursor advancement or idempotency.
+      observation.outcome = 'failed';
+      if (directionsBlocked > 0) {
+        observation.reason = 'setup_limit_reached';
+        tracker.stage = 'persistence';
+        addCode('setup_not_persisted');
+      } else {
+        observation.reason = 'detector_unavailable';
+        tracker.stage = 'detection';
+      }
+      flushDiagnostics();
+      return;
+    }
+
+    // Reaching here means at least one direction ran through M3. That is an
+    // EVALUATION, distinct from a cursor skip.
     observation.outcome = 'evaluated';
     observation.reason = directionsEvaluated === directions.length ? null : 'partial_evaluation';
     observation.conditions = conditionTotals;
     if (engineReasons.length > 0) observation.failureReasons = engineReasons;
+    tracker.stage = 'complete';
+    flushDiagnostics();
   }
 
   private async fetchValidatedCandles(args: {

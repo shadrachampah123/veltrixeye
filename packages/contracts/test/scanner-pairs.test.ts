@@ -15,12 +15,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DETECTION_CONDITION_OUTCOMES_MAX,
   SCANNER_PAIR_OUTCOMES,
+  SCANNER_PAIR_STAGES,
+  SCANNER_RUN_PAIR_CODE_MAX_CHARS,
+  SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX,
+  SCANNER_RUN_PAIR_FAILING_MAX,
   SCANNER_RUN_PAIR_ITEMS_MAX,
   conditionSummarySchema,
   detectionItemDtoSchema,
   readScannerRunPairAggregate,
   readScannerRunPairs,
+  scannerPairDiagnosticsSchema,
   scannerRunPairAggregateSchema,
   scannerRunPairsSchema,
 } from '../src/index.js';
@@ -130,7 +136,7 @@ test('historical and malformed metadata parse as null (detail unavailable, never
   assert.equal(readScannerRunPairs(null), null);
   assert.equal(readScannerRunPairs({}), null);
   assert.equal(readScannerRunPairs({ triggeredBy: 'system', candles: { store: 0, provider: 0, total: 0 } }), null);
-  assert.equal(readScannerRunPairs({ pairs: { v: 2, totals: {} } }), null, 'a future version is refused, not guessed');
+  assert.equal(readScannerRunPairs({ pairs: { v: 99, totals: {} } }), null, 'a future version is refused, not guessed');
   assert.equal(readScannerRunPairs({ pairs: 'nope' }), null);
   const good = readScannerRunPairs({ pairs: block() });
   assert.equal(good?.totals.pairs, 2);
@@ -195,7 +201,11 @@ test('the aggregate projection still refuses unreconciled or malformed counters'
     null,
     'outcomes must still sum to totals.pairs',
   );
-  assert.equal(readScannerRunPairAggregate({ pairs: { ...withoutItems, v: 2 } }), null);
+  assert.equal(
+    readScannerRunPairAggregate({ pairs: { ...withoutItems, v: 99 } }),
+    null,
+    'an unknown block version is refused even when every counter is valid',
+  );
   assert.equal(readScannerRunPairAggregate({}), null);
   assert.equal(readScannerRunPairAggregate(null), null);
   assert.equal(readScannerRunPairAggregate({ pairs: 'nope' }), null);
@@ -208,4 +218,175 @@ test('the aggregate projection still refuses unreconciled or malformed counters'
     'nested payloads in the counters are refused',
   );
   assert.equal(scannerRunPairAggregateSchema.safeParse({ v: 1, totals: withoutItems.totals }).success, false);
+});
+
+/* ------------------------------------------------------------------------- */
+/* PR A — per-pair evaluation diagnostics                                    */
+/* ------------------------------------------------------------------------- */
+
+/** A v2 pair carrying the full diagnostics object. */
+function v2Item(overrides: Record<string, unknown> = {}) {
+  return {
+    strategyId,
+    assetClass: 'crypto',
+    symbol: 'BTCUSD',
+    timeframe: '1h',
+    outcome: 'evaluated',
+    cursorMs: 1_700_000_000_000,
+    anchorMs: 1_700_003_600_000,
+    reason: null,
+    conditions: { satisfied: 1, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+    diagnostics: {
+      stage: 'complete',
+      codes: ['setup_limit_reached'],
+      data: {
+        htf: { candles: 60, newestMs: 1_700_000_000_000 },
+        setup: { candles: 120, newestMs: 1_700_003_600_000 },
+        entry: { candles: 0, newestMs: null },
+      },
+      directions: {
+        long: {
+          state: 'not_qualified',
+          conditions: { satisfied: 0, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+          failing: ['liquidity_sweep:unsatisfied'],
+        },
+        short: { state: 'blocked' },
+      },
+    },
+    ...overrides,
+  };
+}
+
+function v2Block(item: Record<string, unknown> = v2Item()) {
+  return {
+    v: 2,
+    totals: { pairs: 1, evaluated: 1, cursor_skipped: 0, stale: 0, failed: 0 },
+    conditions: { satisfied: 1, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+    truncated: false,
+    items: [item],
+  };
+}
+
+test('a v2 block round-trips and a v1 block keeps parsing unchanged', () => {
+  const parsed = scannerRunPairsSchema.safeParse(v2Block());
+  assert.equal(parsed.success, true);
+  if (parsed.success) {
+    assert.equal(parsed.data.v, 2);
+    assert.equal(parsed.data.items[0]?.diagnostics?.stage, 'complete');
+    assert.deepEqual(parsed.data.items[0]?.diagnostics?.directions?.long?.failing, ['liquidity_sweep:unsatisfied']);
+  }
+
+  // Version 1 is still readable: historical runs never carried diagnostics.
+  assert.equal(scannerRunPairsSchema.safeParse(block()).success, true);
+  assert.equal(readScannerRunPairs({ pairs: block() })?.items[0]?.diagnostics, undefined);
+});
+
+test('diagnostics are optional — a v2 block without them is valid', () => {
+  const { diagnostics: _diagnostics, ...withoutDiagnostics } = v2Item();
+  assert.equal(scannerRunPairsSchema.safeParse(v2Block(withoutDiagnostics)).success, true);
+});
+
+test('diagnostics are a closed, bounded vocabulary', () => {
+  // The stage enum is the published lifecycle list.
+  for (const stage of SCANNER_PAIR_STAGES) {
+    assert.equal(scannerPairDiagnosticsSchema.safeParse({ stage }).success, true, `${stage} must be a valid stage`);
+  }
+  assert.equal(scannerPairDiagnosticsSchema.safeParse({ stage: 'almost_done' }).success, false);
+  assert.equal(scannerPairDiagnosticsSchema.safeParse({}).success, false, 'a stage is required');
+
+  // Unknown keys never survive — including anything that could smuggle text in.
+  assert.equal(scannerPairDiagnosticsSchema.safeParse({ stage: 'complete', note: 'tenant text' }).success, false);
+  assert.equal(
+    scannerPairDiagnosticsSchema.safeParse({ stage: 'complete', directions: { long: { state: 'qualified', detail: 'x' } } })
+      .success,
+    false,
+  );
+
+  // Direction states are the five published values.
+  for (const state of ['qualified', 'not_qualified', 'blocked', 'error', 'not_run'] as const) {
+    assert.equal(
+      scannerPairDiagnosticsSchema.safeParse({ stage: 'detection', directions: { long: { state } } }).success,
+      true,
+      `${state} must be a valid direction state`,
+    );
+  }
+  assert.equal(
+    scannerPairDiagnosticsSchema.safeParse({ stage: 'detection', directions: { long: { state: 'passed' } } }).success,
+    false,
+  );
+
+  // Counts are bounded.
+  assert.equal(
+    scannerPairDiagnosticsSchema.safeParse({ stage: 'detection', codes: Array(SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX + 1).fill('x') })
+      .success,
+    false,
+  );
+  assert.equal(
+    scannerPairDiagnosticsSchema.safeParse({ stage: 'detection', codes: ['x'.repeat(SCANNER_RUN_PAIR_CODE_MAX_CHARS + 1)] })
+      .success,
+    false,
+  );
+  assert.equal(
+    scannerPairDiagnosticsSchema.safeParse({
+      stage: 'detection',
+      directions: { long: { state: 'not_qualified', failing: Array(SCANNER_RUN_PAIR_FAILING_MAX + 1).fill('a:unsatisfied') } },
+    }).success,
+    false,
+  );
+  assert.equal(
+    scannerPairDiagnosticsSchema.safeParse({ stage: 'detection', codes: [''] }).success,
+    false,
+    'an empty code is not a code',
+  );
+});
+
+test('malformed diagnostics fail the whole block closed, never partially render', () => {
+  const broken = v2Block(v2Item({ diagnostics: { stage: 'complete', codes: ['ok'], extra: { symbol: 'BTCUSD' } } }));
+  assert.equal(scannerRunPairsSchema.safeParse(broken).success, false);
+  assert.equal(readScannerRunPairs({ pairs: broken }), null, 'one corrupt item makes the sample unreadable, not guessed');
+  assert.equal(
+    readScannerRunPairs({ pairs: v2Block(v2Item({ diagnostics: { stage: 'nope' } })) }),
+    null,
+    'an unknown stage is refused',
+  );
+});
+
+test('the aggregate projection of a v2 block still carries no observations', () => {
+  const aggregate = readScannerRunPairAggregate({ pairs: v2Block() });
+  assert.ok(aggregate);
+  assert.equal(aggregate.v, 2);
+  assert.equal('items' in aggregate, false);
+  assert.equal(JSON.stringify(aggregate).includes('liquidity_sweep'), false, 'diagnostics never reach the aggregate');
+});
+
+test('a detection item carries bounded condition failures only when diagnostics are requested', () => {
+  const base = { direction: 'long', qualified: false, setup: null, created: false, failureReasons: ['rule group "Structure" (AND) is not satisfied'] };
+
+  const plain = detectionItemDtoSchema.safeParse(base);
+  assert.equal(plain.success, true);
+  assert.equal(plain.success && 'conditionOutcomes' in plain.data, false, 'the M4 response shape is unchanged');
+
+  const withOutcomes = detectionItemDtoSchema.safeParse({
+    ...base,
+    conditionSummary: { satisfied: 0, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+    conditionOutcomes: [
+      { conditionType: 'liquidity_sweep', status: 'unsatisfied' },
+      { conditionType: 'news_filter', status: 'insufficient_data' },
+    ],
+  });
+  assert.equal(withOutcomes.success, true);
+
+  assert.equal(
+    detectionItemDtoSchema.safeParse({
+      ...base,
+      conditionOutcomes: Array(DETECTION_CONDITION_OUTCOMES_MAX + 1).fill({ conditionType: 'fvg', status: 'unsatisfied' }),
+    }).success,
+    false,
+    'the list is bounded',
+  );
+  assert.equal(
+    detectionItemDtoSchema.safeParse({ ...base, conditionOutcomes: [{ conditionType: 'fvg', status: 'skipped' }] }).success,
+    false,
+    'only the four engine statuses are accepted',
+  );
 });

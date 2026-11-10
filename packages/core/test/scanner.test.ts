@@ -866,7 +866,7 @@ describe('F4: Scanner tenant privacy', () => {
         force: false,
         duplicateCandleSkips: 1,
         pairs: {
-          v: 1,
+          v: 2,
           totals: { pairs: 1, evaluated: 0, cursor_skipped: 1, stale: 0, failed: 0 },
           conditions: { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
           truncated: false,
@@ -880,6 +880,12 @@ describe('F4: Scanner tenant privacy', () => {
               cursorMs: 1_700_000_000_000,
               anchorMs: 1_700_003_600_000,
               reason: 'cursor_hit',
+              // PR A: the richest per-pair evidence, here as a leak probe.
+              diagnostics: {
+                stage: 'cursor',
+                codes: ['cursor_hit'],
+                directions: { long: { state: 'not_run' } },
+              },
             },
           ],
         },
@@ -922,7 +928,17 @@ describe('F4: Scanner tenant privacy', () => {
 
       // No per-pair identifier — not even the symbol/timeframe/timing — leaks.
       const shownPayload = JSON.stringify(shown.metadata);
-      for (const marker of ['XAUUSD', '"cursorMs"', '"anchorMs"', '"timeframe"', '"outcome"', '"items"']) {
+      for (const marker of [
+        'XAUUSD',
+        '"cursorMs"',
+        '"anchorMs"',
+        '"timeframe"',
+        '"outcome"',
+        '"items"',
+        '"diagnostics"',
+        '"codes"',
+        '"directions"',
+      ]) {
         assert.equal(shownPayload.includes(marker), false, `per-pair field ${marker} must not leak`);
       }
       // The aggregate half is readable; the detail half is gone.
@@ -1126,6 +1142,51 @@ describe('F4: Scanner tenant privacy', () => {
       const health = await scanner.getHealth();
       assert.ok(health.lastRun);
       assert.equal(health.lastRun!.metadata.triggeredBy, USER_A);
+    });
+
+    test('another tenant sees a redacted last run even when it carries diagnostics', async () => {
+      await pool.query(
+        `INSERT INTO scanner_runs (status, provider_slug, started_at, finished_at, metadata)
+         VALUES ('completed', 'twelve-data', now(), now(), $1::jsonb)`,
+        [
+          JSON.stringify({
+            triggeredBy: USER_B,
+            strategyId: STRATEGY_B,
+            force: false,
+            pairs: {
+              v: 2,
+              totals: { pairs: 1, evaluated: 1, cursor_skipped: 0, stale: 0, failed: 0 },
+              conditions: { satisfied: 1, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+              truncated: false,
+              items: [
+                {
+                  strategyId: STRATEGY_B,
+                  assetClass: 'commodity',
+                  symbol: 'XAUUSD',
+                  timeframe: '1h',
+                  outcome: 'evaluated',
+                  cursorMs: 1_700_000_000_000,
+                  anchorMs: 1_700_003_600_000,
+                  reason: null,
+                  diagnostics: {
+                    stage: 'validation',
+                    codes: ['insufficient_history'],
+                    directions: { long: { state: 'not_qualified', failing: ['liquidity_sweep:unsatisfied'] } },
+                  },
+                },
+              ],
+            },
+          }),
+        ],
+      );
+
+      const health = await scanner.getHealth(USER_A);
+      assert.ok(health.lastRun);
+      const payload = JSON.stringify(health.lastRun);
+      for (const marker of ['diagnostics', 'insufficient_history', 'liquidity_sweep', USER_B, STRATEGY_B, 'XAUUSD']) {
+        assert.equal(payload.includes(marker), false, `${marker} must not reach another tenant through health`);
+      }
+      assert.equal(readScannerRunPairAggregate(health.lastRun!.metadata)?.totals.evaluated, 1);
     });
   });
 

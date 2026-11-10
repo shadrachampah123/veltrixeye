@@ -52,6 +52,8 @@ import {
   createPool,
   createProviderRegistry,
   hashPassword,
+  normalisePairDiagnostics,
+  redactScannerRunForViewer,
   redactScannerRunMetadata,
   runMigrations,
 } from '../src/index.js';
@@ -115,6 +117,8 @@ class PhaseAProvider implements MarketDataProvider {
   public failWith: ProviderError | null = null;
   /** Phase B: shift a timeframe's batches into the past to force staleness. */
   public lagByTimeframe: Partial<Record<string, number>> = {};
+  /** PR A: cap the returned batch so a pair can be starved of history. */
+  public maxCandles: number | null = null;
 
   async getSymbols() {
     return [];
@@ -123,7 +127,8 @@ class PhaseAProvider implements MarketDataProvider {
   async getHistoricalCandles(request: { timeframe: Timeframe; to: number }): Promise<Candle[]> {
     this.calls.push(request.timeframe);
     if (this.failWith) throw this.failWith;
-    return roleBatch(request.timeframe, request.to - (this.lagByTimeframe[request.timeframe] ?? 0));
+    const batch = roleBatch(request.timeframe, request.to - (this.lagByTimeframe[request.timeframe] ?? 0));
+    return this.maxCandles === null ? batch : batch.slice(-this.maxCandles);
   }
 
   subscribeRealtime(_sub: RealtimeSubscription): RealtimeCandleStream {
@@ -189,7 +194,7 @@ interface ScopedStrategy {
 }
 
 async function createScopedStrategy(
-  assetClass: 'forex' | 'commodity' | 'crypto',
+  assetClass: 'forex' | 'commodity' | 'crypto' | 'index',
   symbol: string,
   userId?: string,
 ): Promise<ScopedStrategy> {
@@ -280,10 +285,22 @@ function makeHarness(
     /** Phase B: what the stubbed detector reports for each direction. */
     detectSummary?: { satisfied: number; unsatisfied: number; insufficient_data: number; unsupported: number };
     detectReasons?: string[];
+    /** PR A: per-condition failures the stubbed detector reports. */
+    detectConditionOutcomes?: { conditionType: string; status: string }[];
+    /**
+     * PR A: take over the stubbed detector entirely — omit a direction,
+     * qualify one, or throw — so every scanner exit path can be exercised.
+     */
+    detectOverride?: (args: { direction: 'long' | 'short'; asOf: number }) => unknown;
+    /** PR A: a qualified detection needs scoring/alerts stubbed out (they need real rows). */
+    stubScoringAndAlerts?: boolean;
+    /** PR A: starve the provider so a pair has too little history. */
+    providerMaxCandles?: number;
   } = {},
 ): Harness {
   const provider = new PhaseAProvider();
   provider.lagByTimeframe = options.providerLagByTimeframe ?? {};
+  provider.maxCandles = options.providerMaxCandles ?? null;
   if (options.providerFails) provider.failWith = new ProviderError('rate_limited', 'phase a: provider rate limited');
 
   const registry = createProviderRegistry();
@@ -311,6 +328,7 @@ function makeHarness(
   const stubSetups = {
     detect: async (args: { versionId: string; asOf: number; direction: 'long' | 'short' }) => {
       detectCalls.push({ versionId: args.versionId, asOf: args.asOf, direction: args.direction });
+      if (options.detectOverride) return options.detectOverride({ direction: args.direction, asOf: args.asOf });
       return {
         detections: [
           {
@@ -320,14 +338,19 @@ function makeHarness(
             created: false,
             failureReasons: options.detectReasons ?? [],
             ...(options.detectSummary ? { conditionSummary: options.detectSummary } : {}),
+            ...(options.detectConditionOutcomes ? { conditionOutcomes: options.detectConditionOutcomes } : {}),
           },
         ],
       };
     },
   } as unknown as SetupService;
 
-  const scoring = new ScoringService(pool, strategies, evaluation);
-  const alerts = new AlertService(pool, strategies, new StubAlertSender(), new NotificationOutbox(pool, { maxAttempts: 5 }));
+  const scoring = options.stubScoringAndAlerts
+    ? ({ scoreSetup: async () => undefined } as unknown as ScoringService)
+    : new ScoringService(pool, strategies, evaluation);
+  const alerts = options.stubScoringAndAlerts
+    ? ({ generateAlert: async () => ({ alert: null, created: false }) } as unknown as AlertService)
+    : new AlertService(pool, strategies, new StubAlertSender(), new NotificationOutbox(pool, { maxAttempts: 5 }));
 
   const scanner = new ScannerService(
     pool,
@@ -774,5 +797,380 @@ describe('Phase B — per-pair evaluation outcomes', () => {
       null,
       'a malformed block never throws',
     );
+  });
+});
+
+describe('PR A — evaluation diagnostics', () => {
+  const nowMs = () => Math.floor(Date.now() / HOUR_MS) * HOUR_MS + 25 * 60_000;
+  const pairsOf = (run: { metadata: Record<string, unknown> }) => readScannerRunPairs(run.metadata);
+  const limitError = () =>
+    new Error('Saved setups limit reached. Your plan allows up to 1000 saved setups.');
+
+  async function seededPair(assetClass: 'commodity' | 'crypto', symbol: string) {
+    const now = nowMs();
+    const scoped = await createScopedStrategy(assetClass, symbol);
+    const instrument = await candleStore.resolveInstrument(assetClass, symbol);
+    assert.ok(instrument);
+    await seedStore(instrument.id, now);
+    return { now, ...scoped };
+  }
+
+  test('A1: a cursor skip records the cursor stage and no direction evidence', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const harness = makeHarness();
+
+    const first = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    assert.equal(pairsOf(first.run)?.items[0]?.diagnostics?.stage, 'complete', 'the first scan evaluates');
+    const callsAfterFirst = harness.detectCalls.length;
+    assert.equal(callsAfterFirst, 2, 'the detector ran for both directions');
+
+    const second = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const item = pairsOf(second.run)?.items[0];
+    assert.equal(item?.outcome, 'cursor_skipped');
+    assert.equal(item?.diagnostics?.stage, 'cursor');
+    assert.deepEqual(item?.diagnostics?.codes, ['cursor_hit']);
+    assert.equal(item?.diagnostics?.directions, undefined, 'a skip evaluated no direction');
+    assert.equal(item?.diagnostics?.data?.setup.candles, ROLE_COUNTS['1h'], 'the loaded history is still recorded');
+    assert.equal(harness.detectCalls.length, callsAfterFirst, 'a cursor skip never invokes the detector');
+  });
+
+  test('A2: an evaluated pair names the failing condition of each direction', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const harness = makeHarness({
+      detectSummary: { satisfied: 1, unsatisfied: 1, insufficient_data: 1, unsupported: 1 },
+      detectConditionOutcomes: [
+        { conditionType: 'liquidity_sweep', status: 'unsatisfied' },
+        { conditionType: 'news_filter', status: 'insufficient_data' },
+      ],
+      detectReasons: ['rule group "Structure" (AND) is not satisfied'],
+    });
+
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const item = pairsOf(result.run)?.items[0];
+    assert.equal(item?.outcome, 'evaluated');
+    assert.equal(item?.reason, null, 'both directions were evaluated');
+    assert.equal(item?.diagnostics?.stage, 'complete');
+
+    const long = item?.diagnostics?.directions?.long;
+    assert.equal(long?.state, 'not_qualified');
+    assert.deepEqual(long?.failing, ['liquidity_sweep:unsatisfied', 'news_filter:insufficient_data']);
+    assert.deepEqual(long?.conditions, { satisfied: 1, unsatisfied: 1, insufficient_data: 1, unsupported: 1 });
+    assert.equal(item?.diagnostics?.directions?.short?.state, 'not_qualified');
+    // The legacy fields keep their exact meaning.
+    assert.deepEqual(item?.conditions, { satisfied: 2, unsatisfied: 2, insufficient_data: 2, unsupported: 2 });
+    assert.equal(result.run.setupsDetected, 0);
+  });
+
+  test('A3: an evaluated and qualified pair marks the direction qualified', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const setupId = '44444444-4444-4444-8444-444444444444';
+    const harness = makeHarness({
+      stubScoringAndAlerts: true,
+      detectOverride: ({ direction }) => ({
+        detections: [
+          {
+            direction,
+            qualified: direction === 'long',
+            setup: direction === 'long' ? { id: setupId } : null,
+            created: direction === 'long',
+            failureReasons: [],
+            conditionSummary: { satisfied: 2, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+          },
+        ],
+      }),
+    });
+
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const item = pairsOf(result.run)?.items[0];
+    assert.equal(item?.outcome, 'evaluated');
+    assert.equal(item?.diagnostics?.directions?.long?.state, 'qualified');
+    assert.equal(item?.diagnostics?.directions?.long?.failing, undefined, 'a qualified direction has nothing to explain');
+    assert.equal(item?.diagnostics?.directions?.short?.state, 'not_qualified');
+    assert.equal(result.run.setupsDetected, 1);
+    assert.equal(result.run.setupsCreated, 1);
+    assert.equal(result.run.alertsCreated, 0, 'the stubbed alert service created nothing');
+  });
+
+  test('A4: insufficient history is recorded as validation with the counts that prove it', async () => {
+    const now = nowMs();
+    // GBPUSD is deliberately NOT seeded here: the pair depends entirely on what
+    // the provider returns, and here that is a batch too short for the roles.
+    const { userId, strategyId } = await createScopedStrategy('forex', 'GBPUSD');
+    const harness = makeHarness({ providerMaxCandles: 10 });
+
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const item = pairsOf(result.run)?.items[0];
+    assert.equal(item?.outcome, 'stale');
+    assert.equal(item?.reason, 'mtf_invalid', 'the stable reason code is unchanged');
+    assert.equal(item?.diagnostics?.stage, 'validation');
+    assert.ok(item?.diagnostics?.codes?.includes('insufficient_history'), 'the category is recorded');
+    assert.ok(
+      item?.diagnostics?.codes?.includes('insufficient_candles_for_correlation'),
+      'the specific validation cause is recorded alongside it',
+    );
+    const counts = item?.diagnostics?.data;
+    assert.deepEqual(
+      { htf: counts?.htf.candles, setup: counts?.setup.candles, entry: counts?.entry.candles },
+      { htf: 10, setup: 10, entry: 10 },
+      'the per-role history is what makes this diagnosable',
+    );
+    assert.equal(typeof counts?.htf.newestMs, 'number');
+    assert.equal(item?.diagnostics?.directions, undefined, 'validation never reached the detector');
+    assert.equal(result.run.staleRejections, 1);
+  });
+
+  test('A5: stale freshness names the role that was too old', async () => {
+    const now = nowMs();
+    const { userId, strategyId } = await createScopedStrategy('forex', 'EURUSD');
+    const harness = makeHarness({ providerLagByTimeframe: { '1h': HOUR_MS } });
+
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const item = pairsOf(result.run)?.items[0];
+    assert.equal(item?.outcome, 'stale');
+    assert.equal(item?.diagnostics?.stage, 'freshness');
+    assert.deepEqual(item?.diagnostics?.codes, ['setup_stale_candle']);
+    assert.ok(item?.diagnostics?.data, 'the data counts are recorded even when the data is stale');
+  });
+
+  test('A6: a persistence limit is a failure with a cause, not an evaluation', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const harness = makeHarness({ detectOverride: () => { throw limitError(); } });
+
+    const first = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const pairs = pairsOf(first.run);
+    assert.ok(pairs);
+    assert.deepEqual(
+      pairs.totals,
+      { pairs: 1, evaluated: 0, cursor_skipped: 0, stale: 0, failed: 1 },
+      'a refused evaluation is never counted as evaluated',
+    );
+    const item = pairs.items[0];
+    assert.equal(item?.outcome, 'failed');
+    assert.equal(item?.reason, 'setup_limit_reached');
+    assert.equal(item?.diagnostics?.stage, 'persistence');
+    assert.deepEqual(item?.diagnostics?.codes, ['setup_limit_reached', 'setup_not_persisted']);
+    assert.equal(item?.diagnostics?.directions?.long?.state, 'blocked');
+    assert.equal(item?.diagnostics?.directions?.short?.state, 'blocked');
+    assert.equal(item?.conditions, undefined, 'nothing was evaluated, so there are no condition counts');
+    assert.equal(first.run.setupsDetected, 0);
+
+    // PR A records this state; it does NOT change cursor advancement.
+    const second = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    assert.equal(pairsOf(second.run)?.items[0]?.outcome, 'cursor_skipped', 'the cursor still advanced');
+  });
+
+  test('A7: one blocked direction and one evaluated direction stays evaluated, and says which', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const harness = makeHarness({
+      detectOverride: ({ direction }) => {
+        if (direction === 'long') throw limitError();
+        return {
+          detections: [
+            {
+              direction,
+              qualified: false,
+              setup: null,
+              created: false,
+              failureReasons: [],
+              conditionSummary: { satisfied: 0, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+              conditionOutcomes: [{ conditionType: 'fvg', status: 'unsatisfied' }],
+            },
+          ],
+        };
+      },
+    });
+
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const item = pairsOf(result.run)?.items[0];
+    assert.equal(item?.outcome, 'evaluated');
+    assert.equal(item?.reason, 'partial_evaluation');
+    assert.deepEqual(item?.diagnostics?.codes, ['setup_limit_reached']);
+    assert.equal(item?.diagnostics?.directions?.long?.state, 'blocked');
+    assert.equal(item?.diagnostics?.directions?.short?.state, 'not_qualified');
+    assert.deepEqual(item?.diagnostics?.directions?.short?.failing, ['fvg:unsatisfied']);
+  });
+
+  test('A8: a detector that returns no item is a failure, not an evaluation', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const harness = makeHarness({ detectOverride: () => ({ detections: [] }) });
+
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const pairs = pairsOf(result.run);
+    assert.deepEqual(pairs?.totals, { pairs: 1, evaluated: 0, cursor_skipped: 0, stale: 0, failed: 1 });
+    const item = pairs?.items[0];
+    assert.equal(item?.reason, 'detector_unavailable');
+    assert.equal(item?.diagnostics?.stage, 'detection');
+    assert.equal(item?.diagnostics?.directions?.long?.state, 'not_run');
+    assert.equal(item?.diagnostics?.directions?.short?.state, 'not_run');
+    assert.equal(harness.detectCalls.length, 2, 'the detector WAS called — this is not a pre-detection failure');
+  });
+
+  test('A9: a failure before evaluation records the candle stage and no history', async () => {
+    const now = nowMs();
+    // SPX500 is never seeded anywhere in this file, so the store stays empty
+    // and the failure can only come from the provider call.
+    const { userId, strategyId } = await createScopedStrategy('index', 'SPX500');
+    const harness = makeHarness({ providerFails: true, maxRetries: 0 });
+
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const item = pairsOf(result.run)?.items[0];
+    assert.equal(item?.outcome, 'failed');
+    assert.equal(item?.reason, 'rate_limited', 'the bounded provider kind is unchanged');
+    assert.equal(item?.diagnostics?.stage, 'candles');
+    assert.equal(item?.diagnostics?.data, undefined, 'no role completed a fetch');
+    assert.equal(result.run.providerFailures, 1);
+  });
+
+  test('A10: a failure during evaluation records the detection stage and the direction', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const harness = makeHarness({
+      detectOverride: () => {
+        throw new ProviderError('unavailable', 'detector exploded');
+      },
+    });
+
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const item = pairsOf(result.run)?.items[0];
+    assert.equal(item?.outcome, 'failed');
+    assert.equal(item?.reason, 'unavailable');
+    assert.equal(item?.diagnostics?.stage, 'detection');
+    assert.equal(item?.diagnostics?.directions?.long?.state, 'error');
+    assert.deepEqual(item?.diagnostics?.codes, ['unavailable']);
+    assert.ok(item?.diagnostics?.data, 'the history it did have is still recorded');
+  });
+
+  test('A11: diagnostics are bounded and the sample stays deterministic', () => {
+    const makeObservation = (index: number): PairObservationLike =>
+      ({
+        strategyId: `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+        assetClass: 'crypto',
+        symbol: `SYM${index % 7}`,
+        timeframe: '1h',
+        outcome: 'evaluated',
+        cursorMs: 1_700_000_000_000 + index,
+        anchorMs: 1_700_003_600_000 + index,
+        reason: null,
+        conditions: { satisfied: 1, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+        diagnostics: {
+          stage: 'complete',
+          codes: ['a', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+          directions: {
+            long: { state: 'not_qualified', failing: ['x:unsatisfied', 'x:unsatisfied', 'y:unsatisfied', 'z:unsatisfied', 'w:unsatisfied'] },
+          },
+        },
+      }) as PairObservationLike;
+
+    const observations = Array.from({ length: 250 }, (_, index) => makeObservation(index));
+    const block = buildScannerRunPairs(observations);
+    assert.equal(scannerRunPairsSchema.safeParse(block).success, true, 'the block always satisfies its own contract');
+    assert.equal(block.v, 2);
+
+    const diagnostics = block.items[0]?.diagnostics;
+    assert.ok(diagnostics);
+    assert.deepEqual(diagnostics.codes, ['a', 'b', 'c', 'd', 'e', 'f'], 'codes are de-duplicated and capped');
+    assert.deepEqual(diagnostics.directions?.long?.failing, ['x:unsatisfied', 'y:unsatisfied', 'z:unsatisfied', 'w:unsatisfied']);
+
+    const reversed = [...observations].reverse();
+    assert.deepEqual(buildScannerRunPairs(reversed).items, block.items, 'the sample does not depend on scan order');
+
+    // The normaliser is idempotent and preserves an already-clean object.
+    const cleaned = normalisePairDiagnostics(diagnostics);
+    assert.deepEqual(normalisePairDiagnostics(cleaned), cleaned);
+    assert.equal(normalisePairDiagnostics(undefined), undefined);
+  });
+
+  test('A12: diagnostics never reach a viewer who does not own the run', () => {
+    const owner = '55555555-5555-4555-8555-555555555555';
+    const metadata = {
+      triggeredBy: owner,
+      force: false,
+      duplicateCandleSkips: 0,
+      pairs: buildScannerRunPairs([
+        {
+          strategyId: '66666666-6666-4666-8666-666666666666',
+          assetClass: 'crypto',
+          symbol: 'BTCUSD',
+          timeframe: '1h',
+          outcome: 'evaluated',
+          cursorMs: 1_700_000_000_000,
+          anchorMs: 1_700_003_600_000,
+          reason: null,
+          conditions: { satisfied: 1, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+          diagnostics: {
+            stage: 'complete',
+            codes: ['setup_limit_reached'],
+            data: { htf: { candles: 60, newestMs: 1_700_000_000_000 }, setup: { candles: 120, newestMs: 1_700_003_600_000 }, entry: { candles: 120, newestMs: 1_700_003_600_000 } },
+            directions: { long: { state: 'not_qualified', failing: ['liquidity_sweep:unsatisfied'] } },
+          },
+        },
+      ] as never),
+    };
+
+    // The owner sees the evidence.
+    const own = JSON.stringify(redactScannerRunMetadata(metadata, owner));
+    assert.ok(own.includes('"diagnostics"'));
+    assert.ok(own.includes('liquidity_sweep:unsatisfied'));
+
+    // Every other viewer sees counts and nothing else.
+    for (const viewer of ['not-the-owner', '']) {
+      const shared = redactScannerRunMetadata(metadata, viewer);
+      const payload = JSON.stringify(shared);
+      for (const marker of ['diagnostics', 'liquidity_sweep', 'setup_limit_reached', 'BTCUSD', 'candleMs', 'newestMs']) {
+        assert.equal(payload.includes(marker), false, `${marker} must not reach another viewer`);
+      }
+      assert.equal(readScannerRunPairs(shared), null, 'there is no detail sample to read');
+      assert.equal(readScannerRunPairAggregate(shared)?.totals.evaluated, 1, 'aggregates stay readable');
+    }
+
+    // A trusted operator read keeps the evidence (identifiers still stripped).
+    const operator = redactScannerRunMetadata(metadata, '', { keepPairObservations: true });
+    assert.ok(JSON.stringify(operator).includes('liquidity_sweep:unsatisfied'));
+    assert.equal(JSON.stringify(operator).includes('66666666-6666-4666-8666-666666666666'), false);
+  });
+
+  test('A13: a run recorded before PR A still reads, with no fabricated diagnostics', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const harness = makeHarness();
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const pairs = pairsOf(result.run);
+    assert.ok(pairs);
+
+    // Simulate the historical shape: same block, version 1, no diagnostics key.
+    const legacy = {
+      ...pairs,
+      v: 1,
+      items: pairs.items.map(({ diagnostics: _diagnostics, ...rest }) => rest),
+    };
+    const read = readScannerRunPairs({ pairs: legacy });
+    assert.ok(read, 'a v1 block is still readable');
+    assert.equal(read.v, 1);
+    assert.equal(read.items[0]?.diagnostics, undefined);
+    assert.equal(readScannerRunPairAggregate({ pairs: legacy })?.totals.pairs, 1);
+  });
+
+  test('A14: health redaction keeps the owner\u2019s diagnostics but strips another tenant\u2019s', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const harness = makeHarness();
+    const result = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+
+    const healthForOwner = await harness.scanner.getHealth(userId);
+    assert.ok(healthForOwner.lastRun);
+    assert.equal(JSON.stringify(healthForOwner.lastRun).includes('"diagnostics"'), true);
+
+    const healthForOther = await harness.scanner.getHealth('77777777-7777-4777-8777-777777777777');
+    assert.ok(healthForOther.lastRun);
+    const other = JSON.stringify(healthForOther.lastRun);
+    assert.equal(other.includes('"diagnostics"'), false, 'another tenant never receives pair diagnostics');
+    assert.equal(other.includes('cursor_hit'), false);
+    assert.equal(other.includes(userId), false);
+    // NOTE: run-level `symbolsProcessed`/`timeframesProcessed` already existed
+    // before PR A and are returned to every viewer of the shared health feed.
+    // That is a pre-existing surface, deliberately untouched here (reported as
+    // a follow-up finding) — this test pins only that PR A's diagnostics do not
+    // add to it.
+
+    // And the owner-level run DTO is the same object the API returns.
+    const viewerDto = redactScannerRunForViewer(result.run, '77777777-7777-4777-8777-777777777777');
+    assert.equal(JSON.stringify(viewerDto).includes('"diagnostics"'), false);
   });
 });
