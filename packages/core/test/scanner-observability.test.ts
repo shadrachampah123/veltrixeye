@@ -25,6 +25,7 @@ import {
   SCANNER_RUN_PAIR_ITEMS_MAX,
   readScannerRunPairAggregate,
   readScannerRunPairs,
+  scannerPairDiagnosticsSchema,
   scannerRunPairsSchema,
   type Candle,
   type MarketDataProvider,
@@ -1079,6 +1080,113 @@ describe('PR A — evaluation diagnostics', () => {
     assert.equal(normalisePairDiagnostics(undefined), undefined);
   });
 
+  test('A11b: malformed diagnostics fail closed — nothing is coerced into evidence', () => {
+    /** The public entry point, called the way a hand-built observation would. */
+    const normalise = (value: unknown) => normalisePairDiagnostics(value as never);
+
+    // An unknown stage is not "close enough": we cannot say where the pair
+    // stopped, so no diagnostics are stored at all.
+    assert.equal(normalise({ stage: 'somewhere_else' }), undefined);
+    assert.equal(normalise({ stage: 42 }), undefined);
+    assert.equal(normalise({}), undefined, 'a stage is mandatory');
+
+    // Codes must be bounded machine tokens. Over-long and prose values are
+    // DROPPED — never truncated into something that reads as a valid code.
+    assert.deepEqual(
+      normalise({
+        stage: 'complete',
+        codes: ['x'.repeat(200), 'Setup limit reached', 'UPPER', 'cursor_hit', ' cursor_hit ', '', 'ok_code'],
+      })?.codes,
+      ['cursor_hit', 'ok_code'],
+      'only real tokens survive, de-duplicated and trimmed',
+    );
+    assert.deepEqual(
+      normalise({ stage: 'complete', codes: Array.from({ length: 9 }, (_, i) => `code_${i}`) })?.codes,
+      ['code_0', 'code_1', 'code_2', 'code_3', 'code_4', 'code_5'],
+      'the list is still capped',
+    );
+
+    // `data` is all-or-nothing: each role must be three verified numbers.
+    const malformedRoles: unknown[] = [
+      { candles: -1, newestMs: null },
+      { candles: 1.5, newestMs: null },
+      { candles: 2_000_000, newestMs: null },
+      { candles: '120', newestMs: null },
+      { candles: 120, newestMs: 0 },
+      { candles: 120, newestMs: -5 },
+      { candles: 120, newestMs: 1.5 },
+      { candles: 120, newestMs: '1700000000000' },
+      { candles: 120 },
+      null,
+    ];
+    for (const bad of malformedRoles) {
+      const out = normalise({
+        stage: 'validation',
+        data: { htf: bad, setup: { candles: 120, newestMs: 1_700_000_000_000 }, entry: { candles: 120, newestMs: 1_700_000_000_000 } },
+      });
+      assert.equal(out?.data, undefined, `a malformed role drops data (${JSON.stringify(bad)})`);
+      assert.equal(out?.stage, 'validation', 'the verified stage survives');
+      assert.equal(scannerPairDiagnosticsSchema.safeParse(out).success, true);
+    }
+
+    // A direction with an unknown state is dropped; a malformed condition block
+    // is dropped while the verified state survives.
+    const directions = normalise({
+      stage: 'complete',
+      directions: {
+        long: { state: 'probably_fine' },
+        short: { state: 'not_qualified', conditions: { satisfied: -1, unsatisfied: 1, insufficient_data: 0, unsupported: 0 } },
+      },
+    });
+    assert.equal(directions?.directions?.long, undefined, 'an unknown state is not stored');
+    assert.deepEqual(directions?.directions?.short, { state: 'not_qualified' }, 'the state survives, the bad counts do not');
+
+    assert.equal(
+      normalise({ stage: 'complete', directions: { long: { state: 'nope' }, short: { state: 'nope' } } })?.directions,
+      undefined,
+      'no valid direction means no directions key at all',
+    );
+
+    // `failing` obeys the same token rule.
+    assert.deepEqual(
+      normalise({
+        stage: 'detection',
+        directions: { long: { state: 'not_qualified', failing: ['z'.repeat(90), 'not a code', 'fvg:unsatisfied'] } },
+      })?.directions?.long?.failing,
+      ['fvg:unsatisfied'],
+    );
+
+    // Unknown keys are never copied through.
+    assert.deepEqual(normalise({ stage: 'complete', symbol: 'XAUUSD', strategyId: 'leak' }), { stage: 'complete' });
+  });
+
+  test('A11c: a hand-built observation can never persist an out-of-contract block', () => {
+    const observation = {
+      strategyId: '00000000-0000-4000-8000-000000000001',
+      assetClass: 'commodity',
+      symbol: 'XAUUSD',
+      timeframe: '1h',
+      outcome: 'evaluated',
+      cursorMs: 1_700_000_000_000,
+      anchorMs: 1_700_003_600_000,
+      reason: null,
+      conditions: { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+      diagnostics: {
+        stage: 'not_a_stage',
+        codes: ['Setup limit reached'],
+        data: { htf: { candles: -1, newestMs: null }, setup: { candles: -1, newestMs: null }, entry: { candles: -1, newestMs: null } },
+        directions: { long: { state: 'bogus' } },
+      },
+    };
+
+    const block = buildScannerRunPairs([observation as never]);
+    assert.equal(scannerRunPairsSchema.safeParse(block).success, true, 'the persisted block is always contract-valid');
+    assert.equal(block.items[0]?.diagnostics, undefined, 'nothing survived normalisation, so nothing is claimed');
+    // The rest of the observation is untouched by diagnostics normalisation.
+    assert.equal(block.items[0]?.outcome, 'evaluated');
+    assert.deepEqual(block.totals, { pairs: 1, evaluated: 1, cursor_skipped: 0, stale: 0, failed: 0 });
+  });
+
   test('A12: diagnostics never reach a viewer who does not own the run', () => {
     const owner = '55555555-5555-4555-8555-555555555555';
     const metadata = {
@@ -1172,5 +1280,50 @@ describe('PR A — evaluation diagnostics', () => {
     // And the owner-level run DTO is the same object the API returns.
     const viewerDto = redactScannerRunForViewer(result.run, '77777777-7777-4777-8777-777777777777');
     assert.equal(JSON.stringify(viewerDto).includes('"diagnostics"'), false);
+  });
+
+  test('A15: one direction blocked by the limit and the other with no item is a failed pair', async () => {
+    const { now, userId, strategyId } = await seededPair('commodity', 'XAUUSD');
+    const harness = makeHarness({
+      detectOverride: ({ direction }) => {
+        // Long is refused by the saved-setup limit, short simply returns
+        // nothing. Neither direction was evaluated, so the pair must not claim
+        // to have been — while still naming what stopped each direction.
+        if (direction === 'long') throw limitError();
+        return { detections: [] };
+      },
+    });
+
+    const first = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const pairs = pairsOf(first.run);
+    assert.ok(pairs);
+    assert.deepEqual(
+      pairs.totals,
+      { pairs: 1, evaluated: 0, cursor_skipped: 0, stale: 0, failed: 1 },
+      'a pair with no evaluated direction is failed, not evaluated',
+    );
+
+    const item = pairs.items[0];
+    assert.equal(item?.outcome, 'failed');
+    assert.equal(item?.reason, 'setup_limit_reached', 'the limit is the cause worth surfacing');
+    assert.equal(item?.diagnostics?.stage, 'persistence');
+    assert.deepEqual(item?.diagnostics?.codes, ['setup_limit_reached', 'setup_not_persisted']);
+    assert.equal(item?.diagnostics?.directions?.long?.state, 'blocked', 'refused by the limit');
+    assert.equal(item?.diagnostics?.directions?.short?.state, 'not_run', 'the detector had nothing to report');
+    assert.equal(item?.conditions, undefined, 'no direction produced condition counts');
+    assert.equal(item?.failureReasons, undefined);
+    assert.equal(first.run.setupsDetected, 0);
+    assert.equal(first.run.status, 'completed', 'a refused pair does not fail the run');
+
+    // Cursor advancement and idempotency are unchanged by PR A.
+    const callsAfterFirst = harness.detectCalls.length;
+    assert.equal(callsAfterFirst, 2, 'both directions were consulted once');
+
+    const second = await harness.scanner.triggerScan({ strategyId, force: false, initiatedBy: userId, nowMs: now });
+    const secondItem = pairsOf(second.run)?.items[0];
+    assert.equal(secondItem?.outcome, 'cursor_skipped', 'the cursor still advanced on the limit path');
+    assert.equal(secondItem?.reason, 'cursor_hit');
+    assert.equal(secondItem?.diagnostics?.stage, 'cursor');
+    assert.equal(harness.detectCalls.length, callsAfterFirst, 'the second scan never reached the detector');
   });
 });

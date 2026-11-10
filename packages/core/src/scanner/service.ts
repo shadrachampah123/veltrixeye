@@ -26,9 +26,11 @@ import {
   SCANNER_RUN_PAIR_REASONS_MAX,
   SCANNER_RUN_PAIR_REASON_MAX_CHARS,
   SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS,
+  SCANNER_PAIR_DIRECTION_STATES,
   SCANNER_RUN_PAIR_CODE_MAX_CHARS,
   SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX,
   SCANNER_RUN_PAIR_FAILING_MAX,
+  scannerPairDiagnosticsSchema,
   type ScannerPairData,
   type ScannerPairDiagnostics,
   type ScannerPairDirectionDiagnostic,
@@ -510,14 +512,38 @@ function comparePairObservations(a: PairObservation, b: PairObservation): number
 }
 
 /**
- * PR A — bound and canonicalise one pair's diagnostics.
+ * A diagnostic code is a machine token: lowercase words joined by `_`, `:` or
+ * `-` (e.g. `setup_limit_reached`, `liquidity_sweep:unsatisfied`). Anything
+ * else — spaces, uppercase prose, `…` from a truncated message — is not
+ * evidence, and is refused instead of being stored.
+ */
+const DIAGNOSTIC_CODE_PATTERN = /^[a-z][a-z0-9_:-]*$/;
+
+/** Upper bound for any diagnostic counter, so one value cannot distort a block. */
+const DIAGNOSTIC_COUNT_MAX = 1_000_000;
+
+/**
+ * PR A — bound, validate and canonicalise one pair's diagnostics.
  *
- * Pure, total and deterministic. Applied twice on purpose: once where the
- * observation is built (`scanPairCore`) and once where it is persisted
- * (`buildScannerRunPairs`), so a caller-built observation can never write a
- * block the contract would reject. Bounds match `scannerPairDiagnosticsSchema`:
- * codes are trimmed, de-duplicated, order-preserving and capped; empty arrays
- * are dropped rather than stored as noise.
+ * **Fail-closed by construction.** Every nested value is rebuilt from scratch
+ * with an explicit check, and the result is then re-parsed against
+ * `scannerPairDiagnosticsSchema`; if that parse fails, the whole diagnostics
+ * object is dropped. A caller — including a future one that builds an
+ * observation by hand — therefore cannot persist a block a reader would
+ * misinterpret as evidence:
+ *
+ *  - an unknown `stage` drops everything (we cannot say where the pair stopped);
+ *  - `codes` / `failing` are trimmed, de-duplicated and capped, and each entry
+ *    must be a token of at most `SCANNER_RUN_PAIR_CODE_MAX_CHARS`. **Nothing is
+ *    truncated into an apparently valid code** — an over-long or non-token
+ *    string is dropped;
+ *  - `data` is all-or-nothing: the three roles are required by the contract, so
+ *    one malformed role drops the whole object rather than half of it;
+ *  - a direction with an unknown `state` is dropped, and a malformed
+ *    `conditions` block is dropped while the verified `state` survives.
+ *
+ * Valid input is preserved exactly and the function is idempotent, so the
+ * persisted form is deterministic.
  */
 export function normalisePairDiagnostics(
   diagnostics: ScannerPairDiagnostics | undefined,
@@ -525,14 +551,21 @@ export function normalisePairDiagnostics(
   if (!diagnostics) return undefined;
 
   const codes = uniqueBoundedCodes(diagnostics.codes, SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX);
+  const data = normalisePairData(diagnostics.data);
   const directions = normaliseDirections(diagnostics.directions);
 
-  return {
+  const candidate: ScannerPairDiagnostics = {
     stage: diagnostics.stage,
     ...(codes.length > 0 ? { codes } : {}),
-    ...(diagnostics.data ? { data: diagnostics.data } : {}),
+    ...(data ? { data } : {}),
     ...(directions ? { directions } : {}),
   };
+
+  // Final gate: if the rebuilt object is still not a valid contract block (an
+  // unknown stage, for example), nothing is persisted rather than something
+  // that merely looks like diagnostics.
+  const parsed = scannerPairDiagnosticsSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : undefined;
 }
 
 function normaliseDirections(
@@ -543,24 +576,70 @@ function normaliseDirections(
   for (const direction of ['long', 'short'] as const) {
     const entry = directions[direction];
     if (!entry) continue;
+    if (!SCANNER_PAIR_DIRECTION_STATES.includes(entry.state)) continue;
+    const conditions = normaliseConditions(entry.conditions);
     const failing = uniqueBoundedCodes(entry.failing, SCANNER_RUN_PAIR_FAILING_MAX);
     out[direction] = {
       state: entry.state,
-      ...(entry.conditions ? { conditions: { ...entry.conditions } } : {}),
+      ...(conditions ? { conditions } : {}),
       ...(failing.length > 0 ? { failing } : {}),
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** Trim, drop empties, truncate, de-duplicate and cap — order preserved. */
+/** Three verified per-role counts, or nothing: a partial `data` is not stored. */
+function normalisePairData(data: ScannerPairDiagnostics['data']): ScannerPairData | undefined {
+  if (!data) return undefined;
+  const htf = normaliseRoleData(data.htf);
+  const setup = normaliseRoleData(data.setup);
+  const entry = normaliseRoleData(data.entry);
+  if (!htf || !setup || !entry) return undefined;
+  return { htf, setup, entry };
+}
+
+function normaliseRoleData(role: ScannerPairRoleData | undefined): ScannerPairRoleData | undefined {
+  if (!role) return undefined;
+  const candles: unknown = role.candles;
+  if (!isDiagnosticCount(candles)) return undefined;
+  // A timestamp is validated as a positive safe integer, not as a bounded
+  // counter: epoch milliseconds are legitimately far above `DIAGNOSTIC_COUNT_MAX`.
+  const newestMs: unknown = role.newestMs;
+  if (newestMs === null) return { candles, newestMs: null };
+  if (typeof newestMs !== 'number' || !Number.isSafeInteger(newestMs) || newestMs <= 0) return undefined;
+  return { candles, newestMs };
+}
+
+function normaliseConditions(conditions: ConditionSummary | undefined): ConditionSummary | undefined {
+  if (!conditions) return undefined;
+  const keys = ['satisfied', 'unsatisfied', 'insufficient_data', 'unsupported'] as const;
+  const out = {} as ConditionSummary;
+  for (const key of keys) {
+    const value: unknown = conditions[key];
+    if (!isDiagnosticCount(value)) return undefined;
+    out[key] = value;
+  }
+  return out;
+}
+
+function isDiagnosticCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= DIAGNOSTIC_COUNT_MAX;
+}
+
+/**
+ * Trim, validate, de-duplicate and cap — order preserved.
+ *
+ * Rejects rather than repairs: a string that is not a bounded machine token is
+ * dropped, never shortened into something the contract would accept.
+ */
 function uniqueBoundedCodes(codes: readonly string[] | undefined, max: number): string[] {
   const out: string[] = [];
   for (const raw of codes ?? []) {
     if (typeof raw !== 'string' || out.length >= max) continue;
-    const code = raw.trim().slice(0, SCANNER_RUN_PAIR_CODE_MAX_CHARS);
-    if (code.length === 0 || out.includes(code)) continue;
-    out.push(code);
+    const code = raw.trim();
+    if (code.length === 0 || code.length > SCANNER_RUN_PAIR_CODE_MAX_CHARS) continue;
+    if (!DIAGNOSTIC_CODE_PATTERN.test(code)) continue;
+    if (!out.includes(code)) out.push(code);
   }
   return out;
 }
@@ -575,20 +654,20 @@ function roleDataOf(candles: readonly { time: number }[]): ScannerPairRoleData {
 /**
  * Turn M4's bounded condition diagnostics into `<type>:<status>` codes.
  *
- * The status suffix is kept inside the 64-character budget so a long-but-legal
- * condition type is truncated rather than producing a code the contract would
- * reject. Closed vocabulary: the type comes from the condition registry and the
- * status from the engine, so no user or provider text can reach run metadata.
+ * Closed vocabulary: the type comes from the condition registry and the status
+ * from the engine, so no user or provider text can reach run metadata. A pair
+ * that would exceed the 64-character budget is skipped rather than shortened,
+ * so a stored code always names the condition that actually failed.
  */
 function failingConditionCodes(outcomes: readonly { conditionType: string; status: string }[] | undefined): string[] {
   const codes: string[] = [];
   for (const outcome of outcomes ?? []) {
     if (codes.length >= SCANNER_RUN_PAIR_FAILING_MAX) break;
-    const status = String(outcome.status);
-    const room = Math.max(0, SCANNER_RUN_PAIR_CODE_MAX_CHARS - status.length - 1);
-    const conditionType = String(outcome.conditionType).slice(0, room);
-    if (conditionType.length === 0) continue;
-    const code = `${conditionType}:${status}`;
+    const conditionType = String(outcome.conditionType).trim();
+    const code = `${conditionType}:${String(outcome.status)}`;
+    // Never shorten a long type to fit: it is dropped instead, so a stored code
+    // always names a real condition from the registry.
+    if (conditionType.length === 0 || code.length > SCANNER_RUN_PAIR_CODE_MAX_CHARS) continue;
     if (!codes.includes(code)) codes.push(code);
   }
   return codes;
@@ -1676,10 +1755,15 @@ export class ScannerService {
       directions: { long?: ScannerPairDirectionDiagnostic; short?: ScannerPairDirectionDiagnostic };
     } = { stage: 'candles', codes: [], directions: {} };
 
-    /** Record one bounded cause code (sanitized, de-duplicated, capped). */
+    /**
+     * Record one cause code. The value is sanitized (redaction, single line)
+     * but deliberately NOT shortened: a code that is too long or not a machine
+     * token is dropped by `normalisePairDiagnostics`, never truncated into
+     * something that reads as valid evidence.
+     */
     const addCode = (raw: string | null | undefined): void => {
-      if (tracker.codes.length >= SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX) return;
-      const code = sanitizeScannerError(raw ?? '', this.redact, SCANNER_RUN_PAIR_CODE_MAX_CHARS, true).trim();
+      if (!raw || tracker.codes.length >= SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX) return;
+      const code = sanitizeScannerError(raw, this.redact, SCANNER_RUN_PAIR_CODE_MAX_CHARS * 4, true).trim();
       if (code.length === 0 || tracker.codes.includes(code)) return;
       tracker.codes.push(code);
     };
