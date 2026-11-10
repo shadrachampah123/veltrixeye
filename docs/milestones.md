@@ -1022,7 +1022,9 @@ canonical billing contracts and the Paystack provider seam — see
   USD→GHS pricing, the FX authority, provider-plan epochs and the sandbox
   Paystack adapter (migration `0032`); PR-C added checkout initialization;
   Step 4 added the plan-provisioning workflow (the operator run itself is still
-  pending); Step 5.1/5.2 added the verified webhook event contract and the
+  pending; the Step 4 audit remediation added a verified sandbox database
+  identity guard and a recorded, enforced FX source approval before any run,
+  see [billing.md](./billing.md#sandbox-plan-provisioning-step-4)); Step 5.1/5.2 added the verified webhook event contract and the
   secure, receipt-only webhook receiver; Billing Step 6 added customer
   provisioning; Billing Step 7 added transaction verification and durable
   payment evidence (migration `0033`); Later-billing-PR #7 added verified

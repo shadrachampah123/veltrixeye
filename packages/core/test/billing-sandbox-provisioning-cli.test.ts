@@ -53,6 +53,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Pool } from 'pg';
+import type { SandboxDatabaseIdentityExpectation } from '../src/index.js';
 import {
   BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION,
   BillingFxRateVersionStore,
@@ -62,7 +63,7 @@ import {
   computePaymentAmountMinor,
   providerIntervalForBillingInterval,
 } from '../src/index.js';
-import { retireActiveEpochs, startBillingTestDb } from './helpers/billing-checkout.js';
+import { retireActiveEpochs, startBillingTestDb, fxSourceApprovalFor, markSandboxDatabase } from './helpers/billing-checkout.js';
 
 // Unique per suite file (see the port ledger across packages/core/test/*.test.ts).
 const DB_PORT = 5549;
@@ -82,10 +83,13 @@ const FX_ANCHOR = Date.now();
 let fxTick = 0;
 
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
+/** The marked sandbox database's explicit identity expectation (set in before()). */
+let SANDBOX_IDENT: SandboxDatabaseIdentityExpectation;
 let pool: Pool;
 
 before(async () => {
   db = await startBillingTestDb(DB_PORT);
+  SANDBOX_IDENT = await markSandboxDatabase(db.pool);
   pool = db.pool;
 }, { timeout: 180_000 });
 
@@ -121,6 +125,7 @@ async function publishFxNow(options: { rateScaled?: bigint; capturedSecondsBefor
     capturedAt,
     source: 'ops',
     sourceReference: 'ops-sandbox-fx-board-1',
+    sourceApprovalId: await fxSourceApprovalFor(pool, 'ops-sandbox-fx-board-1'),
     createdBy: OPERATOR,
   });
 }
@@ -200,7 +205,7 @@ function cli(env: Record<string, string | null>, args: readonly string[]) {
 function baseArgs(fxId: string, evidence: readonly unknown[]): string[] {
   return [
     '--fx-rate-version', fxId,
-    '--by', OPERATOR,
+    '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
     '--reason', REASON,
     '--evidence', JSON.stringify(evidence),
   ];
@@ -332,7 +337,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
   const present = (omit: string): string[] => {
     const args = [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
       '--reason', REASON,
       '--evidence', '[]',
     ];
@@ -361,7 +366,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
   test('blank required values are refused', () => {
     const result = cli({}, [
       '--fx-rate-version', randomUUID(),
-      '--by', '   ',
+      '--by', '   ', '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
       '--reason', REASON,
       '--evidence', '[]',
     ]);
@@ -370,7 +375,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
 
     const blankEvidence = cli({}, [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
       '--reason', REASON,
       '--evidence', ' ',
     ]);
@@ -381,7 +386,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
   test('malformed --evidence JSON, repeated flags and conflicting flags are usage errors', () => {
     const malformed = cli(preConnectionEnv('test'), [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
       '--reason', REASON,
       '--evidence', '{not json',
     ]);
@@ -390,8 +395,8 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
 
     const repeated = cli({}, [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
-      '--by', 'someone-else',
+      '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
+      '--by', 'someone-else', '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
       '--reason', REASON,
       '--evidence', '[]',
     ]);
@@ -400,7 +405,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
 
     const conflicting = cli({}, [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
       '--reason', REASON,
       '--evidence', '[]',
       '--apply',
@@ -415,7 +420,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
     // the service's strict input schema refuses it (exit 1, nothing written).
     const result = cli(preConnectionEnv('test'), [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
       '--reason', REASON,
       '--evidence', '42',
     ]);
@@ -425,7 +430,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
 
     const badUuid = cli(preConnectionEnv('test'), [
       '--fx-rate-version', 'not-a-uuid',
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
       '--reason', REASON,
       '--evidence', JSON.stringify([]),
     ]);
@@ -582,7 +587,7 @@ describe('sandbox provisioning CLI — dry run is the default and writes nothing
 
     const result = cli(sandboxEnv(), [
       '--fx-rate-version', fx.id,
-      '--by', 'ops-bearer-identifier-1',
+      '--by', 'ops-bearer-identifier-1', '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
       '--reason', REASON,
       '--evidence', JSON.stringify(evidence),
     ]);
@@ -882,7 +887,7 @@ describe('sandbox provisioning — validateSandboxPlanEpochs cannot write', () =
     const auditsBefore = await auditCount();
 
     const service = new BillingPlanProvisioningService({ db: pool, mode: 'test' });
-    const batch = await service.validateSandboxPlanEpochs({
+    const batch = await service.validateSandboxPlanEpochs({ databaseIdentity: SANDBOX_IDENT,
       fxRateVersionId: fx.id,
       evidence,
       audit: { operatorId: OPERATOR, reason: REASON },
@@ -913,7 +918,7 @@ describe('sandbox provisioning — validateSandboxPlanEpochs cannot write', () =
     const service = new BillingPlanProvisioningService({ db: pool, mode: 'test' });
 
     await assert.rejects(
-      () => service.validateSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence }),
+      () => service.validateSandboxPlanEpochs({ databaseIdentity: SANDBOX_IDENT, fxRateVersionId: fx.id, evidence }),
       (error: unknown) =>
         typeof error === 'object' && error !== null && 'reason' in error &&
         (error as { reason: unknown }).reason === 'currency_mismatch',
@@ -938,7 +943,7 @@ describe('sandbox provisioning CLI — the database boundary', () => {
   // valid so the target gate is the FIRST thing that can refuse.
   const requiredArgs = (evidence: readonly unknown[] = []): string[] => [
     '--fx-rate-version', randomUUID(),
-    '--by', OPERATOR,
+    '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier,
     '--reason', REASON,
     '--evidence', JSON.stringify(evidence),
   ];
@@ -976,18 +981,18 @@ describe('sandbox provisioning CLI — the database boundary', () => {
     assert.equal(await auditCount(), auditsBefore, 'no audit event was written');
   });
 
-  test('the gate is --apply-only: dry runs skip it and keep their read-only behaviour', async () => {
+  test('the target gate covers dry runs too: an unverifiable target is refused before any connection', async () => {
     const historyBefore = await testEpochHistory();
     const auditsBefore = await auditCount();
-    // Same unverifiable target, WITHOUT --apply: the gate must not fire.
-    // The run reaches the normal read-only failure path (exit 1) — the
-    // configured target is merely an unreachable/garbage connection string
-    // to the pool, and a dry run cannot write in any case.
+    // Same unverifiable target, WITHOUT --apply. Identity can only be checked
+    // by connecting, so a dry run is held to the same loopback gate: it is
+    // refused before any pool exists (exit 2), never connected to.
     const result = cli(
       { DATABASE_URL: 'not-a-connection-string', PAYSTACK_MODE: 'test' },
       requiredArgs(),
     );
-    assert.equal(result.status, 1, `dry-run failure taxonomy unchanged: ${result.stderr}`);
+    assert.equal(result.status, 2, `the dry run is gated: ${result.stderr}`);
+    assert.match(result.stderr, /the dry run refuses this database target/);
     assert.doesNotMatch(result.stderr, /--apply refuses this database target/);
     assert.equal(await testEpochHistory(), historyBefore, 'a dry run writes no epoch');
     assert.equal(await auditCount(), auditsBefore, 'a dry run writes no audit event');
@@ -1002,7 +1007,7 @@ describe('sandbox provisioning CLI — the database boundary', () => {
     const auditsBefore = await auditCount();
     const result = cli(
       { DATABASE_URL: 'postgres://127.0.0.1:5549/veltrixeye', PAYSTACK_MODE: 'test' },
-      ['--fx-rate-version', 'not-a-uuid', '--by', OPERATOR, '--reason', REASON, '--evidence', '[]', '--apply'],
+      ['--fx-rate-version', 'not-a-uuid', '--by', OPERATOR, '--expect-database', SANDBOX_IDENT.databaseName, '--expect-system-identifier', SANDBOX_IDENT.systemIdentifier, '--reason', REASON, '--evidence', '[]', '--apply'],
     );
     assert.equal(result.status, 1, `past the gate, into the service: ${result.stderr}`);
     assert.match(result.stderr, /refused \(invalid_evidence\)/);

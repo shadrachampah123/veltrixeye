@@ -53,6 +53,9 @@ import { isBillingFxError } from '../src/billing/fx-rate-versions.js';
 // ---------------------------------------------------------------------------
 
 const FX_ID = randomUUID();
+/** The explicit sandbox database expectation every run names (these runs never connect). */
+const EXPECT_DB = 'veltrixeye_sandbox_focused';
+const EXPECT_SID = '7000000000000000002';
 const OPERATOR = 'ops-sandbox-focused-01';
 const REASON = 'focused dry-run validation — paper only';
 const REFERENCE = 'paystack-dashboard-sandbox-plans-2026-10-16';
@@ -130,7 +133,7 @@ function cli(env: Record<string, string | null>, args: readonly string[]) {
 function baseArgs(fxId: string, evidence: readonly unknown[]): string[] {
   return [
     '--fx-rate-version', fxId,
-    '--by', OPERATOR,
+    '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID,
     '--reason', REASON,
     '--evidence', JSON.stringify(evidence),
   ];
@@ -144,10 +147,10 @@ describe('focused dry-run — invalid inputs are refused before any write', () =
   test('missing required flags are usage errors (exit 2)', () => {
     const cases: Array<[string, string[]]> = [
       ['no args', []],
-      ['missing --fx-rate-version', ['--by', OPERATOR, '--reason', REASON, '--evidence', '[]']],
-      ['missing --by', ['--fx-rate-version', FX_ID, '--reason', REASON, '--evidence', '[]']],
-      ['missing --reason', ['--fx-rate-version', FX_ID, '--by', OPERATOR, '--evidence', '[]']],
-      ['missing --evidence', ['--fx-rate-version', FX_ID, '--by', OPERATOR, '--reason', REASON]],
+      ['missing --fx-rate-version', ['--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID, '--reason', REASON, '--evidence', '[]']],
+      ['missing --by', ['--fx-rate-version', FX_ID, '--reason', REASON, '--evidence', '[]', '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID]],
+      ['missing --reason', ['--fx-rate-version', FX_ID, '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID, '--evidence', '[]']],
+      ['missing --evidence', ['--fx-rate-version', FX_ID, '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID, '--reason', REASON]],
     ];
     for (const [label, args] of cases) {
       const r = cli({}, args);
@@ -159,7 +162,7 @@ describe('focused dry-run — invalid inputs are refused before any write', () =
   test('blank required values are refused (exit 2)', () => {
     const r = cli({}, [
       '--fx-rate-version', FX_ID,
-      '--by', '   ',
+      '--by', '   ', '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID,
       '--reason', REASON,
       '--evidence', '[]',
     ]);
@@ -170,7 +173,7 @@ describe('focused dry-run — invalid inputs are refused before any write', () =
   test('malformed --evidence JSON is refused (exit 2, nothing validated)', () => {
     const r = cli({ PAYSTACK_MODE: 'test', DATABASE_URL: 'postgres://127.0.0.1:1/test' }, [
       '--fx-rate-version', FX_ID,
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID,
       '--reason', REASON,
       '--evidence', '{not json',
     ]);
@@ -182,7 +185,7 @@ describe('focused dry-run — invalid inputs are refused before any write', () =
   test('repeated flags and mutually exclusive flags are refused (exit 2)', () => {
     const repeated = cli({}, [
       '--fx-rate-version', FX_ID,
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID,
       '--by', 'other',
       '--reason', REASON,
       '--evidence', '[]',
@@ -192,7 +195,7 @@ describe('focused dry-run — invalid inputs are refused before any write', () =
 
     const both = cli({}, [
       '--fx-rate-version', FX_ID,
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID,
       '--reason', REASON,
       '--evidence', '[]',
       '--apply', '--dry-run',
@@ -219,7 +222,7 @@ describe('focused dry-run — invalid inputs are refused before any write', () =
     // Valid JSON but not an evidence array shape — caught by strict schema
     const r = cli({ PAYSTACK_MODE: 'test', DATABASE_URL: 'postgres://127.0.0.1:1/test' }, [
       '--fx-rate-version', 'not-a-uuid',
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID,
       '--reason', REASON,
       '--evidence', '42',
     ]);
@@ -404,7 +407,7 @@ describe('focused dry-run — absence of side effects', () => {
 
   test('CLI behaviour: default is dry-run and --dry-run is explicit; both do not require --apply', () => {
     // The parser treats --apply and --dry-run as mutually exclusive, default is dry-run
-    const both = cli({}, ['--fx-rate-version', FX_ID, '--by', OPERATOR, '--reason', REASON, '--evidence', '[]', '--apply', '--dry-run']);
+    const both = cli({}, ['--fx-rate-version', FX_ID, '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID, '--reason', REASON, '--evidence', '[]', '--apply', '--dry-run']);
     assert.equal(both.status, 2);
     assert.match(both.stderr, /mutually exclusive/);
   });
@@ -424,12 +427,14 @@ describe('focused dry-run — absence of side effects', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const cliSrc = readFileSync(path.resolve(here, '..', '..', '..', 'scripts', 'billing', 'provision-sandbox.ts'), 'utf8');
     assert.match(cliSrc, /localDatabaseTargetRejection/, 'gate exists');
-    assert.match(cliSrc, /if \(args\.apply\)/, 'gate is --apply only');
+    // The gate is UNCONDITIONAL (dry runs too): identity can only be checked by
+    // connecting, so the tool connects only to a verified loopback target.
+    assert.doesNotMatch(cliSrc, /if \(args\.apply\) \{\s*const rejection/, 'gate is not --apply only');
     assert.ok(cliSrc.indexOf('localDatabaseTargetRejection(databaseUrl)') < cliSrc.indexOf('createPool({ databaseUrl })'), 'gate precedes pool');
     // Behavioural: --apply with prod host is refused with no echo, even before parsing evidence
     const r = cli({ PAYSTACK_MODE: 'test', DATABASE_URL: 'postgres://user:fake-credential@dpg-sandbox.render.com/veltrixeye' }, [
       '--fx-rate-version', FX_ID,
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID,
       '--reason', REASON,
       '--evidence', '[]',
       '--apply',
@@ -441,11 +446,13 @@ describe('focused dry-run — absence of side effects', () => {
     // Dry run with same target does NOT hit the gate (would fail later as typed refusal, not gate)
     const dry = cli({ PAYSTACK_MODE: 'test', DATABASE_URL: 'not-a-connection-string' }, [
       '--fx-rate-version', FX_ID,
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--expect-database', EXPECT_DB, '--expect-system-identifier', EXPECT_SID,
       '--reason', REASON,
       '--evidence', '[]',
     ]);
-    assert.equal(dry.status, 1);
+    // A dry run is refused by the SAME target gate, before any connection.
+    assert.equal(dry.status, 2);
+    assert.match(dry.stderr, /the dry run refuses this database target/);
     assert.doesNotMatch(dry.stderr, /--apply refuses this database target/);
   });
 

@@ -667,7 +667,12 @@ Step 4 (`packages/core/src/billing/provisioning.ts`) validates the whole
 four-plan batch and registers it atomically outside the adapter — see the
 *Sandbox plan provisioning (Step 4)* runbook in
 [billing.md](./billing.md). What remains is the separately-authorized operator
-run (dashboard plan creation + FX publication + one registration call).
+run (dashboard plan creation + recorded FX source approval + FX publication + one
+registration call). Since the Step 4 audit remediation, that run also requires a
+sandbox database identity marker and explicit `--expect-database` /
+`--expect-system-identifier` values, both verified on the connected database; see
+the *Sandbox database identity guard* and *FX source approval* sections of
+[billing.md](./billing.md).
 
 | Plan | Interval | Currency | Mode |
 | --- | --- | --- | --- |

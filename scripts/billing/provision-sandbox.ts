@@ -48,6 +48,15 @@
  * `billing:provision:live`, it deliberately has no HTTP route and no operator
  * token; the database connection is the whole trust boundary.
  *
+ * DATABASE IDENTITY (the second boundary). The run must name the database it is
+ * authorized for with `--expect-database <name>` and `--expect-system-identifier
+ * <digits>`. The service then verifies, on the connection it actually opened and
+ * inside the write transaction before any INSERT, that the database (1) carries
+ * the sandbox marker `veltrixeye:billing-sandbox:v1`, (2) has exactly that name,
+ * and (3) has exactly that cluster system identifier. A localhost port-forward
+ * to production fails all three checks. The marker is set by a database owner
+ * out of band; this tool never sets it.
+ *
  * WHAT IT NEVER DOES
  *  - never calls Paystack or any provider: no transport, no credential and no
  *    provider import — the four sandbox plans already exist in the dashboard
@@ -91,7 +100,7 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const USAGE = [
   'Usage:',
   '  npm run billing:provision:sandbox -- --fx-rate-version <uuid> --by <operator-id> --reason <text> \\',
-  '    --evidence <json> [--apply]',
+  '    --evidence <json> --expect-database <name> --expect-system-identifier <digits> [--apply]',
   '',
   'Provisions the four sandbox provider-plan epochs (Pro/Elite × monthly/annual) from ONE',
   'already-published FX rate version and the four assembled Step 4 evidence entries, passed',
@@ -104,10 +113,14 @@ const USAGE = [
   'in a single transaction (rolled back together on any refusal or conflict).',
   '',
   'Requires PAYSTACK_MODE exactly "test" (live mode is refused before any connection) and',
-  'DATABASE_URL. --apply additionally refuses any database target that is not a verified local',
-  'loopback host: a production or unverified database is refused before the first connection,',
-  'because the provider-domain pin says nothing about where DATABASE_URL points. Dry runs are',
-  'read-only and unaffected by that gate.',
+  'DATABASE_URL. DATABASE_URL must be a verified local loopback target for BOTH dry runs and',
+  '--apply: a production or unverified host is refused before the first connection, because the',
+  'provider-domain pin says nothing about where DATABASE_URL points.',
+  '',
+  'DATABASE IDENTITY: --expect-database and --expect-system-identifier are mandatory for every run.',
+  'The connected database must carry the sandbox marker (COMMENT ON DATABASE <name> IS',
+  "'veltrixeye:billing-sandbox:v1') and match both values exactly; anything else is refused and",
+  'nothing is written. Set the marker out of band with the owner of the sandbox database only.',
   '',
   'Never publishes or approves an FX rate, never calls a provider, never',
   'confirms a payment and never grants execution.',
@@ -149,6 +162,8 @@ interface Args {
   by?: string;
   reason?: string;
   evidence?: string;
+  expectDatabase?: string;
+  expectSystemIdentifier?: string;
   apply: boolean;
   /** Set when `--dry-run` was passed explicitly (the default is a dry run). */
   dryRunExplicit?: boolean;
@@ -205,6 +220,14 @@ function parseArgs(argv: string[]): Args {
       case '--evidence':
         assign(args.evidence, flag);
         args.evidence = value;
+        break;
+      case '--expect-database':
+        assign(args.expectDatabase, flag);
+        args.expectDatabase = value;
+        break;
+      case '--expect-system-identifier':
+        assign(args.expectSystemIdentifier, flag);
+        args.expectSystemIdentifier = value;
         break;
       default:
         // Unknown arguments are refused — including any attempt to smuggle in
@@ -357,6 +380,25 @@ async function main(): Promise<number> {
     );
     return 2;
   }
+  if (args.expectDatabase === undefined || args.expectSystemIdentifier === undefined) {
+    console.info(USAGE);
+    console.error(
+      '[billing:provision:sandbox] --expect-database and --expect-system-identifier are both required: ' +
+        'the run must name the sandbox database it is authorized to touch. Nothing was connected or written.',
+    );
+    return 2;
+  }
+  if (
+    !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$/.test(args.expectDatabase) ||
+    !/^[0-9]{1,20}$/.test(args.expectSystemIdentifier)
+  ) {
+    console.info(USAGE);
+    console.error(
+      '[billing:provision:sandbox] --expect-database must be a plain database name and ' +
+        '--expect-system-identifier must be the unsigned cluster identifier digits. Nothing was connected or written.',
+    );
+    return 2;
+  }
   if (
     args.fxRateVersion.trim() === '' ||
     args.by.trim() === '' ||
@@ -397,21 +439,20 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  // THE DATABASE-TARGET GATE (the `--apply` write path only): the provider
-  // domain above says nothing about WHERE this connection string points, so
-  // a sandbox-mode run against a production or unverified database must be
-  // impossible. `--apply` is refused here — before the evidence is even
-  // parsed and before any pool exists — unless DATABASE_URL is a verified
-  // local loopback target. Dry runs never write, so they are unaffected.
-  if (args.apply) {
+  // THE DATABASE-TARGET GATE (every run, dry or applied): the provider domain
+  // above says nothing about WHERE this connection string points, and an
+  // identity check can only be made by CONNECTING. So this tool opens a
+  // connection only to a verified local loopback target — a production or
+  // unverified host is refused here, before the evidence is parsed and before
+  // any pool exists. A dry run reads the authority, so it is gated too.
+  {
     const rejection = localDatabaseTargetRejection(databaseUrl);
     if (rejection !== null) {
       console.error(
-        `[billing:provision:sandbox] --apply refuses this database target: ${rejection}.\n` +
-          '        Sandbox epoch writes are only permitted against a verified LOCAL (loopback) database.\n' +
-          '        A production or unverified target is never written by this tool — PAYSTACK_MODE=test\n' +
-          '        proves the provider domain, never the database. Nothing was written.\n' +
-          '        Dry runs (the default) are read-only and unaffected by this gate.',
+        `[billing:provision:sandbox] ${args.apply ? '--apply' : 'the dry run'} refuses this database target: ${rejection}.\n` +
+          '        Sandbox provisioning only connects to a verified LOCAL (loopback) database.\n' +
+          '        A production or unverified target is never connected to by this tool — PAYSTACK_MODE=test\n' +
+          '        proves the provider domain, never the database. Nothing was written.',
       );
       return 2;
     }
@@ -438,6 +479,13 @@ async function main(): Promise<number> {
       fxRateVersionId: args.fxRateVersion,
       evidence,
       audit: { operatorId: args.by, reason: args.reason },
+      // The operator's explicit allowlist entry, verified by the service on the
+      // CONNECTED database (marker, name, cluster identifier) before any read
+      // of business rows and, on --apply, before any INSERT.
+      databaseIdentity: {
+        databaseName: args.expectDatabase,
+        systemIdentifier: args.expectSystemIdentifier,
+      },
     };
 
     if (!args.apply) {

@@ -542,9 +542,11 @@ export function validateFxRateCandidate(
         const code: FxValidationIssueCode =
           error.reason === 'missing'
             ? 'missing_evidence'
-            : error.reason === 'ambiguous'
+            : error.reason === 'ambiguous' || error.reason === 'source_not_approved'
               ? 'invalid'
-              : error.reason;
+              : error.reason === 'source_not_permitted'
+                ? 'unsupported_source'
+                : error.reason;
         issues.push({ field: 'capturedAt', code, message: error.message });
       } else {
         throw error;
