@@ -15,18 +15,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  CONDITION_FAILURE_STATUSES,
   DETECTION_CONDITION_OUTCOMES_MAX,
+  DETECTION_CONDITION_TYPES,
   SCANNER_PAIR_OUTCOMES,
-  conditionFailingCode,
-  conditionFailingCodeSchema,
-  parseConditionFailingCode,
   SCANNER_PAIR_STAGES,
   SCANNER_RUN_PAIR_CODE_MAX_CHARS,
   SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX,
   SCANNER_RUN_PAIR_FAILING_MAX,
   SCANNER_RUN_PAIR_ITEMS_MAX,
+  conditionFailingCode,
+  conditionFailingCodeSchema,
   conditionSummarySchema,
+  detectionConditionOutcomeSchema,
   detectionItemDtoSchema,
+  parseConditionFailingCode,
   readScannerRunPairAggregate,
   readScannerRunPairs,
   scannerPairDiagnosticsSchema,
@@ -390,7 +393,7 @@ test('a detection item carries bounded condition failures only when diagnostics 
   assert.equal(
     detectionItemDtoSchema.safeParse({ ...base, conditionOutcomes: [{ conditionType: 'fvg', status: 'skipped' }] }).success,
     false,
-    'only the four engine statuses are accepted',
+    'only the three failure statuses are accepted',
   );
 });
 
@@ -448,4 +451,82 @@ test('the diagnostics block refuses arbitrary tokens as condition evidence', () 
   // Pair-level codes stay extensible: provider failure kinds are not enums here.
   const providerCode = v2Block(v2Item({ diagnostics: { stage: 'candles', codes: ['some_future_provider_kind'] } }));
   assert.equal(scannerRunPairsSchema.safeParse(providerCode).success, true);
+});
+
+test('condition outcomes use the same closed vocabulary as failing codes', () => {
+  const outcome = (conditionType: unknown, status: unknown) =>
+    detectionConditionOutcomeSchema.safeParse({ conditionType, status });
+
+  // Every allowed failure status, for a registered condition type.
+  for (const status of CONDITION_FAILURE_STATUSES) {
+    assert.equal(outcome('liquidity_sweep', status).success, true, `${status} must be accepted`);
+  }
+  // Every registered condition type is valid evidence.
+  for (const conditionType of DETECTION_CONDITION_TYPES) {
+    assert.equal(outcome(conditionType, 'unsatisfied').success, true, `${conditionType} must be accepted`);
+  }
+
+  // Anything outside the two enums is refused.
+  assert.equal(outcome('foo', 'unsatisfied').success, false, 'an unknown condition type is rejected');
+  assert.equal(outcome('liquidity_sweep', 'satisfied').success, false, 'a failing entry cannot be satisfied');
+  assert.equal(outcome('LIQUIDITY_SWEEP', 'unsatisfied').success, false, 'the enum casing is exact');
+  assert.equal(outcome('fvg', 'bogus').success, false, 'an unknown status is rejected');
+  assert.equal(outcome('', 'unsatisfied').success, false);
+  assert.equal(outcome(42, 'unsatisfied').success, false);
+  assert.equal(
+    detectionConditionOutcomeSchema.safeParse({ conditionType: 'fvg', status: 'unsatisfied', extra: 1 }).success,
+    false,
+    'the object stays strict',
+  );
+
+  // The detection item agrees with the standalone schema…
+  const base = { direction: 'long', qualified: false, setup: null, created: false, failureReasons: [] };
+  assert.equal(
+    detectionItemDtoSchema.safeParse({ ...base, conditionOutcomes: [{ conditionType: 'liquidity_sweep', status: 'unsatisfied' }] })
+      .success,
+    true,
+  );
+  assert.equal(
+    detectionItemDtoSchema.safeParse({ ...base, conditionOutcomes: [{ conditionType: 'foo', status: 'unsatisfied' }] }).success,
+    false,
+  );
+  assert.equal(
+    detectionItemDtoSchema.safeParse({ ...base, conditionOutcomes: [{ conditionType: 'fvg', status: 'satisfied' }] }).success,
+    false,
+  );
+
+  // …and the optional/bounded behaviour of `conditionOutcomes` is unchanged.
+  assert.equal(detectionItemDtoSchema.safeParse(base).success, true, 'still optional');
+  const plain = detectionItemDtoSchema.safeParse(base);
+  assert.equal(plain.success && 'conditionOutcomes' in plain.data, false, 'still absent by default');
+  assert.equal(
+    detectionItemDtoSchema.safeParse({
+      ...base,
+      conditionOutcomes: Array(DETECTION_CONDITION_OUTCOMES_MAX + 1).fill({ conditionType: 'fvg', status: 'unsatisfied' }),
+    }).success,
+    false,
+    'still bounded',
+  );
+});
+
+test('scanner failing codes stay enum-bound while pair-level codes stay extensible', () => {
+  // Direction evidence: the enums, nothing else.
+  assert.equal(conditionFailingCodeSchema.safeParse('fvg:unsatisfied').success, true);
+  assert.equal(conditionFailingCodeSchema.safeParse('fvg:insufficient_data').success, true);
+  assert.equal(conditionFailingCodeSchema.safeParse('fvg:satisfied').success, false);
+  assert.equal(conditionFailingCodeSchema.safeParse('foo:unsatisfied').success, false);
+
+  // Pair-level codes are a bounded string at the contract level, not an enum, so
+  // a new provider failure kind needs no contract change. (The core normaliser
+  // still refuses non-token shapes when writing; see the scanner observability
+  // suite.)
+  const providerFailure = v2Block(v2Item({ diagnostics: { stage: 'candles', codes: ['some_future_provider_kind'] } }));
+  assert.equal(scannerRunPairsSchema.safeParse(providerFailure).success, true, 'provider codes stay extensible');
+  assert.equal(
+    scannerRunPairsSchema.safeParse(
+      v2Block(v2Item({ diagnostics: { stage: 'candles', codes: ['x'.repeat(SCANNER_RUN_PAIR_CODE_MAX_CHARS + 1)] } })),
+    ).success,
+    false,
+    'but they are still bounded',
+  );
 });

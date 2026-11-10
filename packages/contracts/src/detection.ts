@@ -1,7 +1,6 @@
 import { z } from 'zod';
 import { assetClassSchema, instrumentSymbolSchema } from './assets.js';
 import { CONDITION_TYPE_REGISTRY, type ConditionType } from './conditions.js';
-import { EVALUATION_OUTCOME_STATUSES } from './evaluation.js';
 
 /**
  * Setup detection contracts (M4).
@@ -198,33 +197,24 @@ export type ConditionSummary = z.infer<typeof conditionSummarySchema>;
  * Bounded by construction — the engine walks the version's rule groups in
  * config order, so the first `DETECTION_CONDITION_OUTCOMES_MAX` entries are
  * deterministic. Never includes `satisfied` conditions (they explain nothing
- * about a failure) and never includes free text: the type comes from
- * `CONDITION_TYPE_REGISTRY`, which the config write path validates against.
+ * about a failure) and never includes free text: the condition type is
+ * validated against `CONDITION_TYPE_REGISTRY`, and the status against
+ * `CONDITION_FAILURE_STATUSES`.
  */
 export const DETECTION_CONDITION_OUTCOMES_MAX = 4;
 
-export const detectionConditionOutcomeSchema = z
-  .object({
-    /** A registered condition type (`liquidity_sweep`, `news_filter`, …). */
-    conditionType: z.string().min(1).max(64),
-    /** Why it failed: `unsatisfied`, `insufficient_data` or `unsupported`. */
-    status: z.enum(EVALUATION_OUTCOME_STATUSES),
-  })
-  .strict();
-export type DetectionConditionOutcome = z.infer<typeof detectionConditionOutcomeSchema>;
-
 /**
  * Condition types the engine can report — derived from the single registry, so a
- * new condition type becomes valid evidence automatically and nothing else drifts.
+ * new condition type becomes valid evidence automatically and nothing drifts.
  */
 export const DETECTION_CONDITION_TYPES = Object.keys(CONDITION_TYPE_REGISTRY) as ConditionType[];
 
 /**
  * Statuses that a *failing* condition entry may carry.
  *
- * `satisfied` is deliberately excluded: an entry stored in `failing` says the
- * condition did **not** pass, so `liquidity_sweep:satisfied` is a contradiction
- * rather than evidence.
+ * `satisfied` is deliberately excluded: an entry describing a condition that
+ * did not pass cannot be satisfied, so `liquidity_sweep:satisfied` is a
+ * contradiction rather than evidence.
  */
 export const CONDITION_FAILURE_STATUSES = ['unsatisfied', 'insufficient_data', 'unsupported'] as const;
 export type ConditionFailureStatus = (typeof CONDITION_FAILURE_STATUSES)[number];
@@ -239,6 +229,35 @@ function isConditionType(value: unknown): value is ConditionType {
 function isConditionFailureStatus(value: unknown): value is ConditionFailureStatus {
   return typeof value === 'string' && (CONDITION_FAILURE_STATUSES as readonly string[]).includes(value);
 }
+
+/**
+ * A registered condition type.
+ *
+ * The registry is a static, non-empty literal, so the tuple cast below is safe;
+ * `z.enum` then gives both runtime validation and the `ConditionType` union.
+ */
+export const conditionTypeSchema = z.enum(DETECTION_CONDITION_TYPES as [ConditionType, ...ConditionType[]]);
+
+/** A status a failing condition may carry — never `satisfied`. */
+export const conditionFailureStatusSchema = z.enum(CONDITION_FAILURE_STATUSES);
+
+/**
+ * One condition that blocked a direction, as reported by the detection engine.
+ *
+ * Both halves are closed vocabularies: the type must be a registered condition
+ * type, and the status must be one of the failure statuses. An arbitrary
+ * machine-like token is therefore refused here as well as in the scanner's
+ * persisted `failing` codes, so the two surfaces cannot drift apart.
+ */
+export const detectionConditionOutcomeSchema = z
+  .object({
+    /** A registered condition type (`liquidity_sweep`, `news_filter`, …). */
+    conditionType: conditionTypeSchema,
+    /** Why it failed: `unsatisfied`, `insufficient_data` or `unsupported`. */
+    status: conditionFailureStatusSchema,
+  })
+  .strict();
+export type DetectionConditionOutcome = z.infer<typeof detectionConditionOutcomeSchema>;
 
 /**
  * The stored form of one failing condition: `<conditionType>:<status>`, or
