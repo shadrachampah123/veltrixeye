@@ -96,6 +96,23 @@ function fullBlock(totals: ScannerPairTotals, overrides: Record<string, unknown>
   };
 }
 
+/**
+ * A stored sample capped at the API limit (`SCANNER_RUN_PAIR_ITEMS_MAX = 200`)
+ * for a run that walked more pairs — the shape that proves the disclosure uses
+ * the aggregate total rather than the sample size.
+ */
+function truncatedBlock(totals: ScannerPairTotals) {
+  const stored = Math.min(200, totals.pairs);
+  const items = Array.from({ length: stored }, (_, i) => itemFor(i, 'evaluated'));
+  return {
+    v: 1,
+    totals,
+    conditions: { satisfied: totals.evaluated, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+    truncated: totals.pairs > stored,
+    items,
+  };
+}
+
 /** The aggregate-only projection the API returns for a run the viewer does not own. */
 function aggregateOnly(totals: ScannerPairTotals) {
   const { items: _items, ...rest } = fullBlock(totals);
@@ -481,43 +498,71 @@ describe('ScannerRunOutcomes', () => {
 /* Render: the global health last run                                        */
 /* ------------------------------------------------------------------------- */
 
-describe('ScannerLastRunOutcomes (health lastRun)', () => {
-  test('an owned last run renders its own observations', () => {
+describe('regression: last-run audience attribution', () => {
+  /** What `getHealth().lastRun` looks like for a run the viewer does not own. */
+  const redactedLastRun = () =>
+    runFixture({ pairs: aggregateOnly(totalsOf({ pairs: 10, cursor_skipped: 10 })) });
+
+  test('an owned run is "owner" and may show its per-pair details', () => {
     const run = runFixture({ triggeredBy: 'user-id', pairs: fullBlock(totalsOf({ pairs: 2, evaluated: 2 })) });
+    assert.equal(runAudience(run), 'owner');
+
     const html = render(React.createElement(ScannerLastRunOutcomes, { run }));
-    assert.match(html, /data-testid="pair-items"/);
+    assert.match(html, /data-testid="pair-items"/, 'the owner can open their observations');
+    assert.match(html, /Per-pair observations \(2 shown of 2\)/);
     assert.ok(!html.includes('Per-pair details withheld'));
   });
 
-  test('an unowned last run is never called "System" and never claims the automatic cycle', () => {
-    // The global lastRun may be another tenant's manual scan, redacted exactly
-    // like a system run. Without a scope we cannot tell them apart, so the copy
-    // must stay neutral and true for both.
-    const run = runFixture({ pairs: aggregateOnly(totalsOf({ pairs: 10, cursor_skipped: 10 })) });
-    const html = render(React.createElement(ScannerLastRunOutcomes, { run }));
+  test('a redacted last run with no triggeredBy is "other", never assumed to be "system"', () => {
+    const run = redactedLastRun();
+    assert.equal(run.metadata.triggeredBy, undefined, 'the payload carries no owner');
+    assert.equal(runAudience(run), 'other');
+    assert.notEqual(runAudience(run), 'system', 'the global lastRun cannot prove system authorship');
+  });
 
+  test('an "other" run shows no System badge and makes no automatic-cycle claim', () => {
+    const html = render(React.createElement(ScannerLastRunOutcomes, { run: redactedLastRun() }));
+    assert.ok(!html.includes('>System</span>'), 'not labelled System');
+    assert.ok(!html.includes('automatic scan cycle'), 'no origin is asserted');
+  });
+
+  test('an "other" run explains the withholding neutrally', () => {
+    const html = render(React.createElement(ScannerLastRunOutcomes, { run: redactedLastRun() }));
     assert.match(html, /Per-pair details withheld/);
     assert.match(html, /was not triggered from your session/);
-    assert.ok(!html.includes('>System</span>'), 'the run is not labelled System');
-    assert.ok(!html.includes('automatic scan cycle'), 'the copy does not assert where it came from');
-    assert.match(html, /10 of 10 pairs already evaluated this setup bar\./, 'aggregates are still shown');
-    assert.ok(!html.includes('data-testid="pair-items"'));
+    assert.match(html, /only aggregate outcome metrics are shown/);
+    assert.ok(!html.includes('mixes pairs from every account'), 'the system-specific reason is not reused');
+    assert.match(html, /10 of 10 pairs already evaluated this setup bar\./, 'aggregates stay visible');
   });
 
-  test('a legacy last run shows "unavailable" without counts', () => {
-    const run = runFixture({ candles: { store: 240, provider: 0, total: 240 } });
-    const html = render(React.createElement(ScannerLastRunOutcomes, { run }));
-    assert.match(html, /Pair outcomes unavailable/);
-    assert.ok(!html.includes('data-testid="pair-outcome-legend"'));
+  test('a genuine system row in a system scope is labelled and explained as system', () => {
+    const run = redactedLastRun();
+    // `system`/`all` can only contain own runs plus the automatic cycle's, so an
+    // unowned row there *is* a system run — this is the one place the UI may say so.
+    assert.equal(runAudience(run, 'system'), 'system');
+    assert.equal(runAudience(run, 'all'), 'system');
+
+    const html = render(React.createElement(ScannerRunRow, { run, scope: 'system' }));
+    assert.match(html, />System</, 'the badge is shown where the scope proves it');
+    assert.match(html, /mixes pairs from every account/);
   });
 
-  test('a full block on an unowned last run is still not rendered', () => {
-    // Defence in depth: even if the API returned a complete block for a run the
-    // viewer does not own, the health card exposes aggregates only.
+  test('unowned runs never render observations, even when a complete block is supplied', () => {
+    // Defence in depth: a redaction regression on the server must not become a
+    // client-side leak, in the health card or in either unscoped list.
     const run = runFixture({ pairs: fullBlock(totalsOf({ pairs: 2, evaluated: 2 })) });
-    const html = render(React.createElement(ScannerLastRunOutcomes, { run }));
-    assert.ok(!html.includes('data-testid="pair-items"'));
-    assert.ok(!html.includes('EURUSD'), 'no instrument from an observation leaks');
+    const renderings: [string, string][] = [
+      ['health last run', render(React.createElement(ScannerLastRunOutcomes, { run }))],
+      ['scope=system', render(React.createElement(ScannerRunRow, { run, scope: 'system' }))],
+      ['scope=all', render(React.createElement(ScannerRunRow, { run, scope: 'all' }))],
+    ];
+
+    for (const [label, html] of renderings) {
+      assert.ok(!html.includes('data-testid="pair-items"'), `${label}: no observations`);
+      assert.ok(!html.includes('Per-pair observations'), `${label}: no disclosure control either`);
+      assert.ok(!html.includes('EURUSD'), `${label}: no instrument from an observation`);
+      assert.match(html, /2 of 2 pairs evaluated\./, `${label}: aggregates are still shown`);
+    }
   });
 });
 
@@ -539,18 +584,6 @@ describe('pair outcome primitives', () => {
     const html = render(React.createElement(PairOutcomeBar, { totals: totalsOf() }));
     assert.match(html, /no pairs walked/);
     assert.equal((html.match(/data-outcome=/g) ?? []).length, 0);
-  });
-
-  test('the disclosure label never claims to show more observations than it draws', () => {
-    const totals = totalsOf({ pairs: 20, evaluated: 20 });
-    const summary = readScannerPairSummary({ triggeredBy: 'user-id', pairs: fullBlock(totals) });
-    assert.equal(summary.kind === 'detail' && summary.items.length, 20, 'the block stores all 20 observations');
-    const html = render(React.createElement(ScannerRunOutcomes, { summary }));
-
-    assert.equal(PAIR_ITEM_PREVIEW_LIMIT, 12);
-    assert.match(html, /12 shown of 20/, 'the label matches the rendered rows, not the stored sample');
-    assert.match(html, /Showing 12 of 20 pairs/, 'and the list footer agrees');
-    assert.equal((html.match(/class="col-span-2 font-mono text-ink-100"/g) ?? []).length, 12);
   });
 
   test('the item list states how many observations of how many pairs are shown', () => {
@@ -577,6 +610,74 @@ describe('pair outcome primitives', () => {
     const html = render(React.createElement(ScannerRunRow, { run, scope: 'mine' }));
     assert.match(html, /Pair outcomes unavailable/);
     assert.ok(!html.includes('data-testid="pair-outcome-legend"'));
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* Regression: honest observation disclosure count                            */
+/* ------------------------------------------------------------------------- */
+
+describe('regression: observation disclosure count', () => {
+  /** One rendered observation row (the symbol cell is unique to a row). */
+  const renderedRows = (html: string) =>
+    (html.match(/class="col-span-2 font-mono text-ink-100"/g) ?? []).length;
+
+  const detailSummary = (block: Record<string, unknown>) => {
+    const summary = readScannerPairSummary({ triggeredBy: 'user-id', pairs: block });
+    assert.equal(summary.kind, 'detail', 'the fixture must be a readable detail block');
+    return summary;
+  };
+
+  test('more stored observations than the limit reports the rendered count, not the stored count', () => {
+    const totals = totalsOf({ pairs: 20, evaluated: 20 });
+    const summary = detailSummary(fullBlock(totals));
+    assert.equal(summary.kind === 'detail' && summary.items.length, 20, 'all 20 observations are stored');
+
+    const html = render(React.createElement(ScannerRunOutcomes, { summary }));
+    assert.match(html, /12 shown of 20/, 'the disclosure matches what is drawn');
+    assert.ok(!html.includes('20 shown of 20'), 'the stored sample size is not presented as shown');
+    assert.equal(renderedRows(html), PAIR_ITEM_PREVIEW_LIMIT, 'only the shared limit is rendered');
+  });
+
+  test('the list renders no more rows than the shared limit, from either component', () => {
+    assert.equal(PAIR_ITEM_PREVIEW_LIMIT, 12, 'the single source of truth for the preview cap');
+
+    const items = Array.from({ length: 200 }, (_, i) => itemFor(i, 'evaluated'));
+    const totals = totalsOf({ pairs: 250, evaluated: 250 });
+
+    // `PairItemList` uses the constant as its default, with no caller override.
+    const listHtml = render(React.createElement(PairItemList, { items, totals, truncated: true }));
+    assert.equal(renderedRows(listHtml), PAIR_ITEM_PREVIEW_LIMIT);
+
+    // …and the outcome block that wraps it agrees.
+    const summary = detailSummary(truncatedBlock(totals));
+    const html = render(React.createElement(ScannerRunOutcomes, { summary }));
+    assert.equal(renderedRows(html), PAIR_ITEM_PREVIEW_LIMIT);
+    assert.match(html, /12 shown of 250/);
+  });
+
+  test('fewer observations than the limit reports the smaller actual number', () => {
+    const totals = totalsOf({ pairs: 3, evaluated: 3 });
+    const summary = detailSummary(fullBlock(totals));
+    const html = render(React.createElement(ScannerRunOutcomes, { summary }));
+
+    assert.match(html, /3 shown of 3/);
+    assert.match(html, /Showing 3 of 3 pairs/);
+    assert.equal(renderedRows(html), 3);
+    assert.ok(!html.includes('12 shown'), 'the cap is never reported as a count');
+  });
+
+  test('a truncated sample keeps the aggregate total, and disclosure and footer agree', () => {
+    const totals = totalsOf({ pairs: 250, evaluated: 250 });
+    const summary = detailSummary(truncatedBlock(totals));
+    assert.equal(summary.kind === 'detail' && summary.items.length, 200, '200 observations stored, 250 pairs walked');
+
+    const html = render(React.createElement(ScannerRunOutcomes, { summary }));
+    assert.match(html, /12 shown of 250/, 'the denominator is the aggregate total');
+    assert.ok(!html.includes('12 shown of 200'), 'never the stored sample size');
+    assert.match(html, /Showing 12 of 250 pairs/, 'the footer agrees with the disclosure');
+    assert.match(html, /stored sample is capped, totals still cover every pair/);
+    assert.equal(renderedRows(html), PAIR_ITEM_PREVIEW_LIMIT);
   });
 });
 
