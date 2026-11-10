@@ -392,13 +392,24 @@ API calls to it.
   explicit sentence that nothing was re-evaluated and nothing failed. A run that
   walked no pairs says so, and a run where pairs went stale/failed names those
   counts instead of implying success.
-- **Aggregates for system runs, with the privacy notice** — a run the viewer does
-  not own (`metadata.triggeredBy` is redacted away for every such row) is tagged
-  `System`, shows its aggregate outcomes, and displays "Per-pair details withheld
-  — this run … mixes pairs from every account". No `pairs.items[]` entry is ever
-  rendered for it. As defence in depth the client decides this itself
-  (`allowDetail: false`), so a server-side redaction regression cannot become a
-  client-side leak even if a full block arrives.
+- **Aggregates for runs the viewer does not own, with the privacy notice** — a
+  row in the `System`/`All runs` list without `metadata.triggeredBy` (the API
+  keeps that key only for the caller's own runs, so its absence means "not mine"
+  and, in those scopes, "the automatic cycle") is tagged `System`, shows its
+  aggregate outcomes, and displays "Per-pair details withheld — this run came
+  from the automatic scan cycle and mixes pairs from every account". No
+  `pairs.items[]` entry is ever rendered for it. As defence in depth the client
+  decides this itself (`allowDetail: false`), so a server-side redaction
+  regression cannot become a client-side leak even if a full block arrives.
+- **The global last run is never labelled "System"** — `getHealth().lastRun` is
+  the newest row in the shared ledger, which may be *another tenant's manual
+  scan*; that row is redacted exactly like a system run, so the payload cannot
+  tell them apart. The health card therefore shows "This run was not triggered
+  from your session, so only aggregate outcome metrics are shown" instead of
+  asserting an origin it cannot prove.
+- **The disclosure label matches what is drawn** — the observation block says
+  "N shown of M pairs" using the same preview cap (`PAIR_ITEM_PREVIEW_LIMIT = 12`)
+  that renders the rows, so it never claims to show more than the page displays.
 - **Detailed owner runs** — the caller's own rows render their observations
   (symbol, timeframe, outcome, reason, setup-candle time) inside a native
   `<details>` element, with "Showing N of M pairs" and an explicit note when the

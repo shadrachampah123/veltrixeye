@@ -11,13 +11,11 @@ import type { MarketInstrument } from '@/lib/api';
 import { WatchlistPanel } from '@/components/watchlist';
 import { SetupCardGrid } from '@/components/setup-card';
 import { BRAND } from '@/lib/brand';
-import { ScannerRunOutcomes, ScannerRunsCard } from '@/components/scanner-observability';
+import { ScannerLastRunOutcomes, ScannerRunsCard } from '@/components/scanner-observability';
 import {
   buildScannerRunsRequest,
   describeScannerRunsError,
   initialScannerRunsState,
-  isSystemRun,
-  readScannerPairSummary,
   scannerRunsReducer,
 } from '@/lib/scanner-observability';
 
@@ -208,16 +206,7 @@ function ScannerContent() {
                 )}
                 {health.lastRun.error && <div className="mt-3 rounded bg-red-500/10 px-3 py-2 text-xs text-red-400">{health.lastRun.error}</div>}
                 <div className="mt-4 border-t border-ink-700 pt-3">
-                  <div className="mb-2 flex flex-wrap items-center gap-2">
-                    <span className="text-[11px] uppercase tracking-wider text-ink-400">Pair outcomes</span>
-                    {isSystemRun(health.lastRun) && <Badge tone="neutral">System</Badge>}
-                  </div>
-                  <ScannerRunOutcomes
-                    summary={readScannerPairSummary(health.lastRun.metadata, {
-                      allowDetail: !isSystemRun(health.lastRun),
-                    })}
-                    systemRun={isSystemRun(health.lastRun)}
-                  />
+                  <ScannerLastRunOutcomes run={health.lastRun} />
                 </div>
               </div>
             </Card>

@@ -29,7 +29,7 @@ import {
   describeScannerOutcomes,
   describeScannerRunsError,
   initialScannerRunsState,
-  isSystemRun,
+  runAudience,
   readScannerPairSummary,
   scannerRunsEmptyCopy,
   scannerRunsReducer,
@@ -37,9 +37,11 @@ import {
   type ScannerRunsState,
 } from '../lib/scanner-observability';
 import {
+  PAIR_ITEM_PREVIEW_LIMIT,
   PairItemList,
   PairOutcomeBar,
   RunScopeControl,
+  ScannerLastRunOutcomes,
   ScannerRunOutcomes,
   ScannerRunRow,
   ScannerRunsCard,
@@ -246,9 +248,21 @@ describe('readScannerPairSummary', () => {
 /* ------------------------------------------------------------------------- */
 
 describe('scope helpers', () => {
-  test('a run without triggeredBy is a system run; an owned run is not', () => {
-    assert.equal(isSystemRun(runFixture({ pairs: aggregateOnly(totalsOf({ pairs: 1, stale: 1 })) })), true);
-    assert.equal(isSystemRun(runFixture({ triggeredBy: 'user-id', force: false })), false);
+  test('ownership: a present triggeredBy is mine, and an unowned row needs a scope to be "system"', () => {
+    const owned = runFixture({ triggeredBy: 'user-id', force: false });
+    const unowned = runFixture({ pairs: aggregateOnly(totalsOf({ pairs: 1, stale: 1 })) });
+
+    assert.equal(runAudience(owned), 'owner');
+    assert.equal(runAudience(owned, 'all'), 'owner');
+
+    // The automatic-cycle runs returned by these scopes are provably system rows.
+    assert.equal(runAudience(unowned, 'system'), 'system');
+    assert.equal(runAudience(unowned, 'all'), 'system');
+
+    // Without a scope (the global health lastRun) an unowned row may be another
+    // tenant's manual run, redacted exactly like a system one — never claim it
+    // came from the automatic cycle.
+    assert.equal(runAudience(unowned), 'other');
   });
 
   test('the scope request always names the scope the control shows', () => {
@@ -398,8 +412,9 @@ describe('RunScopeControl', () => {
 describe('ScannerRunOutcomes', () => {
   test('a system no-op run shows aggregates, the no-op copy and the privacy notice', () => {
     const metadata = { pairs: aggregateOnly(totalsOf({ pairs: 10, cursor_skipped: 10 })) };
-    const summary = readScannerPairSummary(metadata, { allowDetail: !isSystemRun(runFixture(metadata)) });
-    const html = render(React.createElement(ScannerRunOutcomes, { summary, systemRun: true }));
+    const audience = runAudience(runFixture(metadata), 'system');
+    const summary = readScannerPairSummary(metadata, { allowDetail: audience === 'owner' });
+    const html = render(React.createElement(ScannerRunOutcomes, { summary, audience }));
 
     assert.match(html, /10 of 10 pairs already evaluated this setup bar\./);
     assert.match(html, /No-op/);
@@ -446,7 +461,7 @@ describe('ScannerRunOutcomes', () => {
     const totals = totalsOf({ pairs: 2, evaluated: 2 });
     const metadata = { pairs: fullBlock(totals) };
     const summary = readScannerPairSummary(metadata, { allowDetail: false });
-    const html = render(React.createElement(ScannerRunOutcomes, { summary, systemRun: true }));
+    const html = render(React.createElement(ScannerRunOutcomes, { summary, audience: 'system' }));
 
     assert.ok(!html.includes('EURUSD'), 'no instrument from an observation leaks');
     assert.ok(!html.includes('data-testid="pair-items"'));
@@ -456,9 +471,53 @@ describe('ScannerRunOutcomes', () => {
 
   test('an aggregate-only run that walked no pairs withholds nothing', () => {
     const summary = readScannerPairSummary({ pairs: aggregateOnly(totalsOf()) });
-    const html = render(React.createElement(ScannerRunOutcomes, { summary, systemRun: true }));
+    const html = render(React.createElement(ScannerRunOutcomes, { summary, audience: 'system' }));
     assert.match(html, /No pairs were walked in this run\./);
     assert.ok(!html.includes('Per-pair details withheld'));
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* Render: the global health last run                                        */
+/* ------------------------------------------------------------------------- */
+
+describe('ScannerLastRunOutcomes (health lastRun)', () => {
+  test('an owned last run renders its own observations', () => {
+    const run = runFixture({ triggeredBy: 'user-id', pairs: fullBlock(totalsOf({ pairs: 2, evaluated: 2 })) });
+    const html = render(React.createElement(ScannerLastRunOutcomes, { run }));
+    assert.match(html, /data-testid="pair-items"/);
+    assert.ok(!html.includes('Per-pair details withheld'));
+  });
+
+  test('an unowned last run is never called "System" and never claims the automatic cycle', () => {
+    // The global lastRun may be another tenant's manual scan, redacted exactly
+    // like a system run. Without a scope we cannot tell them apart, so the copy
+    // must stay neutral and true for both.
+    const run = runFixture({ pairs: aggregateOnly(totalsOf({ pairs: 10, cursor_skipped: 10 })) });
+    const html = render(React.createElement(ScannerLastRunOutcomes, { run }));
+
+    assert.match(html, /Per-pair details withheld/);
+    assert.match(html, /was not triggered from your session/);
+    assert.ok(!html.includes('>System</span>'), 'the run is not labelled System');
+    assert.ok(!html.includes('automatic scan cycle'), 'the copy does not assert where it came from');
+    assert.match(html, /10 of 10 pairs already evaluated this setup bar\./, 'aggregates are still shown');
+    assert.ok(!html.includes('data-testid="pair-items"'));
+  });
+
+  test('a legacy last run shows "unavailable" without counts', () => {
+    const run = runFixture({ candles: { store: 240, provider: 0, total: 240 } });
+    const html = render(React.createElement(ScannerLastRunOutcomes, { run }));
+    assert.match(html, /Pair outcomes unavailable/);
+    assert.ok(!html.includes('data-testid="pair-outcome-legend"'));
+  });
+
+  test('a full block on an unowned last run is still not rendered', () => {
+    // Defence in depth: even if the API returned a complete block for a run the
+    // viewer does not own, the health card exposes aggregates only.
+    const run = runFixture({ pairs: fullBlock(totalsOf({ pairs: 2, evaluated: 2 })) });
+    const html = render(React.createElement(ScannerLastRunOutcomes, { run }));
+    assert.ok(!html.includes('data-testid="pair-items"'));
+    assert.ok(!html.includes('EURUSD'), 'no instrument from an observation leaks');
   });
 });
 
@@ -482,6 +541,18 @@ describe('pair outcome primitives', () => {
     assert.equal((html.match(/data-outcome=/g) ?? []).length, 0);
   });
 
+  test('the disclosure label never claims to show more observations than it draws', () => {
+    const totals = totalsOf({ pairs: 20, evaluated: 20 });
+    const summary = readScannerPairSummary({ triggeredBy: 'user-id', pairs: fullBlock(totals) });
+    assert.equal(summary.kind === 'detail' && summary.items.length, 20, 'the block stores all 20 observations');
+    const html = render(React.createElement(ScannerRunOutcomes, { summary }));
+
+    assert.equal(PAIR_ITEM_PREVIEW_LIMIT, 12);
+    assert.match(html, /12 shown of 20/, 'the label matches the rendered rows, not the stored sample');
+    assert.match(html, /Showing 12 of 20 pairs/, 'and the list footer agrees');
+    assert.equal((html.match(/class="col-span-2 font-mono text-ink-100"/g) ?? []).length, 12);
+  });
+
   test('the item list states how many observations of how many pairs are shown', () => {
     const totals = totalsOf({ pairs: 250, evaluated: 250 });
     const items = Array.from({ length: 200 }, (_, i) => itemFor(i, 'evaluated'));
@@ -495,7 +566,7 @@ describe('pair outcome primitives', () => {
 
   test('a run row labels system rows and shows their aggregate outcomes', () => {
     const run = runFixture({ pairs: aggregateOnly(totalsOf({ pairs: 6, cursor_skipped: 6 })) });
-    const html = render(React.createElement(ScannerRunRow, { run }));
+    const html = render(React.createElement(ScannerRunRow, { run, scope: 'system' }));
     assert.match(html, /System/);
     assert.match(html, /6 of 6 pairs already evaluated this setup bar\./);
     assert.match(html, /Per-pair details withheld/);
@@ -503,7 +574,7 @@ describe('pair outcome primitives', () => {
 
   test('a row for a legacy run shows "unavailable" instead of zero counts', () => {
     const run = runFixture({ triggeredBy: 'user-id', force: false });
-    const html = render(React.createElement(ScannerRunRow, { run }));
+    const html = render(React.createElement(ScannerRunRow, { run, scope: 'mine' }));
     assert.match(html, /Pair outcomes unavailable/);
     assert.ok(!html.includes('data-testid="pair-outcome-legend"'));
   });

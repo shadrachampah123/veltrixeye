@@ -70,16 +70,30 @@ export function buildScannerRunsRequest(
 }
 
 /**
- * A run the viewer did not trigger.
+ * Who a tenant-facing run belongs to, as far as the payload can tell.
  *
- * Tenant-facing responses redact `metadata.triggeredBy` for every run the caller
- * does not own, so its absence is the signal: system runs carry no `triggeredBy`
- * at all after redaction, and a caller's own rows always keep their id. Legacy
- * rows written by `createRun` always had the key, so this never misclassifies an
- * owned run — and if it ever did, the failure mode is showing *less* detail.
+ *  - `owner`  — `metadata.triggeredBy` is present. Redaction keeps it only for
+ *               the viewer's own runs, so a present key means "mine".
+ *  - `system` — no `triggeredBy`, and the caller obtained the run from a scope
+ *               that can only contain own runs plus the automatic cycle
+ *               (`system`/`all`), so it is the system runner's.
+ *  - `other`  — no `triggeredBy` and no scope to disambiguate. This is the
+ *               global `getHealth().lastRun` case: the newest run may be another
+ *               tenant's manual scan, which is redacted exactly like a system
+ *               run. The UI must not claim it came from the automatic cycle.
+ *
+ * The failure mode is always conservative: anything not provably the viewer's
+ * is treated as not-owned, so it can show aggregate metrics but never detail.
  */
-export function isSystemRun(run: Pick<ScannerRunDto, 'metadata'>): boolean {
-  return run.metadata.triggeredBy === undefined;
+export type ScannerRunAudience = 'owner' | 'system' | 'other';
+
+export function runAudience(
+  run: Pick<ScannerRunDto, 'metadata'>,
+  scope?: ScannerRunScope,
+): ScannerRunAudience {
+  if (run.metadata.triggeredBy !== undefined) return 'owner';
+  if (scope === 'system' || scope === 'all') return 'system';
+  return 'other';
 }
 
 /** Empty-state copy, which must not imply the scanner is broken. */

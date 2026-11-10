@@ -24,12 +24,13 @@ import {
   SCANNER_OUTCOME_ORDER,
   SCANNER_RUN_SCOPE_OPTIONS,
   describeScannerOutcomes,
-  isSystemRun,
   readScannerPairSummary,
+  runAudience,
   scannerRunsEmptyCopy,
   type ScannerOutcomeKey,
   type ScannerPairSummary,
   type ScannerPairTotals,
+  type ScannerRunAudience,
   type ScannerRunsState,
 } from '@/lib/scanner-observability';
 
@@ -46,6 +47,13 @@ const OUTCOME_TEXT: Record<ScannerOutcomeKey, string> = {
   stale: 'text-amber-450',
   failed: 'text-danger-450',
 };
+
+/**
+ * How many stored observations are rendered per run. The API caps the stored
+ * sample at 200; 12 keeps a long list scannable. The disclosure label is derived
+ * from this same constant, so it can never claim to show more than it draws.
+ */
+export const PAIR_ITEM_PREVIEW_LIMIT = 12;
 
 const OUTCOME_BADGE: Record<ScannerOutcomeKey, 'success' | 'info' | 'warning' | 'danger'> = {
   evaluated: 'success',
@@ -171,7 +179,7 @@ export function PairItemList({
   items,
   totals,
   truncated,
-  limit = 12,
+  limit = PAIR_ITEM_PREVIEW_LIMIT,
 }: {
   items: readonly ScannerPairItem[];
   totals: ScannerPairTotals;
@@ -225,10 +233,10 @@ export function PairItemList({
 
 export function ScannerRunOutcomes({
   summary,
-  systemRun = false,
+  audience = 'owner',
 }: {
   summary: ScannerPairSummary;
-  systemRun?: boolean;
+  audience?: ScannerRunAudience;
 }) {
   if (summary.kind === 'unavailable') {
     return (
@@ -264,7 +272,9 @@ export function ScannerRunOutcomes({
       {summary.kind === 'detail' ? (
         <details data-testid="pair-items" className="rounded-md border border-ink-700 bg-ink-850/30 px-3 py-2">
           <summary className="cursor-pointer text-xs font-medium text-ink-200">
-            Per-pair observations ({summary.items.length} shown of {summary.aggregate.totals.pairs})
+            Per-pair observations (
+            {Math.min(summary.items.length, PAIR_ITEM_PREVIEW_LIMIT)} shown of{' '}
+            {summary.aggregate.totals.pairs})
           </summary>
           <div className="mt-2">
             <PairItemList
@@ -277,9 +287,11 @@ export function ScannerRunOutcomes({
       ) : summary.detailWithheld ? (
         <div data-testid="pair-details-withheld">
           <Alert tone="info" title="Per-pair details withheld">
-            {systemRun
+            {audience === 'system'
               ? 'This run came from the automatic scan cycle and mixes pairs from every account, so only aggregate outcome metrics are shown.'
-              : 'Individual pair observations are not shown for this run. Aggregate outcome metrics remain accurate.'}
+              : audience === 'other'
+                ? 'This run was not triggered from your session, so only aggregate outcome metrics are shown — individual pair observations are withheld.'
+                : 'Individual pair observations are not shown for this run. Aggregate outcome metrics remain accurate.'}
           </Alert>
         </div>
       ) : null}
@@ -295,9 +307,11 @@ function statusTone(status: ScannerRunDto['status']): 'success' | 'danger' | 'in
   return status === 'completed' ? 'success' : status === 'failed' ? 'danger' : status === 'running' ? 'info' : 'warning';
 }
 
-export function ScannerRunRow({ run }: { run: ScannerRunDto }) {
-  const systemRun = isSystemRun(run);
-  const summary = readScannerPairSummary(run.metadata, { allowDetail: !systemRun });
+export function ScannerRunRow({ run, scope }: { run: ScannerRunDto; scope?: ScannerRunScope }) {
+  // A list is fetched for one scope, so the scope disambiguates an unowned row:
+  // `system`/`all` can only contain own runs plus the automatic cycle's.
+  const audience = runAudience(run, scope);
+  const summary = readScannerPairSummary(run.metadata, { allowDetail: audience === 'owner' });
 
   return (
     <div data-testid="scanner-run-row" data-run-id={run.id} className="px-5 py-4 transition-colors hover:bg-ink-750/40">
@@ -306,7 +320,7 @@ export function ScannerRunRow({ run }: { run: ScannerRunDto }) {
         <span className="font-mono text-sm text-ink-100">{run.id.slice(0, 8)}</span>
         <span className="text-xs text-ink-400">{new Date(run.startedAt).toLocaleString()}</span>
         <span className="text-xs text-ink-500">· {run.providerSlug}</span>
-        {systemRun && <Badge tone="neutral">System</Badge>}
+        {audience === 'system' && <Badge tone="neutral">System</Badge>}
       </div>
 
       <div className="mt-2 grid gap-1 text-xs text-ink-400 sm:grid-cols-2 lg:grid-cols-4">
@@ -325,8 +339,37 @@ export function ScannerRunRow({ run }: { run: ScannerRunDto }) {
       </div>
 
       <div className="mt-3">
-        <ScannerRunOutcomes summary={summary} systemRun={systemRun} />
+        <ScannerRunOutcomes summary={summary} audience={audience} />
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------------- */
+/* Last run (global health)                                                  */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The `getHealth().lastRun` block.
+ *
+ * This run is the newest row in the shared ledger, which may be another
+ * tenant's manual scan — redacted exactly like a system run. Without a scope the
+ * payload cannot distinguish the two, so this block never labels the run
+ * "System" and never claims it came from the automatic cycle; it simply says the
+ * detail belongs to someone else.
+ */
+export function ScannerLastRunOutcomes({ run }: { run: ScannerRunDto }) {
+  const audience = runAudience(run);
+  return (
+    <div data-testid="last-run-outcomes">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <span className="text-[11px] uppercase tracking-wider text-ink-400">Pair outcomes</span>
+        {audience === 'system' && <Badge tone="neutral">System</Badge>}
+      </div>
+      <ScannerRunOutcomes
+        summary={readScannerPairSummary(run.metadata, { allowDetail: audience === 'owner' })}
+        audience={audience}
+      />
     </div>
   );
 }
@@ -394,7 +437,7 @@ export function ScannerRunsCard({
             ) : (
               <div className="-mx-5 divide-y divide-ink-700 border-t border-ink-700">
                 {runs.map((run) => (
-                  <ScannerRunRow key={run.id} run={run} />
+                  <ScannerRunRow key={run.id} run={run} scope={scope} />
                 ))}
               </div>
             )}
