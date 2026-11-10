@@ -17,6 +17,9 @@ import assert from 'node:assert/strict';
 import {
   DETECTION_CONDITION_OUTCOMES_MAX,
   SCANNER_PAIR_OUTCOMES,
+  conditionFailingCode,
+  conditionFailingCodeSchema,
+  parseConditionFailingCode,
   SCANNER_PAIR_STAGES,
   SCANNER_RUN_PAIR_CODE_MAX_CHARS,
   SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX,
@@ -389,4 +392,60 @@ test('a detection item carries bounded condition failures only when diagnostics 
     false,
     'only the four engine statuses are accepted',
   );
+});
+
+/* ------------------------------------------------------------------------- */
+/* PR A — failing-condition vocabulary                                       */
+/* ------------------------------------------------------------------------- */
+
+test('failing codes are <conditionType>:<status> from the real enums', () => {
+  assert.deepEqual(parseConditionFailingCode('liquidity_sweep:unsatisfied'), {
+    conditionType: 'liquidity_sweep',
+    status: 'unsatisfied',
+  });
+  assert.deepEqual(parseConditionFailingCode('news_filter:insufficient_data'), {
+    conditionType: 'news_filter',
+    status: 'insufficient_data',
+  });
+  assert.equal(conditionFailingCode('fvg', 'unsupported'), 'fvg:unsupported');
+
+  // Not condition evidence, whatever it looks like.
+  const rejected = [
+    'foo:bar', // unknown condition type
+    'liquidity_sweep:satisfied', // a failing entry cannot be satisfied
+    'liquidity_sweep:pending', // unknown status
+    'liquidity_sweep', // no status
+    ':unsatisfied', // no condition type
+    'liquidity_sweep:', // empty status
+    'LIQUIDITY_SWEEP:unsatisfied', // enum casing
+    `fvg:${'x'.repeat(80)}`, // over the budget
+    '',
+    42,
+    null,
+    undefined,
+    {},
+    [],
+  ];
+  for (const value of rejected) {
+    assert.equal(parseConditionFailingCode(value), null, `${String(value)} is not a failing code`);
+    assert.equal(conditionFailingCodeSchema.safeParse(value).success, false, `${String(value)} fails the schema`);
+  }
+
+  assert.equal(conditionFailingCode('nope', 'unsatisfied'), null);
+  assert.equal(conditionFailingCode('fvg', 'satisfied'), null);
+  assert.equal(conditionFailingCode(42, 'unsatisfied'), null);
+});
+
+test('the diagnostics block refuses arbitrary tokens as condition evidence', () => {
+  const withFailing = (failing: unknown) =>
+    v2Block(v2Item({ diagnostics: { stage: 'complete', directions: { long: { state: 'not_qualified', failing } } } }));
+
+  assert.equal(scannerRunPairsSchema.safeParse(withFailing(['fvg:unsatisfied'])).success, true);
+  assert.equal(scannerRunPairsSchema.safeParse(withFailing(['foo:bar'])).success, false, 'unknown condition type');
+  assert.equal(scannerRunPairsSchema.safeParse(withFailing(['fvg:satisfied'])).success, false, 'contradictory status');
+  assert.equal(readScannerRunPairs({ pairs: withFailing(['foo:bar']) }), null, 'a bad entry fails the whole block closed');
+
+  // Pair-level codes stay extensible: provider failure kinds are not enums here.
+  const providerCode = v2Block(v2Item({ diagnostics: { stage: 'candles', codes: ['some_future_provider_kind'] } }));
+  assert.equal(scannerRunPairsSchema.safeParse(providerCode).success, true);
 });

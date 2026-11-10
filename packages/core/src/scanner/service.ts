@@ -30,6 +30,8 @@ import {
   SCANNER_RUN_PAIR_CODE_MAX_CHARS,
   SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX,
   SCANNER_RUN_PAIR_FAILING_MAX,
+  conditionFailingCode,
+  parseConditionFailingCode,
   scannerPairDiagnosticsSchema,
   type ScannerPairData,
   type ScannerPairDiagnostics,
@@ -513,9 +515,14 @@ function comparePairObservations(a: PairObservation, b: PairObservation): number
 
 /**
  * A diagnostic code is a machine token: lowercase words joined by `_`, `:` or
- * `-` (e.g. `setup_limit_reached`, `liquidity_sweep:unsatisfied`). Anything
- * else — spaces, uppercase prose, `…` from a truncated message — is not
- * evidence, and is refused instead of being stored.
+ * `-` (e.g. `setup_limit_reached`, `rate_limited`). Anything else — spaces,
+ * uppercase prose, `…` from a truncated message — is not evidence, and is
+ * refused instead of being stored.
+ *
+ * Pair-level codes stay token-bounded rather than enum-bounded so provider
+ * failure kinds can grow without a contract change. Direction `failing` codes
+ * are stricter: they must parse as `<conditionType>:<status>` from the real
+ * enums (see `uniqueFailingCodes`).
  */
 const DIAGNOSTIC_CODE_PATTERN = /^[a-z][a-z0-9_:-]*$/;
 
@@ -523,38 +530,50 @@ const DIAGNOSTIC_CODE_PATTERN = /^[a-z][a-z0-9_:-]*$/;
 const DIAGNOSTIC_COUNT_MAX = 1_000_000;
 
 /**
+ * A non-null, non-array object — i.e. something whose properties are safe to
+ * read. The normaliser is a *runtime* boundary for caller-built observations,
+ * so it can never rely on TypeScript types alone: `codes: 42`, `failing: {}` or
+ * `directions: "x"` all reach here from untyped JSON-shaped callers.
+ */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
  * PR A — bound, validate and canonicalise one pair's diagnostics.
  *
- * **Fail-closed by construction.** Every nested value is rebuilt from scratch
- * with an explicit check, and the result is then re-parsed against
- * `scannerPairDiagnosticsSchema`; if that parse fails, the whole diagnostics
- * object is dropped. A caller — including a future one that builds an
- * observation by hand — therefore cannot persist a block a reader would
- * misinterpret as evidence:
+ * **Fail-closed by construction and by runtime guard.** Every container and
+ * every nested value is checked before it is touched, the object is rebuilt
+ * from the verified parts, and the result is then re-parsed against
+ * `scannerPairDiagnosticsSchema`. If anything is malformed the offending part is
+ * dropped — and if the rebuilt object still fails the contract parse, the whole
+ * diagnostics object is dropped. The function never throws, so a hand-built or
+ * corrupt observation cannot abort a scan run's persistence.
  *
- *  - an unknown `stage` drops everything (we cannot say where the pair stopped);
- *  - `codes` / `failing` are trimmed, de-duplicated and capped, and each entry
- *    must be a token of at most `SCANNER_RUN_PAIR_CODE_MAX_CHARS`. **Nothing is
- *    truncated into an apparently valid code** — an over-long or non-token
- *    string is dropped;
+ *  - a non-object, an unknown `stage`, or a `stage` that fails the contract
+ *    parse drops everything (we cannot say where the pair stopped);
+ *  - `codes` / `failing` must be **actual arrays**; a string, number or object
+ *    is rejected outright instead of being iterated. Entries are trimmed,
+ *    de-duplicated and capped, and each must be a bounded machine token —
+ *    `failing` entries must additionally name a real condition type and a real
+ *    failure status. **Nothing is truncated into an apparently valid code**;
  *  - `data` is all-or-nothing: the three roles are required by the contract, so
  *    one malformed role drops the whole object rather than half of it;
- *  - a direction with an unknown `state` is dropped, and a malformed
- *    `conditions` block is dropped while the verified `state` survives.
+ *  - a direction entry must be a non-null plain object with a known `state`,
+ *    otherwise it is dropped; a malformed `conditions` block is dropped while
+ *    the verified `state` survives.
  *
  * Valid input is preserved exactly and the function is idempotent, so the
  * persisted form is deterministic.
  */
-export function normalisePairDiagnostics(
-  diagnostics: ScannerPairDiagnostics | undefined,
-): ScannerPairDiagnostics | undefined {
-  if (!diagnostics) return undefined;
+export function normalisePairDiagnostics(diagnostics: unknown): ScannerPairDiagnostics | undefined {
+  if (!isPlainObject(diagnostics)) return undefined;
 
   const codes = uniqueBoundedCodes(diagnostics.codes, SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX);
   const data = normalisePairData(diagnostics.data);
   const directions = normaliseDirections(diagnostics.directions);
 
-  const candidate: ScannerPairDiagnostics = {
+  const candidate = {
     stage: diagnostics.stage,
     ...(codes.length > 0 ? { codes } : {}),
     ...(data ? { data } : {}),
@@ -568,19 +587,19 @@ export function normalisePairDiagnostics(
   return parsed.success ? parsed.data : undefined;
 }
 
-function normaliseDirections(
-  directions: ScannerPairDiagnostics['directions'],
-): ScannerPairDiagnostics['directions'] | undefined {
-  if (!directions) return undefined;
+function normaliseDirections(directions: unknown): ScannerPairDiagnostics['directions'] | undefined {
+  if (!isPlainObject(directions)) return undefined;
   const out: NonNullable<ScannerPairDiagnostics['directions']> = {};
   for (const direction of ['long', 'short'] as const) {
     const entry = directions[direction];
-    if (!entry) continue;
-    if (!SCANNER_PAIR_DIRECTION_STATES.includes(entry.state)) continue;
+    // A missing, null, array or primitive entry is not a direction observation.
+    if (!isPlainObject(entry)) continue;
+    const state: unknown = entry.state;
+    if (typeof state !== 'string' || !(SCANNER_PAIR_DIRECTION_STATES as readonly string[]).includes(state)) continue;
     const conditions = normaliseConditions(entry.conditions);
-    const failing = uniqueBoundedCodes(entry.failing, SCANNER_RUN_PAIR_FAILING_MAX);
+    const failing = uniqueFailingCodes(entry.failing, SCANNER_RUN_PAIR_FAILING_MAX);
     out[direction] = {
-      state: entry.state,
+      state: state as (typeof SCANNER_PAIR_DIRECTION_STATES)[number],
       ...(conditions ? { conditions } : {}),
       ...(failing.length > 0 ? { failing } : {}),
     };
@@ -589,8 +608,8 @@ function normaliseDirections(
 }
 
 /** Three verified per-role counts, or nothing: a partial `data` is not stored. */
-function normalisePairData(data: ScannerPairDiagnostics['data']): ScannerPairData | undefined {
-  if (!data) return undefined;
+function normalisePairData(data: unknown): ScannerPairData | undefined {
+  if (!isPlainObject(data)) return undefined;
   const htf = normaliseRoleData(data.htf);
   const setup = normaliseRoleData(data.setup);
   const entry = normaliseRoleData(data.entry);
@@ -598,8 +617,8 @@ function normalisePairData(data: ScannerPairDiagnostics['data']): ScannerPairDat
   return { htf, setup, entry };
 }
 
-function normaliseRoleData(role: ScannerPairRoleData | undefined): ScannerPairRoleData | undefined {
-  if (!role) return undefined;
+function normaliseRoleData(role: unknown): ScannerPairRoleData | undefined {
+  if (!isPlainObject(role)) return undefined;
   const candles: unknown = role.candles;
   if (!isDiagnosticCount(candles)) return undefined;
   // A timestamp is validated as a positive safe integer, not as a bounded
@@ -610,8 +629,8 @@ function normaliseRoleData(role: ScannerPairRoleData | undefined): ScannerPairRo
   return { candles, newestMs };
 }
 
-function normaliseConditions(conditions: ConditionSummary | undefined): ConditionSummary | undefined {
-  if (!conditions) return undefined;
+function normaliseConditions(conditions: unknown): ConditionSummary | undefined {
+  if (!isPlainObject(conditions)) return undefined;
   const keys = ['satisfied', 'unsatisfied', 'insufficient_data', 'unsupported'] as const;
   const out = {} as ConditionSummary;
   for (const key of keys) {
@@ -627,19 +646,44 @@ function isDiagnosticCount(value: unknown): value is number {
 }
 
 /**
- * Trim, validate, de-duplicate and cap — order preserved.
+ * Trim, validate, de-duplicate and cap pair-level codes — order preserved.
  *
- * Rejects rather than repairs: a string that is not a bounded machine token is
- * dropped, never shortened into something the contract would accept.
+ * `value` is deliberately `unknown`: a non-array (including a string, which is
+ * iterable and would otherwise decompose into single characters) is rejected
+ * outright. Individual entries that are not bounded machine tokens are dropped,
+ * never shortened into something the contract would accept.
  */
-function uniqueBoundedCodes(codes: readonly string[] | undefined, max: number): string[] {
+function uniqueBoundedCodes(value: unknown, max: number): string[] {
+  if (!Array.isArray(value)) return [];
   const out: string[] = [];
-  for (const raw of codes ?? []) {
-    if (typeof raw !== 'string' || out.length >= max) continue;
+  for (const raw of value) {
+    if (out.length >= max) break;
+    if (typeof raw !== 'string') continue;
     const code = raw.trim();
     if (code.length === 0 || code.length > SCANNER_RUN_PAIR_CODE_MAX_CHARS) continue;
     if (!DIAGNOSTIC_CODE_PATTERN.test(code)) continue;
     if (!out.includes(code)) out.push(code);
+  }
+  return out;
+}
+
+/**
+ * Validate, de-duplicate and cap `failing` entries — order preserved.
+ *
+ * Each entry must parse as `<conditionType>:<status>` from the real enums, so a
+ * machine-*like* token (`foo:bar`, `liquidity_sweep:satisfied`) is refused
+ * rather than presented as condition evidence. Same non-array guard as the
+ * pair-level codes: a string or object is not iterated.
+ */
+function uniqueFailingCodes(value: unknown, max: number): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  for (const raw of value) {
+    if (out.length >= max) break;
+    const code = parseConditionFailingCode(raw);
+    if (!code) continue;
+    const formatted = `${code.conditionType}:${code.status}`;
+    if (!out.includes(formatted)) out.push(formatted);
   }
   return out;
 }
@@ -654,20 +698,19 @@ function roleDataOf(candles: readonly { time: number }[]): ScannerPairRoleData {
 /**
  * Turn M4's bounded condition diagnostics into `<type>:<status>` codes.
  *
- * Closed vocabulary: the type comes from the condition registry and the status
- * from the engine, so no user or provider text can reach run metadata. A pair
- * that would exceed the 64-character budget is skipped rather than shortened,
- * so a stored code always names the condition that actually failed.
+ * Closed vocabulary, enforced at write time: `conditionFailingCode` accepts
+ * only a condition type from `CONDITION_TYPE_REGISTRY` and a status from
+ * `CONDITION_FAILURE_STATUSES`, so no user or provider text can reach run
+ * metadata and an arbitrary token can never look like condition evidence.
  */
 function failingConditionCodes(outcomes: readonly { conditionType: string; status: string }[] | undefined): string[] {
   const codes: string[] = [];
   for (const outcome of outcomes ?? []) {
     if (codes.length >= SCANNER_RUN_PAIR_FAILING_MAX) break;
-    const conditionType = String(outcome.conditionType).trim();
-    const code = `${conditionType}:${String(outcome.status)}`;
-    // Never shorten a long type to fit: it is dropped instead, so a stored code
-    // always names a real condition from the registry.
-    if (conditionType.length === 0 || code.length > SCANNER_RUN_PAIR_CODE_MAX_CHARS) continue;
+    // Enum-validated by the shared helper: a condition type that is not in the
+    // registry, or a status that is not a failure status, produces nothing.
+    const code = conditionFailingCode(outcome.conditionType, outcome.status);
+    if (!code || code.length > SCANNER_RUN_PAIR_CODE_MAX_CHARS) continue;
     if (!codes.includes(code)) codes.push(code);
   }
   return codes;

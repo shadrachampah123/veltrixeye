@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { assetClassSchema, instrumentSymbolSchema } from './assets.js';
+import { CONDITION_TYPE_REGISTRY, type ConditionType } from './conditions.js';
 import { EVALUATION_OUTCOME_STATUSES } from './evaluation.js';
 
 /**
@@ -211,6 +212,72 @@ export const detectionConditionOutcomeSchema = z
   })
   .strict();
 export type DetectionConditionOutcome = z.infer<typeof detectionConditionOutcomeSchema>;
+
+/**
+ * Condition types the engine can report — derived from the single registry, so a
+ * new condition type becomes valid evidence automatically and nothing else drifts.
+ */
+export const DETECTION_CONDITION_TYPES = Object.keys(CONDITION_TYPE_REGISTRY) as ConditionType[];
+
+/**
+ * Statuses that a *failing* condition entry may carry.
+ *
+ * `satisfied` is deliberately excluded: an entry stored in `failing` says the
+ * condition did **not** pass, so `liquidity_sweep:satisfied` is a contradiction
+ * rather than evidence.
+ */
+export const CONDITION_FAILURE_STATUSES = ['unsatisfied', 'insufficient_data', 'unsupported'] as const;
+export type ConditionFailureStatus = (typeof CONDITION_FAILURE_STATUSES)[number];
+
+/** Longest `<conditionType>:<status>` this model can produce. */
+export const CONDITION_FAILING_CODE_MAX_CHARS = 64;
+
+function isConditionType(value: unknown): value is ConditionType {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(CONDITION_TYPE_REGISTRY, value);
+}
+
+function isConditionFailureStatus(value: unknown): value is ConditionFailureStatus {
+  return typeof value === 'string' && (CONDITION_FAILURE_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * The stored form of one failing condition: `<conditionType>:<status>`, or
+ * `null` when either half is not part of its enum.
+ *
+ * Shared by the scanner (which writes the codes) and the contract (which
+ * validates them), so a stored code can only ever name a real condition type
+ * and a real failure status.
+ */
+export function conditionFailingCode(conditionType: unknown, status: unknown): string | null {
+  if (!isConditionType(conditionType) || !isConditionFailureStatus(status)) return null;
+  return `${conditionType}:${status}`;
+}
+
+/** Parse a stored failing code back into its parts, or `null` if it is not one. */
+export function parseConditionFailingCode(
+  value: unknown,
+): { conditionType: ConditionType; status: ConditionFailureStatus } | null {
+  if (typeof value !== 'string' || value.length > CONDITION_FAILING_CODE_MAX_CHARS) return null;
+  const separator = value.indexOf(':');
+  if (separator <= 0 || separator === value.length - 1) return null;
+  const conditionType = value.slice(0, separator);
+  const status = value.slice(separator + 1);
+  if (!isConditionType(conditionType) || !isConditionFailureStatus(status)) return null;
+  return { conditionType, status };
+}
+
+/**
+ * A single failing-condition code. Stricter than "machine-like token": both
+ * halves must come from their enums, so an arbitrary `foo:bar` is refused
+ * instead of being presented as condition evidence.
+ */
+export const conditionFailingCodeSchema = z
+  .string()
+  .min(1)
+  .max(CONDITION_FAILING_CODE_MAX_CHARS)
+  .refine((value) => parseConditionFailingCode(value) !== null, {
+    message: 'failing condition codes must be <conditionType>:<status> from the condition registry',
+  });
 
 /** Per-direction detection outcome. */
 export const detectionItemDtoSchema = z

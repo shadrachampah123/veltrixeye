@@ -1056,7 +1056,17 @@ describe('PR A — evaluation diagnostics', () => {
           stage: 'complete',
           codes: ['a', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
           directions: {
-            long: { state: 'not_qualified', failing: ['x:unsatisfied', 'x:unsatisfied', 'y:unsatisfied', 'z:unsatisfied', 'w:unsatisfied'] },
+            long: {
+              state: 'not_qualified',
+              failing: [
+                'fvg:unsatisfied',
+                'fvg:unsatisfied',
+                'bos:unsatisfied',
+                'choch:insufficient_data',
+                'order_block:unsupported',
+                'liquidity_sweep:unsatisfied',
+              ],
+            },
           },
         },
       }) as PairObservationLike;
@@ -1069,7 +1079,11 @@ describe('PR A — evaluation diagnostics', () => {
     const diagnostics = block.items[0]?.diagnostics;
     assert.ok(diagnostics);
     assert.deepEqual(diagnostics.codes, ['a', 'b', 'c', 'd', 'e', 'f'], 'codes are de-duplicated and capped');
-    assert.deepEqual(diagnostics.directions?.long?.failing, ['x:unsatisfied', 'y:unsatisfied', 'z:unsatisfied', 'w:unsatisfied']);
+    assert.deepEqual(
+      diagnostics.directions?.long?.failing,
+      ['fvg:unsatisfied', 'bos:unsatisfied', 'choch:insufficient_data', 'order_block:unsupported'],
+      'duplicate dropped, capped at four, real condition/status pairs only',
+    );
 
     const reversed = [...observations].reverse();
     assert.deepEqual(buildScannerRunPairs(reversed).items, block.items, 'the sample does not depend on scan order');
@@ -1158,6 +1172,128 @@ describe('PR A — evaluation diagnostics', () => {
 
     // Unknown keys are never copied through.
     assert.deepEqual(normalise({ stage: 'complete', symbol: 'XAUUSD', strategyId: 'leak' }), { stage: 'complete' });
+  });
+
+  test('A11d: malformed runtime containers are dropped, never thrown on', () => {
+    /** The normaliser as a runtime boundary: input typed as `never`. */
+    const normalise = (value: unknown) => normalisePairDiagnostics(value as never);
+    const valid = (out: unknown) => out === undefined || scannerPairDiagnosticsSchema.safeParse(out).success;
+
+    const malformed: [string, unknown][] = [
+      ['codes: 42', { stage: 'complete', codes: 42 }],
+      ['codes: "cursor_hit"', { stage: 'complete', codes: 'cursor_hit' }],
+      ['codes: {}', { stage: 'complete', codes: {} }],
+      ['codes: [[\'cursor_hit\']]', { stage: 'complete', codes: [['cursor_hit']] }],
+      ['failing: {}', { stage: 'complete', directions: { long: { state: 'not_qualified', failing: {} } } }],
+      ['failing: "fvg:unsatisfied"', { stage: 'complete', directions: { long: { state: 'not_qualified', failing: 'fvg:unsatisfied' } } }],
+      ['directions: null', { stage: 'complete', directions: null }],
+      ['directions: "long"', { stage: 'complete', directions: 'long' }],
+      ['directions: []', { stage: 'complete', directions: [] }],
+      ['directions: 42', { stage: 'complete', directions: 42 }],
+      ['directions.long: null', { stage: 'complete', directions: { long: null } }],
+      ['directions.long: 42', { stage: 'complete', directions: { long: 42 } }],
+      ['directions.long: "qualified"', { stage: 'complete', directions: { long: 'qualified' } }],
+      ['directions.long: []', { stage: 'complete', directions: { long: [] } }],
+      ['directions.long.conditions: "x"', { stage: 'complete', directions: { long: { state: 'not_qualified', conditions: 'x' } } }],
+      ['directions.long.conditions: 42', { stage: 'complete', directions: { long: { state: 'not_qualified', conditions: 42 } } }],
+      ['directions.long.complete: {}', { stage: 'complete', directions: { long: {} } }],
+      ['data: 42', { stage: 'validation', data: 42 }],
+      ['data: []', { stage: 'validation', data: [] }],
+      ['data.htf: 42', { stage: 'validation', data: { htf: 42, setup: null, entry: 'x' } }],
+      ['diagnostics: "complete"', 'complete'],
+      ['diagnostics: []', []],
+      ['stage: null', { stage: null }],
+    ];
+
+    for (const [label, value] of malformed) {
+      let out: unknown;
+      assert.doesNotThrow(() => {
+        out = normalise(value);
+      }, `${label} must not throw`);
+      assert.equal(valid(out), true, `${label} must yield a schema-valid block or nothing`);
+    }
+
+    // Specific outcomes: a string is never decomposed into per-character codes,
+    // and a non-array is never iterated.
+    const fromString = normalise({ stage: 'complete', codes: 'cursor_hit' });
+    assert.deepEqual(fromString, { stage: 'complete' }, 'a string is dropped, never decomposed into character codes');
+    assert.equal(normalise({ stage: 'complete', codes: 42 })?.codes, undefined);
+    // The stage is verified evidence, so it survives; the malformed directions
+    // are dropped rather than the whole block.
+    assert.deepEqual(normalise({ stage: 'complete', directions: { long: null } }), { stage: 'complete' });
+    assert.deepEqual(normalise({ stage: 'complete', directions: 'long' }), { stage: 'complete' });
+    assert.deepEqual(normalise({ stage: 'complete', directions: { long: 42 } }), { stage: 'complete' });
+    assert.deepEqual(
+      normalise({ stage: 'complete', codes: ['cursor_hit'], directions: { long: { state: 'qualified' } } }),
+      { stage: 'complete', codes: ['cursor_hit'], directions: { long: { state: 'qualified' } } },
+      'the valid parts still survive alongside the dropped ones',
+    );
+  });
+
+  test('A11e: failing entries must name a real condition type and failure status', () => {
+    const normalise = (value: unknown) => normalisePairDiagnostics(value as never);
+    const direction = (failing: unknown) =>
+      normalise({ stage: 'complete', directions: { long: { state: 'not_qualified', failing } } })?.directions?.long
+        ?.failing;
+
+    assert.deepEqual(
+      direction([
+        'foo:bar', // unknown condition type
+        'liquidity_sweep:satisfied', // satisfied is not a failure
+        'liquidity_sweep:bogus', // unknown status
+        ':unsatisfied', // no condition type
+        'liquidity_sweep', // no status
+        'LIQUIDITY_SWEEP:unsatisfied', // not the enum casing
+        'fvg:unsatisfied',
+        'choch:insufficient_data',
+        'news_filter:unsupported',
+      ]),
+      ['fvg:unsatisfied', 'choch:insufficient_data', 'news_filter:unsupported'],
+      'only enum-valid condition evidence survives',
+    );
+
+    // The stored block still parses, and a block whose only entries were invalid
+    // simply carries no failing list.
+    assert.equal(direction(['foo:bar']), undefined);
+    assert.equal(scannerPairDiagnosticsSchema.safeParse(normalise({ stage: 'complete' })).success, true);
+  });
+
+  test('A11f: malformed containers cannot abort run persistence', () => {
+    const observations = [
+      {
+        strategyId: '00000000-0000-4000-8000-000000000002',
+        assetClass: 'commodity',
+        symbol: 'XAUUSD',
+        timeframe: '1h',
+        outcome: 'evaluated',
+        cursorMs: 1_700_000_000_000,
+        anchorMs: 1_700_003_600_000,
+        reason: null,
+        conditions: { satisfied: 1, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+        diagnostics: { stage: 'complete', codes: 42, directions: { long: null, short: { state: 'not_qualified', failing: {} } } },
+      },
+      {
+        strategyId: '00000000-0000-4000-8000-000000000003',
+        assetClass: 'commodity',
+        symbol: 'XAGUSD',
+        timeframe: '1h',
+        outcome: 'evaluated',
+        cursorMs: 1_700_000_000_000,
+        anchorMs: 1_700_003_600_000,
+        reason: null,
+        conditions: { satisfied: 0, unsatisfied: 1, insufficient_data: 0, unsupported: 0 },
+        diagnostics: 'not-an-object',
+      },
+    ];
+
+    let block: ReturnType<typeof buildScannerRunPairs> | undefined;
+    assert.doesNotThrow(() => {
+      block = buildScannerRunPairs(observations as never);
+    }, 'a malformed observation must never abort persistence');
+    assert.ok(block);
+    assert.equal(scannerRunPairsSchema.safeParse(block).success, true, 'the persisted block is contract-valid');
+    assert.deepEqual(block.totals, { pairs: 2, evaluated: 2, cursor_skipped: 0, stale: 0, failed: 0 });
+    assert.equal(block.items.length, 2);
   });
 
   test('A11c: a hand-built observation can never persist an out-of-contract block', () => {

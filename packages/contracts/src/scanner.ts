@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { conditionSummarySchema } from './detection.js';
+import { conditionFailingCodeSchema, conditionSummarySchema } from './detection.js';
 
 /**
  * Live scanner contracts (M7.5) — production market-data and scanner pipeline.
@@ -162,18 +162,19 @@ const scannerPairDataSchema = z
 export type ScannerPairData = z.infer<typeof scannerPairDataSchema>;
 
 /**
- * One direction's evaluation evidence. `failing` entries are
- * `<conditionType>:<status>` from `DETECTION_CONDITION_OUTCOMES_MAX`-bounded
- * detection diagnostics — a closed vocabulary, never free text.
+ * One direction's evaluation evidence.
+ *
+ * `failing` entries are `<conditionType>:<status>` and are validated against
+ * the real enums (`conditionFailingCodeSchema`: the condition-type registry and
+ * `CONDITION_FAILURE_STATUSES`), so an arbitrary machine-like token can never be
+ * presented as condition evidence. Pair-level `codes` stay token-bounded rather
+ * than enum-bounded, because provider failure kinds are extensible.
  */
 const scannerPairDirectionDiagnosticSchema = z
   .object({
     state: scannerPairDirectionStateSchema,
     conditions: conditionSummarySchema.optional(),
-    failing: z
-      .array(z.string().min(1).max(SCANNER_RUN_PAIR_CODE_MAX_CHARS))
-      .max(SCANNER_RUN_PAIR_FAILING_MAX)
-      .optional(),
+    failing: z.array(conditionFailingCodeSchema).max(SCANNER_RUN_PAIR_FAILING_MAX).optional(),
   })
   .strict();
 export type ScannerPairDirectionDiagnostic = z.infer<typeof scannerPairDirectionDiagnosticSchema>;
