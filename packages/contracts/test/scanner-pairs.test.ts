@@ -457,13 +457,16 @@ test('condition outcomes use the same closed vocabulary as failing codes', () =>
   const outcome = (conditionType: unknown, status: unknown) =>
     detectionConditionOutcomeSchema.safeParse({ conditionType, status });
 
-  // Every allowed failure status, for a registered condition type.
-  for (const status of CONDITION_FAILURE_STATUSES) {
-    assert.equal(outcome('liquidity_sweep', status).success, true, `${status} must be accepted`);
-  }
-  // Every registered condition type is valid evidence.
+  // The full cross product: every registered condition type against every
+  // allowed failure status is valid evidence.
   for (const conditionType of DETECTION_CONDITION_TYPES) {
-    assert.equal(outcome(conditionType, 'unsatisfied').success, true, `${conditionType} must be accepted`);
+    for (const status of CONDITION_FAILURE_STATUSES) {
+      assert.equal(
+        outcome(conditionType, status).success,
+        true,
+        `${conditionType}:${status} must be accepted`,
+      );
+    }
   }
 
   // Anything outside the two enums is refused.
