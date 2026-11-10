@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { assetClassSchema, instrumentSymbolSchema } from './assets.js';
+import { CONDITION_TYPE_REGISTRY, type ConditionType } from './conditions.js';
 
 /**
  * Setup detection contracts (M4).
@@ -184,6 +185,119 @@ export const conditionSummarySchema = z
   .strict();
 export type ConditionSummary = z.infer<typeof conditionSummarySchema>;
 
+/**
+ * Bounded list of the conditions a direction did NOT satisfy.
+ *
+ * This is the missing link between "the counts say three conditions were
+ * unsatisfied" and "the liquidity sweep is the one that blocked it": the counts
+ * in `conditionSummary` aggregate away *which* condition failed, and
+ * `failureReasons` only carries rule-group-level sentences. The scanner stores
+ * these as `metadata.pairs.items[].diagnostics.directions[<dir>].failing`.
+ *
+ * Bounded by construction — the engine walks the version's rule groups in
+ * config order, so the first `DETECTION_CONDITION_OUTCOMES_MAX` entries are
+ * deterministic. Never includes `satisfied` conditions (they explain nothing
+ * about a failure) and never includes free text: the condition type is
+ * validated against `CONDITION_TYPE_REGISTRY`, and the status against
+ * `CONDITION_FAILURE_STATUSES`.
+ */
+export const DETECTION_CONDITION_OUTCOMES_MAX = 4;
+
+/**
+ * Condition types the engine can report — derived from the single registry, so a
+ * new condition type becomes valid evidence automatically and nothing drifts.
+ */
+export const DETECTION_CONDITION_TYPES = Object.keys(CONDITION_TYPE_REGISTRY) as ConditionType[];
+
+/**
+ * Statuses that a *failing* condition entry may carry.
+ *
+ * `satisfied` is deliberately excluded: an entry describing a condition that
+ * did not pass cannot be satisfied, so `liquidity_sweep:satisfied` is a
+ * contradiction rather than evidence.
+ */
+export const CONDITION_FAILURE_STATUSES = ['unsatisfied', 'insufficient_data', 'unsupported'] as const;
+export type ConditionFailureStatus = (typeof CONDITION_FAILURE_STATUSES)[number];
+
+/** Longest `<conditionType>:<status>` this model can produce. */
+export const CONDITION_FAILING_CODE_MAX_CHARS = 64;
+
+function isConditionType(value: unknown): value is ConditionType {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(CONDITION_TYPE_REGISTRY, value);
+}
+
+function isConditionFailureStatus(value: unknown): value is ConditionFailureStatus {
+  return typeof value === 'string' && (CONDITION_FAILURE_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * A registered condition type.
+ *
+ * The registry is a static, non-empty literal, so the tuple cast below is safe;
+ * `z.enum` then gives both runtime validation and the `ConditionType` union.
+ */
+export const conditionTypeSchema = z.enum(DETECTION_CONDITION_TYPES as [ConditionType, ...ConditionType[]]);
+
+/** A status a failing condition may carry — never `satisfied`. */
+export const conditionFailureStatusSchema = z.enum(CONDITION_FAILURE_STATUSES);
+
+/**
+ * One condition that blocked a direction, as reported by the detection engine.
+ *
+ * Both halves are closed vocabularies: the type must be a registered condition
+ * type, and the status must be one of the failure statuses. An arbitrary
+ * machine-like token is therefore refused here as well as in the scanner's
+ * persisted `failing` codes, so the two surfaces cannot drift apart.
+ */
+export const detectionConditionOutcomeSchema = z
+  .object({
+    /** A registered condition type (`liquidity_sweep`, `news_filter`, …). */
+    conditionType: conditionTypeSchema,
+    /** Why it failed: `unsatisfied`, `insufficient_data` or `unsupported`. */
+    status: conditionFailureStatusSchema,
+  })
+  .strict();
+export type DetectionConditionOutcome = z.infer<typeof detectionConditionOutcomeSchema>;
+
+/**
+ * The stored form of one failing condition: `<conditionType>:<status>`, or
+ * `null` when either half is not part of its enum.
+ *
+ * Shared by the scanner (which writes the codes) and the contract (which
+ * validates them), so a stored code can only ever name a real condition type
+ * and a real failure status.
+ */
+export function conditionFailingCode(conditionType: unknown, status: unknown): string | null {
+  if (!isConditionType(conditionType) || !isConditionFailureStatus(status)) return null;
+  return `${conditionType}:${status}`;
+}
+
+/** Parse a stored failing code back into its parts, or `null` if it is not one. */
+export function parseConditionFailingCode(
+  value: unknown,
+): { conditionType: ConditionType; status: ConditionFailureStatus } | null {
+  if (typeof value !== 'string' || value.length > CONDITION_FAILING_CODE_MAX_CHARS) return null;
+  const separator = value.indexOf(':');
+  if (separator <= 0 || separator === value.length - 1) return null;
+  const conditionType = value.slice(0, separator);
+  const status = value.slice(separator + 1);
+  if (!isConditionType(conditionType) || !isConditionFailureStatus(status)) return null;
+  return { conditionType, status };
+}
+
+/**
+ * A single failing-condition code. Stricter than "machine-like token": both
+ * halves must come from their enums, so an arbitrary `foo:bar` is refused
+ * instead of being presented as condition evidence.
+ */
+export const conditionFailingCodeSchema = z
+  .string()
+  .min(1)
+  .max(CONDITION_FAILING_CODE_MAX_CHARS)
+  .refine((value) => parseConditionFailingCode(value) !== null, {
+    message: 'failing condition codes must be <conditionType>:<status> from the condition registry',
+  });
+
 /** Per-direction detection outcome. */
 export const detectionItemDtoSchema = z
   .object({
@@ -205,6 +319,15 @@ export const detectionItemDtoSchema = z
      * is unchanged. Optional because historical/other callers omit it.
      */
     conditionSummary: conditionSummarySchema.optional(),
+    /**
+     * Which conditions blocked this direction, bounded and in config order.
+     *
+     * Like `conditionSummary`, populated only when the caller asks for
+     * diagnostics, so the M4 HTTP response shape is unchanged. Optional because
+     * historical callers and stubbed detectors omit it; the scanner treats a
+     * missing value as "no per-condition detail" rather than as a failure.
+     */
+    conditionOutcomes: z.array(detectionConditionOutcomeSchema).max(DETECTION_CONDITION_OUTCOMES_MAX).optional(),
   })
   .strict()
   .superRefine((item, ctx) => {

@@ -1,9 +1,11 @@
 import type pg from 'pg';
 import {
+  DETECTION_CONDITION_OUTCOMES_MAX,
   DETECTOR_VERSION,
   SETUP_INITIAL_STATE,
   type CandidateLevels,
   type ConditionSummary,
+  type DetectionConditionOutcome,
   type DetectionItemDto,
   type DetectionResponseDto,
   type SetupDetailDto,
@@ -102,7 +104,16 @@ export class SetupService {
     const detections: DetectionItemDto[] = [];
     for (const direction of directions) {
       const dirEval = item.directions[direction];
-      const diagnostics = args.includeDiagnostics ? { conditionSummary: summariseConditions(dirEval) } : {};
+      // PR A: the counts say *how many* conditions failed; `conditionOutcomes`
+      // says *which*. Only the failing ones are reported (a satisfied condition
+      // explains nothing about a rejection) and only when the caller opted in,
+      // so the M4 HTTP response is unchanged.
+      const diagnostics = args.includeDiagnostics
+        ? {
+            conditionSummary: summariseConditions(dirEval),
+            ...(dirEval.passed ? {} : { conditionOutcomes: failingConditionOutcomes(dirEval) }),
+          }
+        : {};
       if (!dirEval.passed) {
         detections.push({
           direction,
@@ -496,6 +507,32 @@ function toNumberOrNull(value: string | null): number | null {
   if (value === null || value === undefined) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * PR A: the conditions a direction did NOT satisfy, bounded and in config order.
+ *
+ * Companion to {@link summariseConditions}. The summary answers "how many",
+ * this answers "which", and both are pure, total and deterministic: the engine
+ * walks the version's rule groups in their stored order, so the same evaluation
+ * always yields the same list. Capped at `DETECTION_CONDITION_OUTCOMES_MAX` so
+ * one pair cannot inflate run metadata.
+ *
+ * Never influences qualification — `DirectionEvaluation.passed` already decided
+ * that, and this function is only called for a direction that failed.
+ */
+export function failingConditionOutcomes(
+  direction: Pick<DirectionEvaluation, 'groups'>,
+): DetectionConditionOutcome[] {
+  const outcomes: DetectionConditionOutcome[] = [];
+  for (const group of direction.groups) {
+    for (const condition of group.conditions) {
+      if (condition.status === 'satisfied') continue;
+      outcomes.push({ conditionType: condition.conditionType, status: condition.status });
+      if (outcomes.length >= DETECTION_CONDITION_OUTCOMES_MAX) return outcomes;
+    }
+  }
+  return outcomes;
 }
 
 /**

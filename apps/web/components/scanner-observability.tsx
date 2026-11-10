@@ -23,6 +23,7 @@ import {
   SCANNER_OUTCOME_LABELS,
   SCANNER_OUTCOME_ORDER,
   SCANNER_RUN_SCOPE_OPTIONS,
+  describePairDiagnostics,
   describeScannerOutcomes,
   readScannerPairSummary,
   runAudience,
@@ -202,22 +203,34 @@ export function PairItemList({
         <span className="col-span-3">Setup candle (UTC)</span>
       </div>
       <div className="divide-y divide-ink-700/60">
-        {shown.map((item, index) => (
-          <div
-            key={`${item.symbol}-${item.timeframe}-${item.outcome}-${item.cursorMs ?? 'none'}-${index}`}
-            className="grid grid-cols-2 gap-1 py-1.5 sm:grid-cols-12 sm:items-center sm:gap-2"
-          >
-            <span className="col-span-2 font-mono text-ink-100">{item.symbol}</span>
-            <span className="col-span-1 text-ink-400">{item.timeframe}</span>
-            <span className="col-span-2">
-              <Badge tone={OUTCOME_BADGE[item.outcome]}>{SCANNER_OUTCOME_LABELS[item.outcome]}</Badge>
-            </span>
-            <span className="col-span-4 truncate text-ink-400" title={item.reason ?? undefined}>
-              {item.reason ?? '—'}
-            </span>
-            <span className="col-span-3 font-mono text-[11px] text-ink-400">{formatCursor(item.cursorMs)}</span>
-          </div>
-        ))}
+        {shown.map((item, index) => {
+          const diagnostics = describePairDiagnostics(item);
+          return (
+            <div
+              key={`${item.symbol}-${item.timeframe}-${item.outcome}-${item.cursorMs ?? 'none'}-${index}`}
+              className="grid grid-cols-2 gap-1 py-1.5 sm:grid-cols-12 sm:items-center sm:gap-2"
+            >
+              <span className="col-span-2 font-mono text-ink-100">{item.symbol}</span>
+              <span className="col-span-1 text-ink-400">{item.timeframe}</span>
+              <span className="col-span-2">
+                <Badge tone={OUTCOME_BADGE[item.outcome]}>{SCANNER_OUTCOME_LABELS[item.outcome]}</Badge>
+              </span>
+              <span className="col-span-4 truncate text-ink-400" title={item.reason ?? undefined}>
+                {item.reason ?? '—'}
+              </span>
+              <span className="col-span-3 font-mono text-[11px] text-ink-400">{formatCursor(item.cursorMs)}</span>
+              {diagnostics && (
+                <span
+                  data-testid="pair-diagnostic"
+                  className="col-span-2 truncate text-[11px] text-ink-500 sm:col-span-12"
+                  title={diagnostics}
+                >
+                  {diagnostics}
+                </span>
+              )}
+            </div>
+          );
+        })}
       </div>
       <div className="mt-1.5 text-[11px] text-ink-500">
         Showing {shown.length} of {totals.pairs} pairs

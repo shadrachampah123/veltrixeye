@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { conditionSummarySchema } from './detection.js';
+import { conditionFailingCodeSchema, conditionSummarySchema } from './detection.js';
 
 /**
  * Live scanner contracts (M7.5) — production market-data and scanner pipeline.
@@ -86,6 +86,150 @@ export const SCANNER_RUN_PAIR_REASON_MAX_CHARS = 64;
 export const SCANNER_RUN_PAIR_REASONS_MAX = 2;
 export const SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS = 160;
 
+/* ------------------------------------------------------------------------- */
+/* PR A — evaluation diagnostics                                             */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The lifecycle stage a pair reached before it stopped.
+ *
+ * A pair walks these in order and the recorded value is the LAST one it
+ * reached, so the stage alone answers "how far did this pair get?":
+ *
+ *   candles → validation → freshness → anchor → cursor → detection → persistence → complete
+ *
+ *  - `candles`     — fetching one of the three role batches failed.
+ *  - `validation`  — `validateMultiTimeframe` rejected the data.
+ *  - `freshness`   — a role's newest closed candle was too old.
+ *  - `anchor`      — no fully-closed setup candle existed at scan time.
+ *  - `cursor`      — the closed bar had already been processed (idempotent skip).
+ *  - `detection`   — M3/M4 was invoked but produced no usable direction item.
+ *  - `persistence` — detection qualified but the setup could not be persisted
+ *                    (e.g. the plan's saved-setup limit).
+ *  - `complete`    — both directions were evaluated; the pair is `evaluated`.
+ */
+export const SCANNER_PAIR_STAGES = [
+  'candles',
+  'validation',
+  'freshness',
+  'anchor',
+  'cursor',
+  'detection',
+  'persistence',
+  'complete',
+] as const;
+export type ScannerPairStage = (typeof SCANNER_PAIR_STAGES)[number];
+export const scannerPairStageSchema = z.enum(SCANNER_PAIR_STAGES);
+
+/**
+ * Per-direction evaluation state.
+ *
+ *  - `qualified`     — the engine passed this direction (a setup was persisted).
+ *  - `not_qualified` — the engine ran and rejected it; `failing` names why.
+ *  - `blocked`       — the engine qualified it but persistence was refused by a
+ *                      limit. A limit is not a strategy outcome.
+ *  - `error`         — detection threw; the pair is `failed`.
+ *  - `not_run`       — the detector returned no item for this direction, which
+ *                      is NOT an evaluation.
+ */
+export const SCANNER_PAIR_DIRECTION_STATES = ['qualified', 'not_qualified', 'blocked', 'error', 'not_run'] as const;
+export type ScannerPairDirectionState = (typeof SCANNER_PAIR_DIRECTION_STATES)[number];
+export const scannerPairDirectionStateSchema = z.enum(SCANNER_PAIR_DIRECTION_STATES);
+
+/** Bounded counts, so one run's metadata cannot be inflated by a pair. */
+export const SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX = 6;
+export const SCANNER_RUN_PAIR_FAILING_MAX = 4;
+export const SCANNER_RUN_PAIR_CODE_MAX_CHARS = 64;
+
+/**
+ * Candidate-volume evidence for one role: how much history the pair actually
+ * had. `candles` is the batch length handed to validation; `newestMs` is the
+ * open time of its newest candle (null when the batch was empty). Small,
+ * non-identifying numbers that make "insufficient history" distinguishable
+ * from "conditions not met".
+ */
+const scannerPairRoleDataSchema = z
+  .object({
+    candles: z.number().int().min(0).max(1_000_000),
+    newestMs: z.number().int().positive().nullable(),
+  })
+  .strict();
+export type ScannerPairRoleData = z.infer<typeof scannerPairRoleDataSchema>;
+
+const scannerPairDataSchema = z
+  .object({ htf: scannerPairRoleDataSchema, setup: scannerPairRoleDataSchema, entry: scannerPairRoleDataSchema })
+  .strict();
+export type ScannerPairData = z.infer<typeof scannerPairDataSchema>;
+
+/**
+ * One direction's evaluation evidence.
+ *
+ * `failing` entries are `<conditionType>:<status>` and are validated against
+ * the real enums (`conditionFailingCodeSchema`: the condition-type registry and
+ * `CONDITION_FAILURE_STATUSES`), so an arbitrary machine-like token can never be
+ * presented as condition evidence. Pair-level `codes` stay token-bounded rather
+ * than enum-bounded, because provider failure kinds are extensible.
+ */
+const scannerPairDirectionDiagnosticSchema = z
+  .object({
+    state: scannerPairDirectionStateSchema,
+    conditions: conditionSummarySchema.optional(),
+    failing: z.array(conditionFailingCodeSchema).max(SCANNER_RUN_PAIR_FAILING_MAX).optional(),
+  })
+  .strict();
+export type ScannerPairDirectionDiagnostic = z.infer<typeof scannerPairDirectionDiagnosticSchema>;
+
+/**
+ * Everything a pair can say about *why* it ended where it did, beyond its
+ * outcome and reason code.
+ *
+ * Bounded, deterministic and identifier-free: `codes` are machine codes from a
+ * fixed vocabulary, `data` is three pairs of numbers, and `directions` holds at
+ * most two entries. Nothing here is free text, so nothing here can carry a
+ * tenant identifier, a credential or a provider payload. Like the rest of
+ * `items[]` it is only ever present in a run the viewer owns.
+ */
+export const scannerPairDiagnosticsSchema = z
+  .object({
+    stage: scannerPairStageSchema,
+    /** Pair-level causes (`setup_limit_reached`, `insufficient_history`, …). */
+    codes: z.array(z.string().min(1).max(SCANNER_RUN_PAIR_CODE_MAX_CHARS)).max(SCANNER_RUN_PAIR_DIAGNOSTIC_CODES_MAX).optional(),
+    data: scannerPairDataSchema.optional(),
+    directions: z
+      .object({
+        long: scannerPairDirectionDiagnosticSchema.optional(),
+        short: scannerPairDirectionDiagnosticSchema.optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+export type ScannerPairDiagnostics = z.infer<typeof scannerPairDiagnosticsSchema>;
+
+/**
+ * Well-known pair-level diagnostic codes. Not a closed enum (the `reason` field
+ * has always been a bounded code, and provider failures contribute their own
+ * `kind`), but the UI and the tests share this list so new codes are documented
+ * in one place.
+ *
+ *  - `cursor_hit`             — the bar was already processed.
+ *  - `no_closed_candle`       — nothing had closed at scan time.
+ *  - `insufficient_history`   — too few candles for the roles to be correlated.
+ *  - `setup_limit_reached`    — the plan's saved-setup limit refused persistence.
+ *  - `detector_unavailable`   — the detector produced no direction item.
+ *  - `setup_not_persisted`    — detection qualified but no setup row exists.
+ */
+export const SCANNER_PAIR_DIAGNOSTIC_CODES = [
+  'cursor_hit',
+  'no_closed_candle',
+  'insufficient_history',
+  'setup_limit_reached',
+  'detector_unavailable',
+  'setup_not_persisted',
+] as const;
+export type ScannerPairDiagnosticCode = (typeof SCANNER_PAIR_DIAGNOSTIC_CODES)[number];
+
+
 const scannerPairTotalsSchema = z
   .object({
     pairs: z.number().int().min(0),
@@ -116,6 +260,12 @@ const scannerPairItemSchema = z
       .array(z.string().max(SCANNER_RUN_PAIR_REASON_TEXT_MAX_CHARS))
       .max(SCANNER_RUN_PAIR_REASONS_MAX)
       .optional(),
+    /**
+     * PR A: bounded evaluation evidence (stage, cause codes, per-role history,
+     * per-direction state). Optional so every run recorded before PR A — and
+     * every pair recorded without it — keeps parsing exactly as it did.
+     */
+    diagnostics: scannerPairDiagnosticsSchema.optional(),
   })
   .strict();
 
@@ -140,13 +290,26 @@ function assertPairTotalsReconcile(
 }
 
 /**
- * `scanner_runs.metadata.pairs` (Phase B). Additive: runs recorded before this
- * block existed carry no `pairs` key at all, so every reader must treat a null
- * parse as "detail unavailable" — never as zero.
+ * Block versions a reader accepts.
+ *
+ *  - `1` — Phase B: outcomes, condition counts, sanitized reasons.
+ *  - `2` — PR A: the same, plus the optional per-pair `diagnostics` object.
+ *
+ * A writer always stamps the newest version it produces (`2`). Readers accept
+ * both because the new field is optional and because historical rows must keep
+ * rendering; anything else is refused rather than guessed.
+ */
+export const SCANNER_RUN_PAIRS_VERSIONS = [1, 2] as const;
+export type ScannerRunPairsVersion = (typeof SCANNER_RUN_PAIRS_VERSIONS)[number];
+
+/**
+ * `scanner_runs.metadata.pairs` (Phase B, extended by PR A). Additive: runs
+ * recorded before this block existed carry no `pairs` key at all, so every
+ * reader must treat a null parse as "detail unavailable" — never as zero.
  */
 export const scannerRunPairsSchema = z
   .object({
-    v: z.literal(1),
+    v: z.union([z.literal(1), z.literal(2)]),
     /** Computed over ALL pairs, including those beyond the item cap. */
     totals: scannerPairTotalsSchema,
     /** Summed over `evaluated` pairs only (skips/stale/failed contribute 0). */
@@ -182,7 +345,7 @@ export type ScannerPairItem = z.infer<typeof scannerPairItemSchema>;
  */
 export const scannerRunPairAggregateSchema = z
   .object({
-    v: z.literal(1),
+    v: z.union([z.literal(1), z.literal(2)]),
     totals: scannerPairTotalsSchema,
     conditions: conditionSummarySchema,
     truncated: z.boolean(),

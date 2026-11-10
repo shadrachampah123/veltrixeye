@@ -24,8 +24,10 @@ import {
   type ScannerRunDto,
 } from '@veltrixeye/contracts';
 import {
+  PAIR_DIAGNOSTIC_TEXT_MAX,
   SCANNER_RUN_SCOPE_OPTIONS,
   buildScannerRunsRequest,
+  describePairDiagnostics,
   describeScannerOutcomes,
   describeScannerRunsError,
   initialScannerRunsState,
@@ -765,5 +767,179 @@ describe('ScannerRunsCard', () => {
     assert.match(html, /data-testid="pair-items"/, 'the owned row keeps detail');
     assert.match(html, /Per-pair details withheld/, 'the system row says detail is withheld');
     assert.ok(!html.includes('XAUUSD'), 'no system observation is rendered');
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* PR A: per-pair evaluation diagnostics                                     */
+/* ------------------------------------------------------------------------- */
+
+/** A v2 block whose items each carry the diagnostics the API now writes. */
+function diagnosticsBlock(diagnostics: (Record<string, unknown> | undefined)[]) {
+  const items = diagnostics.map((entry, index) => {
+    const base = itemFor(index, 'evaluated');
+    return entry ? { ...base, diagnostics: entry } : base;
+  });
+  return {
+    v: 2,
+    totals: totalsOf({ pairs: items.length, evaluated: items.length }),
+    conditions: { satisfied: 0, unsatisfied: 0, insufficient_data: 0, unsupported: 0 },
+    truncated: false,
+    items,
+  };
+}
+
+const renderedObservations = (html: string) =>
+  (html.match(/class="col-span-2 font-mono text-ink-100"/g) ?? []).length;
+
+describe('describePairDiagnostics', () => {
+  test('a pair with no diagnostics renders nothing at all', () => {
+    assert.equal(describePairDiagnostics({}), null);
+    assert.equal(describePairDiagnostics({ diagnostics: undefined }), null);
+  });
+
+  test('it reads stage, then codes, then directions, then candle counts', () => {
+    const text = describePairDiagnostics({
+      diagnostics: {
+        stage: 'persistence',
+        codes: ['setup_limit_reached', 'setup_not_persisted'],
+        directions: {
+          long: { state: 'blocked' },
+          short: { state: 'not_qualified', failing: ['liquidity_sweep:unsatisfied'] },
+        },
+        data: {
+          htf: { candles: 60, newestMs: null },
+          setup: { candles: 120, newestMs: null },
+          entry: { candles: 119, newestMs: null },
+        },
+      },
+    });
+    assert.equal(
+      text,
+      'Stage: persistence · codes: setup_limit_reached, setup_not_persisted · long blocked by limit · short not qualified (liquidity_sweep:unsatisfied) · candles 60/120/119',
+    );
+  });
+
+  test('every direction state has plain words, and only failing conditions are named', () => {
+    const cases = [
+      ['qualified', 'qualified'],
+      ['not_qualified', 'not qualified'],
+      ['blocked', 'blocked by limit'],
+      ['error', 'error'],
+      ['not_run', 'not run'],
+    ] as const;
+    for (const [state, label] of cases) {
+      assert.equal(describePairDiagnostics({ diagnostics: { stage: 'detection', directions: { long: { state } } } }), `Stage: detection · long ${label}`);
+    }
+    // A qualified direction carries no explanation, so nothing is invented.
+    assert.equal(
+      describePairDiagnostics({ diagnostics: { stage: 'complete', directions: { long: { state: 'qualified' } } } }),
+      'Stage: complete · long qualified',
+    );
+  });
+
+  test('directions always read long before short, whatever the stored key order', () => {
+    const diagnostics = {
+      stage: 'complete',
+      directions: { short: { state: 'error' }, long: { state: 'qualified' } },
+    } as const;
+    assert.equal(describePairDiagnostics({ diagnostics }), 'Stage: complete · long qualified · short error');
+    assert.equal(
+      describePairDiagnostics({ diagnostics }),
+      describePairDiagnostics({ diagnostics }),
+      'the same observation always renders the same sentence',
+    );
+  });
+
+  test('the line is capped, so one pair cannot distort the table', () => {
+    const failing = Array.from({ length: 4 }, (_, i) => `condition_${'x'.repeat(40)}:${i}`);
+    const text = describePairDiagnostics({
+      diagnostics: { stage: 'complete', codes: ['cursor_hit'], directions: { long: { state: 'not_qualified', failing } } },
+    })!;
+    assert.equal(text.length, PAIR_DIAGNOSTIC_TEXT_MAX);
+    assert.ok(text.startsWith('Stage: complete · codes: cursor_hit'));
+  });
+
+  test('a minimal stage-only diagnostic still explains the pair', () => {
+    assert.equal(describePairDiagnostics({ diagnostics: { stage: 'candles' } }), 'Stage: candles');
+  });
+});
+
+describe('pair diagnostics in the observation list', () => {
+  test('only pairs that carry diagnostics get a diagnostic row', () => {
+    const summary = readScannerPairSummary(
+      {
+        triggeredBy: 'user-id',
+        pairs: diagnosticsBlock([
+          { stage: 'complete', codes: ['cursor_hit'] },
+          undefined,
+          { stage: 'validation', codes: ['insufficient_history'] },
+        ]),
+      },
+      {},
+    );
+    assert.equal(summary.kind, 'detail');
+    const html = render(React.createElement(ScannerRunOutcomes, { summary }));
+
+    assert.equal((html.match(/data-testid="pair-diagnostic"/g) ?? []).length, 2, 'one row per pair with evidence');
+    assert.match(html, /Stage: complete · codes: cursor_hit/);
+    assert.match(html, /Stage: validation · codes: insufficient_history/);
+    assert.equal(renderedObservations(html), 3, 'the diagnostic row never duplicates an observation');
+  });
+
+  test('a run recorded before PR A renders exactly as it did before', () => {
+    const legacy = readScannerPairSummary({ triggeredBy: 'user-id', pairs: fullBlock(totalsOf({ pairs: 3, evaluated: 3 })) });
+    const html = render(React.createElement(ScannerRunOutcomes, { summary: legacy }));
+
+    assert.ok(!html.includes('data-testid="pair-diagnostic"'), 'nothing is fabricated for a historical run');
+    assert.ok(!html.includes('Stage:'), 'no stage is invented');
+    assert.equal(renderedObservations(html), 3);
+  });
+
+  test('the full sentence is available as the row title, not just the clipped text', () => {
+    const text = 'Stage: persistence · codes: setup_limit_reached';
+    const summary = readScannerPairSummary({
+      triggeredBy: 'user-id',
+      pairs: diagnosticsBlock([{ stage: 'persistence', codes: ['setup_limit_reached'] }]),
+    });
+    const html = render(React.createElement(ScannerRunOutcomes, { summary }));
+    assert.ok(html.includes(`title="${text}"`), 'the title carries the untruncated description');
+    assert.equal(html.includes('<span data-testid="pair-diagnostic"'), true);
+  });
+
+  test('a system run never renders diagnostics, even if a full block arrives', () => {
+    const metadata = {
+      pairs: diagnosticsBlock([{ stage: 'complete', codes: ['setup_limit_reached'], directions: { long: { state: 'blocked' } } }]),
+    };
+    const audience = runAudience(runFixture(metadata), 'system');
+    const allowDetail = audience === 'owner';
+    assert.equal(audience, 'system');
+    const summary = readScannerPairSummary(metadata, { allowDetail });
+    assert.equal(summary.kind, 'aggregate', 'the client refuses to read detail it is not allowed to show');
+
+    const html = render(React.createElement(ScannerRunOutcomes, { summary, audience }));
+    assert.ok(!html.includes('data-testid="pair-diagnostic"'));
+    assert.ok(!html.includes('setup_limit_reached'), 'no cause code leaks through the aggregate view');
+    assert.ok(!html.includes('blocked by limit'));
+    assert.match(html, /Per-pair details withheld/);
+  });
+
+  test('another tenant’s row shows no diagnostics and no reason text', () => {
+    // The API redacts `triggeredBy` for a run the viewer does not own, so the
+    // payload arrives without an owner — and, defensively, still with a full
+    // block here: the client must refuse to read it.
+    const metadata = { pairs: diagnosticsBlock([{ stage: 'detection', codes: ['detector_unavailable'] }]) };
+    const run = runFixture(metadata);
+    const audience = runAudience(run, 'mine');
+    const allowDetail = audience === 'owner';
+    assert.equal(audience, 'other');
+    const summary = readScannerPairSummary(metadata, { allowDetail });
+    assert.equal(summary.kind, 'aggregate', 'detail is refused for a run the viewer does not own');
+
+    const html = render(React.createElement(ScannerRunRow, { run, scope: 'mine' }));
+    assert.ok(!html.includes('data-testid="pair-diagnostic"'));
+    assert.ok(!html.includes('detector_unavailable'));
+    assert.ok(!html.includes('Stage:'), 'no stage is rendered');
+    assert.match(html, /Per-pair details withheld/);
   });
 });
