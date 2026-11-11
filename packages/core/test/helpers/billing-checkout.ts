@@ -1,9 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import type { Pool } from 'pg';
 import { startEmbeddedPostgres } from '../../../../scripts/db/embedded.mjs';
 import {
+  BillingFxRateVersionStore,
+  BillingFxSourceApprovalStore,
+  type BillingFxRateVersion,
+  type DatabaseIdentityAllowlist,
+  type DatabaseTargetSelector,
+  parseDatabaseIdentityAllowlist,
   billingCheckoutReference, billingSubscriptionActivationIdempotencyKey,
   billingVerifiedTransactionEvidenceHash, billingVerifiedTransactionIdempotencyKey,
   createPool, runMigrations, MIGRATIONS_DIR, BILLING_CATALOGUE_VERSION,
@@ -33,6 +39,157 @@ export async function startBillingTestDb(port: number) {
     pool, dbUrl: db.dbUrl,
     async stop() { await pool.end(); await db.stop(); rmSync(dataDir, { recursive: true, force: true }); },
   };
+}
+
+/** The allowlist id the embedded TEST database is approved under (tests only). */
+export const SANDBOX_TEST_TARGET_ID = 'embedded-test-sandbox';
+/** The production-environment id used by live-path tests (the embedded DB, tests only). */
+export const PRODUCTION_TEST_TARGET_ID = 'embedded-test-production';
+
+/** A test-only identity: an allowlist injected into a service, and a selector. */
+export interface SandboxTestIdentity {
+  /** A reviewed-shape allowlist naming ONLY the connected embedded test database. */
+  readonly allowlist: DatabaseIdentityAllowlist;
+  /** The selector a run supplies (an id, never a name or identifier). */
+  readonly target: DatabaseTargetSelector;
+  readonly databaseName: string;
+  readonly systemIdentifier: string;
+}
+
+/**
+ * TEST FIXTURE ONLY: approve the CONNECTED embedded test database through an
+ * allowlist injected into the service — the same shape the committed allowlist
+ * uses. No database comment is written or consulted; nothing outside the
+ * embedded test cluster is touched. The committed allowlist stays empty.
+ */
+export async function approveSandboxDatabase(
+  pool: Pool,
+  targetId: string = SANDBOX_TEST_TARGET_ID,
+  environment: 'sandbox' | 'production' = 'sandbox',
+): Promise<SandboxTestIdentity> {
+  const { rows } = await pool.query(
+    'SELECT current_database() AS name, (SELECT system_identifier::text FROM pg_control_system()) AS sid',
+  );
+  const databaseName = rows[0].name as string;
+  const systemIdentifier = rows[0].sid as string;
+  const allowlist = parseDatabaseIdentityAllowlist({
+    schemaVersion: 1,
+    entries: [{ id: targetId, environment, databaseName, systemIdentifier }],
+  });
+  return { allowlist, target: { targetId }, databaseName, systemIdentifier };
+}
+
+/**
+ * TEST FIXTURE ONLY: two NON-superuser login principals, one approver and one
+ * publisher, each a member of the DBA roles created by the reviewed script
+ * `scripts/billing/fx-approval-roles.sql`. The database — not this helper —
+ * decides who may approve and who may publish. Separate logins make the
+ * separation-of-duties rule observable (a session login is the principal).
+ */
+export interface FxPrincipals {
+  readonly approverPool: Pool;
+  readonly publisherPool: Pool;
+  readonly approverLogin: string;
+  readonly publisherLogin: string;
+  readonly approvals: BillingFxSourceApprovalStore;
+  readonly publications: BillingFxRateVersionStore;
+  readonly close: () => Promise<void>;
+}
+
+export async function createFxPrincipals(adminPool: Pool, dbUrl: string): Promise<FxPrincipals> {
+  const script = readFileSync(
+    path.resolve(MIGRATIONS_DIR, '../../../../../scripts/billing/fx-approval-roles.sql'),
+    'utf8',
+  );
+  await adminPool.query(script);
+  const suffix = randomUUID().replaceAll('-', '').slice(0, 12);
+  const approverLogin = `fx_approver_${suffix}`;
+  const publisherLogin = `fx_publisher_${suffix}`;
+  const password = randomUUID();
+  for (const login of [approverLogin, publisherLogin]) {
+    await adminPool.query(`CREATE ROLE "${login}" LOGIN PASSWORD '${password}'`);
+  }
+  await adminPool.query(`GRANT veltrixeye_fx_approver TO "${approverLogin}"`);
+  await adminPool.query(`GRANT veltrixeye_fx_publisher TO "${publisherLogin}"`);
+  const approverPool = createPool({ databaseUrl: databaseUrlAsLogin(dbUrl, approverLogin, password) });
+  const publisherPool = createPool({ databaseUrl: databaseUrlAsLogin(dbUrl, publisherLogin, password) });
+  return {
+    approverPool,
+    publisherPool,
+    approverLogin,
+    publisherLogin,
+    approvals: new BillingFxSourceApprovalStore(approverPool),
+    publications: new BillingFxRateVersionStore(publisherPool),
+    close: async () => {
+      await approverPool.end();
+      await publisherPool.end();
+    },
+  };
+}
+
+/** TEST FIXTURE ONLY: the same cluster reached as another login (never a superuser). */
+export function databaseUrlAsLogin(dbUrl: string, user: string, password: string): string {
+  const url = new URL(dbUrl);
+  url.username = user;
+  url.password = password;
+  return url.toString();
+}
+
+/**
+ * TEST FIXTURE ONLY: an ordinary login with NO DBA-role membership and NO
+ * table grants — the shape of the application's own database access. Used to
+ * prove the application cannot write approvals, consumptions or rate rows.
+ */
+export async function createPlainLogin(adminPool: Pool, dbUrl: string, label: string) {
+  const login = `${label}_${randomUUID().replaceAll('-', '').slice(0, 10)}`;
+  const password = randomUUID();
+  await adminPool.query(`CREATE ROLE "${login}" LOGIN PASSWORD '${password}'`);
+  const pool = createPool({ databaseUrl: databaseUrlAsLogin(dbUrl, login, password) });
+  return { login, pool };
+}
+
+/** The exact rate a test publishes; the approval binds every field of it. */
+export interface ApprovedFxInput {
+  readonly fxRateScaled?: bigint;
+  readonly fxRateScale?: number;
+  readonly effectiveFrom: Date;
+  readonly capturedAt: Date;
+  readonly source?: 'ops' | 'import';
+  readonly sourceReference: string;
+  readonly reason?: string;
+}
+
+/**
+ * TEST FIXTURE ONLY: record an approval of EXACTLY this rate as the approver
+ * login, then publish through the publisher login. Returns the published
+ * version. Every publication in a test database goes through the real,
+ * approval-enforcing path.
+ */
+export async function publishApprovedFx(
+  principals: FxPrincipals,
+  input: ApprovedFxInput,
+): Promise<BillingFxRateVersion> {
+  const rateScaled = input.fxRateScaled ?? 12_500_000n;
+  const rateScale = input.fxRateScale ?? 6;
+  const source = input.source ?? 'ops';
+  const approval = await principals.approvals.recordApproval({
+    source,
+    sourceReference: input.sourceReference,
+    fxRateScaled: rateScaled,
+    fxRateScale: rateScale,
+    effectiveFrom: input.effectiveFrom,
+    capturedAt: input.capturedAt,
+    reason: input.reason ?? 'test fixture: recorded approval for a publication under test',
+  });
+  return principals.publications.publish({
+    fxRateScaled: rateScaled,
+    fxRateScale: rateScale,
+    effectiveFrom: input.effectiveFrom,
+    capturedAt: input.capturedAt,
+    source,
+    sourceReference: input.sourceReference,
+    sourceApprovalId: approval.approvalId,
+  });
 }
 
 export async function insertFx(pool: Pool, rateScaled = 12_500_000) {

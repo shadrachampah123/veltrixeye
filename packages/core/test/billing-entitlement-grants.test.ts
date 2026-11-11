@@ -143,13 +143,13 @@ const auditRows = async (userId: string) =>
 /* ========================================================================== */
 
 describe('0036 — the grant fact table', () => {
-  it('all shipped migrations are applied and 0039 is the current tip', async () => {
+  it('all shipped migrations are applied and 0040 is the current tip', async () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
-    assert.equal(status.expectedCount, 39);
-    assert.equal(status.appliedCount, 39);
-    // 0037–0039 legitimately follow this step's 0036 and are named here
+    assert.equal(status.expectedCount, 40);
+    assert.equal(status.appliedCount, 40);
+    // 0037–0040 legitimately follow this step's 0036 and are named here
     // deliberately, so the tip cannot drift silently.
-    assert.equal(status.latestApplied, '0039_notification_smtp_test_claim.sql');
+    assert.equal(status.latestApplied, '0040_billing_fx_source_approvals.sql');
     assert.equal(status.checksumsMatch, true);
   });
 
@@ -292,11 +292,12 @@ describe('0036 — the grant fact table', () => {
         assert.equal(status.expectedCount, 35, 'the base file set is exactly 0001-0035');
         assert.equal(status.pending.length, 0, 'the base set is fully applied');
         assert.equal(full.appliedCount, 36, 'the upgrade path ends at 0036, this step’s tip');
-        assert.equal(full.expectedCount, 39, 'the full shipped migration set includes later additive migrations');
+        assert.equal(full.expectedCount, 40, 'the full shipped migration set includes later additive migrations');
         assert.deepEqual(full.pending, [
           '0037_scheduled_ingestion_trigger.sql',
           '0038_billing_fx_source_observations.sql',
           '0039_notification_smtp_test_claim.sql',
+          '0040_billing_fx_source_approvals.sql',
         ]);
         assert.equal(full.latestApplied, '0036_billing_entitlement_grants.sql');
         assert.equal(full.checksumsMatch, true, '0001-0035 are byte-identical after the upgrade');
@@ -316,17 +317,17 @@ describe('0036 — the grant fact table', () => {
     // still verifies every historical file. What this catches is a migration
     // set that drifted rather than grew.
     const files = readdirSync(MIGRATIONS_DIR).filter((file) => file.endsWith('.sql')).sort();
-    assert.equal(files.length, 39);
+    assert.equal(files.length, 40);
     const versions = files.map((file) => Number(/^(\d{4})_/.exec(file)![1]));
     assert.equal(new Set(versions).size, versions.length, 'no duplicate migration version');
-    for (let expected = 1; expected <= 39; expected += 1) {
+    for (let expected = 1; expected <= 40; expected += 1) {
       assert.ok(versions.includes(expected), `migration ${String(expected).padStart(4, '0')} exists`);
     }
     assert.equal(
       files.filter((file) => Number(/^(\d{4})_/.exec(file)![1]) <= 36).at(-1),
       '0036_billing_entitlement_grants.sql',
     );
-    assert.equal(files.at(-1), '0039_notification_smtp_test_claim.sql');
+    assert.equal(files.at(-1), '0040_billing_fx_source_approvals.sql');
   });
 });
 

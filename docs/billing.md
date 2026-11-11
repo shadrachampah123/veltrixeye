@@ -847,7 +847,12 @@ ledger write — receipt only) — while everything below remains true at the
   payment-confirmation authority is the out-of-band CLI
   (`npm run billing:activate`), which requires a named operator and a stated
   reason and writes nothing else; there is no activation route, no admin role,
-  no operator endpoint and no activation token. A provider-backed subscription
+  no operator endpoint and no activation token. The one database-role authority
+  added by PR #150 remediation (migration `0040`) is FX source approval: it is
+  bound to DBA-granted database logins (`veltrixeye_fx_approver` /
+  `veltrixeye_fx_publisher`), not to an application role, and it does not confirm
+  any payment. Those logins are recorded as principals; they are not verified
+  people. A provider-backed subscription
   without an activation fact stays execution-inert (`paymentConfirmed: false`,
   free entitlements — the hardening sweep pins the same).
   **Since Step 9 there IS a checkout UI** (`/settings`, sandbox only) — and it is
@@ -1547,8 +1552,10 @@ migration, no schema change, no provider operation and no authority**.
   which is why adding one is an **entitlement change** and not a naming change.
 - **No provider plan and no pricing.** `billing_provider_plans` and
   `billing_pricing_snapshots` CHECK `catalogue_plan IN ('pro','elite')`, the
-  Step 4 provisioning workflow provisions only the two sellable plans, and both
-  pricing entry points refuse a plan returned by `unmappedCommercialPlans()`.
+  Step 4 provisioning workflow provisions only the four sandbox combinations
+  (Pro Monthly, Pro Annual, Elite Monthly, Elite Annual — the two sellable
+  catalogue tiers, each in both billing periods), and both pricing entry points
+  refuse a plan returned by `unmappedCommercialPlans()`.
 - **No checkout and no activation.** The server's checkout input schema is
   `z.enum(['pro','elite'])`, and the activation authority — plus the migration
   `0034` CHECK and its coherence trigger — refuses `starter` explicitly.
@@ -1575,7 +1582,7 @@ set PR2 recorded; this is the full inventory:
 | 6 | Pricing derivation | `packages/core/src/billing/pricing.ts` (both entry points refuse `unmappedCommercialPlans()`) | both refusals and their tests |
 | 7 | Provider-plan epochs | `packages/core/src/billing/provider-plans.ts` (`forbidden_plan`) + `0032` → `billing_provider_plans_catalogue_plan_check` | epoch registration and the CHECK |
 | 8 | Pricing-snapshot persistence | `0032` → `billing_pricing_snapshots_catalogue_plan_check` | the CHECK the immutable pricing lock depends on |
-| 9 | Step 4 sandbox provisioning | `packages/core/src/billing/provisioning.ts` (the two sellable plans only) | the provisioning workflow — and a provider plan would have to exist first |
+| 9 | Step 4 sandbox provisioning | `packages/core/src/billing/provisioning.ts` (exactly the four Pro/Elite × monthly/annual sandbox combinations) | the provisioning workflow — and a provider plan would have to exist first |
 | 10 | Activation authority | `packages/core/src/billing/activation.ts` (`forbidden_plan`) + `0034` CHECK and coherence trigger | the service refusal, the CHECK and the trigger |
 | 11 | Checkout contract + surface | `packages/contracts/src/billing-checkout.ts` (`BILLING_CHECKOUT_SELLABLE_PLANS`, `BILLING_CHECKOUT_CHOICES`) and `apps/web/components/billing-checkout.tsx` | the sellable set and the four offered choices |
 | 12 | Portal identity + seam sellability | `packages/core/src/billing/portal.ts` and `packages/contracts/src/billing-provider.ts` (`isSellableBillingPlan`) | the commercial-identity resolution |
@@ -1874,133 +1881,257 @@ moves no state.
 
 ## Sandbox plan provisioning (Step 4)
 
-**Status: the workflow exists; the run has not happened.** No sandbox plan is
-provisioned and no FX rate is published in the deployed environment. This
-section is the runbook for the separately-authorized operator run that
-registers the four sandbox epochs; executing it is an explicit operational
-decision, never implied by this repository.
+**Status: the workflow exists and is tested; the run has not happened.** No sandbox
+plan is provisioned and no FX rate is published in the deployed environment. This
+section is the runbook for a separately-authorized operator run that registers the
+four sandbox epochs. Executing it is an explicit operational decision, never implied
+by this repository.
 
-Step 4 adds `packages/core/src/billing/provisioning.ts` — the **outside-adapter**
-workflow that registers the four production-shaped sandbox plans
-(paystack-provider-contract.md §7.2) as local `billing_provider_plans` epochs.
-It also repairs `BillingProviderPlanStore.register()` (migration 0032 declares
-`catalogue_amount_minor` NOT NULL, so registration must persist it) and keeps
-every store projection parser-compatible (the strict epoch parser refuses the
-durable audit columns a full-row `RETURNING` would add; both `RETURNING`
-clauses and the lookup `SELECT` project the explicit column list).
+Step 4 adds `packages/core/src/billing/provisioning.ts`, the outside-adapter workflow
+that registers the four production-shaped sandbox plans (paystack-provider-contract.md
+§7.2) as local `billing_provider_plans` epochs. It repairs
+`BillingProviderPlanStore.register()` (migration 0032 declares
+`catalogue_amount_minor` NOT NULL, so registration persists it).
 
-**What the workflow guarantees before anything is written**
+### The four plan combinations
 
-- The batch is exactly **Pro Monthly, Pro Annual, Elite Monthly, Elite Annual**
-  — Starter and every other combination is refused; nothing is priced "new".
-- Exactly **one operator-selected FX version** is used: the workflow reads the
-  durable `billing_fx_rate_versions` row by id — never "latest", never a newer
-  row, never a constructed or fixture rate. It must be USD→GHS, `half_up`,
-  already effective at the registration instant, and fresh
-  (`registration_time − captured_at ≤ 900 s`, inclusive at 900; 901 s is
-  refused). An id that does not exist is `missing`, not a promotion.
-- Each plan's GHS amount is **derived, never taken from evidence**:
-  `half_up(catalogue USD minor × FX rate)` via
-  `computePaymentAmountMinor`/`cataloguePriceMinor` — the two existing
-  authorities. Evidence confirms the derivation; it can never override it.
-  Anything below Paystack's documented GHS minimum (10 pesewas) is refused.
-- Evidence must show **test mode**, **GHS**, minor-unit exponent 2, the
-  explicit provider interval for the local period (`monthly` → `monthly`,
-  `annual` → `annually`), an **uncapped** recurring plan (a payment-count cap
-  — including the evidence plan's `max payments = 1` — is refused), and a
-  genuine, non-placeholder `PLN_…` code, unique within the batch.
-- The GHS 2.00 capability-evidence plan (§7.1, assembled in code so no source
-  file carries the literal) is refused at batch admission
-  (`excluded_provider_plan`) — an independent second refusal on top of
-  checkout's `forbidden_plan`. It can never become an epoch.
-- Only after the **whole** batch validates does anything persist: the four
-  `register()` calls run inside **one transaction**; a write-time conflict
-  (combination already active, or a provider code already registered anywhere)
-  rolls the entire batch back. Nothing is upserted, nothing is retired
-  automatically, no partial batch can exist.
-- The module contains no transport, no credential and no environment read, it
-  never publishes FX and never retires an epoch (source-pinned in tests).
+The workflow admits exactly four combinations. Starter and every other combination is
+refused, and nothing is priced "new". Amounts come from the catalogue
+(`packages/contracts/src/billing-catalogue.ts`) and are converted through ONE
+operator-selected FX version.
 
-**Runbook (operator, separately authorized — sandbox only)**
+| Slot | Catalogue plan | Billing interval | Catalogue price (USD) | Provider interval sent to Paystack |
+| --- | --- | --- | --- | --- |
+| `pro-monthly` | Pro | monthly | $39 (3900 minor) | `monthly` |
+| `pro-annual` | Pro | annual | $390 (39000 minor) | `annually` |
+| `elite-monthly` | Elite | monthly | $99 (9900 minor) | `monthly` |
+| `elite-annual` | Elite | annual | $990 (99000 minor) | `annually` |
 
-The run is driven by the operator CLI — `npm run
-billing:provision:sandbox` — a thin wrapper over the service below. It is a
-**dry run by default** (validation only, zero writes), requires
-`PAYSTACK_MODE` to be exactly `test` (live or unreadable configuration is
-refused before any connection), takes ONE already-published `--fx-rate-version`
-id plus `--by` / `--reason` / `--evidence`, and has **no FX publication,
-approval, rate or mode option of any kind**: publication stays the separate
-approved operation from step 3 and the `need_source` source-approval gate is
-untouched. Only an explicit `--apply` registers, and it writes the four epochs
-plus ONE transactional `billing.provider_plans_registered` audit event
-naming the operator and the reason. The provider-domain pin is never treated
-as database isolation: **`--apply` additionally refuses any `DATABASE_URL`
-that is not a verified local loopback target** — a production or unverified
-database is refused *before the first connection*, and the refusal echoes no
-part of the configured target; a committed run against a deployed database
-is therefore a separate, explicitly approved change, not something this tool
-will do silently. Dry runs are read-only and unaffected by that gate. Exit
-codes: 0 clean dry run or registered batch, 1 typed refusal (nothing
-written), 2 usage/configuration error.
+The GHS amount of each slot is **derived, never taken from evidence**:
+`half_up(catalogue USD minor × FX rate)` via `computePaymentAmountMinor` /
+`cataloguePriceMinor`. Evidence confirms the derivation and can never override it.
 
-1. **Agree the inputs before touching anything.** This run needs: (a) the four
-   plan amounts, derived from the catalogue
-   (`billing-catalogue.ts` — Pro $39/mo, Pro $390/yr, Elite $99/mo,
-   Elite $990/yr) through ONE published FX version — not a rate typed into a
-   dashboard; and (b) the four real provider codes the dashboard issues.
-2. **Confirm authorization and environment.** This run uses **test/sandbox
-   mode only** (`sk_test_` elsewhere; this module reads no key at all). Live
-   mode is refused by the code and forbidden here.
-3. **Publish the FX version first.** Insert the operator-approved USD→GHS rate
-   via `BillingFxRateVersionStore.publish({ fxRateScaled, fxRateScale, effectiveFrom, capturedAt, source: 'ops', … })`
-   with `effective_from = captured_at`. Registration must run within
-   **900 seconds** of `captured_at`.
-4. **Create the four plans in the Paystack Dashboard** (manual, test
-   environment — the adapter never mutates plans): plan names for Pro/Elite ×
-   monthly/annual, currency **GHS**, interval **monthly**/**annually**, **no
-   invoice/payment-count limit**, amount **exactly** the derived GHS figure.
-   Record each `PLN_…` code as issued.
-5. **Verify the exclusion.** If any recorded code equals the §7.1
-   capability-evidence plan, STOP — that plan is never an epoch.
-6. **Assemble evidence** — one entry per plan with: `cataloguePlan`,
-   `interval`, `providerInterval` (the mapping above), `providerPlanId`
-   (real code), `paymentCurrency: 'GHS'`, `paymentAmountMinor` (the derived
-   amount as an integer), `paymentAmountExponent: 2`, `mode: 'test'`,
-   `paymentCountCap: 'uncapped'`, and an `evidenceReference` provenance label
-   (e.g. the dashboard/ticket reference — never a credential). These four
-   entries are passed verbatim to the CLI as `--evidence '<json array>'` —
-   the CLI assembles nothing and invents nothing.
-7. **Register.** Run
-   `npm run billing:provision:sandbox -- --fx-rate-version <uuid> --by <operator-id> --reason <text> --evidence '<json array>'`
-   once as the dry run (nothing is written; the printed plan is the exact
-   batch `--apply` would persist), then re-run with `--apply` to commit. On
-   success it reports the four epochs in matrix order, all `active`, all
-   pinning the same `fx_rate_version_id`, together with their audit event.
-   The underlying call is
-   `BillingPlanProvisioningService.registerSandboxPlanEpochs({ fxRateVersionId, evidence, audit })`.
-8. **On ANY refusal, stop.** A `BillingProvisioningError` reason
-   (`invalid_evidence`, `plan_matrix`, `interval_mismatch`, `mode_mismatch`,
-   `currency_mismatch`, `exponent_mismatch`, `cap_mismatch`, `amount_mismatch`,
-   `below_minimum`, `invalid_provider_plan`, `excluded_provider_plan`,
-   `duplicate_combination`, `duplicate_provider_plan`, `shared_fx_violation`,
-   `invalid_instant`) or `BillingFxError` (`missing` / `stale` / `invalid` /
-   `unsupported_currency`) means **nothing was written**. Fix the *input*
-   (evidence or FX selection) and rerun the whole batch — never retry the same
-   input in a loop.
-9. **On a conflict (`billing_provider_plan_unusable`, reason `conflict`)
-   stop likewise.** Inspect `billing_provider_plans` read-only; if an epoch
-   must be replaced, that is a **separate, explicitly approved** retirement —
-   never part of provisioning.
-10. **After a successful run, verify the four rows** (`SELECT ... FROM
-    billing_provider_plans WHERE status = 'active'`): exactly the four
-    combinations, one shared `fx_rate_version_id`, test mode, GHS, the derived
-    amounts and the real `PLN_…` codes. Checkout then works end-to-end for
-    those combinations (PR-C) with amounts frozen by the epochs — a later FX
-    publication never reprices them (D-9).
+### What the workflow guarantees before anything is written
 
-Registration does not notify anyone, synchronize anything or confirm any
-payment: it only makes the four epochs *selectable* by checkout. AC5 clears
-when these four epochs exist **and** the dashboard plans match them.
+- Exactly **one operator-selected FX version** is used, read by id. It must be
+  USD→GHS, `half_up`, already effective at the registration instant, and fresh
+  (`registration_time − captured_at ≤ 900 s`, inclusive at 900; 901 s is refused).
+  An id that does not exist is `missing`, never a promotion to "latest".
+- Evidence must show **test mode**, **GHS**, minor-unit exponent 2, the explicit
+  provider interval for the local period, an **uncapped** recurring plan (a
+  payment-count cap is refused), and a genuine, non-placeholder `PLN_…` code, unique
+  within the batch. Anything below Paystack's GHS minimum (10 pesewas) is refused.
+- The GHS 2.00 capability-evidence plan (§7.1) is refused at batch admission
+  (`excluded_provider_plan`) and can never become an epoch.
+- The batch persists only after the **whole** batch validates. The four `register()`
+  calls run in **one transaction** with the audit event; a write-time conflict rolls
+  everything back. No partial batch can exist, and nothing is upserted or retired.
+- **The database identity is verified on the write connection, inside that
+  transaction, before the FX row is read or any INSERT is issued** (see the identity
+  policy below).
+- The module contains no transport, no credential and no environment read, never
+  publishes FX and never retires an epoch (source-pinned in tests).
+
+### Database identity policy — sandbox (remediation of PR #150 finding H1)
+
+A loopback hostname proves nothing about which database answers it: a `localhost`
+port-forward or SSH tunnel can reach a production cluster. A database **COMMENT is
+never consulted and establishes no trust**: its owner sets it, so it cannot prove
+what the database is. Identity is therefore decided by three facts, none of which is
+taken from the connection string, from runtime input, or from a database comment:
+
+1. **A reviewed allowlist file, committed outside the protected database:**
+   `config/billing/database-identity-allowlist.json` (`schemaVersion` 1). Each entry
+   binds an `id`, an `environment` (`sandbox` or `production`), the exact
+   `databaseName` and the exact PostgreSQL `systemIdentifier`
+   (`pg_control_system().system_identifier`, unsigned digits, at most 19). The
+   parser refuses duplicate ids, duplicate identities, and any identity listed under
+   both environments. The file's exact bytes are **pinned by SHA-256 in code**
+   (`DATABASE_IDENTITY_ALLOWLIST_SHA256`), so an edited copy is refused
+   (`allowlist_pin_mismatch`). Changing the allowlist therefore requires a reviewed
+   code change that updates the pin.
+2. **An operator SELECTION by id, never by name.** The run passes `--target <id>`.
+   The id is a selector, not an authority: the database name and system identifier
+   come only from the reviewed entry. A run cannot supply a name or identifier and
+   thereby authorize a target. An unknown id, or an entry of the wrong environment,
+   is refused before any connection (`target_not_approved`, `environment_mismatch`).
+3. **The CONNECTED database's real identity, read on the write connection.** The
+   verification reads `current_database()` and `pg_control_system().system_identifier`
+   on the very connection the write uses, inside the transaction. Both must equal
+   the entry exactly. A dry run performs the same check before any business read.
+   An identity that cannot be read is never assumed to match (`identity_unverified`).
+
+The refusal messages say WHICH fact differs (the name, or the cluster identifier)
+and never echo its value.
+
+**The committed allowlist currently has NO entries.** Every database is therefore
+refused until an owner adds a reviewed entry and updates the pin in the same change.
+This is the intended fail-closed state.
+
+### Runbook (operator, separately authorized, sandbox only)
+
+The run is driven by `npm run billing:provision:sandbox`, a thin wrapper over
+`BillingPlanProvisioningService`. It is a **dry run by default** (validation only, zero
+writes). Only an explicit `--apply` registers.
+
+```bash
+npm run billing:provision:sandbox -- --fx-rate-version <uuid> --by <operator-id> \
+  --reason "<text>" --evidence '<json array of the four entries>' --target <sandbox-id> [--apply]
+```
+
+Refusals are checked in this order, and every one of them happens **before the first
+connection**, except the identity check, which is the first thing the write connection
+does:
+
+1. Usage: all of `--fx-rate-version`, `--by`, `--reason`, `--evidence`, `--target` are
+   required, once each, with no unknown flag. There is no flag that publishes, approves,
+   sets a rate or sets a mode.
+2. `--evidence` must be valid JSON (exit 2).
+3. `DATABASE_URL` must be set, and `PAYSTACK_MODE` must be exactly `test`. Live or
+   unreadable configuration is refused.
+4. **Loopback gate, for dry runs AND `--apply`:** `DATABASE_URL` must resolve to
+   `localhost`, `127.0.0.1` or `::1` with no query or fragment. This is necessary but
+   not sufficient, because a tunnel can reach any database. It is also the only way the
+   sandbox CLI can target a database at all, so a hosted sandbox database is not
+   reachable from this CLI.
+5. The allowlist loads and passes its pin, and `--target` selects a **sandbox** entry.
+6. The connected identity matches the entry (name and cluster identifier), inside the
+   write transaction.
+
+Exit codes: **0** clean dry run or registered batch; **1** typed refusal (nothing
+written); **2** usage or configuration error.
+
+**Procedure**
+
+1. **Agree the inputs.** The four plan amounts (derived from the catalogue through ONE
+   published FX version, not a rate typed into a dashboard) and the four real provider
+   codes the dashboard issued.
+2. **Confirm the database is an approved entry.** Confirm a reviewed sandbox entry
+   exists in the committed allowlist for the target database, and that the entry's
+   name and system identifier match what the owner of that non-production database
+   reports, e.g. `SELECT current_database(), (SELECT system_identifier FROM pg_control_system());`
+   run by that database's owner. The run itself never reads a name from the operator.
+3. **Publish the FX version first** (see *FX source approval* below). It must be
+   published and fresh (≤900 s from `captured_at`) when the batch runs.
+4. **Create the four plans in the Paystack Dashboard** (test environment, manual; the
+   adapter never mutates plans): currency **GHS**, interval **monthly** or
+   **annually**, **no invoice or payment-count limit**, amount exactly the derived GHS
+   figure. Record each `PLN_…` code as issued.
+5. **Verify the exclusion.** If any recorded code equals the §7.1 capability-evidence
+   plan, STOP.
+6. **Assemble evidence**: one entry per slot with `cataloguePlan`, `interval`,
+   `providerInterval`, `providerPlanId` (real code), `paymentCurrency: 'GHS'`,
+   `paymentAmountMinor` (the derived integer), `paymentAmountExponent: 2`,
+   `mode: 'test'`, `paymentCountCap: 'uncapped'` and an `evidenceReference`
+   provenance label (a ticket or dashboard reference, never a credential).
+7. **Dry run, then apply.** Run without `--apply`, inspect the printed batch, then
+   re-run with `--apply`. Success reports the four epochs in matrix order, all `active`,
+   pinning the same `fx_rate_version_id`, with their audit event.
+8. **On ANY refusal, stop.** Nothing was written. Fix the input and rerun the whole
+   batch. Never retry the same input in a loop.
+9. **On a conflict** (`billing_provider_plan_unusable`, reason `conflict`) stop
+   likewise. Replacing an epoch is a **separate, explicitly approved** retirement, never
+   part of provisioning.
+10. **Verify the four rows** (`billing_provider_plans WHERE status = 'active'`): exactly
+    the four combinations, one shared `fx_rate_version_id`, test mode, GHS, the derived
+    amounts and the real `PLN_…` codes.
+
+Registration does not notify anyone, synchronize anything or confirm any payment. It
+only makes the four epochs *selectable* by checkout.
+
+### FX source approval and separation of duties (remediation of PR #150 findings H2, H3, H4)
+
+A publication is accepted only when a recorded approval authorizes that exact rate.
+Migration `0040_billing_fx_source_approvals.sql` enforces this **in the database**, and
+`BillingFxRateVersionStore.publish()` relies on it.
+
+**Who may approve and publish: database logins, not verified people.** The authorization
+is a database role. An approval is recorded by a login that is a member of
+`veltrixeye_fx_approver`; a publication is made by a login that is a member of
+`veltrixeye_fx_publisher`. The approver and publisher recorded are the authenticated
+session login (`session_user`), never a caller-supplied name. **A database login proves
+which principal acted. It does not prove which human acted**, and one human holding two
+logins cannot be detected. Accountability is only as strong as having one login per
+named human. This repository has no per-person identity, operator token or admin role
+(`DATABASE_URL` is the whole trust boundary, as for `billing:activate` and
+`billing:grant`).
+
+**Provisioning (DBA only).** `scripts/billing/fx-approval-roles.sql` creates the two
+`NOLOGIN` roles and grants EXECUTE on the two writers. It creates no login and no
+membership. The DBA grants membership one named login at a time, e.g.
+`GRANT veltrixeye_fx_approver TO <named_login>;`. Migrations do **not** run this script.
+Until it is run, every approval and publication is refused, which is the fail-closed
+default. **The shared application `DATABASE_URL` login must not be a member of either
+role**, and the approver and publisher must be different logins (the database refuses a
+publication whose approver equals its publisher, by function and by a CHECK constraint).
+
+**What the database enforces**
+
+- **Authorized writers only.** `billing_record_fx_source_approval()` and
+  `billing_publish_fx_rate_version()` are SECURITY DEFINER, with a pinned
+  `search_path`. Each refuses any session whose login is not a member of its role
+  (SQLSTATE `42501`). PUBLIC holds no EXECUTE on either, and no ordinary role holds
+  INSERT on the approval tables. The application login has no table privilege on the
+  approval tables or on `billing_fx_rate_versions` (the public INSERT is revoked).
+- **Append-only approval evidence.** Approval and consumption rows refuse UPDATE,
+  DELETE and TRUNCATE by trigger for **every** role, including the table owner. A
+  deletion or rewrite of an approval is refused, so the audit trail cannot be altered
+  afterwards. The owner (or a superuser) could still disable the trigger; see the
+  limitations below.
+- **Exact-rate binding.** Each approval stores a SHA-256 fingerprint over the source,
+  source reference, currency pair, rate value, rate scale, rounding mode, effective
+  instant and capture instant. A CHECK constraint keeps the fingerprint consistent with
+  its own fields. Publication recomputes the fingerprint from its own inputs and
+  refuses any difference. Changing **any** bound field after approval is a refusal
+  (`source_not_approved`), never a silent re-authorization. A trailing-space change to
+  the reference is also refused.
+- **Single use.** `billing_fx_source_approval_consumptions` has the approval id as its
+  primary key, so one approval can be consumed at most once, and `fx_rate_version_id`
+  is UNIQUE. The consumption is written in the same transaction as the rate version and
+  its `billing.fx_rate_published` audit event.
+- **Expiry.** An approval expires exactly one hour after it is recorded
+  (`expires_at = approved_at + interval '1 hour'`). An expired approval is refused
+  (`approval_expired`).
+- **Refusal reasons** (typed `BillingFxError`, nothing written): `source_not_approved`
+  (no such approval, or the approval does not authorize this exact rate),
+  `approval_consumed` (single use), `approval_expired`, `separation_of_duties` (the
+  publisher login recorded the approval), `source_not_permitted`, and
+  `billing_fx_principal_unauthorized` (SQLSTATE `42501`) for a login with no role.
+- **Transactional and race-safe.** Publication locks the approval `FOR UPDATE`, checks
+  expiry, consumption, fingerprint and separation of duties, then inserts the version,
+  the consumption and the audit event together. The audit metadata cites the approval
+  id and its fingerprint, approver and publisher principals. Two simultaneous publications of one
+  approval cannot both succeed. A failed publication rolls back its version,
+  consumption and audit with it, and the approval stays unconsumed.
+- **Permitted sources.** `ops` and `import` only (`FX_PUBLICATION_PERMITTED_SOURCES`).
+  `db` (a copy of the platform's own rows) and `config` (an environment value) are
+  refused outright. This list is a code decision proposed for review.
+
+**Limitations, stated plainly**
+
+- The table **owner** can still run `ALTER TABLE … DISABLE TRIGGER`, drop a function or
+  use a superuser session to bypass the append-only triggers. The protection holds
+  against every role that does not own these objects. Object ownership must be
+  separated from the application login for the guarantee to hold in production. This is
+  a deployment prerequisite, not something the migration can enforce.
+- There is **no operator CLI** for recording an approval or publishing a rate. The
+  store methods (`BillingFxSourceApprovalStore.recordApproval`,
+  `BillingFxRateVersionStore.publish`) are the only entry points, and they run only in a
+  session authenticated as the approver or publisher login. Building that operator path,
+  and the DBA procedure for granting logins, are prerequisites before any real
+  publication.
+- There is no revocation. An approval is valid for at most one hour and for one
+  publication.
+
+### What Step 4 deliberately does not do
+
+- It does not publish FX, approve a rate, create a Paystack plan, call a provider or
+  retire an epoch.
+- It does not confirm a payment, activate a subscription or grant execution. A
+  registered epoch makes the four combinations selectable by checkout, and nothing else
+  (`grantsExecution` and `paymentConfirmed` stay `false`).
+- It does not write to a hosted database through this CLI. Writing to a deployed
+  database remains a separate, explicitly approved change to the write-path policy.
 
 
 ## Live mode is configuration, not a go-live procedure (`PAYSTACK_MODE`)
@@ -2080,14 +2211,58 @@ subscription, grants no execution and publishes no FX rate.
 ```bash
 PAYSTACK_MODE=live PAYSTACK_LIVE_PLAN_CODES='{"pro-monthly":"PLN_…","pro-annual":"PLN_…","elite-monthly":"PLN_…","elite-annual":"PLN_…"}' \
   npm run billing:provision:live -- --fx-rate-version <uuid> --by <operator-id> \
-    --reason "…" --reference "<dashboard/ticket label>" [--dry-run] [--amount <slot>=<minor>]
+    --reason "…" --reference "<dashboard/ticket label>" \
+    --target <production-id> --confirm-target <production-id> [--dry-run] [--amount <slot>=<minor>]
 ```
 
 or all four codes as `--plan <slot>=<PLN_…>` flags (supplying some flags and
 some environment values is refused, so no code's provenance is ambiguous).
+
+The four slots are the same four combinations as the sandbox run: Pro Monthly,
+Pro Annual, Elite Monthly and Elite Annual (see the table in *Sandbox plan
+provisioning (Step 4)*). Starter is refused.
+
 Exit codes: **0** registered (or a clean `--dry-run`), **1** typed refusal
-(nothing written), **2** usage/configuration error — an unknown or absent
-`PAYSTACK_MODE`, a missing/malformed code set or a missing operator argument.
+(nothing written), **2** usage or configuration error. Exit 2 covers: an absent or
+non-`live` `PAYSTACK_MODE`; a missing or malformed code set; a missing operator argument;
+a missing `--target` or `--confirm-target`; a target id that is not an approved
+**production** entry; and a confirmation that does not repeat the target id.
+
+**Production target identity policy (remediation of PR #150 finding M1)**
+
+A live write is never accepted on the strength of a supplied database name or system
+identifier. The live CLI has no flag for either. The production target is decided by
+the same reviewed allowlist (`config/billing/database-identity-allowlist.json`,
+pin-verified in code) that governs the sandbox, with these rules:
+
+- **Explicit selection and confirmation.** `--target <id>` selects ONE entry whose
+  `environment` is `production`. `--confirm-target <id>` must repeat that id exactly.
+  Both are required for every run, dry runs included. This is the operator's typed
+  confirmation of the production target.
+- **Environment is typed.** A `sandbox` entry can never authorize a live write
+  (`environment_mismatch`), and a `production` entry can never authorize a sandbox
+  write. The sandbox rules (the loopback gate on `DATABASE_URL`) do not apply to live
+  provisioning, because a production host is expected here. Identity, not locality, is
+  the control.
+- **Resolved before the database is read.** The order is: usage; `PAYSTACK_MODE`
+  exactly `live`; the plan codes; the allowlist (pin, selected id, confirmation); then
+  `DATABASE_URL`. Every refusal before the connection is a plain exit 2 with nothing
+  connected or written.
+- **Verified on the connection that touches data.** The service reads the FX row
+  only after `current_database()` and the cluster `system_identifier` match the
+  production entry on that same connection. The write path verifies again inside its
+  transaction, before any INSERT. An identity that cannot be read is refused.
+- **Refusal reason.** A live identity refusal is the typed
+  `database_identity_refused`, and its message names which fact differs without echoing
+  any value.
+
+**State of this change.** The committed allowlist contains **no production entry**.
+The live CLI therefore refuses every run, with a fully valid live configuration, until
+an operator-reviewed production entry and its pin are added in a separate reviewed
+change. The live success path is not exercised by the subprocess CLI tests for that
+reason. The registered-batch behaviour is covered at the service level, against a
+production-environment fixture on the embedded test database, which is not a
+production identity and is never written to the committed file.
 
 **What it enforces, all of it inherited from the existing Step 4 workflow**
 
@@ -2121,8 +2296,8 @@ Exit codes: **0** registered (or a clean `--dry-run`), **1** typed refusal
   explicitly approved action.
 - **No provider call of any kind.** No transport, no fetch, no adapter import,
   no credential and no environment read in the workflow module (silent
-  registration is SQL only). The CLI reads `DATABASE_URL`, `PAYSTACK_MODE` and
-  the supplied codes at its own configuration boundary.
+  registration is SQL only). The CLI reads `PAYSTACK_MODE`, the supplied codes,
+  the committed allowlist and `DATABASE_URL` at its own configuration boundary.
 - **Sandbox behaviour unchanged.** A `test` batch still registers without an
   audit descriptor and writes no audit event; the two domains never see each
   other's epochs or keys.

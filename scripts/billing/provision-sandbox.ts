@@ -48,6 +48,16 @@
  * `billing:provision:live`, it deliberately has no HTTP route and no operator
  * token; the database connection is the whole trust boundary.
  *
+ * DATABASE IDENTITY (the second boundary). The run selects ONE reviewed entry of
+ * the committed allowlist `config/billing/database-identity-allowlist.json` with
+ * `--target <id>`. The allowlist file is loaded here and must match its pinned
+ * SHA-256 (see `packages/core/src/billing/database-identity.ts`). The run supplies
+ * NO database name or system identifier: those come only from the reviewed entry.
+ * The service then verifies, on the connection it actually opened and inside the
+ * write transaction before any read or INSERT, that the connected database has
+ * exactly the entry's name AND cluster system identifier. A localhost port-forward
+ * to any other database fails that check. A database COMMENT is never consulted.
+ *
  * WHAT IT NEVER DOES
  *  - never calls Paystack or any provider: no transport, no credential and no
  *    provider import — the four sandbox plans already exist in the dashboard
@@ -77,6 +87,10 @@ import { createPool } from '@veltrixeye/core';
 import {
   BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION,
   BillingPlanProvisioningService,
+  DATABASE_IDENTITY_ALLOWLIST_RELATIVE_PATH,
+  type DatabaseIdentityAllowlist,
+  loadDatabaseIdentityAllowlist,
+  resolveDatabaseTarget,
   isBillingFxError,
   isBillingProviderPlanError,
   isBillingProvisioningError,
@@ -91,7 +105,7 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const USAGE = [
   'Usage:',
   '  npm run billing:provision:sandbox -- --fx-rate-version <uuid> --by <operator-id> --reason <text> \\',
-  '    --evidence <json> [--apply]',
+  '    --evidence <json> --target <allowlist-id> [--apply]',
   '',
   'Provisions the four sandbox provider-plan epochs (Pro/Elite × monthly/annual) from ONE',
   'already-published FX rate version and the four assembled Step 4 evidence entries, passed',
@@ -104,10 +118,14 @@ const USAGE = [
   'in a single transaction (rolled back together on any refusal or conflict).',
   '',
   'Requires PAYSTACK_MODE exactly "test" (live mode is refused before any connection) and',
-  'DATABASE_URL. --apply additionally refuses any database target that is not a verified local',
-  'loopback host: a production or unverified database is refused before the first connection,',
-  'because the provider-domain pin says nothing about where DATABASE_URL points. Dry runs are',
-  'read-only and unaffected by that gate.',
+  'DATABASE_URL. DATABASE_URL must be a verified local loopback target for BOTH dry runs and',
+  '--apply: a production or unverified host is refused before the first connection, because the',
+  'provider-domain pin says nothing about where DATABASE_URL points.',
+  '',
+  'DATABASE IDENTITY: --target <id> is mandatory for every run. It selects a reviewed SANDBOX entry of',
+  'config/billing/database-identity-allowlist.json. The database name and system identifier come only',
+  'from that entry; they cannot be supplied on the command line. The connected database must match both',
+  'exactly, or nothing is written. A database comment or marker is never consulted.',
   '',
   'Never publishes or approves an FX rate, never calls a provider, never',
   'confirms a payment and never grants execution.',
@@ -149,6 +167,7 @@ interface Args {
   by?: string;
   reason?: string;
   evidence?: string;
+  target?: string;
   apply: boolean;
   /** Set when `--dry-run` was passed explicitly (the default is a dry run). */
   dryRunExplicit?: boolean;
@@ -205,6 +224,10 @@ function parseArgs(argv: string[]): Args {
       case '--evidence':
         assign(args.evidence, flag);
         args.evidence = value;
+        break;
+      case '--target':
+        assign(args.target, flag);
+        args.target = value;
         break;
       default:
         // Unknown arguments are refused — including any attempt to smuggle in
@@ -357,6 +380,22 @@ async function main(): Promise<number> {
     );
     return 2;
   }
+  if (args.target === undefined) {
+    console.info(USAGE);
+    console.error(
+      '[billing:provision:sandbox] --target is required: the run must select a reviewed sandbox entry ' +
+        'of the database identity allowlist. Nothing was connected or written.',
+    );
+    return 2;
+  }
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(args.target)) {
+    console.info(USAGE);
+    console.error(
+      '[billing:provision:sandbox] --target must be an allowlist id (lowercase letters, digits, hyphens). ' +
+        'Nothing was connected or written.',
+    );
+    return 2;
+  }
   if (
     args.fxRateVersion.trim() === '' ||
     args.by.trim() === '' ||
@@ -367,6 +406,20 @@ async function main(): Promise<number> {
     console.error(
       '[billing:provision:sandbox] blank values are refused: every required flag must carry a real value. ' +
         'Nothing was validated and nothing was written.',
+    );
+    return 2;
+  }
+
+  // Pure input parsing first: malformed JSON is refused before any configuration,
+  // allowlist or connection is touched.
+  let evidence: unknown;
+  try {
+    evidence = JSON.parse(args.evidence);
+  } catch (error) {
+    console.error(
+      '[billing:provision:sandbox] --evidence is not valid JSON (a JSON array of the four Step 4 ' +
+        `evidence entries is expected): ${error instanceof Error ? error.message : String(error)}\n` +
+        '        Nothing was validated and nothing was written.',
     );
     return 2;
   }
@@ -397,34 +450,39 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  // THE DATABASE-TARGET GATE (the `--apply` write path only): the provider
-  // domain above says nothing about WHERE this connection string points, so
-  // a sandbox-mode run against a production or unverified database must be
-  // impossible. `--apply` is refused here — before the evidence is even
-  // parsed and before any pool exists — unless DATABASE_URL is a verified
-  // local loopback target. Dry runs never write, so they are unaffected.
-  if (args.apply) {
+  // THE DATABASE-TARGET GATE (every run, dry or applied): the provider domain
+  // above says nothing about WHERE this connection string points, and an
+  // identity check can only be made by CONNECTING. So this tool opens a
+  // connection only to a verified local loopback target — a production or
+  // unverified host is refused here, before the evidence is parsed and before
+  // any pool exists. A dry run reads the authority, so it is gated too.
+  {
     const rejection = localDatabaseTargetRejection(databaseUrl);
     if (rejection !== null) {
       console.error(
-        `[billing:provision:sandbox] --apply refuses this database target: ${rejection}.\n` +
-          '        Sandbox epoch writes are only permitted against a verified LOCAL (loopback) database.\n' +
-          '        A production or unverified target is never written by this tool — PAYSTACK_MODE=test\n' +
-          '        proves the provider domain, never the database. Nothing was written.\n' +
-          '        Dry runs (the default) are read-only and unaffected by this gate.',
+        `[billing:provision:sandbox] ${args.apply ? '--apply' : 'the dry run'} refuses this database target: ${rejection}.\n` +
+          '        Sandbox provisioning only connects to a verified LOCAL (loopback) database.\n' +
+          '        A production or unverified target is never connected to by this tool — PAYSTACK_MODE=test\n' +
+          '        proves the provider domain, never the database. Nothing was written.',
       );
       return 2;
     }
   }
 
-  let evidence: unknown;
+  // THE REVIEWED ALLOWLIST (static, before any connection, after the mode and
+  // loopback gates): loaded from the
+  // committed file, pin-verified, and the selected id resolved to a SANDBOX
+  // entry. Any failure — missing, unpinned, malformed, unknown id, or a
+  // production entry — refuses here, before DATABASE_URL is even read.
+  let identityAllowlist: DatabaseIdentityAllowlist;
   try {
-    evidence = JSON.parse(args.evidence);
+    identityAllowlist = loadDatabaseIdentityAllowlist(
+      path.join(REPO_ROOT, DATABASE_IDENTITY_ALLOWLIST_RELATIVE_PATH),
+    );
+    resolveDatabaseTarget(identityAllowlist, 'sandbox', args.target);
   } catch (error) {
     console.error(
-      '[billing:provision:sandbox] --evidence is not valid JSON (a JSON array of the four Step 4 ' +
-        `evidence entries is expected): ${error instanceof Error ? error.message : String(error)}\n` +
-        '        Nothing was validated and nothing was written.',
+      `[billing:provision:sandbox] ${error instanceof Error ? error.message : 'The database identity check failed.'}`,
     );
     return 2;
   }
@@ -433,11 +491,19 @@ async function main(): Promise<number> {
   try {
     // Pinned literal: the gate above already refused anything that is not the
     // sandbox domain, and no argument can influence the service's mode.
-    const service = new BillingPlanProvisioningService({ db: pool, mode: 'test' });
+    const service = new BillingPlanProvisioningService({
+      db: pool,
+      mode: 'test',
+      identityAllowlist,
+    });
     const request = {
       fxRateVersionId: args.fxRateVersion,
       evidence,
       audit: { operatorId: args.by, reason: args.reason },
+      // The selector only. The service resolves it against the allowlist and
+      // verifies the CONNECTED database (name and cluster identifier) before any
+      // read of business rows and, on --apply, before any INSERT.
+      databaseTarget: { targetId: args.target },
     };
 
     if (!args.apply) {

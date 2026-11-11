@@ -58,6 +58,7 @@ const LATER_MIGRATIONS = [
   '0035_billing_live_mode.sql', '0036_billing_entitlement_grants.sql',
   '0037_scheduled_ingestion_trigger.sql',
   '0038_billing_fx_source_observations.sql', '0039_notification_smtp_test_claim.sql',
+  '0040_billing_fx_source_approvals.sql',
 ] as const;
 /** Columns `subscriptions` had before 0031 (migration 0014). */
 const SUBSCRIPTION_COLUMNS_0014 = [

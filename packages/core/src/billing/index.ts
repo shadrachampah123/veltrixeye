@@ -8,6 +8,7 @@ export * from './fx-source-observations.js';
 export * from './pricing.js';
 export * from './provider-plans.js';
 export * from './provisioning.js';
+export * from './database-identity.js';
 export * from './live-plan-registration.js';
 export * from './legacy-free-row-remediation.js';
 export * from './provider.js';

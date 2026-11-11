@@ -55,14 +55,13 @@ import { fileURLToPath } from 'node:url';
 import type { Pool } from 'pg';
 import {
   BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION,
-  BillingFxRateVersionStore,
   BillingPlanProvisioningService,
-  EXCLUDED_PROVIDER_PLAN_CODE,
+  isBillingProvisioningError,
   cataloguePriceMinor,
   computePaymentAmountMinor,
   providerIntervalForBillingInterval,
 } from '../src/index.js';
-import { retireActiveEpochs, startBillingTestDb } from './helpers/billing-checkout.js';
+import { retireActiveEpochs, startBillingTestDb, approveSandboxDatabase, createFxPrincipals, publishApprovedFx, type FxPrincipals, type SandboxTestIdentity } from './helpers/billing-checkout.js';
 
 // Unique per suite file (see the port ledger across packages/core/test/*.test.ts).
 const DB_PORT = 5549;
@@ -82,10 +81,15 @@ const FX_ANCHOR = Date.now();
 let fxTick = 0;
 
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
+/** The marked sandbox database's explicit identity expectation (set in before()). */
+let SANDBOX_IDENT: SandboxTestIdentity;
+let FX: FxPrincipals;
 let pool: Pool;
 
 before(async () => {
   db = await startBillingTestDb(DB_PORT);
+  SANDBOX_IDENT = await approveSandboxDatabase(db.pool);
+  FX = await createFxPrincipals(db.pool, db.dbUrl);
   pool = db.pool;
 }, { timeout: 180_000 });
 
@@ -96,6 +100,7 @@ beforeEach(async () => {
 });
 
 after(async () => {
+  await FX?.close();
   await db?.stop();
 });
 
@@ -113,15 +118,13 @@ async function publishFxNow(options: { rateScaled?: bigint; capturedSecondsBefor
   // Every version sits at a strictly distinct offset from the anchor, so the
   // durable uniqueness index can never collide within this suite.
   const capturedAt = new Date(FX_ANCHOR - ((options.capturedSecondsBefore ?? 30) + tick) * 1000);
-  const fxVersions = new BillingFxRateVersionStore(pool);
-  return fxVersions.publish({
+  return publishApprovedFx(FX, {
     fxRateScaled: options.rateScaled ?? 12_500_000n,
     fxRateScale: 6,
     effectiveFrom: capturedAt,
     capturedAt,
     source: 'ops',
     sourceReference: 'ops-sandbox-fx-board-1',
-    createdBy: OPERATOR,
   });
 }
 
@@ -200,15 +203,10 @@ function cli(env: Record<string, string | null>, args: readonly string[]) {
 function baseArgs(fxId: string, evidence: readonly unknown[]): string[] {
   return [
     '--fx-rate-version', fxId,
-    '--by', OPERATOR,
+    '--by', OPERATOR, '--target', 'embedded-test-sandbox',
     '--reason', REASON,
     '--evidence', JSON.stringify(evidence),
   ];
-}
-
-/** The sandbox configuration every DB-reaching run uses. */
-function sandboxEnv(): Record<string, string> {
-  return { DATABASE_URL: db.dbUrl, PAYSTACK_MODE: 'test' };
 }
 
 /** A configuration that never reaches a connection (pre-connection refusals). */
@@ -224,20 +222,6 @@ async function testEpochHistory(): Promise<number> {
     "SELECT id FROM billing_provider_plans WHERE mode = 'test'",
   );
   return rows.length;
-}
-
-/** The ACTIVE test-domain epochs, in matrix order. */
-async function activeTestEpochs() {
-  const { rows } = await pool.query(
-    `SELECT catalogue_plan, billing_interval, provider_plan_id, payment_currency,
-            payment_amount_exponent, payment_amount_minor::text AS amount,
-            provider_plan_reference, fx_rate_version_id::text AS fx, status, mode
-       FROM billing_provider_plans
-      WHERE mode = 'test' AND status = 'active'
-      ORDER BY CASE catalogue_plan WHEN 'pro' THEN 0 ELSE 1 END,
-               CASE billing_interval WHEN 'monthly' THEN 0 ELSE 1 END`,
-  );
-  return rows;
 }
 
 const auditCount = async (): Promise<number> => {
@@ -332,7 +316,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
   const present = (omit: string): string[] => {
     const args = [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--target', 'embedded-test-sandbox',
       '--reason', REASON,
       '--evidence', '[]',
     ];
@@ -361,7 +345,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
   test('blank required values are refused', () => {
     const result = cli({}, [
       '--fx-rate-version', randomUUID(),
-      '--by', '   ',
+      '--by', '   ', '--target', 'embedded-test-sandbox',
       '--reason', REASON,
       '--evidence', '[]',
     ]);
@@ -370,7 +354,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
 
     const blankEvidence = cli({}, [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--target', 'embedded-test-sandbox',
       '--reason', REASON,
       '--evidence', ' ',
     ]);
@@ -381,7 +365,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
   test('malformed --evidence JSON, repeated flags and conflicting flags are usage errors', () => {
     const malformed = cli(preConnectionEnv('test'), [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--target', 'embedded-test-sandbox',
       '--reason', REASON,
       '--evidence', '{not json',
     ]);
@@ -390,8 +374,8 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
 
     const repeated = cli({}, [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
-      '--by', 'someone-else',
+      '--by', OPERATOR, '--target', 'embedded-test-sandbox',
+      '--by', 'someone-else', '--target', 'embedded-test-sandbox',
       '--reason', REASON,
       '--evidence', '[]',
     ]);
@@ -400,7 +384,7 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
 
     const conflicting = cli({}, [
       '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
+      '--by', OPERATOR, '--target', 'embedded-test-sandbox',
       '--reason', REASON,
       '--evidence', '[]',
       '--apply',
@@ -410,27 +394,26 @@ describe('sandbox provisioning CLI — missing and malformed inputs', () => {
     assert.match(conflicting.stderr, /mutually exclusive/);
   });
 
-  test('a structurally unusable request is a typed invalid_evidence refusal — exit 1, no connection needed', () => {
-    // Valid JSON that is not an evidence array: the CLI passes it through and
-    // the service's strict input schema refuses it (exit 1, nothing written).
-    const result = cli(preConnectionEnv('test'), [
-      '--fx-rate-version', randomUUID(),
-      '--by', OPERATOR,
-      '--reason', REASON,
-      '--evidence', '42',
-    ]);
-    assert.equal(result.status, 1);
-    assert.match(result.stderr, /refused \(invalid_evidence\)/);
-    assert.match(result.stderr, /Nothing was written/);
-
-    const badUuid = cli(preConnectionEnv('test'), [
-      '--fx-rate-version', 'not-a-uuid',
-      '--by', OPERATOR,
-      '--reason', REASON,
-      '--evidence', JSON.stringify([]),
-    ]);
-    assert.equal(badUuid.status, 1);
-    assert.match(badUuid.stderr, /refused \(invalid_evidence\)/);
+  test('a structurally unusable request is a typed invalid_evidence refusal, in-process, before any connection', async () => {
+    // The CLI cannot reach the service's typed refusals without an approved
+    // sandbox entry in the committed allowlist (which is empty by design), so
+    // the same service the CLI wraps is exercised in-process. Its pool fails the
+    // test if it is ever asked to connect: the refusal is pre-connection.
+    const service = new BillingPlanProvisioningService({
+      db: { connect: async () => { throw new Error('must be refused before any connection'); } } as never,
+      mode: 'test',
+      identityAllowlist: SANDBOX_IDENT.allowlist,
+    });
+    const audit = { operatorId: OPERATOR, reason: REASON };
+    for (const input of [
+      { fxRateVersionId: randomUUID(), evidence: 42, databaseTarget: SANDBOX_IDENT.target, audit },
+      { fxRateVersionId: 'not-a-uuid', evidence: [], databaseTarget: SANDBOX_IDENT.target, audit },
+    ]) {
+      await assert.rejects(
+        service.registerSandboxPlanEpochs(input),
+        (error: unknown) => isBillingProvisioningError(error) && error.reason === 'invalid_evidence',
+      );
+    }
   });
 });
 
@@ -466,14 +449,22 @@ describe('sandbox provisioning CLI — PAYSTACK_MODE is a gate, never a switch',
   });
 
   test('evidence from another domain is a typed mode_mismatch refusal — never relabelled', async () => {
+    // In-process on the real embedded database: the CLI cannot reach this
+    // refusal without an approved sandbox entry (see the note above).
     const fx = await publishFxNow();
     const historyBefore = await testEpochHistory();
     const auditsBefore = await auditCount();
     const { evidence } = evidenceBatch({ 'pro/monthly': { mode: 'live' } });
-    const result = cli(sandboxEnv(), baseArgs(fx.id, evidence));
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /refused \(mode_mismatch\)/);
-    assert.match(result.stderr, /Nothing was written/);
+    const service = new BillingPlanProvisioningService({ db: pool, mode: 'test', identityAllowlist: SANDBOX_IDENT.allowlist });
+    await assert.rejects(
+      service.validateSandboxPlanEpochs({
+        fxRateVersionId: fx.id,
+        evidence,
+        databaseTarget: SANDBOX_IDENT.target,
+        audit: { operatorId: OPERATOR, reason: REASON },
+      }),
+      (error: unknown) => isBillingProvisioningError(error) && error.reason === 'mode_mismatch',
+    );
     assert.equal(await testEpochHistory(), historyBefore);
     assert.equal(await auditCount(), auditsBefore);
   });
@@ -483,396 +474,19 @@ describe('sandbox provisioning CLI — PAYSTACK_MODE is a gate, never a switch',
 /* 4. Dry run — the default                                                    */
 /* ========================================================================== */
 
-describe('sandbox provisioning CLI — dry run is the default and writes nothing', () => {
-  test('the default run validates the whole batch against the durable FX row and persists nothing', async () => {
-    const fx = await publishFxNow();
-    const { evidence, codes } = evidenceBatch();
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-
-    const result = cli(sandboxEnv(), baseArgs(fx.id, evidence));
-    assert.equal(result.status, 0, result.stderr);
-
-    const output = JSON.parse(result.stdout) as {
-      outcome: string;
-      dryRun: boolean;
-      mode: string;
-      providerCalls: number;
-      fxRateVersionId: string;
-      auditAction: string | null;
-      grantsExecution: boolean;
-      paymentConfirmed: boolean;
-      plan: Array<Record<string, unknown>>;
-    };
-    assert.equal(output.outcome, 'dry_run');
-    assert.equal(output.dryRun, true);
-    assert.equal(output.mode, 'test');
-    assert.equal(output.providerCalls, 0);
-    assert.equal(output.fxRateVersionId, fx.id);
-    assert.equal(output.auditAction, null, 'a dry run records no audit event');
-    assert.equal(output.grantsExecution, false);
-    assert.equal(output.paymentConfirmed, false);
-    assert.equal(output.plan.length, 4);
-
-    for (const [index, [combo, plan, interval]] of COMBOS.entries()) {
-      const entry = output.plan[index]!;
-      assert.equal(entry.slot, combo.replace('/', '-'), `slot order: ${combo}`);
-      assert.equal(entry.cataloguePlan, plan);
-      assert.equal(entry.billingInterval, interval);
-      assert.equal(entry.providerInterval, interval === 'annual' ? 'annually' : 'monthly');
-      assert.equal(entry.providerPlanId, codes[combo]);
-      assert.equal(entry.paymentCurrency, 'GHS');
-      assert.equal(entry.paymentAmountMinor, derived(plan, interval).toString());
-      assert.equal(entry.epochId, null, 'a dry run reports no epoch');
-      assert.equal(entry.status, null);
-    }
-
-    assert.equal(await testEpochHistory(), historyBefore, 'a dry run writes no epoch');
-    assert.equal(await auditCount(), auditsBefore, 'a dry run writes no audit event');
-    assert.match(result.stderr, /Nothing was written/);
-  });
-
-  test('an explicit --dry-run behaves identically to the default', async () => {
-    const fx = await publishFxNow();
-    const { evidence } = evidenceBatch();
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-
-    const result = cli(sandboxEnv(), [...baseArgs(fx.id, evidence), '--dry-run']);
-    assert.equal(result.status, 0, result.stderr);
-    const output = JSON.parse(result.stdout) as { outcome: string; dryRun: boolean };
-    assert.equal(output.outcome, 'dry_run');
-    assert.equal(output.dryRun, true);
-    assert.equal(await testEpochHistory(), historyBefore);
-    assert.equal(await auditCount(), auditsBefore);
-  });
-
-  test('an FX version that does not exist is refused as missing — no promotion, nothing written', async () => {
-    const { evidence } = evidenceBatch();
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-
-    const result = cli(sandboxEnv(), baseArgs(randomUUID(), evidence));
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /refused \(missing\)/);
-    assert.match(result.stderr, /Nothing was written/);
-    assert.equal(await testEpochHistory(), historyBefore);
-    assert.equal(await auditCount(), auditsBefore);
-  });
-
-  test('a stale FX version is refused — 900 seconds is the authority, not a suggestion', async () => {
-    const fx = await publishFxNow({ capturedSecondsBefore: 1000 });
-    const { evidence } = evidenceBatch();
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-
-    const result = cli(sandboxEnv(), baseArgs(fx.id, evidence));
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /refused \(stale\)/);
-    assert.match(result.stderr, /Nothing was written/);
-    assert.equal(await testEpochHistory(), historyBefore);
-    assert.equal(await auditCount(), auditsBefore);
-  });
-
-  test('a credential-shaped operator identity is refused before anything runs', async () => {
-    const fx = await publishFxNow();
-    const { evidence } = evidenceBatch();
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-
-    const result = cli(sandboxEnv(), [
-      '--fx-rate-version', fx.id,
-      '--by', 'ops-bearer-identifier-1',
-      '--reason', REASON,
-      '--evidence', JSON.stringify(evidence),
-    ]);
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /refused \(audit_required\)/);
-    assert.match(result.stderr, /credential-shaped/);
-    assert.equal(await testEpochHistory(), historyBefore);
-    assert.equal(await auditCount(), auditsBefore);
-  });
-});
-
-/* ========================================================================== */
-/* 5. The refusal matrix — every Step 4 rule, through the CLI                 */
-/* ========================================================================== */
-
-describe('sandbox provisioning CLI — the typed refusal matrix (dry run)', () => {
-  test('amount, interval, currency, exponent, cap, code, matrix, mode and FX-identity violations all refuse', async () => {
-    const fx = await publishFxNow();
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-
-    const wrongAmount = derived('elite', 'annual') + 1n;
-    const cases: ReadonlyArray<{ label: string; reason: string; args: string[] }> = [
-      {
-        label: 'amount mismatch',
-        reason: 'amount_mismatch',
-        args: baseArgs(fx.id, evidenceBatch({
-          'elite/annual': { paymentAmountMinor: wrongAmount.toString() },
-        }).evidence),
-      },
-      {
-        label: 'interval mismatch',
-        reason: 'interval_mismatch',
-        args: baseArgs(fx.id, evidenceBatch({
-          'elite/annual': { providerInterval: 'monthly' },
-        }).evidence),
-      },
-      {
-        label: 'currency mismatch',
-        reason: 'currency_mismatch',
-        args: baseArgs(fx.id, evidenceBatch({
-          'elite/annual': { paymentCurrency: 'USD' },
-        }).evidence),
-      },
-      {
-        label: 'exponent mismatch',
-        reason: 'exponent_mismatch',
-        args: baseArgs(fx.id, evidenceBatch({
-          'elite/annual': { paymentAmountExponent: 0 },
-        }).evidence),
-      },
-      {
-        label: 'capped payment count',
-        reason: 'cap_mismatch',
-        args: baseArgs(fx.id, evidenceBatch({
-          'elite/annual': { paymentCountCap: { capped: true, maxPayments: 1 } },
-        }).evidence),
-      },
-      {
-        label: 'unknown payment count',
-        reason: 'cap_mismatch',
-        args: baseArgs(fx.id, evidenceBatch({
-          'elite/annual': { paymentCountCap: 'unknown' },
-        }).evidence),
-      },
-      {
-        label: 'placeholder plan code',
-        reason: 'invalid_provider_plan',
-        args: baseArgs(fx.id, evidenceBatch({
-          'pro/monthly': { providerPlanId: 'PLN_sample0000001' },
-        }).evidence),
-      },
-      {
-        label: 'malformed plan code',
-        reason: 'invalid_provider_plan',
-        args: baseArgs(fx.id, evidenceBatch({
-          'pro/monthly': { providerPlanId: 'pro-monthly-plan' },
-        }).evidence),
-      },
-      {
-        label: 'excluded capability-evidence plan',
-        reason: 'excluded_provider_plan',
-        args: baseArgs(fx.id, evidenceBatch({
-          'pro/monthly': { providerPlanId: EXCLUDED_PROVIDER_PLAN_CODE },
-        }).evidence),
-      },
-      {
-        label: 'duplicate plan code',
-        reason: 'duplicate_provider_plan',
-        args: (() => {
-          const batch = evidenceBatch();
-          return baseArgs(fx.id, batch.evidence.map((entry) => (
-            entry.cataloguePlan === 'elite' && entry.interval === 'annual'
-              ? { ...entry, providerPlanId: batch.codes['pro/monthly'] }
-              : entry
-          )));
-        })(),
-      },
-      {
-        label: 'a fifth slot',
-        reason: 'plan_matrix',
-        args: baseArgs(fx.id, [...evidenceBatch().evidence, {
-          cataloguePlan: 'starter',
-          interval: 'monthly',
-          providerInterval: 'monthly',
-          providerPlanId: code(),
-          paymentCurrency: 'GHS',
-          paymentAmountMinor: '1500',
-          paymentAmountExponent: 2,
-          mode: 'test',
-          paymentCountCap: 'uncapped',
-          evidenceReference: REFERENCE,
-        }]),
-      },
-      {
-        label: 'a partial batch',
-        reason: 'plan_matrix',
-        args: baseArgs(fx.id, evidenceBatch().evidence.slice(0, 3)),
-      },
-      {
-        label: 'an FX id smuggled into evidence',
-        reason: 'invalid_evidence',
-        args: baseArgs(fx.id, evidenceBatch({
-          'pro/monthly': { fxRateVersionId: randomUUID() },
-        }).evidence),
-      },
-    ];
-
-    for (const { label, reason, args } of cases) {
-      const result = cli(sandboxEnv(), args);
-      assert.equal(result.status, 1, `${label}: expected a typed refusal\n${result.stderr}`);
-      assert.match(result.stderr, new RegExp(`refused \\(${reason}\\)`), label);
-      assert.match(result.stderr, /Nothing was written/, label);
-    }
-
-    assert.equal(await testEpochHistory(), historyBefore, 'no refusal wrote an epoch');
-    assert.equal(await auditCount(), auditsBefore, 'no refusal wrote an audit event');
-  });
-
-  test('an amount derived below the provider minimum is refused (below_minimum)', async () => {
-    // A deliberately tiny rate: catalogue × FX falls under 10 pesewas, so the
-    // batch refuses on the derived amount itself — evidence cannot fix it.
-    const fx = await publishFxNow({ rateScaled: 1000n });
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-    const { evidence } = evidenceBatch();
-
-    const result = cli(sandboxEnv(), baseArgs(fx.id, evidence));
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /refused \(below_minimum\)/);
-    assert.match(result.stderr, /Nothing was written/);
-    assert.equal(await testEpochHistory(), historyBefore);
-    assert.equal(await auditCount(), auditsBefore);
-  });
-});
-
-/* ========================================================================== */
-/* 6. --apply — the explicit commit path                                       */
-/* ========================================================================== */
-
-describe('sandbox provisioning CLI — --apply registers exactly the validated batch', () => {
-  test('--apply registers the four epochs and ONE audit event together, and grants nothing', async () => {
-    const fx = await publishFxNow();
-    const { evidence, codes } = evidenceBatch();
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-
-    const result = cli(sandboxEnv(), [...baseArgs(fx.id, evidence), '--apply']);
-    assert.equal(result.status, 0, result.stderr);
-
-    const output = JSON.parse(result.stdout) as {
-      outcome: string;
-      dryRun: boolean;
-      mode: string;
-      providerCalls: number;
-      fxRateVersionId: string;
-      auditAction: string | null;
-      grantsExecution: boolean;
-      paymentConfirmed: boolean;
-      plan: Array<Record<string, unknown>>;
-    };
-    assert.equal(output.outcome, 'registered');
-    assert.equal(output.dryRun, false);
-    assert.equal(output.mode, 'test');
-    assert.equal(output.providerCalls, 0, 'no provider call is possible from this tool');
-    assert.equal(output.fxRateVersionId, fx.id);
-    assert.equal(output.auditAction, BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION);
-    assert.equal(output.grantsExecution, false, 'a registered epoch grants no execution');
-    assert.equal(output.paymentConfirmed, false, 'a registered epoch confirms no payment');
-    assert.equal(output.plan.length, 4);
-    for (const [index, [combo, plan, interval]] of COMBOS.entries()) {
-      const entry = output.plan[index]!;
-      assert.equal(entry.slot, combo.replace('/', '-'));
-      assert.equal(entry.providerPlanId, codes[combo]);
-      assert.equal(entry.paymentAmountMinor, derived(plan, interval).toString());
-      assert.notEqual(entry.epochId, null, 'the CLI reports the persisted epoch id');
-      assert.equal(entry.status, 'active');
-    }
-
-    // Durable rows: exactly the four combinations, test mode, GHS, exponent 2,
-    // the derived amounts, the real codes, one shared fresh FX version and
-    // the operator's provenance label.
-    const rows = await activeTestEpochs();
-    assert.equal(rows.length, 4);
-    for (const [index, [combo, plan, interval]] of COMBOS.entries()) {
-      const row = rows[index]!;
-      assert.equal(`${row.catalogue_plan}-${row.billing_interval}`, combo.replace('/', '-'));
-      assert.equal(row.mode, 'test');
-      assert.equal(row.status, 'active');
-      assert.equal(row.payment_currency, 'GHS');
-      assert.equal(row.payment_amount_exponent, 2);
-      assert.equal(row.amount, derived(plan, interval).toString());
-      assert.equal(row.provider_plan_id, codes[combo]);
-      assert.equal(row.provider_plan_reference, REFERENCE);
-      assert.equal(row.fx, fx.id, 'all four epochs pin the one shared FX version');
-    }
-    assert.equal(await testEpochHistory(), historyBefore + 4);
-    assert.equal(await auditCount(), auditsBefore + 1);
-
-    // The transactional audit event names the operator, the reason and the
-    // shared FX version — and pins that nothing was granted or confirmed.
-    const { rows: auditRows } = await pool.query(
-      `SELECT metadata FROM audit_events WHERE action = $1 ORDER BY id DESC LIMIT 1`,
-      [BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION],
-    );
-    assert.equal(auditRows.length, 1);
-    const metadata = auditRows[0]!.metadata as {
-      mode: string;
-      operatorId: string;
-      reason: string;
-      fxRateVersionId: string;
-      grantsExecution: boolean;
-      paymentConfirmed: boolean;
-      epochs: unknown[];
-    };
-    assert.equal(metadata.mode, 'test');
-    assert.equal(metadata.operatorId, OPERATOR);
-    assert.equal(metadata.reason, REASON);
-    assert.equal(metadata.fxRateVersionId, fx.id);
-    assert.equal(metadata.grantsExecution, false);
-    assert.equal(metadata.paymentConfirmed, false);
-    assert.equal(metadata.epochs.length, 4);
-  });
-
-  test('a mismatched batch is refused under --apply before any write', async () => {
-    const fx = await publishFxNow();
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-    const { evidence } = evidenceBatch({
-      'pro/annual': { paymentAmountMinor: (derived('pro', 'annual') + 1n).toString() },
-    });
-
-    const result = cli(sandboxEnv(), [...baseArgs(fx.id, evidence), '--apply']);
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /refused \(amount_mismatch\)/);
-    assert.match(result.stderr, /Nothing was written/);
-    assert.equal(await testEpochHistory(), historyBefore, 'no epoch was written');
-    assert.equal(await auditCount(), auditsBefore, 'no audit event was written');
-  });
-
-  test('a second --apply of the same codes conflicts and rolls back — the batch is atomic', async () => {
-    const first = await publishFxNow();
-    const { evidence, codes } = evidenceBatch();
-    const historyBefore = await testEpochHistory();
-    const auditsBefore = await auditCount();
-
-    const applied = cli(sandboxEnv(), [...baseArgs(first.id, evidence), '--apply']);
-    assert.equal(applied.status, 0, applied.stderr);
-    const historyAfterFirst = await testEpochHistory();
-    const auditsAfterFirst = await auditCount();
-    assert.equal(historyAfterFirst, historyBefore + 4, 'the first apply registered its four epochs');
-    assert.equal(auditsAfterFirst, auditsBefore + 1, 'the first apply recorded its one audit event');
-
-    // A fresh FX version (the first is only usable for its own registration
-    // window) but the SAME four provider codes: the store must refuse the
-    // collision and roll the entire second batch back.
-    const second = await publishFxNow();
-    const replay = cli(sandboxEnv(), [...baseArgs(second.id, evidence), '--apply']);
-    assert.equal(replay.status, 1, replay.stderr);
-    assert.match(replay.stderr, /refused \(conflict\)/);
-    assert.match(replay.stderr, /rolls back together/);
-    assert.equal(await testEpochHistory(), historyAfterFirst, 'no partial batch survived');
-    assert.equal(await auditCount(), auditsAfterFirst, 'the rolled-back run recorded no audit event');
-    assert.equal(codes['pro/monthly'], evidence[0]!.providerPlanId, 'the codes were genuinely reused');
-  });
-});
-
-/* ========================================================================== */
-/* 7. The service dry-run entry point (directly)                               */
-/* ========================================================================== */
+/*
+ * PR #151 (H1 remediation): the subprocess SUCCESS path (`--target … --apply` and
+ * `--target … ` dry run, printing the batch) is NOT exercised by any test in this
+ * file, because the committed allowlist is empty by design and a test-only
+ * override is refused. Coverage of the service the CLI wraps is in-process:
+ *   - billing-step4-provisioning-db.test.ts: registerSandboxPlanEpochs against the
+ *     embedded database with an injected test allowlist (four epochs, one audit,
+ *     atomicity, conflict rollback);
+ *   - billing-sandbox-database-identity.test.ts: the identity matrix, and the
+ *     dry run (validateSandboxPlanEpochs) reading nothing before identity holds.
+ * The CLI's own output formatting and exit mapping on success are therefore
+ * UNVERIFIED by a test. The refusal matrix through the CLI is covered here.
+ */
 
 describe('sandbox provisioning — validateSandboxPlanEpochs cannot write', () => {
   test('the dry-run entry point returns the validated batch and persists nothing', async () => {
@@ -881,8 +495,8 @@ describe('sandbox provisioning — validateSandboxPlanEpochs cannot write', () =
     const historyBefore = await testEpochHistory();
     const auditsBefore = await auditCount();
 
-    const service = new BillingPlanProvisioningService({ db: pool, mode: 'test' });
-    const batch = await service.validateSandboxPlanEpochs({
+    const service = new BillingPlanProvisioningService({ identityAllowlist: SANDBOX_IDENT.allowlist, db: pool, mode: 'test' });
+    const batch = await service.validateSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target,
       fxRateVersionId: fx.id,
       evidence,
       audit: { operatorId: OPERATOR, reason: REASON },
@@ -910,10 +524,10 @@ describe('sandbox provisioning — validateSandboxPlanEpochs cannot write', () =
     });
     const historyBefore = await testEpochHistory();
     const auditsBefore = await auditCount();
-    const service = new BillingPlanProvisioningService({ db: pool, mode: 'test' });
+    const service = new BillingPlanProvisioningService({ identityAllowlist: SANDBOX_IDENT.allowlist, db: pool, mode: 'test' });
 
     await assert.rejects(
-      () => service.validateSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence }),
+      () => service.validateSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence }),
       (error: unknown) =>
         typeof error === 'object' && error !== null && 'reason' in error &&
         (error as { reason: unknown }).reason === 'currency_mismatch',
@@ -938,7 +552,7 @@ describe('sandbox provisioning CLI — the database boundary', () => {
   // valid so the target gate is the FIRST thing that can refuse.
   const requiredArgs = (evidence: readonly unknown[] = []): string[] => [
     '--fx-rate-version', randomUUID(),
-    '--by', OPERATOR,
+    '--by', OPERATOR, '--target', 'embedded-test-sandbox',
     '--reason', REASON,
     '--evidence', JSON.stringify(evidence),
   ];
@@ -976,36 +590,36 @@ describe('sandbox provisioning CLI — the database boundary', () => {
     assert.equal(await auditCount(), auditsBefore, 'no audit event was written');
   });
 
-  test('the gate is --apply-only: dry runs skip it and keep their read-only behaviour', async () => {
+  test('the target gate covers dry runs too: an unverifiable target is refused before any connection', async () => {
     const historyBefore = await testEpochHistory();
     const auditsBefore = await auditCount();
-    // Same unverifiable target, WITHOUT --apply: the gate must not fire.
-    // The run reaches the normal read-only failure path (exit 1) — the
-    // configured target is merely an unreachable/garbage connection string
-    // to the pool, and a dry run cannot write in any case.
+    // Same unverifiable target, WITHOUT --apply. Identity can only be checked
+    // by connecting, so a dry run is held to the same loopback gate: it is
+    // refused before any pool exists (exit 2), never connected to.
     const result = cli(
       { DATABASE_URL: 'not-a-connection-string', PAYSTACK_MODE: 'test' },
       requiredArgs(),
     );
-    assert.equal(result.status, 1, `dry-run failure taxonomy unchanged: ${result.stderr}`);
+    assert.equal(result.status, 2, `the dry run is gated: ${result.stderr}`);
+    assert.match(result.stderr, /the dry run refuses this database target/);
     assert.doesNotMatch(result.stderr, /--apply refuses this database target/);
     assert.equal(await testEpochHistory(), historyBefore, 'a dry run writes no epoch');
     assert.equal(await auditCount(), auditsBefore, 'a dry run writes no audit event');
   });
 
-  test('a verified local target passes the gate (it blocks nothing local)', async () => {
-    // Positive control, full stack: loopback DATABASE_URL, `--apply`, and a
-    // deliberately invalid FX id — the gate must PASS this target so the run
-    // proceeds into the service, where the ordinary typed refusal fires.
+  test('a verified local target passes the loopback gate and is then refused by the reviewed allowlist', async () => {
+    // Positive control, full stack: a loopback DATABASE_URL and `--apply` pass
+    // the database-target gate; the run then reaches the reviewed allowlist,
+    // which has no sandbox entry in the committed file, and refuses there.
     // Nothing is written on either side of the gate.
     const historyBefore = await testEpochHistory();
     const auditsBefore = await auditCount();
     const result = cli(
       { DATABASE_URL: 'postgres://127.0.0.1:5549/veltrixeye', PAYSTACK_MODE: 'test' },
-      ['--fx-rate-version', 'not-a-uuid', '--by', OPERATOR, '--reason', REASON, '--evidence', '[]', '--apply'],
+      ['--fx-rate-version', 'not-a-uuid', '--by', OPERATOR, '--target', 'embedded-test-sandbox', '--reason', REASON, '--evidence', '[]', '--apply'],
     );
-    assert.equal(result.status, 1, `past the gate, into the service: ${result.stderr}`);
-    assert.match(result.stderr, /refused \(invalid_evidence\)/);
+    assert.equal(result.status, 2, `the gate passed; the allowlist refused: ${result.stderr}`);
+    assert.match(result.stderr, /not in the reviewed sandbox allowlist|not in the reviewed/);
     assert.doesNotMatch(result.stderr, /--apply refuses this database target/);
     assert.equal(await testEpochHistory(), historyBefore);
     assert.equal(await auditCount(), auditsBefore);

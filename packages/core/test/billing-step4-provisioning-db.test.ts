@@ -23,7 +23,6 @@ import path from 'node:path';
 import {
   BILLING_CATALOGUE_VERSION,
   BILLING_PRICING_POLICY_VERSION,
-  BillingFxRateVersionStore,
   BillingPlanProvisioningService,
   BillingProviderPlanStore,
   MIGRATIONS_DIR,
@@ -36,14 +35,19 @@ import {
   providerIntervalForBillingInterval,
   EXCLUDED_PROVIDER_PLAN_CODE,
 } from '../src/index.js';
-import { startBillingTestDb, retireActiveEpochs } from './helpers/billing-checkout.js';
+import { startBillingTestDb, retireActiveEpochs, approveSandboxDatabase, createFxPrincipals, publishApprovedFx, type FxPrincipals, type SandboxTestIdentity } from './helpers/billing-checkout.js';
 
 // Unique per suite file (see the port ledger in helpers/billing-checkout.ts).
 const DB_PORT = 5495;
 
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
+/** The marked sandbox database's explicit identity expectation (set in before()). */
+let SANDBOX_IDENT: SandboxTestIdentity;
+let FX: FxPrincipals;
 before(async () => {
   db = await startBillingTestDb(DB_PORT);
+  SANDBOX_IDENT = await approveSandboxDatabase(db.pool);
+  FX = await createFxPrincipals(db.pool, db.dbUrl);
 }, { timeout: 180_000 });
 beforeEach(async () => {
   // Epochs are never deleted (history is retained); between tests the active
@@ -52,6 +56,7 @@ beforeEach(async () => {
   await retireActiveEpochs(db.pool);
 });
 after(async () => {
+  await FX?.close();
   await db?.stop();
 });
 
@@ -62,23 +67,21 @@ after(async () => {
 /** An operator-driven registration for ONE instant (anchored to the real clock). */
 function provisioning() {
   const registeredAt = new Date();
-  const fxVersions = new BillingFxRateVersionStore(db.pool);
   let sequence = 0;
   return {
-    service: new BillingPlanProvisioningService({ db: db.pool, now: () => registeredAt }),
+    service: new BillingPlanProvisioningService({ identityAllowlist: SANDBOX_IDENT.allowlist, db: db.pool, now: () => registeredAt }),
     registeredAt,
     publishFx: async (rateScaled = 12_500_000n, capturedSecondsBefore = 300, effectiveFrom?: Date) => {
       // A distinct effective instant per publication within one test (the
       // authority pins one version per pair per instant).
       const tick = sequence++;
-      return fxVersions.publish({
+      return publishApprovedFx(FX, {
         fxRateScaled: rateScaled,
         fxRateScale: 6,
         effectiveFrom: effectiveFrom ?? new Date(registeredAt.getTime() - (capturedSecondsBefore + tick) * 1000),
         capturedAt: new Date(registeredAt.getTime() - (capturedSecondsBefore + tick) * 1000),
         source: 'ops',
         sourceReference: 'ops-sandbox-fx-board-1',
-        createdBy: 'ops@example.com',
       });
     },
   };
@@ -190,7 +193,7 @@ describe('Step 4 — E. registering the four epochs against the real store', () 
     const fx = await publishFx();
     const { evidence, codes } = evidenceBatch(fx.fxRateScaled);
 
-    const registered = await service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence });
+    const registered = await service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence });
     assert.equal(registered.length, 4);
 
     // Matrix order out of the workflow: Pro Monthly, Pro Annual, Elite Monthly, Elite Annual.
@@ -246,9 +249,9 @@ describe('Step 4 — E. registering the four epochs against the real store', () 
     const fx = await publishFx();
     const { evidence, codes } = evidenceBatch(fx.fxRateScaled);
 
-    const first = await service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence });
+    const first = await service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence });
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence }),
+      service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence }),
       (error: unknown) => planReason(error) === 'conflict',
     );
 
@@ -272,7 +275,7 @@ describe('Step 4 — E. registering the four epochs against the real store', () 
     // but one provider plan can never map onto two local epochs.
     const { evidence, codes } = evidenceBatch(fx.fxRateScaled, { 'pro/monthly': { providerPlanId: borrowedCode } });
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence }),
+      service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence }),
       (error: unknown) => planReason(error) === 'conflict',
     );
     const remaining = (Object.entries(codes) as Array<[Combo, string]>)
@@ -288,7 +291,7 @@ describe('Step 4 — E. registering the four epochs against the real store', () 
 
     const { evidence, codes } = evidenceBatch(fx.fxRateScaled);
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence }),
+      service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence }),
       (error: unknown) => planReason(error) === 'conflict',
     );
 
@@ -310,7 +313,7 @@ describe('Step 4 — E. registering the four epochs against the real store', () 
     });
 
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence }),
+      service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence }),
       (error: unknown) => provisioningReason(error) === 'amount_mismatch',
     );
     assert.equal((await durableRows(Object.values(codes))).length, 0, 'no epoch row was written');
@@ -320,7 +323,7 @@ describe('Step 4 — E. registering the four epochs against the real store', () 
     const { service, publishFx } = provisioning();
     const fx = await publishFx();
     const { evidence, codes } = evidenceBatch(fx.fxRateScaled);
-    const registered = await service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence });
+    const registered = await service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence });
 
     const store = new BillingProviderPlanStore(db.pool);
     const proMonthly = registered.find((epoch) => epoch.cataloguePlan === 'pro' && epoch.interval === 'monthly')!;
@@ -375,7 +378,7 @@ describe('Step 4 — the FX authority at the persistence boundary', () => {
     const { evidence, codes } = evidenceBatch(fx.fxRateScaled);
     const nonExistent = randomUUID();
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: nonExistent, evidence }),
+      service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: nonExistent, evidence }),
       (error: unknown) => fxReason(error) === 'missing',
     );
     assert.equal((await durableRows(Object.values(codes))).length, 0);
@@ -386,7 +389,7 @@ describe('Step 4 — the FX authority at the persistence boundary', () => {
     const staleFx = await stale.publishFx(12_500_000n, 901);
     const staleBatch = evidenceBatch(staleFx.fxRateScaled);
     await assert.rejects(
-      stale.service.registerSandboxPlanEpochs({ fxRateVersionId: staleFx.id, evidence: staleBatch.evidence }),
+      stale.service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: staleFx.id, evidence: staleBatch.evidence }),
       (error: unknown) => fxReason(error) === 'stale',
     );
     assert.equal((await durableRows(Object.values(staleBatch.codes))).length, 0);
@@ -395,7 +398,7 @@ describe('Step 4 — the FX authority at the persistence boundary', () => {
     const fx900 = await at900.publishFx(12_500_000n, 900);
     const batch900 = evidenceBatch(fx900.fxRateScaled);
     assert.equal(
-      (await at900.service.registerSandboxPlanEpochs({ fxRateVersionId: fx900.id, evidence: batch900.evidence })).length,
+      (await at900.service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx900.id, evidence: batch900.evidence })).length,
       4,
       'exactly 900 seconds old is inside the inclusive bound',
     );
@@ -407,7 +410,7 @@ describe('Step 4 — the FX authority at the persistence boundary', () => {
     const fx899 = await at899.publishFx(12_500_000n, 899);
     const batch899 = evidenceBatch(fx899.fxRateScaled);
     assert.equal(
-      (await at899.service.registerSandboxPlanEpochs({ fxRateVersionId: fx899.id, evidence: batch899.evidence })).length,
+      (await at899.service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx899.id, evidence: batch899.evidence })).length,
       4,
       '899 seconds old is accepted',
     );
@@ -422,7 +425,7 @@ describe('Step 4 — the FX authority at the persistence boundary', () => {
     );
     const { evidence, codes } = evidenceBatch(fx.fxRateScaled);
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence }),
+      service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence }),
       (error: unknown) => fxReason(error) === 'invalid',
     );
     assert.equal((await durableRows(Object.values(codes))).length, 0);
@@ -434,7 +437,7 @@ describe('Step 4 — the FX authority at the persistence boundary', () => {
     await publishFx(20_000_000n, 200); // a newer, different-rate version now exists
     const { evidence, codes } = evidenceBatch(selected.fxRateScaled);
 
-    await service.registerSandboxPlanEpochs({ fxRateVersionId: selected.id, evidence });
+    await service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: selected.id, evidence });
     const rows = await durableRows(Object.values(codes));
     assert.equal(rows.length, 4);
     for (const row of rows) {
@@ -454,7 +457,7 @@ describe('Step 4 — the FX authority at the persistence boundary', () => {
       'pro/monthly': { providerPlanId: EXCLUDED_PROVIDER_PLAN_CODE },
     });
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence }),
+      service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence }),
       (error: unknown) => provisioningReason(error) === 'excluded_provider_plan',
     );
     assert.equal((await durableRows(Object.values(codes))).length, 0);
@@ -509,8 +512,8 @@ describe('Step 4 — H. migration compatibility', () => {
     const files = readdirSync(MIGRATIONS_DIR)
       .filter((file) => file.endsWith('.sql'))
       .sort();
-    assert.equal(files.length, 39, 'no migration was added or removed by Step 4; later additions remain additive through 0039');
-    assert.equal(files.at(-1), '0039_notification_smtp_test_claim.sql', '0039 is the newest migration (isolated SMTP diagnostic claim)');
+    assert.equal(files.length, 40, 'no migration was added or removed by Step 4; later additions remain additive through 0040');
+    assert.equal(files.at(-1), '0040_billing_fx_source_approvals.sql', '0040 is the newest migration (FX source approvals)');
     for (const [file, sha] of Object.entries(EXPECTED)) {
       const digest = createHash('sha256').update(readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8')).digest('hex');
       assert.equal(digest, sha, `${file} is byte-identical to its pinned bytes`);

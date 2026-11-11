@@ -4,6 +4,7 @@
  *
  *   tsx scripts/billing/provision-live.ts --fx-rate-version <uuid> --by <operator-id> \
  *     --reason <text> --reference <dashboard/ticket label> \
+ *     --target <production-allowlist-id> --confirm-target <production-allowlist-id> \
  *     [--dry-run] [--amount <slot>=<GHS minor units>]
  *
  *   (or, instead of `--plan` flags, the four codes from the environment)
@@ -17,6 +18,17 @@
  * `--plan <slot>=<PLN_…>` flags, or all four in `PAYSTACK_LIVE_PLAN_CODES`
  * (JSON); mixing the two sources is refused so the provenance of every code is
  * unambiguous.
+ *
+ * PRODUCTION TARGET IDENTITY (M1). `--target <id>` selects ONE reviewed
+ * `production` entry of `config/billing/database-identity-allowlist.json`, and
+ * `--confirm-target <id>` must repeat the same id as a separate, explicit
+ * confirmation. Both are required for every run, dry runs included. The
+ * allowlist must match its pinned SHA-256, and the id is resolved BEFORE
+ * `DATABASE_URL` is read. The service then verifies that the CONNECTED database
+ * has exactly the entry's name and cluster system identifier on the same
+ * connection that reads or writes. Supplied names and identifiers are never
+ * accepted, and sandbox entries can never authorize a live write. Production
+ * never uses the sandbox loopback rule: a production host is expected here.
  *
  * This CLI is a THIN wrapper over `BillingLivePlanRegistrationService`
  * (packages/core/src/billing/live-plan-registration.ts): it parses arguments,
@@ -51,7 +63,11 @@ import { fileURLToPath } from 'node:url';
 import { createPool } from '@veltrixeye/core';
 import {
   BillingLivePlanRegistrationService,
+  DATABASE_IDENTITY_ALLOWLIST_RELATIVE_PATH,
+  type DatabaseIdentityAllowlist,
   LIVE_PLAN_CODE_KEYS,
+  loadDatabaseIdentityAllowlist,
+  resolveDatabaseTarget,
   isBillingFxError,
   isBillingLivePlanRegistrationError,
   isBillingProviderPlanError,
@@ -65,14 +81,17 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const USAGE = [
   'Usage:',
   '  npm run billing:provision:live -- --fx-rate-version <uuid> --by <operator-id> --reason <text>',
-  '    [--reference <label>] [--dry-run] [--amount <slot>=<minor>]...',
-  '  npm run billing:provision:live -- --fx-rate-version <uuid> --by <operator-id> --reason <text> \\',
-  '    --plan pro-monthly=PLN_… --plan pro-annual=PLN_… --plan elite-monthly=PLN_… --plan elite-annual=PLN_…',
+  '    --target <id> --confirm-target <id> [--reference <label>] [--dry-run] [--amount <slot>=<minor>]...',
+  '  (the four --plan flags may replace PAYSTACK_LIVE_PLAN_CODES in the same command)',
   '',
   'Registers (or, with --dry-run, validates only) the four LIVE provider-plan epochs for',
   'Pro/Elite × monthly/annual from the four live Paystack plan codes supplied at run time.',
   'Requires PAYSTACK_MODE=live and DATABASE_URL, and writes the four epochs together with',
   'one billing.provider_plans_registered audit event in a single transaction.',
+  '',
+  'PRODUCTION IDENTITY: --target and --confirm-target are both required and must repeat the same',
+  'reviewed production allowlist id. The database name and system identifier come only from that',
+  'entry, and the connected database must match them. Nothing is written otherwise.',
 ].join('\n');
 
 /** Read a single KEY from the repo-root `.env`, if that file exists. */
@@ -108,6 +127,8 @@ interface Args {
   by?: string;
   reason?: string;
   reference?: string;
+  target?: string;
+  confirmTarget?: string;
   plans: string[];
   amounts: string[];
   dryRun: boolean;
@@ -139,6 +160,12 @@ function parseArgs(argv: string[]): Args {
         break;
       case '--reference':
         args.reference = value;
+        break;
+      case '--target':
+        args.target = value;
+        break;
+      case '--confirm-target':
+        args.confirmTarget = value;
         break;
       case '--plan':
         args.plans.push(value);
@@ -246,12 +273,11 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  const databaseUrl = env('DATABASE_URL');
-  if (!databaseUrl) {
+  if (args.target === undefined || args.confirmTarget === undefined) {
+    console.info(USAGE);
     console.error(
-      '[billing:provision:live] DATABASE_URL is not set.\n' +
-        '        Provide it in the environment, or run `npm run setup` to create a local .env.\n' +
-        '        See docs/environment.md.',
+      '[billing:provision:live] --target and --confirm-target are both required: the run must select and ' +
+        'explicitly confirm a reviewed PRODUCTION allowlist entry. Nothing was connected or written.',
     );
     return 2;
   }
@@ -288,10 +314,44 @@ async function main(): Promise<number> {
     throw error;
   }
 
+  // THE REVIEWED ALLOWLIST (static, after the configuration gates and before
+  // DATABASE_URL is read, and before any connection): loaded from
+  // the committed file, pin-verified, and the confirmed id resolved to a
+  // PRODUCTION entry. A sandbox entry, a missing or unpinned allowlist, an
+  // unknown id or a confirmation that does not repeat the id is refused here.
+  let identityAllowlist: DatabaseIdentityAllowlist;
+  try {
+    identityAllowlist = loadDatabaseIdentityAllowlist(
+      path.join(REPO_ROOT, DATABASE_IDENTITY_ALLOWLIST_RELATIVE_PATH),
+    );
+    resolveDatabaseTarget(identityAllowlist, 'production', args.target, args.confirmTarget);
+  } catch (error) {
+    console.error(
+      `[billing:provision:live] ${error instanceof Error ? error.message : 'The production identity check failed.'}`,
+    );
+    return 2;
+  }
+
+  const databaseUrl = env('DATABASE_URL');
+  if (!databaseUrl) {
+    console.error(
+      '[billing:provision:live] DATABASE_URL is not set.\n' +
+        '        Provide it in the environment, or run `npm run setup` to create a local .env.\n' +
+        '        See docs/environment.md.',
+    );
+    return 2;
+  }
+
   const pool = createPool({ databaseUrl });
   try {
-    const service = new BillingLivePlanRegistrationService({ db: pool, mode: 'live' });
+    const service = new BillingLivePlanRegistrationService({
+      db: pool,
+      mode: 'live',
+      identityAllowlist,
+    });
     const result = await service.registerLivePlanEpochs({
+      targetId: args.target,
+      confirmTargetId: args.confirmTarget,
       fxRateVersionId: args.fxRateVersion,
       planCodes,
       operatorId: args.by,

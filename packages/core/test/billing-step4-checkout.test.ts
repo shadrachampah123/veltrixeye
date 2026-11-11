@@ -28,7 +28,6 @@ import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import {
   BillingCheckoutService,
-  BillingFxRateVersionStore,
   BillingPlanProvisioningService,
   BillingPricingSnapshotStore,
   createBillingProviderRegistry,
@@ -48,18 +47,22 @@ import {
   insertUser,
   retireActiveEpochs,
   retireEpoch,
-  AS_OF,
-} from './helpers/billing-checkout.js';
+  AS_OF, approveSandboxDatabase, createFxPrincipals, publishApprovedFx, type FxPrincipals, type SandboxTestIdentity } from './helpers/billing-checkout.js';
 
 const DB_PORT = 5496;
 const ELITE_ANNUAL = { cataloguePlan: 'elite', interval: 'annual' } as const;
 const EXCLUDED_EVIDENCE_PLAN = ['PLN', 'u0l4961hhipl6ek'].join('_');
 
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
+/** The marked sandbox database's explicit identity expectation (set in before()). */
+let SANDBOX_IDENT: SandboxTestIdentity;
+let FX: FxPrincipals;
 let calls: BillingCheckoutRequest[];
 let service: BillingCheckoutService;
 before(async () => {
   db = await startBillingTestDb(DB_PORT);
+  SANDBOX_IDENT = await approveSandboxDatabase(db.pool);
+  FX = await createFxPrincipals(db.pool, db.dbUrl);
 }, { timeout: 180_000 });
 beforeEach(async () => {
   await retireActiveEpochs(db.pool);
@@ -94,6 +97,7 @@ beforeEach(async () => {
   });
 });
 after(async () => {
+  await FX?.close();
   await db?.stop();
 });
 
@@ -105,14 +109,13 @@ type Combo = 'pro/monthly' | 'pro/annual' | 'elite/monthly' | 'elite/annual';
 
 async function provisionSandboxEpochs(rateScaled = 12_500_000n) {
   const registeredAt = new Date();
-  const fx = await new BillingFxRateVersionStore(db.pool).publish({
+  const fx = await publishApprovedFx(FX, {
     fxRateScaled: rateScaled,
     fxRateScale: 6,
     effectiveFrom: new Date(registeredAt.getTime() - 300_000),
     capturedAt: new Date(registeredAt.getTime() - 300_000),
     source: 'ops',
     sourceReference: 'ops-sandbox-fx-1',
-    createdBy: 'ops@example.com',
   });
   const combos: ReadonlyArray<['pro' | 'elite', 'monthly' | 'annual']> = [
     ['pro', 'monthly'],
@@ -141,8 +144,8 @@ async function provisionSandboxEpochs(rateScaled = 12_500_000n) {
       evidenceReference: 'ops-sandbox-evidence-2026-09-22',
     };
   });
-  const provisioningService = new BillingPlanProvisioningService({ db: db.pool, now: () => registeredAt });
-  const epochs = await provisioningService.registerSandboxPlanEpochs({
+  const provisioningService = new BillingPlanProvisioningService({ identityAllowlist: SANDBOX_IDENT.allowlist, db: db.pool, now: () => registeredAt });
+  const epochs = await provisioningService.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target,
     fxRateVersionId: fx.id,
     evidence,
   });
