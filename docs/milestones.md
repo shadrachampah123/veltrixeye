@@ -5,7 +5,7 @@
 This is the canonical roadmap/status record. Implemented code, merged PRs,
 successful deployments, production health, and release approval are distinct
 evidence categories. This checkpoint is based on the current `main` tip
-`991e431ca01b7315f19fbc7dec97c572ddc2c4b0` (PR #155 merge; follows PR #154 and includes PR #153), GitHub PR
+`56a8cac72c08f5d9b7e21e50ab43b24149209c1b` (PR #156 merge; follows PR #155 and includes the reconciled November 14 deployment status), GitHub PR
 metadata, Render deployment records, and the owner's Vercel dashboard
 screenshot. It is a read-only reconciliation; it does not authorize production
 operations. No overall completion percentage is stated because the roadmap
@@ -14,9 +14,13 @@ and blocking gates without a stable denominator.
 
 ### Current repository and PR status
 
-- **Latest main:** `991e431ca01b7315f19fbc7dec97c572ddc2c4b0`, verified from
-  GitHub's `main` branch record. It is the merge commit for PR #155, which
-  advances the checkpoint after PR #154 and includes the PR #153 corrections.
+- **Latest main:** `56a8cac72c08f5d9b7e21e50ab43b24149209c1b`, verified from
+  GitHub's `main` branch record. It is the merge commit for PR #156, which
+  reconciles the November 14 deployment status and advances the checkpoint
+  after PR #155.
+- **PR #156 — November 14 deployment-status reconciliation: MERGED.**
+  Documentation-only update to `docs/deployment.md` and `docs/milestones.md`;
+  no application code or production operation.
 - **PR #155 — post-PR #154 roadmap checkpoint advancement: MERGED.**
   Documentation-only update to the canonical main SHA and the PR #154 merge
   relationship; no application code or production operation.

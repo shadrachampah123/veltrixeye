@@ -17,7 +17,7 @@ October report also recorded Free compute usage above its monthly allowance;
 the current remaining compute balance has not been remeasured.
 
 The latest repository `main` checkpoint at this documentation review is
-`991e431ca01b7315f19fbc7dec97c572ddc2c4b0` (PR #155 merge, 2026-11-14).
+`56a8cac72c08f5d9b7e21e50ab43b24149209c1b` (PR #156 merge, 2026-11-14).
 This is repository metadata only and does not establish a production
 deployment or application-health state.
 
@@ -779,7 +779,7 @@ migration safety and the web↔API wiring only.
 
 ## Production infrastructure reliability audit (2026-11-14 UTC)
 
-**Scope:** read-only deployment and configuration review across Render and Vercel. Billing operations, production database probes, migrations, secret/environment-variable changes, and deployments were not part of the audit. No production settings or application resources were changed by the review. The latest repository checkpoint at the time of this follow-up is main SHA `991e431ca01b7315f19fbc7dec97c572ddc2c4b0` (PR #155 merge); this does not imply a new production deployment.
+**Scope:** read-only deployment and configuration review across Render and Vercel. Billing operations, production database probes, migrations, secret/environment-variable changes, and deployments were not part of the audit. No production settings or application resources were changed by the review. The latest repository checkpoint at the time of this follow-up is main SHA `56a8cac72c08f5d9b7e21e50ab43b24149209c1b` (PR #156 merge); this does not imply a new production deployment.
 
 ### Deployment evidence
 
