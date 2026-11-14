@@ -1,106 +1,164 @@
 # Milestone Boundaries
 
-## Current roadmap and release-status reconciliation (2026-11-03)
+## Current roadmap and release-status reconciliation (2026-11-14)
 
-This is the canonical roadmap/status record. The milestone sections below describe
-implemented scope; **implementation/merge is not the same as production
-verification or release approval**. This checkpoint starts from latest `main`
-SHA `d5e4d68073018d5f082116a55635d28b9d4c5aa3`, which merged PR #131
-(read-only verified payment records); the notification branch behind PR #134
-was merged with that mainline on 2026-11-03. PR #130 (M9.2 notification subject
-disambiguation), #132 (runtime dependency-advisory patch) and #133 (strategy
-entitlements aligned with the subscription catalogue) are also merged on that
-mainline; the asset-class-aware notification subject in
-`packages/core/src/notifications/render.ts` and its regression in
-`packages/core/test/m92-outbox.test.ts` are present in the fetched tree. PR #134
-remains open, unmerged and in Draft. This checkpoint reconciles current PR
-metadata, CI checks and recorded deployment/status data; it does not authorize
-production changes. No overall completion percentage is stated: the roadmap
-mixes delivered milestones, deferred product decisions, external validations
-and blocking gates without a stable, non-overlapping denominator.
+This is the canonical roadmap/status record. Implemented code, merged PRs,
+successful deployments, production health, and release approval are distinct
+evidence categories. This checkpoint is based on the current `main` tip
+`2a5666ada37fadd75511277eed17112ecface150` (PR #153 merge), GitHub PR
+metadata, Render deployment records, and the owner's Vercel dashboard
+screenshot. It is a read-only reconciliation; it does not authorize production
+operations. No overall completion percentage is stated because the roadmap
+mixes delivered milestones, external validations, deferred product decisions,
+and blocking gates without a stable denominator.
 
-- **Production database and health verification: BLOCKED (2026-10-17 UTC).**
-  Neon production compute is exhausted. Do not use the production
-  `DATABASE_URL`, run migration/status queries, call production `/api/health`
-  or `/api/health/ready`, or report worker/retention health until compute is
-  restored and an authorized owner explicitly permits a read-only check. The
-  last compute-exhaustion report was recorded while reviewing `main` at
-  `f9e660d66fe56af2ea4f1d2031759210af497d67` and is carried forward from that
-  owner evidence; this task did not access production or revalidate compute.
-  Local embedded-Postgres tests and deployment records are not production
-  evidence. The latest main SHA is `d5e4d68073018d5f082116a55635d28b9d4c5aa3`
-  (PR #131 merged); compute status has not been revalidated. No production configuration, data,
-  migration or infrastructure may be changed to clear this block.
+### Current repository and PR status
 
-### Current delivery and gates
+- **Latest main:** `2a5666ada37fadd75511277eed17112ecface150`, verified from
+  GitHub's `main` branch record. It is the squash merge of PR #153.
+- **PR #153 — production infrastructure audit documentation: MERGED.**
+  The documentation-only change records the November 14 Render/Vercel
+  deployment evidence, the unresolved November 10 Render timeout, startup
+  migration coupling, and the PostgreSQL SSL compatibility warning.
+- **PR #151 — consolidated billing security remediation: MERGED.**
+  It supersedes PR #150. The merged implementation adds a fail-closed,
+  externally pinned database identity allowlist; authenticated PostgreSQL
+  approval identity and separation of duties; append-only approval evidence;
+  exact-rate fingerprint binding; one-hour expiry and single-use approval;
+  and a live-target guard. The allowlist is empty by default and the DBA role
+  provisioning script has not been run. **Do not merge PR #150**; it remains
+  open as a historical/audit record and must not be treated as an active
+  implementation branch.
+- **PR #152 — dashboard detail-fetch optimization: MERGED.**
+  Dashboard strategy detail is fetched only for the three displayed cards.
+  The owner's November 14 browser screenshot showed the dashboard rendering
+  and its three strategy-detail requests returning 200 at that time; this is
+  a historical visual/network smoke check, not a current production health
+  guarantee.
+- **PR #134 — notification worker lease fencing: MERGED.**
+  The implementation is on main. Delivery remains at-least-once; a provider
+  acceptance followed by a lost response/lease can still lead to a duplicate.
+  Production inbox delivery and exactly-once delivery are not established.
+- **PR #150 — billing Step 4 sandbox audit remediation: OPEN, Draft,
+  superseded by #151.** Preserve for history; do not merge it.
+- **PR #104 — Gold v8 read-only diagnostic safety fixes: OPEN, Draft,
+  explicitly not approved for merge.** Gold v8 remains paused; this PR is not
+  authorization to resume, execute, or amend that investigation.
 
-- **Merged, repository/CI verified:** M1–M9.2 and M10.0/Gate 9/B1/B2 are present
-  on `main`; latest merges include #122 (sandbox provisioning dry-run tests),
-  #123 (checkout epoch revalidation), #124 (typed scanner transient failures),
-  #130 (M9.2 notification subject disambiguation), #131 (read-only verified
-  payment records), #132 (runtime dependency-advisory patch) and #133 (strategy
-  entitlements aligned with the subscription catalogue). Their reported required
-  CI jobs passed. This is code/test evidence, not proof that every feature is
-  operational or production-verified.
-- **M9.2 outbox symbol collision — closed on `main` by PR #130.**
-  Rendering otherwise identical alerts for the same canonical ticker under
-  `forex` and `crypto` previously produced the same email subject because the
-  subject omitted `assetClass`, even though the structured payload retained it.
-  This was presentation ambiguity, not an outbox-row or idempotency-key
-  collision. The merged fix includes the asset class in the subject;
-  `packages/core/test/m92-outbox.test.ts` guards the distinction. PR #130 merged
-  as `a5a36fd4e9df53056e991311d1ccbbfbf91ddd22`; the exact current mainline tree
-  contains both the renderer change and regression test.
-- **Latest main deployment metadata (not a health check):** for main SHA
-  `a5a36fd4e9df53056e991311d1ccbbfbf91ddd22`, GitHub records Vercel deployment
-  `7146343163` as `success` (`Deployment has completed`) and Render deployment
-  `7146335883` as `failure`. The Render deployment cause is not available in
-  the GitHub deployment record. No production API health probe, database query,
-  or migration check was performed; these deployment states do not establish
-  production readiness. [deployment.md](./deployment.md) carries the later
-  read-only deployment evidence, including the owner-provided Render dashboard
-  snapshot for `085d3b6`; none of it was revalidated while reconciling this
-  branch, and `main` has since advanced to `d5e4d68` with no new deployment or
-  health observation recorded here.
-- **Notification reliability reconciliation — PR #128 closed as superseded; PR #134 remains open (Draft), awaiting an authorized independent review and deployment-safety confirmation.** PR #128 (`5e9df827c40a5352d1c95f7ea16367102f8fcf1c`) was closed without merge on 2026-11-02; its notification ticker liveness, CI hardening, tests, and docs were carried forward in PR #134. PR #134's implementation commit is `df7bc4900a7328717de190b4b13a7d0b49ef4248`; later PR commits are documentation-only. The live PR head, exact-head verification, review requests, and deployment gate are maintained in the [PR description](https://github.com/shadrachampah123/veltrixeye/pull/134), not duplicated here as a stale current-head claim. The implementation claims one job at a time, renews each active lease, writes a unique owner token, and requires the live token for renewal and every delivery outcome transition. Tests against real embedded PostgreSQL cover an attempt longer than the initial lease, concurrent recovery while sending, current/stale token behavior, failed renewal, old-owner acknowledgement after reclaim, crash recovery, and duplicate prevention. At review checkpoint `667aff4`, focused outbox/worker + SMTP + delivery-ticker tests **53/53 passed**; full `npm test` **3,359/3,359 passed**; `npm run typecheck`, `npm run lint`, `npm run build`, and `git diff --check` passed. Exact-head CI and Preview evidence for that checkpoint is recorded in the PR conversation. These are code/test evidence, not production email evidence. At-least-once delivery remains: if a provider has accepted a message before lease ownership is lost, a later retry can duplicate it; no exactly-once SMTP claim is made. Production email and the historical Render failure remain unverified; see [deployment.md](./deployment.md).
+### Production deployment and verification status
+
+- **Render API:** latest observed live deployment
+  `dep-dbs8nc15efls73efnrrg` runs commit
+  `9b1de75a5e8f83c9e43beae969fc410e5e602826` (PR #151 merge) and completed
+  at `2026-11-14T16:27:17.558055Z`.
+- **Vercel web:** the owner's November 14 dashboard screenshot shows the same
+  short commit `9b1de75` as Production / Ready. It also shows PR #152 merge
+  `bdab81a` as Production / Ready and visible Preview deployments as Ready.
+  The Vercel evidence is owner-provided screenshot evidence, not direct
+  connector inspection.
+- **Cross-platform alignment:** Render and Vercel showed the same latest
+  production commit `9b1de75`. This confirms deployment alignment only;
+  it does not establish general application health, end-to-end correctness,
+  billing readiness, or current database health.
+- **Production migration side effect:** the Render startup logs for the
+  November 14 PR #151 deployment reported that migration
+  `0040_billing_fx_source_approvals.sql` was applied automatically during
+  API startup. This was a deployment-startup action, not a manual migration
+  command issued during the documentation audit. Do not rerun it or query
+  production to re-verify it as part of this roadmap task.
+- **Historical Render timeout:** the November 10 deployment for commit
+  `8ec2fe978f49e57cb74c7748f6e566b7f94af0f4` built successfully but ended
+  `update_failed` after Render logged `Timed Out`. Readiness returned 200
+  before the timeout and a replacement process subsequently started. The
+  available logs do not establish the exact cause. Keep this as an unresolved
+  historical handover/readiness investigation; the successful November 14
+  deployment does not prove the cause is fixed.
+- **Production verification remains BLOCKED.** Do not use the production
+  `DATABASE_URL`, run schema/migration-status queries, call production
+  `/api/health` or `/api/health/ready`, or claim current worker/retention
+  health until Neon access is restored and the owner explicitly authorizes a
+  bounded read-only check. Deployment records and local tests are not
+  production health evidence.
+
+### Neon resource constraint and development mode
+
+- **Public network transfer: EXHAUSTED (owner-provided Neon alert,
+  2026-11-14).** Neon reported 100% of the monthly 5 GB public network
+  transfer allowance used and warned that application connections and
+  database operations may fail until reset or plan change.
+- **Compute:** a prior October report recorded Free compute usage above the
+  monthly allowance. The current remaining compute balance was not remeasured.
+- **Operating mode:** local-first development only. Use local embedded
+  PostgreSQL for tests and development. Avoid production Neon queries,
+  health probes, migration checks, database writes, and repeated Render
+  requests that depend on Neon. Do not upgrade the Neon plan or migrate
+  providers without explicit owner approval.
+- This transfer exhaustion is separate from database storage capacity. It
+  should not be described as proof that the database has been deleted or that
+  every possible connection is already failing; it means the provider warns
+  that application connections/operations may fail until allowance reset or
+  plan change.
+
+### Current delivery and release gates
+
+- **Merged, repository/CI verified:** M1–M9.2 and M10.0/Gate 9/B1/B2 are
+  implemented on main, along with the merged billing sandbox/test foundation,
+  read-only portal/payment records, notification lease fencing, dashboard
+  optimization, and the November 14 billing security remediation. This is
+  repository/test evidence, not proof every feature is production-verified.
+- **Billing / Paystack:** sandbox/test scope only. PR #151 is merged, but its
+  database identity allowlist ships empty by default and required DBA roles
+  and ownership separation remain unprovisioned. Migration 0040 was observed
+  applying at API startup during the November 14 deployment. No FX rate
+  publication, sandbox plan provisioning, production Paystack credentials,
+  or live billing go-live is evidenced or authorized by this checkpoint.
+  PR #150 is superseded; do not merge both.
+- **FX:** no authoritative FX rate publication is evidenced here. Publication
+  and dependent plan provisioning remain deliberate operator actions behind
+  their separate approvals; do not run them as part of local development.
 - **Execution safety:** automation remains OFF; live execution remains
-  unavailable/impossible by the enforced boundary. M10/Gate 9 is a non-live
-  foundation only. Trading remains paper-only. No broker orders, live/demo
-  connectivity, or Gold v8 work is authorized by this roadmap.
-- **Release readiness:** not release-ready by assertion. Required gates include
-  externally validated execution transport (still absent), end-to-end release
-  evidence, production configuration/health verification for the deployed
-  schema, approved legal copy, and closure of remaining reliability and
-  commercial gates below.
-- **Billing / Paystack:** sandbox/test only. #119 merged the provisioning CLI
-  with dry-run default, and #122 added a focused dry-run preparation suite; these
-  do not prove that sandbox plans were provisioned. Provisioning remains an
-  explicit operator gate. Production credentials and live Paystack remain
-  prohibited/deferred. No surprise plan rotation is authorized.
-- **FX:** #120 added read-only Bank of Ghana source observations; #116 added a
-  dry-run-only evidence validator. No FX rate publication is evidenced here.
-  Publishing an authoritative FX version remains a deliberate operator action
-  and a prerequisite for dependent provider-plan provisioning; do not publish
-  as part of this work.
-- **Retention / monitoring:** scanner-run retention and unauthenticated
-  retention-sweep observability were merged (#107/#111); the M9.1 deployment
-  health note records schema 0027 at the time of that check. Current `main`
-  includes later migrations through 0038, and this checkpoint has no fresh
-  production readiness observation for that current schema. Treat current
-  production migration/health status as unverified. CI's test retry loop was
-  removed (#112); latest inspected CI runs pass, but reliability is monitored
-  through actual authoritative runs, not retries or a single green badge.
-- **Legal / commercial polish:** customer-facing legal/risk copy from #106 is
-  explicitly draft and awaits legal approval. Billing Portal v1 and the R-1
-  Verified Payment Records view are read-only; customer-facing cancellation
-  remains deferred under C-1. Starter is not sold; production billing
-  credentials, provider provisioning, FX publication, and any unapproved
-  pricing/plan changes remain gates. Do not represent the product as legally
-  or commercially launch-ready.
-- **AI / ChatGPT Strategy Builder:** intentionally the final roadmap feature,
-  after operational safety, production validation, legal, commercial and
-  release-readiness gates. It is not implemented or approved to displace those
-  prerequisites.
+  unavailable/impossible by the enforced boundary. Trading remains paper-only.
+  Gold v8 remains PAUSED. No broker orders, live/demo connectivity, or Gold v8
+  work is authorized by this roadmap.
+- **Legal / commercial:** customer-facing legal/risk copy remains draft and
+  awaits legal approval. Customer-facing cancellation remains deferred under
+  C-1. Starter is not sold. Production billing credentials, provider
+  provisioning, FX publication, and unapproved pricing/plan changes remain
+  gated. Do not represent the product as legally or commercially launch-ready.
+- **External execution transport:** a validated MT5/Exness bridge and approved
+  external secret manager remain absent. The transport foundation does not
+  establish broker connectivity or live execution.
+- **AI / ChatGPT Strategy Builder:** remains a final roadmap feature, after
+  operational safety, production validation, legal, commercial, and release
+  readiness gates. It is not implemented or approved to displace them.
+
+### Next work sequence — local-first, no production Neon dependency
+
+1. **Reconcile stale roadmap sections and PR references** as part of this
+   documentation change; keep the historical milestone descriptions below
+   intact unless an individual claim is independently revalidated.
+2. **Choose the next implementation slice only after a local repository audit**
+   identifies a bounded defect or feature that can be implemented and tested
+   without production Neon, live provider credentials, FX publication,
+   billing provisioning, or broker connectivity.
+3. Use local embedded PostgreSQL and synthetic fixtures for relevant tests.
+   Record exact commands, test totals, and commit SHA; do not treat these as
+   production evidence.
+4. Have Arena independently review the exact PR head. Keep the PR Draft until
+   its review and CI evidence are complete; obtain explicit owner authorization
+   before merge.
+5. Keep deployment and production verification separate. Do not trigger or
+   request a production deployment/health probe while Neon transfer is
+   exhausted unless the owner explicitly authorizes a plan and safe procedure.
+
+### Guardrails
+
+No production Neon query, health probe, migration command, FX publication,
+Paystack operation, DBA role provisioning, secret/configuration edit, or
+deployment is authorized by this roadmap reconciliation. Billing operations
+remain out of scope for the next local-first implementation selection.
+Gold v8 remains paused, paper-only, and automation OFF.
+
 
 ### PR #121 / Vercel Preview status
 
