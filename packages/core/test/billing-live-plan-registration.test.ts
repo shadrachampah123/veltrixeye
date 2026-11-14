@@ -43,7 +43,6 @@ import {
   BILLING_CATALOGUE_VERSION,
   BILLING_PRICING_POLICY_VERSION,
   BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION,
-  BillingFxRateVersionStore,
   BillingLivePlanRegistrationService,
   BillingPlanProvisioningService,
   BillingProviderPlanStore,
@@ -64,7 +63,7 @@ import {
   buildLivePlanRegistrationEvidence,
   prepareSandboxProvisioningBatch,
 } from '../src/index.js';
-import { retireActiveEpochs, seedCommercialSubscription, startBillingTestDb, insertUser } from './helpers/billing-checkout.js';
+import { retireActiveEpochs, seedCommercialSubscription, startBillingTestDb, insertUser, approveSandboxDatabase, createFxPrincipals, publishApprovedFx, PRODUCTION_TEST_TARGET_ID, type FxPrincipals, type SandboxTestIdentity } from './helpers/billing-checkout.js';
 
 // Unique per suite file: every DB-backed core suite binds its own port.
 const DB_PORT = 5533;
@@ -76,10 +75,18 @@ const REASON = 'register the four live Paystack plan epochs for the go-live revi
 const REFERENCE = 'paystack-dashboard-live-plans-2026-09-29';
 
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
+/** The marked sandbox database's explicit identity expectation (set in before()). */
+let SANDBOX_IDENT: SandboxTestIdentity;
+/** The embedded test database approved as a PRODUCTION target (live-path tests only). */
+let PROD_IDENT: SandboxTestIdentity;
+let FX: FxPrincipals;
 let pool: Pool;
 
 before(async () => {
   db = await startBillingTestDb(DB_PORT);
+  SANDBOX_IDENT = await approveSandboxDatabase(db.pool);
+  PROD_IDENT = await approveSandboxDatabase(db.pool, PRODUCTION_TEST_TARGET_ID, 'production');
+  FX = await createFxPrincipals(db.pool, db.dbUrl);
   pool = db.pool;
 }, { timeout: 180_000 });
 
@@ -90,6 +97,7 @@ beforeEach(async () => {
 });
 
 after(async () => {
+  await FX?.close();
   await db?.stop();
 });
 
@@ -101,6 +109,7 @@ after(async () => {
 function liveRegistration(mode: 'test' | 'live' = 'live', registeredAt: Date = REGISTERED_AT) {
   return new BillingLivePlanRegistrationService({
     db: pool,
+    identityAllowlist: PROD_IDENT.allowlist,
     mode,
     now: () => registeredAt,
   });
@@ -110,16 +119,14 @@ let fxSequence = 0;
 
 /** Publish an operator FX version INSIDE the freshness window of the batch. */
 async function publishFx(rateScaled = 12_500_000n, capturedSecondsBefore = 120) {
-  const fxVersions = new BillingFxRateVersionStore(pool);
   const capturedAt = new Date(REGISTERED_AT.getTime() - (capturedSecondsBefore + fxSequence++) * 1000);
-  return fxVersions.publish({
+  return publishApprovedFx(FX, {
     fxRateScaled: rateScaled,
     fxRateScale: 6,
     effectiveFrom: capturedAt,
     capturedAt,
     source: 'ops',
     sourceReference: 'ops-live-fx-board-1',
-    createdBy: OPERATOR,
   });
 }
 
@@ -129,16 +136,14 @@ async function publishFx(rateScaled = 12_500_000n, capturedSecondsBefore = 120) 
  * live freshness window at the moment it runs.
  */
 async function publishFxNow(capturedSecondsBefore = 30) {
-  const fxVersions = new BillingFxRateVersionStore(pool);
   const capturedAt = new Date(Date.now() - (capturedSecondsBefore + fxSequence++) * 1000);
-  return fxVersions.publish({
+  return publishApprovedFx(FX, {
     fxRateScaled: 12_500_000n,
     fxRateScale: 6,
     effectiveFrom: capturedAt,
     capturedAt,
     source: 'ops',
     sourceReference: 'ops-live-fx-board-1',
-    createdBy: OPERATOR,
   });
 }
 
@@ -178,6 +183,8 @@ function liveRequest(overrides: Record<string, unknown> = {}) {
     operatorId: OPERATOR,
     reason: REASON,
     evidenceReference: REFERENCE,
+    targetId: PRODUCTION_TEST_TARGET_ID,
+    confirmTargetId: PRODUCTION_TEST_TARGET_ID,
     ...overrides,
   };
 }
@@ -481,11 +488,11 @@ describe('live plan registration — evidence assembly', () => {
 describe('live plan registration — fail-closed gates', () => {
   test('migration 0035 is present and applied (the live epoch schema)', async () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
-    assert.equal(status.expectedCount, 39);
-    assert.equal(status.appliedCount, 39);
-    // 0035 is the newest migration OF THIS STEP; 0036–0039 legitimately follow
+    assert.equal(status.expectedCount, 40);
+    assert.equal(status.appliedCount, 40);
+    // 0035 is the newest migration OF THIS STEP; 0036–0040 legitimately follow
     // it and are named here deliberately.
-    assert.equal(status.latestApplied, '0039_notification_smtp_test_claim.sql');
+    assert.equal(status.latestApplied, '0040_billing_fx_source_approvals.sql');
   });
 
   test('a service that is not explicitly live refuses before anything is read or written', async () => {
@@ -563,9 +570,9 @@ describe('live plan registration — fail-closed gates', () => {
       fxVersion: fxRow,
       evidenceReference: REFERENCE,
     });
-    const service = new BillingPlanProvisioningService({ db: pool, mode: 'live', now: () => REGISTERED_AT });
+    const service = new BillingPlanProvisioningService({ identityAllowlist: PROD_IDENT.allowlist, db: pool, mode: 'live', now: () => REGISTERED_AT });
     const error = await catchError(() =>
-      service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence }),
+      service.registerSandboxPlanEpochs({ databaseTarget: PROD_IDENT.target, fxRateVersionId: fx.id, evidence }),
     );
     assert.equal(provisioningReason(error), 'audit_required');
     assert.equal(await epochHistory('live'), 0, 'no epoch row of any status was written');
@@ -578,7 +585,7 @@ describe('live plan registration — fail-closed gates', () => {
       { operatorId: 'svc token 01', reason: REASON },
     ]) {
       const shaped = await catchError(() =>
-        service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence, audit: shapedAudit }),
+        service.registerSandboxPlanEpochs({ databaseTarget: PROD_IDENT.target, fxRateVersionId: fx.id, evidence, audit: shapedAudit }),
       );
       assert.equal(
         provisioningReason(shaped),
@@ -784,8 +791,8 @@ describe('live plan registration — the sandbox path is unchanged', () => {
     }).map((entry) => ({ ...entry, mode: 'test' }));
 
     const auditsBefore = await auditCount();
-    const service = new BillingPlanProvisioningService({ db: pool, mode: 'test', now: () => REGISTERED_AT });
-    const registered = await service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence });
+    const service = new BillingPlanProvisioningService({ identityAllowlist: SANDBOX_IDENT.allowlist, db: pool, mode: 'test', now: () => REGISTERED_AT });
+    const registered = await service.registerSandboxPlanEpochs({ databaseTarget: SANDBOX_IDENT.target, fxRateVersionId: fx.id, evidence });
     assert.equal(registered.length, 4);
     for (const epoch of registered) assert.equal(epoch.mode, 'test');
     assert.equal((await epochRows('test')).length, 4);
@@ -894,11 +901,21 @@ describe('live plan registration — the operator CLI', () => {
     });
   }
 
+  /**
+   * A selector only. The committed allowlist has NO production entry, so every
+   * CLI run that reaches the allowlist is refused (fail closed); no production
+   * identity is ever invented for a test. The CLI success path therefore runs
+   * only against an operator-approved production entry, and the registered-batch
+   * behaviour is covered by the service-level tests above.
+   */
+  const UNAPPROVED_TARGET = 'embedded-test-production';
   const baseArgs = (fxId: string) => [
     '--fx-rate-version', fxId,
     '--by', OPERATOR,
     '--reason', REASON,
     '--reference', REFERENCE,
+    '--target', UNAPPROVED_TARGET,
+    '--confirm-target', UNAPPROVED_TARGET,
   ];
 
   test('refuses without an explicit live configuration, and writes nothing', async () => {
@@ -956,81 +973,48 @@ describe('live plan registration — the operator CLI', () => {
     assert.equal(await auditCount(), auditsBefore, 'no audit event was written');
   });
 
-  test('a dry run prints the validated plan and writes nothing', async () => {
+  test('a fully valid live configuration is refused before connecting when no production entry is approved', async () => {
     const fx = await publishFxNow();
     const historyBefore = await epochHistory('live');
     const auditsBefore = await auditCount();
-    const result = cli(
-      { DATABASE_URL: db.dbUrl, PAYSTACK_MODE: 'live', PAYSTACK_LIVE_PLAN_CODES: JSON.stringify(planCodes()) },
-      [...baseArgs(fx.id), '--dry-run'],
-    );
-    assert.equal(result.status, 0, result.stderr);
-    const output = JSON.parse(result.stdout) as Record<string, unknown>;
-    assert.equal(output.outcome, 'dry_run');
-    assert.equal(output.dryRun, true);
-    assert.equal(output.mode, 'live');
-    assert.equal(output.providerCalls, 0);
-    assert.equal(output.auditAction, null);
-    assert.equal(output.fxRateVersionId, fx.id);
-    assert.equal((output.plan as unknown[]).length, 4);
-    assert.equal(await epochHistory('live'), historyBefore, 'a dry run writes no epoch');
-    assert.equal(await auditCount(), auditsBefore, 'a dry run writes no audit event');
-  });
-
-  test('registers the four live epochs from the supplied codes, atomically and audited', async () => {
-    const fx = await publishFxNow();
-    const supplied = planCodes();
-    const historyBefore = await epochHistory('live');
-    const auditsBefore = await auditCount();
-
-    const result = cli(
-      { DATABASE_URL: db.dbUrl, PAYSTACK_MODE: 'live', PAYSTACK_LIVE_PLAN_CODES: JSON.stringify(supplied) },
-      baseArgs(fx.id),
-    );
-    assert.equal(result.status, 0, result.stderr);
-    const output = JSON.parse(result.stdout) as {
-      outcome: string;
-      auditAction: string;
-      grantsExecution: boolean;
-      paymentConfirmed: boolean;
-      plan: Array<Record<string, unknown>>;
-    };
-    assert.equal(output.outcome, 'registered');
-    assert.equal(output.auditAction, BILLING_PROVIDER_PLAN_REGISTRATION_AUDIT_ACTION);
-    assert.equal(output.grantsExecution, false);
-    assert.equal(output.paymentConfirmed, false);
-    assert.equal(output.plan.length, 4);
-    for (const [index, [slot, plan, interval]] of MATRIX.entries()) {
-      const entry = output.plan[index]!;
-      assert.equal(entry.slot, slot);
-      assert.equal(entry.providerPlanId, supplied[slot]);
-      assert.equal(entry.billingInterval, interval);
-      assert.equal(entry.providerInterval, interval === 'annual' ? 'annually' : 'monthly');
-      assert.equal(entry.paymentAmountMinor, derived(plan, interval).toString());
-      assert.notEqual(entry.epochId, null, 'the CLI reports the persisted epoch id');
+    for (const mode of ['dry-run', 'apply'] as const) {
+      const args = mode === 'dry-run' ? [...baseArgs(fx.id), '--dry-run'] : baseArgs(fx.id);
+      const result = cli(
+        { DATABASE_URL: db.dbUrl, PAYSTACK_MODE: 'live', PAYSTACK_LIVE_PLAN_CODES: JSON.stringify(planCodes()) },
+        args,
+      );
+      assert.equal(result.status, 2, `${mode}: an unapproved production target is a refusal`);
+      assert.match(result.stderr, /not in the reviewed production allowlist/);
+      assert.match(result.stderr, /Nothing was connected or written/);
+      assert.equal(result.stdout, '', `${mode}: no outcome document is printed for a refused run`);
     }
-
-    assert.equal((await epochRows('live')).length, 4);
-    assert.equal(await epochHistory('live'), historyBefore + 4);
-    assert.equal(await auditCount(), auditsBefore + 1);
+    assert.equal(await epochHistory('live'), historyBefore, 'no live epoch row was written');
+    assert.equal(await auditCount(), auditsBefore, 'no audit event was written');
   });
 
-  test('a refused batch exits 1 and leaves the database untouched', async () => {
+  test('a sandbox-typed target can never authorize a live run (crossover is refused)', async () => {
     const fx = await publishFxNow();
     const historyBefore = await epochHistory('live');
     const auditsBefore = await auditCount();
-    const result = cli(
-      {
-        DATABASE_URL: db.dbUrl,
-        PAYSTACK_MODE: 'live',
-        PAYSTACK_LIVE_PLAN_CODES: JSON.stringify({ ...planCodes(), 'elite-annual': 'PLN_placeholder01' }),
-      },
-      baseArgs(fx.id),
+    const crossover = cli(
+      { DATABASE_URL: db.dbUrl, PAYSTACK_MODE: 'live', PAYSTACK_LIVE_PLAN_CODES: JSON.stringify(planCodes()) },
+      [...baseArgs(fx.id), '--target', 'embedded-test-sandbox', '--confirm-target', 'embedded-test-sandbox'],
     );
-    assert.equal(result.status, 1, result.stderr);
-    assert.match(result.stderr, /refused \(invalid_provider_plan\)/);
-    assert.match(result.stderr, /Nothing was written/);
+    assert.equal(crossover.status, 2, 'a sandbox target is not a production entry');
+    assert.match(crossover.stderr, /Nothing was connected or written/);
     assert.equal(await epochHistory('live'), historyBefore);
     assert.equal(await auditCount(), auditsBefore);
+  });
+
+  test('a confirmation that does not repeat the target is refused before connecting', async () => {
+    const fx = await publishFxNow();
+    const historyBefore = await epochHistory('live');
+    const result = cli(
+      { DATABASE_URL: db.dbUrl, PAYSTACK_MODE: 'live', PAYSTACK_LIVE_PLAN_CODES: JSON.stringify(planCodes()) },
+      [...baseArgs(fx.id), '--confirm-target', 'some-other-id'],
+    );
+    assert.equal(result.status, 2, 'a mismatched confirmation is a refusal');
+    assert.match(result.stderr, /Nothing was connected or written/);
+    assert.equal(await epochHistory('live'), historyBefore);
   });
 });

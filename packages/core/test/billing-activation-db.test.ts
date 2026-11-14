@@ -142,8 +142,8 @@ describe('Step 8 — 0034 file conventions and history integrity', () => {
     assert.equal(files.filter((file) => file.startsWith('0035_')).length, 1, 'exactly one 0035 migration (live mode)');
     // 0034 is the newest migration OF THIS STEP. 0035 (live-mode widening),
     // 0036 (non-commercial operator grants), 0037 (scheduled ingestion trigger),
-    // 0038 (read-only FX source observations) and 0039 (isolated SMTP diagnostic)
-    // are later migrations and are
+    // 0038 (read-only FX source observations), 0039 (isolated SMTP diagnostic)
+    // and 0040 (FX source approvals) are later migrations and are
     // named here deliberately, so "nothing unexpected follows 0034" stays a real
     // assertion rather than a silently drifting tip.
     assert.ok(
@@ -151,13 +151,14 @@ describe('Step 8 — 0034 file conventions and history integrity', () => {
         files.includes('0036_billing_entitlement_grants.sql') &&
         files.includes('0037_scheduled_ingestion_trigger.sql') &&
         files.includes('0038_billing_fx_source_observations.sql') &&
-        files.includes('0039_notification_smtp_test_claim.sql'),
+        files.includes('0039_notification_smtp_test_claim.sql') &&
+        files.includes('0040_billing_fx_source_approvals.sql'),
       'the migrations that legitimately follow 0034 are the recorded ones',
     );
     assert.equal(
-      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 39).length,
+      files.filter((file) => Number(/^(\d{4})_/.exec(file)?.[1]) > 40).length,
       0,
-      'nothing is numbered after 0039',
+      'nothing is numbered after 0040',
     );
   });
 

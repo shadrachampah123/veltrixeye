@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { Pool } from 'pg';
 import {
+  BILLING_CREDENTIAL_SHAPED_RE,
   BILLING_CURRENCY,
   BILLING_FX_SOURCES,
   BILLING_PAYMENT_CURRENCIES,
@@ -11,6 +12,11 @@ import {
   type BillingRoundingMode,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
+import {
+  DatabaseIdentityError,
+  verifyConnectedDatabaseIdentity,
+  type DatabaseIdentityEntry,
+} from './database-identity.js';
 
 /**
  * Billing PR3 — the AUTHORITATIVE, server-side FX rate boundary.
@@ -142,7 +148,23 @@ export type BillingFxFailureReason =
   | 'stale'
   | 'invalid'
   | 'ambiguous'
-  | 'unsupported_currency';
+  | 'unsupported_currency'
+  /**
+   * Publication refused: the source approval is missing, unrecorded, malformed,
+   * or does not match this exact source, source reference and currency pair.
+   * Nothing was written.
+   */
+  | 'source_not_approved'
+  /** Publication refused: the source is not in {@link FX_PUBLICATION_PERMITTED_SOURCES}. */
+  | 'source_not_permitted'
+  /** Publication refused: the approval was already consumed by an earlier publication (single-use). */
+  | 'approval_consumed'
+  /** Publication refused: the approval is past its validity window. */
+  | 'approval_expired'
+  /** Publication refused: the publisher login is the login that recorded the approval. */
+  | 'separation_of_duties'
+  /** Refused by the database: the session login lacks the required approver or publisher role. */
+  | 'principal_unauthorized';
 
 /** A rate that cannot price a payment. Always a hard failure (fail closed). */
 export class BillingFxError extends Error {
@@ -360,50 +382,393 @@ export function fxRateVersionKey(params: {
 export interface PublishFxRateVersionInput {
   fxRateScaled: bigint;
   fxRateScale: number;
+  /** REQUIRED: bound by the approval (the approval fingerprint covers it). */
   effectiveFrom: Date;
-  capturedAt?: Date;
+  /** REQUIRED: bound by the approval (the approval fingerprint covers it). */
+  capturedAt: Date;
   source: BillingFxSource;
-  sourceReference?: string | null;
-  createdBy?: string | null;
+  /** The published source reference the approval must name exactly. */
+  sourceReference: string;
   roundingMode?: BillingRoundingMode;
+  /**
+   * The id of the RECORDED, UNCONSUMED, UNEXPIRED approval whose fingerprint
+   * equals this exact rate. The publisher is the authenticated database login.
+   */
+  sourceApprovalId: string;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Source approval — database-enforced, authenticated principal, single-use   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The FX sources that MAY be approved for publication. `db` (a copy of the
+ * platform's own rows) and `config` (an environment-supplied value) are never a
+ * market-rate source and are refused outright. Being in this list approves
+ * nothing: every publication needs its own recorded, unconsumed, unexpired
+ * approval of that exact rate.
+ *
+ * Policy note: a proposed default for operator review, not an external approval.
+ */
+export const FX_PUBLICATION_PERMITTED_SOURCES: readonly BillingFxSource[] = Object.freeze([
+  'ops',
+  'import',
+] as BillingFxSource[]);
+
+/** Audit action written by the database when an approval is recorded. */
+export const FX_SOURCE_APPROVED_AUDIT_ACTION = 'billing.fx_source_approved' as const;
+/** Audit action written by the database when a rate is published. */
+export const FX_RATE_PUBLISHED_AUDIT_ACTION = 'billing.fx_rate_published' as const;
+/** The approval validity window. Enforced by the database (migration 0040). */
+export const FX_APPROVAL_VALIDITY_SECONDS = 60 * 60;
+
+export interface FxSourceApprovalInput {
+  /** Must be in {@link FX_PUBLICATION_PERMITTED_SOURCES}. */
+  source: BillingFxSource;
+  /** The named publication reference (a board or ticket reference). */
+  sourceReference: string;
+  /** The EXACT proposed rate this approval authorizes. */
+  fxRateScaled: bigint;
+  fxRateScale: number;
+  /** The EXACT proposed effective instant. */
+  effectiveFrom: Date;
+  /** The EXACT proposed capture instant. */
+  capturedAt: Date;
+  /** The stated reason for the approval. */
+  reason: string;
+}
+
+export interface RecordedFxSourceApproval {
+  /** The durable approval id to cite at publication. */
+  readonly approvalId: string;
+  /** The authenticated database login that recorded it. Never caller-supplied. */
+  readonly approverPrincipal: string;
+  readonly expiresAt: Date;
+  /** SHA-256 over every bound field; publication must reproduce it exactly. */
+  readonly fingerprint: string;
+  readonly source: BillingFxSource;
+  readonly sourceReference: string;
+  readonly baseCurrency: string;
+  readonly quoteCurrency: string;
+  readonly fxRateScaled: bigint;
+  readonly fxRateScale: number;
+  readonly effectiveFrom: Date;
+  readonly capturedAt: Date;
+}
+
+const APPROVAL_ID_PATTERN = /^[1-9][0-9]{0,18}$/;
+/** True when the text holds a C0 control character or DEL (checked by code point). */
+function containsControlCharacter(text: string): boolean {
+  for (const character of text) {
+    const code = character.codePointAt(0) ?? 0;
+    if (code <= 0x1f || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Map a database refusal to a typed failure. Only fixed, reviewed tokens raised
+ * by migration 0040 and SQLSTATEs are recognised; anything else is rethrown
+ * unchanged so an unexpected failure is never reported as a typed refusal.
+ */
+function toFxError(error: unknown): unknown {
+  if (typeof error !== 'object' || error === null) return error;
+  const { code, message } = error as { code?: unknown; message?: unknown };
+  if (code === '42501') {
+    // Only the two reviewed refusals are "not authorized": the function's own
+    // membership check, or EXECUTE denied to a login outside the required role.
+    // Any other permission failure is a fault and is rethrown unchanged.
+    if (
+      message === 'billing_fx_principal_unauthorized' ||
+      (typeof message === 'string' &&
+        /^permission denied for function billing_(record_fx_source_approval|publish_fx_rate_version)$/.test(message))
+    ) {
+      return new BillingFxError(
+        'principal_unauthorized',
+        'The database login is not authorized for this FX operation (it is not a member of the required role). Nothing was written.',
+        { cause: error },
+      );
+    }
+    return error;
+  }
+  if (code === '23505') {
+    return new BillingFxError(
+      'ambiguous',
+      'A published rate already exists for this pair and instant. Nothing was published.',
+      { cause: error },
+    );
+  }
+  if (code === '23514') {
+    return new BillingFxError(
+      'invalid',
+      'The FX approval or publication violates a recorded constraint. Nothing was written.',
+      { cause: error },
+    );
+  }
+  if (code === 'P0001') {
+    switch (message) {
+      case 'approval_not_found':
+        return new BillingFxError('source_not_approved', 'FX publication refused: the cited source approval does not exist. Nothing was published.', { cause: error });
+      case 'approval_mismatch':
+        return new BillingFxError(
+          'source_not_approved',
+          'FX publication refused: the cited approval does not authorize this exact rate (source, reference, pair, rate, scale, rounding, effective or capture time differ). Nothing was published.',
+          { cause: error },
+        );
+      case 'approval_consumed':
+        return new BillingFxError('approval_consumed', 'FX publication refused: this approval was already used. Nothing was published.', { cause: error });
+      case 'approval_expired':
+        return new BillingFxError('approval_expired', 'FX publication refused: this approval has expired. Record a new approval. Nothing was published.', { cause: error });
+      case 'separation_of_duties':
+        return new BillingFxError('separation_of_duties', 'FX publication refused: the publisher login recorded this approval. Approver and publisher must differ. Nothing was published.', { cause: error });
+      case 'source_not_permitted':
+        return new BillingFxError('source_not_permitted', 'FX source is not permitted for publication. Nothing was written.', { cause: error });
+      default:
+        return error;
+    }
+  }
+  return error;
+}
+
+function assertApprovalTextNotCredentialShaped(fields: Record<string, string>): void {
+  for (const [field, value] of Object.entries(fields)) {
+    if (BILLING_CREDENTIAL_SHAPED_RE.test(value)) {
+      throw new BillingFxError(
+        'invalid',
+        `The FX source approval's "${field}" is credential-shaped and is refused: an approval names a publication reference and a reason, never key or token material.`,
+      );
+    }
+  }
+}
+
+/**
+ * Records FX source approvals through the database. AUTHORIZATION IS THE
+ * DATABASE LOGIN: `billing_record_fx_source_approval()` refuses any session whose
+ * login is not a member of `veltrixeye_fx_approver`, and records that login as
+ * the approver. This class accepts no approver identity from its caller, so a
+ * free-text name can never stand in for an authenticated principal.
+ *
+ * The approval binds the exact rate (value, scale, pair, source, reference,
+ * effective and capture instants), expires after {@link FX_APPROVAL_VALIDITY_SECONDS},
+ * and can be consumed once. It never publishes a rate.
+ *
+ * LIMITATION: "the database login" is a person only when each approver has an
+ * individual login. The application's shared DATABASE_URL login must not be an
+ * approver; see scripts/billing/fx-approval-roles.sql.
+ */
+export class BillingFxSourceApprovalStore {
+  /**
+   * M-A: the reviewed, approved target this store may write to. Every write
+   * verifies the CONNECTED database against this entry on the connection and
+   * transaction that performs the write. When no entry is configured (the
+   * empty-by-default allowlist), every write is refused — fail closed. The
+   * entry is never taken from the connection string or operator runtime input.
+   */
+  constructor(
+    private readonly db: Pool,
+    private readonly policy: BillingFxPolicy = BILLING_FX_POLICY,
+    private readonly identity: DatabaseIdentityEntry | undefined,
+  ) {}
+
+  async recordApproval(input: FxSourceApprovalInput): Promise<RecordedFxSourceApproval> {
+    if (!(BILLING_FX_SOURCES as readonly string[]).includes(input.source)) {
+      throw new BillingFxError('invalid', `Unknown FX rate source "${String(input.source)}".`);
+    }
+    if (!(FX_PUBLICATION_PERMITTED_SOURCES as readonly string[]).includes(input.source)) {
+      throw new BillingFxError(
+        'source_not_permitted',
+        `FX source "${input.source}" is not permitted for publication, so it cannot be approved.`,
+      );
+    }
+    const sourceReference = typeof input.sourceReference === 'string' ? input.sourceReference.trim() : '';
+    const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+    if (sourceReference === '' || sourceReference.length > 190 || containsControlCharacter(sourceReference)) {
+      throw new BillingFxError('invalid', 'The FX source approval needs a plain publication reference of 1–190 characters.');
+    }
+    if (reason === '' || reason.length > 500 || containsControlCharacter(reason)) {
+      throw new BillingFxError('invalid', 'The FX source approval needs a reason of 1–500 characters.');
+    }
+    assertApprovalTextNotCredentialShaped({ sourceReference, reason });
+    if (typeof input.fxRateScaled !== 'bigint' || input.fxRateScaled <= 0n) {
+      throw new BillingFxError('invalid', 'The FX source approval needs a positive rate value.');
+    }
+    if (!Number.isInteger(input.fxRateScale) || input.fxRateScale < 1 || input.fxRateScale > 18) {
+      throw new BillingFxError('invalid', 'The FX source approval needs a rate scale between 1 and 18.');
+    }
+    if (!(input.effectiveFrom instanceof Date) || !Number.isFinite(input.effectiveFrom.getTime())) {
+      throw new BillingFxError('invalid', 'The FX source approval needs a valid effective instant.');
+    }
+    if (!(input.capturedAt instanceof Date) || !Number.isFinite(input.capturedAt.getTime())) {
+      throw new BillingFxError('invalid', 'The FX source approval needs a valid capture instant.');
+    }
+    if (input.capturedAt.getTime() > input.effectiveFrom.getTime()) {
+      throw new BillingFxError('invalid', 'A rate is captured at or before the moment it becomes effective.');
+    }
+
+    // M-A: the connected-database identity gate. With no approved entry the
+    // store refuses before any connection; with one, the identity is verified on
+    // the SAME connection and transaction that records the approval.
+    const identity = this.identity;
+    if (identity === undefined) {
+      throw new DatabaseIdentityError(
+        'identity_not_configured',
+        'static',
+        'No approved database identity was configured for this FX approval store, so no approval can be recorded. Nothing was connected or written.',
+      );
+    }
+
+    let row: Record<string, unknown> | undefined;
+    const client = await this.db.connect();
+    try {
+      await client.query('BEGIN');
+      await verifyConnectedDatabaseIdentity(client, identity);
+      const { rows } = await client.query(
+        `SELECT out_approval_id::text AS approval_id, out_approver_principal AS approver_principal,
+                out_expires_at AS expires_at, out_fingerprint AS fingerprint
+           FROM billing_record_fx_source_approval($1, $2, $3, $4, $5::bigint, $6, $7, $8, $9, $10)`,
+        [
+          input.source,
+          sourceReference,
+          this.policy.baseCurrency,
+          this.policy.quoteCurrency,
+          input.fxRateScaled.toString(),
+          input.fxRateScale,
+          this.policy.roundingMode,
+          input.effectiveFrom,
+          input.capturedAt,
+          reason,
+        ],
+      );
+      await client.query('COMMIT');
+      row = rows[0] as Record<string, unknown> | undefined;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      if (error instanceof DatabaseIdentityError) throw error;
+      throw toFxError(error);
+    } finally {
+      client.release();
+    }
+    if (row === undefined) {
+      throw new BillingFxError('invalid', 'The FX source approval was not recorded.');
+    }
+    return Object.freeze({
+      approvalId: String(row.approval_id),
+      approverPrincipal: String(row.approver_principal),
+      expiresAt: new Date(row.expires_at as Date),
+      fingerprint: String(row.fingerprint),
+      source: input.source,
+      sourceReference,
+      baseCurrency: this.policy.baseCurrency,
+      quoteCurrency: this.policy.quoteCurrency,
+      fxRateScaled: input.fxRateScaled,
+      fxRateScale: input.fxRateScale,
+      effectiveFrom: input.effectiveFrom,
+      capturedAt: input.capturedAt,
+    });
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Durable authority — publication                                            */
+/* -------------------------------------------------------------------------- */
 
 /**
  * Postgres-backed authority for FX rate versions.
  *
- * `publish()` APPENDS a version (an immutable row). There is no update path and
- * no delete path, by construction here and by trigger in migration 0032: a
- * published rate can never be edited or re-dated, so a payment that was priced
- * at 09:00 can still be explained later.
+ * `publish()` calls `billing_publish_fx_rate_version()`, which in ONE database
+ * transaction: checks the publisher role; locks and checks the approval (exists,
+ * not consumed, not expired, publisher ≠ approver, fingerprint equal to this exact
+ * rate); inserts the version; records the consumption; and writes the
+ * `billing.fx_rate_published` audit event. Any failure rolls all of it back, so no
+ * version, consumption or audit row can exist without the others.
+ *
+ * Versions are append-only (migration 0032). The public INSERT privilege on the
+ * table is revoked (migration 0040): publication goes through the function.
  */
 export class BillingFxRateVersionStore {
+  /**
+   * M-A: the reviewed, approved target this store may publish into. Every
+   * publication verifies the CONNECTED database against this entry on the
+   * connection and transaction that performs the write. When no entry is
+   * configured (the empty-by-default allowlist), every publication is refused —
+   * fail closed. The entry is never taken from the connection string or operator
+   * runtime input.
+   */
   constructor(
     private readonly db: Pool,
     private readonly policy: BillingFxPolicy = BILLING_FX_POLICY,
+    private readonly identity: DatabaseIdentityEntry | undefined,
   ) {}
 
   async publish(input: PublishFxRateVersionInput): Promise<BillingFxRateVersion> {
-    const capturedAt = input.capturedAt ?? new Date();
-    const { rows } = await this.db.query(
-      `INSERT INTO billing_fx_rate_versions
-         (base_currency, quote_currency, fx_rate_scaled, fx_rate_scale, rounding_mode,
-          source, source_reference, created_by, effective_from, captured_at, published_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
-       RETURNING *`,
-      [
-        this.policy.baseCurrency,
-        this.policy.quoteCurrency,
-        input.fxRateScaled.toString(),
-        input.fxRateScale,
-        input.roundingMode ?? this.policy.roundingMode,
-        input.source,
-        input.sourceReference ?? null,
-        input.createdBy ?? null,
-        input.effectiveFrom,
-        capturedAt,
-      ],
-    );
-    return parseFxRateVersion(rows[0]);
+    if (!(FX_PUBLICATION_PERMITTED_SOURCES as readonly string[]).includes(input.source)) {
+      throw new BillingFxError(
+        'source_not_permitted',
+        `FX source "${input.source}" is not permitted for publication. Nothing was published.`,
+      );
+    }
+    const sourceReference = typeof input.sourceReference === 'string' ? input.sourceReference : '';
+    if (sourceReference.trim() === '') {
+      throw new BillingFxError(
+        'source_not_approved',
+        'FX publication refused: a source reference is required, because the approval names it. Nothing was published.',
+      );
+    }
+    if (typeof input.sourceApprovalId !== 'string' || !APPROVAL_ID_PATTERN.test(input.sourceApprovalId)) {
+      throw new BillingFxError(
+        'source_not_approved',
+        'FX publication refused: the cited source approval id is missing or malformed. Nothing was published.',
+      );
+    }
+    if (!(input.capturedAt instanceof Date) || !Number.isFinite(input.capturedAt.getTime())) {
+      throw new BillingFxError('invalid', 'FX publication needs a valid capture instant. Nothing was published.');
+    }
+    if (!(input.effectiveFrom instanceof Date) || !Number.isFinite(input.effectiveFrom.getTime())) {
+      throw new BillingFxError('invalid', 'FX publication needs a valid effective instant. Nothing was published.');
+    }
+
+    // M-A: the connected-database identity gate. With no approved entry the
+    // store refuses before any connection; with one, the identity is verified on
+    // the SAME connection and transaction that publishes the rate.
+    const identity = this.identity;
+    if (identity === undefined) {
+      throw new DatabaseIdentityError(
+        'identity_not_configured',
+        'static',
+        'No approved database identity was configured for this FX publication store, so no rate can be published. Nothing was connected or written.',
+      );
+    }
+
+    const client = await this.db.connect();
+    try {
+      await client.query('BEGIN');
+      await verifyConnectedDatabaseIdentity(client, identity);
+      const { rows: idRows } = await client.query(
+        `SELECT * FROM billing_publish_fx_rate_version($1::bigint, $2, $3, $4, $5, $6::bigint, $7, $8, $9, $10)`,
+        [
+          input.sourceApprovalId,
+          input.source,
+          sourceReference,
+          this.policy.baseCurrency,
+          this.policy.quoteCurrency,
+          input.fxRateScaled.toString(),
+          input.fxRateScale,
+          input.roundingMode ?? this.policy.roundingMode,
+          input.effectiveFrom,
+          input.capturedAt,
+        ],
+      );
+      await client.query('COMMIT');
+      return parseFxRateVersion(idRows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      if (error instanceof DatabaseIdentityError) throw error;
+      throw toFxError(error);
+    } finally {
+      client.release();
+    }
   }
 
   /**

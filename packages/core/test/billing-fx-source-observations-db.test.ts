@@ -150,13 +150,13 @@ describe('migration 0038 — additive historical migration', () => {
     const files = readdirSync(MIGRATIONS_DIR_PATH)
       .filter((file) => file.endsWith('.sql'))
       .sort();
-    assert.equal(files.length, 39, 'the SMTP diagnostic migration is additive after the observation migration');
-    assert.equal(files.at(-1), '0039_notification_smtp_test_claim.sql');
+    assert.equal(files.length, 40, 'the FX source approval migration is additive after the observation migration');
+    assert.equal(files.at(-1), '0040_billing_fx_source_approvals.sql');
     assert.equal(files.filter((file) => file.startsWith('0038_')).length, 1);
     assert.equal(
-      files.filter((file) => Number.parseInt(file.slice(0, 4), 10) > 39).length,
+      files.filter((file) => Number.parseInt(file.slice(0, 4), 10) > 40).length,
       0,
-      'nothing is numbered after 0039',
+      'nothing is numbered after 0040',
     );
   });
 

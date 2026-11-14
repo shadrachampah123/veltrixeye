@@ -62,6 +62,8 @@ import {
 } from '../src/index.js';
 import {
   AS_OF,
+  PRODUCTION_TEST_TARGET_ID,
+  approveSandboxDatabase,
   insertFx,
   insertUser,
   seedCommercialSubscription,
@@ -136,13 +138,14 @@ after(async () => {
 /* ========================================================================== */
 
 describe('0035 — fresh database: files, constraints and the coherence trigger', () => {
-  it('applies through 0039: every file, both domains in both CHECKs', async () => {
+  it('applies through 0040: every file, both domains in both CHECKs', async () => {
     const status = await migrationStatus(pool, MIGRATIONS_DIR);
     // 0036 (non-commercial operator grants), 0037 (scheduled ingestion trigger),
-    // 0038 (read-only FX source observations) and 0039 (isolated SMTP diagnostic)
-    // are later migrations than this step's 0035; the fresh database carries them too.
-    assert.equal(status.expectedCount, 39, 'the whole shipped file set exists');
-    assert.equal(status.appliedCount, 39, 'the fresh database is fully migrated');
+    // 0038 (read-only FX source observations), 0039 (isolated SMTP diagnostic) and
+    // 0040 (FX source approvals) are later migrations than this step's 0035; the
+    // fresh database carries them too.
+    assert.equal(status.expectedCount, 40, 'the whole shipped file set exists');
+    assert.equal(status.appliedCount, 40, 'the fresh database is fully migrated');
     assert.equal(status.pending.length, 0);
 
     const constraintDef = async (name: string): Promise<string> => {
@@ -228,13 +231,14 @@ describe('0035 — fresh database: files, constraints and the coherence trigger'
         assert.equal(status.expectedCount, 34, 'the base file set is exactly 0001-0034');
         assert.equal(status.pending.length, 0, 'the base set is fully applied');
         assert.equal(full.appliedCount, 35, 'the upgrade path ends at 0035, this step’s tip');
-        // Only 0036–0039 — later migrations this step knows nothing about — are
+        // Only 0036–0040 — later migrations this step knows nothing about — are
         // still pending, and they are exactly those files.
         assert.deepEqual(full.pending, [
           '0036_billing_entitlement_grants.sql',
           '0037_scheduled_ingestion_trigger.sql',
           '0038_billing_fx_source_observations.sql',
           '0039_notification_smtp_test_claim.sql',
+          '0040_billing_fx_source_approvals.sql',
         ]);
         assert.equal(full.latestApplied, '0035_billing_live_mode.sql', '0035 is the newest applied migration');
       } finally {
@@ -361,7 +365,15 @@ describe('0035 — live-mode provisioning and mode-specific directories', () => 
       liveEvidenceEntry('elite', 'monthly'),
       liveEvidenceEntry('elite', 'annual'),
     ];
-    const service = new BillingPlanProvisioningService({ db: pool, mode: 'live', now: () => AS_OF });
+    // The live identity is a PRODUCTION entry of the embedded test database,
+    // selected by id and typed twice (the production confirmation).
+    const liveIdentity = await approveSandboxDatabase(pool, PRODUCTION_TEST_TARGET_ID, 'production');
+    const service = new BillingPlanProvisioningService({
+      db: pool,
+      mode: 'live',
+      now: () => AS_OF,
+      identityAllowlist: liveIdentity.allowlist,
+    });
     // A LIVE registration is auditable by construction: the operator identity
     // and the reason are mandatory in live mode (`audit_required` otherwise),
     // and the audit event is written on the same transaction as the epochs.
@@ -369,6 +381,7 @@ describe('0035 — live-mode provisioning and mode-specific directories', () => 
       fxRateVersionId: fxRow.id,
       evidence: liveEvidence,
       audit: { operatorId: OPERATOR, reason: REASON },
+      databaseTarget: { targetId: PRODUCTION_TEST_TARGET_ID, confirmTargetId: PRODUCTION_TEST_TARGET_ID },
     });
     assert.equal(registered.length, 4);
     for (const epoch of registered) {

@@ -782,11 +782,11 @@ describe('static boundaries — the plan matrix stays provider-agnostic', () => 
     assert.deepEqual(offenders, [], 'every reader goes through resolveEntitlements');
   });
 
-  it('adds 0034–0039 additively, leaving 0001–0033 untouched', () => {
+  it('adds 0034–0040 additively, leaving 0001–0033 untouched', () => {
     const files = readdirSync(MIGRATIONS_DIR).sort();
-    assert.equal(files.length, 39, `unexpected migration set: ${files.join(', ')}`);
+    assert.equal(files.length, 40, `unexpected migration set: ${files.join(', ')}`);
     assert.equal(files[0], '0001_identity_and_audit.sql');
-    assert.equal(files[files.length - 1], '0039_notification_smtp_test_claim.sql');
+    assert.equal(files[files.length - 1], '0040_billing_fx_source_approvals.sql');
   });
 
   it('leaves the checkout INSERT shape and the pricing lock untouched', () => {

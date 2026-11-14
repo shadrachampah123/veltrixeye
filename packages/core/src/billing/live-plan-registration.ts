@@ -21,6 +21,13 @@ import {
   type ValidatedSandboxProvisioningBatch,
 } from './provisioning.js';
 import type { BillingProviderPlan } from './provider-plans.js';
+import {
+  type DatabaseIdentityAllowlist,
+  type DatabaseIdentityEntry,
+  DatabaseIdentityError,
+  resolveDatabaseTarget,
+  verifyConnectedDatabaseIdentity,
+} from './database-identity.js';
 
 /**
  * LIVE plan registration — the operator path that turns the four SUPPLIED live
@@ -112,7 +119,15 @@ export type BillingLivePlanRegistrationFailureReason =
   /** A supplied observation (for example an amount) is malformed. */
   | 'invalid_evidence'
   /** The registration instant is missing or not finite. */
-  | 'invalid_instant';
+  | 'invalid_instant'
+  /**
+   * The production target identity was not established: no reviewed allowlist
+   * was supplied, the selector is unknown or of the wrong environment, the
+   * explicit typed confirmation is absent, or the CONNECTED database is not the
+   * approved production entry (name and cluster system identifier). Nothing was
+   * written.
+   */
+  | 'database_identity_refused';
 
 export class BillingLivePlanRegistrationError extends Error {
   readonly code = 'billing_live_plan_registration_refused' as const;
@@ -481,6 +496,8 @@ const registerLivePlanEpochsInputSchema = z
     evidenceReference: z.string(),
     observedAmountsMinor: z.unknown().optional(),
     dryRun: z.boolean().optional(),
+    targetId: z.string(),
+    confirmTargetId: z.string().optional(),
   })
   .strict();
 
@@ -517,6 +534,12 @@ function operatorTextOrRefuse(kind: string, value: string, max: number): string 
 export interface BillingLivePlanRegistrationOptions {
   db: Pool;
   /**
+   * The reviewed database identity allowlist, loaded and pin-verified by the
+   * CALLER. Absent ⇒ every registration (dry run included) is refused: a live
+   * target is never assumed. See `database-identity.ts`.
+   */
+  identityAllowlist?: DatabaseIdentityAllowlist;
+  /**
    * The configured provider domain. There is no default: the value is the
    * configured `PAYSTACK_MODE`, and the service refuses every registration
    * unless it is exactly `live`. Passing `test` (or omitting the option, which
@@ -542,6 +565,16 @@ export interface RegisterLivePlanEpochsInput {
   observedAmountsMinor?: Partial<Record<LivePlanCodeKey, number | string | bigint>>;
   /** Validate the whole batch and write NOTHING. */
   dryRun?: boolean;
+  /**
+   * The allowlist id of the PRODUCTION target (a selector, never a name or
+   * system identifier). Mandatory for every run, dry runs included.
+   */
+  targetId: string;
+  /**
+   * The explicit production confirmation: must repeat `targetId` exactly. The
+   * CLI requires it as a second, separately typed flag.
+   */
+  confirmTargetId?: string;
 }
 
 /**
@@ -558,11 +591,55 @@ export class BillingLivePlanRegistrationService {
   private readonly db: Pool;
   private readonly nowFn: () => Date;
   private readonly mode: BillingProviderMode;
+  private readonly identityAllowlist: DatabaseIdentityAllowlist | undefined;
 
   constructor(options: BillingLivePlanRegistrationOptions) {
     this.db = options.db;
     this.nowFn = options.now ?? (() => new Date());
     this.mode = options.mode ?? 'test';
+    this.identityAllowlist = options.identityAllowlist;
+  }
+
+  /**
+   * PRODUCTION TARGET IDENTITY (static half): the selector must name a
+   * reviewed `production` entry, and the typed confirmation must repeat its
+   * id. Pure; nothing is connected to. Live targets never use sandbox rules.
+   */
+  private resolveProductionTarget(targetId: string, confirmTargetId: string | undefined): DatabaseIdentityEntry {
+    if (this.identityAllowlist === undefined) {
+      throw new BillingLivePlanRegistrationError(
+        'database_identity_refused',
+        'No reviewed database identity allowlist was supplied, so no production target can be approved. ' +
+          'Nothing was connected or written.',
+      );
+    }
+    try {
+      return resolveDatabaseTarget(this.identityAllowlist, 'production', targetId, confirmTargetId);
+    } catch (error) {
+      if (error instanceof DatabaseIdentityError) {
+        throw new BillingLivePlanRegistrationError('database_identity_refused', error.message, { cause: error });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * PRODUCTION TARGET IDENTITY (connected half): verify, on the caller's
+   * connection, that the connected database is the approved production entry.
+   * Read-only (one catalogue SELECT).
+   */
+  private async verifyProductionIdentity(
+    client: { query: (text: string) => Promise<{ rows: unknown[] }> },
+    target: DatabaseIdentityEntry,
+  ): Promise<void> {
+    try {
+      await verifyConnectedDatabaseIdentity(client, target);
+    } catch (error) {
+      if (error instanceof DatabaseIdentityError) {
+        throw new BillingLivePlanRegistrationError('database_identity_refused', error.message, { cause: error });
+      }
+      throw error;
+    }
   }
 
   /** The configured provider domain this service will (or will not) write in. */
@@ -610,6 +687,9 @@ export class BillingLivePlanRegistrationService {
     const reason = operatorTextOrRefuse('reason', parsed.data.reason, 500);
     const evidenceReference = operatorTextOrRefuse('provenance label', parsed.data.evidenceReference, 190);
 
+    // 2b. THE PRODUCTION TARGET (static, before any connection or read).
+    const target = this.resolveProductionTarget(parsed.data.targetId, parsed.data.confirmTargetId);
+
     // 3. ONE instant per batch (the FX freshness instant and every valid_from).
     const registeredAt = this.nowFn();
     if (!(registeredAt instanceof Date) || !Number.isFinite(registeredAt.getTime())) {
@@ -627,13 +707,23 @@ export class BillingLivePlanRegistrationService {
     // 5. The operator-selected FX version, by IDENTITY: never "latest", never a
     //    constructed or fixture rate. Read as the durable ROW — the same row
     //    the provisioning service re-reads inside its own transaction.
-    const { rows } = await this.db.query(
-      `SELECT id, base_currency, quote_currency, fx_rate_scaled, fx_rate_scale, rounding_mode,
-              source, source_reference, created_by, effective_from, captured_at
-         FROM billing_fx_rate_versions
-        WHERE id = $1`,
-      [parsed.data.fxRateVersionId],
-    );
+    // The identity of the CONNECTED production database is proven on the same
+    // connection that performs the read — a dry run reads nothing from an
+    // unverified database, and a pool-level read could land on another one.
+    const client = await this.db.connect();
+    let rows: Array<Record<string, unknown>>;
+    try {
+      await this.verifyProductionIdentity(client, target);
+      ({ rows } = (await client.query(
+        `SELECT id, base_currency, quote_currency, fx_rate_scaled, fx_rate_scale, rounding_mode,
+                source, source_reference, created_by, effective_from, captured_at
+           FROM billing_fx_rate_versions
+          WHERE id = $1`,
+        [parsed.data.fxRateVersionId],
+      )) as { rows: Array<Record<string, unknown>> });
+    } finally {
+      client.release();
+    }
     if (rows[0] === undefined) {
       throw new BillingFxError(
         'missing',
@@ -684,11 +774,13 @@ export class BillingLivePlanRegistrationService {
       db: this.db,
       now: () => registeredAt,
       mode: 'live',
+      identityAllowlist: this.identityAllowlist,
     });
     const epochs = await provisioning.registerSandboxPlanEpochs({
       fxRateVersionId: parsed.data.fxRateVersionId,
       evidence,
       audit: { operatorId, reason },
+      databaseTarget: { targetId: target.id, confirmTargetId: parsed.data.confirmTargetId },
     });
 
     return {

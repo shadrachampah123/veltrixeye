@@ -542,9 +542,18 @@ export function validateFxRateCandidate(
         const code: FxValidationIssueCode =
           error.reason === 'missing'
             ? 'missing_evidence'
-            : error.reason === 'ambiguous'
+            : error.reason === 'ambiguous' ||
+                error.reason === 'source_not_approved' ||
+                error.reason === 'approval_consumed' ||
+                error.reason === 'approval_expired' ||
+                error.reason === 'separation_of_duties' ||
+                error.reason === 'principal_unauthorized'
               ? 'invalid'
-              : error.reason;
+              : error.reason === 'source_not_permitted'
+                ? 'unsupported_source'
+                : error.reason === 'stale' || error.reason === 'invalid' || error.reason === 'unsupported_currency'
+                  ? error.reason
+                  : 'invalid';
         issues.push({ field: 'capturedAt', code, message: error.message });
       } else {
         throw error;
