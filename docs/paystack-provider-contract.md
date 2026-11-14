@@ -667,7 +667,15 @@ Step 4 (`packages/core/src/billing/provisioning.ts`) validates the whole
 four-plan batch and registers it atomically outside the adapter — see the
 *Sandbox plan provisioning (Step 4)* runbook in
 [billing.md](./billing.md). What remains is the separately-authorized operator
-run (dashboard plan creation + FX publication + one registration call).
+run (dashboard plan creation + a recorded FX source approval by an authorized
+database login + FX publication + one registration call with `--target <id>`
+selecting a reviewed sandbox entry). The target's identity is decided by the
+committed database identity allowlist and verified on the connected database
+(name and cluster system identifier). **A database comment, a supplied name or a
+supplied system identifier is never authorization**; see the *Database identity
+policy* and *FX source approval and separation of duties* sections of
+[billing.md](./billing.md). The committed allowlist currently has no entries, so
+no run is possible until a reviewed entry is added.
 
 | Plan | Interval | Currency | Mode |
 | --- | --- | --- | --- |

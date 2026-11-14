@@ -10,6 +10,14 @@ import {
   type BillingProviderMode,
 } from '@veltrixeye/contracts';
 import { recordAuditEvent } from '../audit.js';
+import {
+  type DatabaseIdentityAllowlist,
+  type DatabaseIdentityEntry,
+  type DatabaseIdentityEnvironment,
+  DatabaseIdentityError,
+  resolveDatabaseTarget,
+  verifyConnectedDatabaseIdentity,
+} from './database-identity.js';
 import { BILLING_CATALOGUE_VERSION, cataloguePriceMinor } from './catalogue.js';
 import {
   assertFxRateVersionFresh,
@@ -138,7 +146,21 @@ export type BillingProvisioningFailureReason =
    * written without a named operator, a stated reason and the transactional
    * audit event that records both.
    */
-  | 'audit_required';
+  | 'audit_required'
+  /**
+   * The connected database could not be POSITIVELY identified as the approved
+   * allowlist target: no allowlist or selection was supplied, the allowlist is
+   * missing, malformed or unpinned, the selector is unknown or of the wrong
+   * environment, a production confirmation is absent, or the connected identity
+   * could not be read. Fail closed.
+   */
+  | 'database_identity_unverified'
+  /**
+   * The connected database IS readable and it is not the approved target: its
+   * name or its cluster system identifier differs from the allowlist entry.
+   * Nothing is written.
+   */
+  | 'database_identity_mismatch';
 
 export class BillingProvisioningError extends Error {
   readonly code = 'billing_provisioning_refused' as const;
@@ -745,6 +767,13 @@ export interface BillingPlanProvisioningOptions {
    * from any other mode is a `mode_mismatch` failure, never a fallback.
    */
   mode?: BillingProviderMode;
+  /**
+   * The reviewed database identity allowlist (see `database-identity.ts`),
+   * loaded and pin-verified by the CALLER from the committed file. Absent ⇒
+   * every write and dry run is refused (`database_identity_unverified`): the
+   * service never guesses an allowlist and never reads one from the database.
+   */
+  identityAllowlist?: DatabaseIdentityAllowlist;
 }
 
 /**
@@ -788,6 +817,51 @@ export interface RegisterSandboxPlanEpochsInput {
    * `billing.provider_plans_registered` audit event. MANDATORY in live mode.
    */
   audit?: ProvisioningAuditDescriptor;
+  /**
+   * The operator's SELECTION of a reviewed allowlist entry, by id. MANDATORY
+   * for every run (sandbox and live). It is a selector, not an authority: the
+   * database name and system identifier come only from the allowlist, and the
+   * connected database must match them on the write transaction's own
+   * connection. A production (`live`) run also requires `confirmTargetId`,
+   * which must repeat the id exactly. Absent, unknown, wrong-environment or
+   * unconfirmed ⇒ refused before any connection.
+   */
+  databaseTarget?: DatabaseTargetSelector;
+}
+
+/** The operator's selector of a reviewed allowlist entry (an id, never a name). */
+export interface DatabaseTargetSelector {
+  readonly targetId: string;
+  readonly confirmTargetId?: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Database identity guard (allowlist; no marker is ever consulted)            */
+/* -------------------------------------------------------------------------- */
+
+const databaseTargetSelectorSchema = z
+  .object({
+    targetId: z.string().regex(/^[a-z0-9][a-z0-9-]{0,62}$/, 'a target id is required'),
+    confirmTargetId: z.string().max(63).optional(),
+  })
+  .strict();
+
+/** The environment a provider mode may write to. Live never maps to sandbox. */
+export function databaseIdentityEnvironmentForMode(mode: BillingProviderMode): DatabaseIdentityEnvironment {
+  return mode === 'live' ? 'production' : 'sandbox';
+}
+
+/**
+ * Translate an identity refusal into the provisioning refusal vocabulary. The
+ * message is the identity module's own, which echoes no name or identifier.
+ */
+function toProvisioningIdentityError(error: unknown): BillingProvisioningError {
+  if (error instanceof DatabaseIdentityError) {
+    const reason: BillingProvisioningFailureReason =
+      error.reason === 'identity_mismatch' ? 'database_identity_mismatch' : 'database_identity_unverified';
+    return new BillingProvisioningError(reason, error.message, { cause: error });
+  }
+  throw error;
 }
 
 const registerSandboxPlanEpochsInputSchema = z
@@ -795,6 +869,7 @@ const registerSandboxPlanEpochsInputSchema = z
     fxRateVersionId: z.string().guid(),
     evidence: z.array(z.unknown()).min(1),
     audit: provisioningAuditDescriptorSchema.optional(),
+    databaseTarget: databaseTargetSelectorSchema.optional(),
   })
   .strict();
 
@@ -851,11 +926,13 @@ export class BillingPlanProvisioningService {
   private readonly db: Pool;
   private readonly nowFn: () => Date;
   private readonly mode: BillingProviderMode;
+  private readonly identityAllowlist: DatabaseIdentityAllowlist | undefined;
 
   constructor(options: BillingPlanProvisioningOptions) {
     this.db = options.db;
     this.nowFn = options.now ?? (() => new Date());
     this.mode = options.mode ?? 'test';
+    this.identityAllowlist = options.identityAllowlist;
   }
 
   /**
@@ -876,6 +953,14 @@ export class BillingPlanProvisioningService {
     const client = await this.db.connect();
     try {
       await client.query('BEGIN');
+
+      // THE DATABASE IDENTITY GUARD, on the write transaction's own connection:
+      // the connected database is proven to be the sandbox this run was
+      // authorized for BEFORE the FX row is read or a single INSERT is issued.
+      // A failure throws, the catch below rolls the transaction back, and no
+      // epoch or audit row can exist. (A pre-connection check cannot prove
+      // what a port-forward actually reaches; this one does.)
+      await this.assertSandboxDatabaseIdentity(client, request);
 
       // The WHOLE batch — the selected authoritative FX row plus every Step 4
       // admission rule — validates here, before the first INSERT. The SAME
@@ -990,6 +1075,9 @@ export class BillingPlanProvisioningService {
 
     const client = await this.db.connect();
     try {
+      // Read-only identity verification first (catalogue SELECTs only), so a
+      // dry run against an unexpected database never reads its FX or epochs.
+      await this.assertSandboxDatabaseIdentity(client, request);
       // Read-only: the shared preparation routine above a single SELECT — no
       // transaction is opened, so nothing in this path can write.
       return await this.prepareSelectedBatch(
@@ -1012,6 +1100,9 @@ export class BillingPlanProvisioningService {
     fxRateVersionId: string;
     evidence: readonly unknown[];
     audit?: ProvisioningAuditDescriptor;
+    databaseTarget?: DatabaseTargetSelector;
+    /** The allowlist entry the selector resolved to (static phase, pre-connection). */
+    target: DatabaseIdentityEntry;
   } {
     const parsed = registerSandboxPlanEpochsInputSchema.safeParse(input);
     if (!parsed.success) {
@@ -1040,7 +1131,52 @@ export class BillingPlanProvisioningService {
     if (parsed.data.audit !== undefined) {
       assertAuditTextIsNotCredentialShaped(parsed.data.audit);
     }
-    return parsed.data;
+    // DATABASE IDENTITY (static half, before any connection): the selector
+    // must name a reviewed allowlist entry of this mode's environment. The
+    // allowlist is supplied by the caller and is never read from the database.
+    // Every refusal here happens before a socket is opened.
+    if (this.identityAllowlist === undefined) {
+      throw new BillingProvisioningError(
+        'database_identity_unverified',
+        'No reviewed database identity allowlist was supplied, so no target can be approved. Nothing was connected or written.',
+      );
+    }
+    if (parsed.data.databaseTarget === undefined) {
+      throw new BillingProvisioningError(
+        'database_identity_unverified',
+        'A provisioning run requires an explicit allowlist target selection. Nothing was connected or written.',
+      );
+    }
+    let target: DatabaseIdentityEntry;
+    try {
+      target = resolveDatabaseTarget(
+        this.identityAllowlist,
+        databaseIdentityEnvironmentForMode(this.mode),
+        parsed.data.databaseTarget.targetId,
+        parsed.data.databaseTarget.confirmTargetId,
+      );
+    } catch (error) {
+      throw toProvisioningIdentityError(error);
+    }
+    return { ...parsed.data, target };
+  }
+
+  /**
+   * DATABASE IDENTITY (connected half), BOTH modes. Verifies on the caller's
+   * connection that the connected database is the allowlist entry resolved
+   * for this run (name AND cluster system identifier). Called on the write
+   * path INSIDE the transaction before the first read or INSERT, and on the
+   * dry-run path before any business read. Read-only: one catalogue SELECT.
+   */
+  private async assertSandboxDatabaseIdentity(
+    runner: PoolClient,
+    request: { target: DatabaseIdentityEntry },
+  ): Promise<void> {
+    try {
+      await verifyConnectedDatabaseIdentity(runner, request.target);
+    } catch (error) {
+      throw toProvisioningIdentityError(error);
+    }
   }
 
   /** ONE finite registration instant per run: the freshness anchor. */
