@@ -5,7 +5,7 @@
 This is the canonical roadmap/status record. Implemented code, merged PRs,
 successful deployments, production health, and release approval are distinct
 evidence categories. This checkpoint is based on the current `main` tip
-`2a5666ada37fadd75511277eed17112ecface150` (PR #153 merge), GitHub PR
+`073c2463d24bb3fc24014b93aae48ca454a7c6c4` (PR #154 merge; includes PR #153), GitHub PR
 metadata, Render deployment records, and the owner's Vercel dashboard
 screenshot. It is a read-only reconciliation; it does not authorize production
 operations. No overall completion percentage is stated because the roadmap
@@ -14,8 +14,9 @@ and blocking gates without a stable denominator.
 
 ### Current repository and PR status
 
-- **Latest main:** `2a5666ada37fadd75511277eed17112ecface150`, verified from
-  GitHub's `main` branch record. It is the squash merge of PR #153.
+- **Latest main:** `073c2463d24bb3fc24014b93aae48ca454a7c6c4`, verified from
+  GitHub's `main` branch record. It is the merge commit for PR #154, which
+  incorporates the PR #153 checkpoint and the follow-up roadmap corrections.
 - **PR #153 — production infrastructure audit documentation: MERGED.**
   The documentation-only change records the November 14 Render/Vercel
   deployment evidence, the unresolved November 10 Render timeout, startup
