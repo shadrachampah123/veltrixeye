@@ -4,10 +4,10 @@ import * as React from 'react';
 import Link from 'next/link';
 import { AppShell, PageHeader } from '@/components/app-shell';
 import { RequireAuth, useAuth } from '@/components/auth-context';
-import { api } from '@/lib/api';
+import { loadDashboardCriticalData, loadDashboardOptionalData } from '@/lib/dashboard';
 import { Button, Card, CardHeader, Spinner } from '@/components/ui';
 import { BRAND } from '@/lib/brand';
-import type { StrategyDetailDto, SetupDto, ScannerHealthDto, BillingStateDto } from '@veltrixeye/contracts';
+import type { StrategyDetailDto, StrategySummaryDto, SetupDto, ScannerHealthDto, BillingStateDto } from '@veltrixeye/contracts';
 import { DashboardStats, DashboardRecentSetups, DashboardWorkflowIntro, DashboardScannerWorkspace } from '@/components/dashboard-widgets';
 import { StrategyCardGrid } from '@/components/strategy-card';
 import { WatchlistPanel } from '@/components/watchlist';
@@ -15,6 +15,8 @@ import { SubscriptionPanel } from '@/components/subscription-panel';
 
 function DashboardContent() {
   const { user } = useAuth();
+  // Every strategy summary (dashboard-wide statistics) and full detail for the displayed cards only.
+  const [strategySummaries, setStrategySummaries] = React.useState<StrategySummaryDto[] | null>(null);
   const [strategies, setStrategies] = React.useState<StrategyDetailDto[] | null>(null);
   const [setups, setSetups] = React.useState<SetupDto[] | null>(null);
   const [scannerHealth, setScannerHealth] = React.useState<ScannerHealthDto | null>(null);
@@ -25,18 +27,14 @@ function DashboardContent() {
     let cancelled = false;
     (async () => {
       try {
-        const [stratList, setupList] = await Promise.all([
-          api.listStrategies().then(async ({ strategies: list }) => {
-            const details = await Promise.all(list.map((s) => api.getStrategy(s.id).then((r) => r.strategy)));
-            return details;
-          }),
-          api.listSetups({ limit: 20 }).then((r) => r.setups),
-        ]);
+        const critical = await loadDashboardCriticalData();
         if (cancelled) return;
-        setStrategies(stratList);
-        setSetups(setupList);
+        setStrategySummaries(critical.strategySummaries);
+        setStrategies(critical.displayedStrategies);
+        setSetups(critical.setups);
       } catch (e: any) {
         if (!cancelled) {
+          setStrategySummaries([]);
           setStrategies([]);
           setSetups([]);
           setError(e?.message ?? 'Failed to load dashboard data');
@@ -44,10 +42,10 @@ function DashboardContent() {
       }
 
       try {
-        const [health, bill] = await Promise.all([api.getScannerHealth(), api.getBillingState()]);
+        const optional = await loadDashboardOptionalData();
         if (!cancelled) {
-          setScannerHealth(health);
-          setBilling(bill);
+          setScannerHealth(optional.scannerHealth);
+          setBilling(optional.billing);
         }
       } catch {
         // Non-critical — dashboard still renders without scanner/billing
@@ -62,7 +60,7 @@ function DashboardContent() {
     };
   }, []);
 
-  const loading = strategies === null || setups === null;
+  const loading = strategySummaries === null || strategies === null || setups === null;
 
   return (
     <AppShell>
@@ -100,7 +98,7 @@ function DashboardContent() {
       ) : (
         <div className="space-y-6">
           {/* Stats */}
-          <DashboardStats strategies={strategies!} setups={setups!} scannerHealth={scannerHealth} />
+          <DashboardStats strategies={strategySummaries!} setups={setups!} scannerHealth={scannerHealth} />
 
           {/* Workflow intro */}
           <DashboardWorkflowIntro />
@@ -119,8 +117,8 @@ function DashboardContent() {
                   }
                 />
                 <div className="p-4">
-                  <StrategyCardGrid strategies={(strategies ?? []).slice(0, 3)} />
-                  {(strategies?.length ?? 0) === 0 && (
+                  <StrategyCardGrid strategies={strategies ?? []} />
+                  {(strategySummaries?.length ?? 0) === 0 && (
                     <div className="mt-4 text-center">
                       <Link href="/strategies/new" className="inline-flex items-center justify-center rounded-md bg-signal-600 px-4 py-2 text-sm font-medium text-white hover:bg-signal-500">
                         Create first strategy

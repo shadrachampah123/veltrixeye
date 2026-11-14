@@ -2,19 +2,20 @@
 
 import * as React from 'react';
 import Link from 'next/link';
-import type { SetupDto, StrategyDetailDto, ScannerHealthDto } from '@veltrixeye/contracts';
+import type { SetupDto, StrategySummaryDto, ScannerHealthDto } from '@veltrixeye/contracts';
 import { Badge, Card, CardHeader } from '@/components/ui';
 import { BRAND } from '@/lib/brand';
+import { summarizeDashboardStrategies } from '@/lib/dashboard';
 import { SetupCard } from '@/components/setup-card';
 
-export function DashboardStats({ strategies, setups, scannerHealth }: { strategies: StrategyDetailDto[]; setups: SetupDto[]; scannerHealth: ScannerHealthDto | null }) {
-  const published = strategies.filter((s) => s.currentVersion);
+export function DashboardStats({ strategies, setups, scannerHealth }: { strategies: StrategySummaryDto[]; setups: SetupDto[]; scannerHealth: ScannerHealthDto | null }) {
+  const strategyStats = summarizeDashboardStrategies(strategies);
   const activeSetups = setups.filter((s) => !['expired', 'invalidated', 'completed'].includes(s.state));
   const avgQuality = setups.length > 0 ? Math.round(setups.filter((s) => s.qualityScore !== null).reduce((acc, s) => acc + (s.qualityScore ?? 0), 0) / Math.max(1, setups.filter((s) => s.qualityScore !== null).length)) : null;
 
   return (
     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-      <StatCard label="Strategies" value={strategies.length} sub={`${published.length} published · ${strategies.length - published.length} draft`} href="/strategies" />
+      <StatCard label="Strategies" value={strategyStats.total} sub={`${strategyStats.published} published · ${strategyStats.draft} draft`} href="/strategies" />
       <StatCard label="Active Setups" value={activeSetups.length} sub={`${setups.length} total · ${avgQuality !== null ? `avg Q ${avgQuality}` : 'not scored yet'}`} href="/setups" />
       <StatCard label="Scanner" value={scannerHealth?.status === 'running' ? 'Running' : scannerHealth?.status ?? '—'} sub={scannerHealth ? `${scannerHealth.activeRuns} active · ${scannerHealth.recentFailures} failures (1h)` : 'Loading…'} href="/scanner" tone={scannerHealth?.status === 'running' ? 'success' : scannerHealth?.status === 'degraded' ? 'warning' : 'neutral'} />
       <StatCard label="Safety" value={`M8.7`} sub={`Automation OFF · ${BRAND.safety.executionNote}`} href="/trading" tone="info" />
