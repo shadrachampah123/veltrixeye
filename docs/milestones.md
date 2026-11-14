@@ -5,7 +5,7 @@
 This is the canonical roadmap/status record. Implemented code, merged PRs,
 successful deployments, production health, and release approval are distinct
 evidence categories. This checkpoint is based on the current `main` tip
-`991e431ca01b7315f19fbc7dec97c572ddc2c4b0` (PR #154 merge; includes PR #153), GitHub PR
+`991e431ca01b7315f19fbc7dec97c572ddc2c4b0` (PR #155 merge; follows PR #154 and includes PR #153), GitHub PR
 metadata, Render deployment records, and the owner's Vercel dashboard
 screenshot. It is a read-only reconciliation; it does not authorize production
 operations. No overall completion percentage is stated because the roadmap
