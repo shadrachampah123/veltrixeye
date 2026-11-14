@@ -12,6 +12,12 @@ export interface DatabaseConfig {
    *  - 'verify-full'  TLS with full certificate verification
    */
   sslMode?: 'disable' | 'require' | 'verify-full';
+  /**
+   * PEM-encoded CA certificate(s) used to verify the server certificate when
+   * `sslMode` is `'verify-full'`. Compatible with the PostgreSQL driver's TLS
+   * CA configuration. Omitted entirely from the SSL options when not supplied.
+   */
+  ca?: string | Buffer | Array<string | Buffer>;
 }
 
 /**
@@ -23,7 +29,10 @@ export function createPool(config: DatabaseConfig): pg.Pool {
     config.sslMode === 'require'
       ? { rejectUnauthorized: false }
       : config.sslMode === 'verify-full'
-        ? { rejectUnauthorized: true }
+        ? {
+            rejectUnauthorized: true,
+            ...(config.ca ? { ca: config.ca } : {}),
+          }
         : undefined;
   return new pg.Pool({
     connectionString: config.databaseUrl,
