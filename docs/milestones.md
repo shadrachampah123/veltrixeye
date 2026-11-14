@@ -194,11 +194,12 @@ resume the paused work. Automation stays OFF and execution stays paper-only.
 
 ### Remaining validation sequence (gates, not completion claims)
 
-1. Obtain an authorized independent review of notification PR #134 (PR #128
-   was closed as superseded without merging). The active-job lease-expiry risk
-   is addressed with per-job claims, renewal and owner fencing. Keep #134
-   unmerged pending approval and deployment safety; SMTP acceptance/deduplication
-   and historical Render diagnosis remain separate, unverified evidence gates.
+1. **Notification worker lease-fencing implementation — merged via PR #134.**
+   The independent review and merge gate are complete. The implementation
+   addresses active-job lease expiry with per-job claims, renewal and owner
+   fencing. SMTP acceptance/inbox delivery and duplicate prevention after an
+   external provider side effect remain separate, unverified evidence gates;
+   delivery is at-least-once, not exactly-once.
 2. **BLOCKED — Render deployment diagnosis.** GitHub reports main deployment
    `7146335883` for `a5a36fd4e9df53056e991311d1ccbbfbf91ddd22` as failed,
    without a cause in the deployment record. The later read-only deployment
@@ -1080,9 +1081,10 @@ canonical billing contracts and the Paystack provider seam — see
   USD→GHS pricing, the FX authority, provider-plan epochs and the sandbox
   Paystack adapter (migration `0032`); PR-C added checkout initialization;
   Step 4 added the plan-provisioning workflow (the operator run itself is still
-  pending; the PR #150 review remediation replaced the comment-marker
-  trust with a committed, pin-verified database identity allowlist and added a
-  database-enforced FX source approval: authenticated approver and publisher
+  pending; the consolidated PR #151 remediation (which supersedes the still-open
+  historical PR #150) replaced the comment-marker trust with a committed,
+  pin-verified database identity allowlist and added a database-enforced FX
+  source approval: authenticated approver and publisher
   database logins, append-only approval evidence, exact-rate fingerprint binding,
   one-hour single-use approvals and transactional publication (migration `0040`);
   the production target policy for live registration is documented alongside
