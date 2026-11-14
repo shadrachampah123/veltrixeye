@@ -5,30 +5,33 @@ wiring that lets the production web app talk to it. Nothing here contains a
 credential: every secret is supplied by the operator at deploy time
 (see [security.md](./security.md)).
 
-## Current production verification gate (2026-11-03 UTC)
+## Current production verification gate (2026-11-14 UTC)
 
-**Status: BLOCKED / not revalidated.** The last owner-reported evidence says
-Neon production compute was exhausted on `main` at
-`f9e660d66fe56af2ea4f1d2031759210af497d67` (2026-10-17). This review did not
-access production or verify whether compute has recovered. Until an authorized
-owner confirms recovery and explicitly authorizes a read-only observation, do
-not run or report production database or health checks. This is an operational
-blocker, not evidence that production is healthy or unhealthy. Latest
-repository `main` is `d5e4d68073018d5f082116a55635d28b9d4c5aa3` (PR #131,
-read-only verified payment records), and the notification branch behind PR #134
-was merged with that mainline on 2026-11-03; no production probe was attempted.
-No Render, Vercel, Neon, secret or environment-variable value was read or
-changed during that reconciliation, and no deployment was triggered or observed.
+**Status: BLOCKED / not revalidated.** The owner-provided Neon alert dated
+2026-11-14 reports that the Free plan's monthly **5 GB public network-transfer
+allowance is 100% exhausted**. This is distinct from database storage capacity
+and is not proof that the database was deleted or that every connection is
+already failing; the provider warns that application connections and database
+operations may fail until the allowance resets or the plan changes. A prior
+October report also recorded Free compute usage above its monthly allowance;
+the current remaining compute balance has not been remeasured.
 
-Database backup/recovery status is also unverified: no Neon snapshot schedule
-had been observed previously, and nothing here was changed. See
-[neon-backup-recovery.md](./neon-backup-recovery.md) for the assessment and the
-owner-authorised recovery plan.
+The latest repository `main` checkpoint at this documentation review is
+`991e431ca01b7315f19fbc7dec97c572ddc2c4b0` (PR #155 merge, 2026-11-14).
+This is repository metadata only and does not establish a production
+deployment or application-health state.
 
-The following production checks are blocked:
+Until Neon access is restored and the owner explicitly authorizes a bounded
+read-only observation, do not run or report production database or health
+checks. This is an operational blocker, not evidence that production is
+healthy or unhealthy. Do not upgrade the Neon plan, migrate providers, change
+production configuration, or initiate a production deployment without
+explicit owner approval.
 
-- `GET /api/health` and `GET /api/health/ready`, including worker and retention
-  observations;
+The following production checks remain blocked:
+
+- `GET /api/health` and `GET /api/health/ready`, including worker and
+  retention observations;
 - `npm run db:migrate -- --status` or any other direct use of the production
   `DATABASE_URL`;
 - production diagnostic workflows, including the paused Gold diagnostic
@@ -37,8 +40,14 @@ The following production checks are blocked:
 Local embedded-Postgres tests, type checks and builds remain allowed; they are
 not production verification. Do not change the production `DATABASE_URL`,
 production migrations, configuration or infrastructure to clear this block.
-After compute is restored, record sanitized HTTP status/JSON and schema/checksum
-evidence here before changing the status.
+After access and quota are restored and the owner authorizes it, record
+sanitized HTTP status/JSON and schema/checksum evidence here before changing
+the status.
+
+Database backup/recovery status remains unverified. No backup schedule or
+restore test is newly established by this documentation reconciliation; see
+[neon-backup-recovery.md](./neon-backup-recovery.md) for the existing
+assessment and owner-authorised recovery plan.
 
 ### Historical Render deployment evidence (read-only)
 
@@ -770,7 +779,7 @@ migration safety and the web↔API wiring only.
 
 ## Production infrastructure reliability audit (2026-11-14 UTC)
 
-**Scope:** read-only deployment and configuration review across Render and Vercel. Billing operations, production database probes, migrations, secret/environment-variable changes, and deployments were not part of the audit. No production settings or application resources were changed by the review.
+**Scope:** read-only deployment and configuration review across Render and Vercel. Billing operations, production database probes, migrations, secret/environment-variable changes, and deployments were not part of the audit. No production settings or application resources were changed by the review. The latest repository checkpoint at the time of this follow-up is main SHA `991e431ca01b7315f19fbc7dec97c572ddc2c4b0` (PR #155 merge); this does not imply a new production deployment.
 
 ### Deployment evidence
 
@@ -789,6 +798,6 @@ migration safety and the web↔API wiring only.
 
 ### Current operating guardrails
 
-- Do not run production Neon queries, migration-status commands, or health probes as part of this documentation update. Prior Neon Free compute and transfer constraints remain a reason to avoid unnecessary production usage; current remaining quota was not remeasured.
+- Do not run production Neon queries, migration-status commands, or health probes as part of this documentation update. Neon reported the monthly 5 GB public network-transfer allowance 100% exhausted on 2026-11-14; the current remaining compute balance was not remeasured. Avoid production usage until access is restored and the owner explicitly authorizes a bounded check.
 - Do not alter Render/Vercel settings, environment variables, database configuration, migrations, or production deployments without explicit authorization.
 - Keep Gold v8 paused, paper-only, and automation OFF. No live trading or execution activation is authorized.
