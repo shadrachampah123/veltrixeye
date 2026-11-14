@@ -767,3 +767,28 @@ WAF, secret manager, least-privilege database roles, log redaction, custom
 domains and autoscaling are operational hardening items listed in
 [milestones.md](./milestones.md). M1 delivers the deployment target, the
 migration safety and the web↔API wiring only.
+
+## Production infrastructure reliability audit (2026-11-14 UTC)
+
+**Scope:** read-only deployment and configuration review across Render and Vercel. Billing operations, production database probes, migrations, secret/environment-variable changes, and deployments were not part of the audit. No production settings or application resources were changed by the review.
+
+### Deployment evidence
+
+- **Render API:** latest observed deployment `dep-dbs8nc15efls73efnrrg`, commit `9b1de75a5e8f83c9e43beae969fc410e5e602826` (PR #151 merge). Render reported build and deployment success; it became live at `2026-11-14T16:27:17.558055Z`.
+- **Vercel web app:** owner-provided dashboard screenshot dated 2026-11-14 shows PR #151 in **Production / Ready** at short SHA `9b1de75`. It also shows PR #152 in **Production / Ready** at `bdab81a`, plus multiple Preview deployments marked Ready.
+- **Cross-platform alignment:** Vercel Production SHA `9b1de75` matches the full Render API commit above. This confirms both platforms deployed the same latest mainline commit. The screenshot is owner-provided evidence, not a direct Vercel connector inspection.
+- **Limit:** a Ready deployment or successful container rollout is not general application-health, database-integrity, billing, or end-to-end verification. No production health endpoint or Neon query was run in this audit.
+
+### Render reliability observations
+
+- Render is configured as a Free, single-instance API service with readiness path `/api/health/ready`. Free-instance spin-down/wake behaviour remains an availability limitation; a sleeping service is not necessarily a failed deployment.
+- The 2026-11-10 deployment for commit `8ec2fe978f49e57cb74c7748f6e566b7f94af0f4` built successfully but ended `update_failed` after Render logged `Timed Out`. Readiness had returned HTTP 200 repeatedly before the timeout; a replacement process subsequently started and its scanner completed a run. Available logs do not establish the precise cause or prove which process Render was waiting on. Treat this as an unresolved historical handover/readiness timeout, not a confirmed current outage.
+- The 2026-11-14 rollout briefly produced readiness 503 responses while the replacement process was starting, then the new process began listening and deployment succeeded. The transient responses resolved during rollout.
+- API startup waits for PostgreSQL and runs migrations before opening the HTTP listener. The migration runner uses a session advisory lock, per-file transactions, SHA-256 drift checks, rollback on failure, and releases the lock in a finally path. However, startup migrations can extend readiness time and deployment handover, particularly on a single-instance Free service. Consider a separately controlled migration release step as future architecture work; no change is authorized or made here.
+- A PostgreSQL connection-string SSL compatibility warning appeared in November 10 and November 14 startup logs. Current configuration sets `DATABASE_SSL_MODE=require`; the pool maps that to `rejectUnauthorized: false`. Review this warning during a planned dependency/configuration change. No evidence links it to the November 10 timeout, and no SSL or connection-string setting was changed.
+
+### Current operating guardrails
+
+- Do not run production Neon queries, migration-status commands, or health probes as part of this documentation update. Prior Neon Free compute and transfer constraints remain a reason to avoid unnecessary production usage; current remaining quota was not remeasured.
+- Do not alter Render/Vercel settings, environment variables, database configuration, migrations, or production deployments without explicit authorization.
+- Keep Gold v8 paused, paper-only, and automation OFF. No live trading or execution activation is authorized.
