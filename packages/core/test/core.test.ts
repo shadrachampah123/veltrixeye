@@ -610,6 +610,49 @@ describe('strategies', () => {
     assert.equal(s.currentVersion, null);
   });
 
+  test('list summary currentVersionId always matches the detail currentVersion', async () => {
+    // The dashboard counts published strategies from list summaries alone, so
+    // the summary and the detail must agree on "the current version" at every
+    // point of the lifecycle — and for every strategy status.
+    const owner = await makeUser();
+    const detail = await strategies.createStrategy(owner, { name: 'Summary Parity', version: FULL_CONFIG });
+    const v1 = detail.versions[0];
+    assert.ok(v1);
+
+    const expectCurrent = async (expected: string | null, label: string) => {
+      const summary = (await strategies.listStrategies(owner)).find((x) => x.id === detail.id);
+      assert.ok(summary, label);
+      const full = await strategies.getStrategy(owner, detail.id);
+      assert.equal(summary.currentVersionId, expected, `${label}: summary`);
+      assert.equal(full.currentVersion?.id ?? null, expected, `${label}: detail`);
+      assert.equal(full.currentVersionId, summary.currentVersionId, `${label}: detail summary fields`);
+      assert.equal(summary.status, full.status, `${label}: status`);
+    };
+
+    await expectCurrent(null, 'draft only');
+
+    await strategies.publishVersion(owner, detail.id, v1.id);
+    await expectCurrent(v1.id, 'v1 published');
+
+    const v2 = await strategies.createVersion(owner, detail.id, { fromVersionId: v1.id });
+    await expectCurrent(v1.id, 'v2 draft alongside published v1');
+
+    await strategies.publishVersion(owner, detail.id, v2.id);
+    await expectCurrent(v2.id, 'v2 published');
+
+    // The strategy's own status does not change which version is current.
+    for (const status of ['paused', 'archived', 'draft', 'active'] as const) {
+      await strategies.updateStrategy(owner, detail.id, { status });
+      await expectCurrent(v2.id, `status ${status}`);
+    }
+
+    await strategies.deprecateVersion(owner, detail.id, v2.id);
+    await expectCurrent(v1.id, 'v2 deprecated, falls back to v1');
+
+    await strategies.deprecateVersion(owner, detail.id, v1.id);
+    await expectCurrent(null, 'no published version remains');
+  });
+
   test('drafts remain fully editable until published', async () => {
     const owner = await makeUser();
     const detail = await strategies.createStrategy(owner, { name: 'Editable Draft', version: FULL_CONFIG });
