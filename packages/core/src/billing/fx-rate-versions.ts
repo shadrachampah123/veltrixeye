@@ -1,6 +1,7 @@
 import { z } from 'zod';
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import {
+  BILLING_CREDENTIAL_SHAPED_RE,
   BILLING_CURRENCY,
   BILLING_FX_SOURCES,
   BILLING_PAYMENT_CURRENCIES,
@@ -11,6 +12,7 @@ import {
   type BillingRoundingMode,
 } from '@veltrixeye/contracts';
 import { Errors } from '../errors.js';
+import { recordAuditEvent } from '../audit.js';
 
 /**
  * Billing PR3 — the AUTHORITATIVE, server-side FX rate boundary.
@@ -142,7 +144,15 @@ export type BillingFxFailureReason =
   | 'stale'
   | 'invalid'
   | 'ambiguous'
-  | 'unsupported_currency';
+  | 'unsupported_currency'
+  /**
+   * Publication refused: the source approval is missing, unrecorded, malformed,
+   * or does not match this exact source, source reference and currency pair.
+   * Nothing was written.
+   */
+  | 'source_not_approved'
+  /** Publication refused: the source is not in {@link FX_PUBLICATION_PERMITTED_SOURCES}. */
+  | 'source_not_permitted';
 
 /** A rate that cannot price a payment. Always a hard failure (fail closed). */
 export class BillingFxError extends Error {
@@ -363,9 +373,213 @@ export interface PublishFxRateVersionInput {
   effectiveFrom: Date;
   capturedAt?: Date;
   source: BillingFxSource;
+  /**
+   * The published source reference. REQUIRED for publication: it is the
+   * reference the source approval must name exactly.
+   */
   sourceReference?: string | null;
   createdBy?: string | null;
   roundingMode?: BillingRoundingMode;
+  /**
+   * The id of the RECORDED source approval (see
+   * {@link BillingFxSourceApprovalStore.recordApproval}) that authorizes this
+   * source and reference for USD→GHS. REQUIRED: publication without a matching
+   * recorded approval is refused.
+   */
+  sourceApprovalId: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Source approval (fail-closed, auditable)                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The FX sources that MAY be approved for publication. `db` (a copy of the
+ * platform's own rows) and `config` (an environment-supplied value) are never
+ * a market-rate source and are refused outright. Being in this list does not
+ * approve anything: every publication still needs a recorded approval of that
+ * exact source and reference.
+ *
+ * Policy note: this list is a proposed default for operator review. It is a
+ * code decision, not an external approval.
+ */
+export const FX_PUBLICATION_PERMITTED_SOURCES: readonly BillingFxSource[] = Object.freeze([
+  'ops',
+  'import',
+] as BillingFxSource[]);
+
+/** Audit action of a recorded FX source approval (the approval decision itself). */
+export const FX_SOURCE_APPROVED_AUDIT_ACTION = 'billing.fx_source_approved' as const;
+/** Audit action of a published FX rate version (links it to the approval it cited). */
+export const FX_RATE_PUBLISHED_AUDIT_ACTION = 'billing.fx_rate_published' as const;
+
+export interface FxSourceApprovalInput {
+  /** Must be in {@link FX_PUBLICATION_PERMITTED_SOURCES}. */
+  source: BillingFxSource;
+  /** The named publication reference the approval covers (e.g. a board/ticket reference). */
+  sourceReference: string;
+  /** The named human operator who took the approval decision. */
+  approvedBy: string;
+  /** The stated reason for the approval. */
+  reason: string;
+}
+
+export interface RecordedFxSourceApproval {
+  /** The durable approval id (an audit event id) to cite at publication. */
+  readonly approvalId: string;
+  readonly source: BillingFxSource;
+  readonly sourceReference: string;
+  readonly approvedBy: string;
+  readonly reason: string;
+  readonly baseCurrency: string;
+  readonly quoteCurrency: string;
+  /** The database's recording instant for the approval. */
+  readonly approvedAt: Date;
+}
+
+const fxSourceApprovalInputSchema = z
+  .object({
+    source: z.string(),
+    sourceReference: z.string().trim().min(1).max(190),
+    approvedBy: z.string().trim().min(1).max(190),
+    reason: z.string().trim().min(1).max(500),
+  })
+  .strict();
+
+const APPROVAL_ID_PATTERN = /^[1-9][0-9]{0,18}$/;
+
+function assertSourceApprovalTextIsNotCredentialShaped(input: FxSourceApprovalInput): void {
+  for (const [field, value] of [
+    ['sourceReference', input.sourceReference],
+    ['approvedBy', input.approvedBy],
+    ['reason', input.reason],
+  ] as const) {
+    if (BILLING_CREDENTIAL_SHAPED_RE.test(value)) {
+      throw new BillingFxError(
+        'invalid',
+        `The FX source approval's "${field}" is credential-shaped and is refused: an approval names a ` +
+          'human, a reason and a publication reference, never key or token material.',
+      );
+    }
+  }
+}
+
+/**
+ * Enforce the approval the publication cites. Runs on the publication's own
+ * transaction connection, before the INSERT. Every failure is typed and fails
+ * closed: a missing id, an unknown id, a non-approval audit row, or an approval
+ * whose recorded source, reference, currency pair or decision does not match
+ * the publication exactly is `source_not_approved`.
+ */
+async function assertFxSourceApproved(
+  runner: Pick<PoolClient, 'query'>,
+  approvalId: string,
+  expected: { source: BillingFxSource; sourceReference: string; baseCurrency: string; quoteCurrency: string },
+): Promise<void> {
+  const refusal = (detail: string): BillingFxError =>
+    new BillingFxError(
+      'source_not_approved',
+      `FX publication refused: ${detail} Nothing was published. Record the source approval first, then cite its id.`,
+    );
+  if (!APPROVAL_ID_PATTERN.test(approvalId)) {
+    throw refusal('the cited source approval id is missing or malformed.');
+  }
+  const { rows } = await runner.query(
+    'SELECT action, metadata FROM audit_events WHERE id = $1::bigint',
+    [approvalId],
+  );
+  const row = rows[0] as { action: string; metadata: Record<string, unknown> } | undefined;
+  if (row === undefined) {
+    throw refusal('the cited source approval does not exist.');
+  }
+  if (row.action !== FX_SOURCE_APPROVED_AUDIT_ACTION) {
+    throw refusal('the cited id is not an FX source approval.');
+  }
+  const m = row.metadata ?? {};
+  const matches =
+    m.decision === 'approved' &&
+    m.source === expected.source &&
+    m.sourceReference === expected.sourceReference &&
+    m.baseCurrency === expected.baseCurrency &&
+    m.quoteCurrency === expected.quoteCurrency &&
+    typeof m.approvedBy === 'string' &&
+    m.approvedBy.length > 0;
+  if (!matches) {
+    throw refusal(
+      'the cited approval does not match this publication (source, source reference, currency pair or decision differ).',
+    );
+  }
+}
+
+/**
+ * Records FX source approval DECISIONS, durably and auditably, as
+ * `billing.fx_source_approved` audit events. Recording an approval is an
+ * operator decision; this class only records what an operator asserts, and
+ * refuses malformed or non-permitted input. It never publishes a rate.
+ *
+ * LIMITATIONS (stated, not hidden): approvals are not revocable in this
+ * version; the approval is enforced by {@link BillingFxRateVersionStore.publish}
+ * and by no database constraint, so a direct SQL insert into
+ * `billing_fx_rate_versions` would bypass it. Both are follow-up decisions.
+ */
+export class BillingFxSourceApprovalStore {
+  constructor(
+    private readonly db: Pool,
+    private readonly policy: BillingFxPolicy = BILLING_FX_POLICY,
+  ) {}
+
+  async recordApproval(input: FxSourceApprovalInput): Promise<RecordedFxSourceApproval> {
+    const parsed = fxSourceApprovalInputSchema.safeParse(input);
+    if (!parsed.success) {
+      throw new BillingFxError(
+        'invalid',
+        `The FX source approval is malformed: ${parsed.error.issues
+          .map((issue) => `${issue.path.join('.') || '<root>'}: ${issue.message}`)
+          .join('; ')}`,
+      );
+    }
+    const approval = parsed.data as FxSourceApprovalInput;
+    if (!(BILLING_FX_SOURCES as readonly string[]).includes(approval.source)) {
+      throw new BillingFxError('invalid', `Unknown FX rate source "${approval.source}".`);
+    }
+    if (!(FX_PUBLICATION_PERMITTED_SOURCES as readonly string[]).includes(approval.source)) {
+      throw new BillingFxError(
+        'source_not_permitted',
+        `FX source "${approval.source}" is not permitted for publication, so it cannot be approved.`,
+      );
+    }
+    assertSourceApprovalTextIsNotCredentialShaped(approval);
+
+    const { rows } = await this.db.query(
+      `INSERT INTO audit_events (user_id, action, entity_type, entity_id, metadata)
+       VALUES (NULL, $1, 'billing_fx_source', $2, $3::jsonb)
+       RETURNING id::text AS id, created_at`,
+      [
+        FX_SOURCE_APPROVED_AUDIT_ACTION,
+        `${this.policy.baseCurrency}-${this.policy.quoteCurrency}:${approval.source}`,
+        JSON.stringify({
+          decision: 'approved',
+          source: approval.source,
+          sourceReference: approval.sourceReference,
+          approvedBy: approval.approvedBy,
+          reason: approval.reason,
+          baseCurrency: this.policy.baseCurrency,
+          quoteCurrency: this.policy.quoteCurrency,
+        }),
+      ],
+    );
+    const row = rows[0] as { id: string; created_at: Date };
+    return Object.freeze({
+      approvalId: row.id,
+      source: approval.source,
+      sourceReference: approval.sourceReference,
+      approvedBy: approval.approvedBy,
+      reason: approval.reason,
+      baseCurrency: this.policy.baseCurrency,
+      quoteCurrency: this.policy.quoteCurrency,
+      approvedAt: new Date(row.created_at),
+    });
+  }
 }
 
 /**
@@ -383,27 +597,77 @@ export class BillingFxRateVersionStore {
   ) {}
 
   async publish(input: PublishFxRateVersionInput): Promise<BillingFxRateVersion> {
+    // Permitted-source gate first: a source outside the list is never approvable.
+    if (!(FX_PUBLICATION_PERMITTED_SOURCES as readonly string[]).includes(input.source)) {
+      throw new BillingFxError(
+        'source_not_permitted',
+        `FX source "${input.source}" is not permitted for publication. Nothing was published.`,
+      );
+    }
+    const sourceReference = input.sourceReference ?? null;
+    if (sourceReference === null || sourceReference.trim() === '') {
+      throw new BillingFxError(
+        'source_not_approved',
+        'FX publication refused: a source reference is required, because the source approval names it. Nothing was published.',
+      );
+    }
     const capturedAt = input.capturedAt ?? new Date();
-    const { rows } = await this.db.query(
-      `INSERT INTO billing_fx_rate_versions
-         (base_currency, quote_currency, fx_rate_scaled, fx_rate_scale, rounding_mode,
-          source, source_reference, created_by, effective_from, captured_at, published_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
-       RETURNING *`,
-      [
-        this.policy.baseCurrency,
-        this.policy.quoteCurrency,
-        input.fxRateScaled.toString(),
-        input.fxRateScale,
-        input.roundingMode ?? this.policy.roundingMode,
-        input.source,
-        input.sourceReference ?? null,
-        input.createdBy ?? null,
-        input.effectiveFrom,
-        capturedAt,
-      ],
-    );
-    return parseFxRateVersion(rows[0]);
+    const client = await this.db.connect();
+    try {
+      await client.query('BEGIN');
+      // THE APPROVAL GATE, on the publication's own transaction, before the INSERT.
+      await assertFxSourceApproved(client, String(input.sourceApprovalId), {
+        source: input.source,
+        sourceReference,
+        baseCurrency: this.policy.baseCurrency,
+        quoteCurrency: this.policy.quoteCurrency,
+      });
+      const { rows } = await client.query(
+        `INSERT INTO billing_fx_rate_versions
+           (base_currency, quote_currency, fx_rate_scaled, fx_rate_scale, rounding_mode,
+            source, source_reference, created_by, effective_from, captured_at, published_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+         RETURNING *`,
+        [
+          this.policy.baseCurrency,
+          this.policy.quoteCurrency,
+          input.fxRateScaled.toString(),
+          input.fxRateScale,
+          input.roundingMode ?? this.policy.roundingMode,
+          input.source,
+          sourceReference,
+          input.createdBy ?? null,
+          input.effectiveFrom,
+          capturedAt,
+        ],
+      );
+      const version = parseFxRateVersion(rows[0]);
+      // The publication is auditable: the version and the approval it cited
+      // commit together, or neither exists.
+      await recordAuditEvent(client, {
+        action: FX_RATE_PUBLISHED_AUDIT_ACTION,
+        entityType: 'billing_fx_rate_version',
+        entityId: version.id,
+        metadata: {
+          approvalId: String(input.sourceApprovalId),
+          source: version.source,
+          sourceReference: version.sourceReference,
+          baseCurrency: version.baseCurrency,
+          quoteCurrency: version.quoteCurrency,
+          fxRateScaled: version.fxRateScaled.toString(),
+          fxRateScale: version.fxRateScale,
+          effectiveFrom: version.effectiveFrom.toISOString(),
+          capturedAt: version.capturedAt.toISOString(),
+        },
+      });
+      await client.query('COMMIT');
+      return version;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   /**

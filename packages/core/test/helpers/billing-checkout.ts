@@ -4,6 +4,9 @@ import path from 'node:path';
 import type { Pool } from 'pg';
 import { startEmbeddedPostgres } from '../../../../scripts/db/embedded.mjs';
 import {
+  BILLING_SANDBOX_DATABASE_MARKER,
+  BillingFxSourceApprovalStore,
+  type SandboxDatabaseIdentityExpectation,
   billingCheckoutReference, billingSubscriptionActivationIdempotencyKey,
   billingVerifiedTransactionEvidenceHash, billingVerifiedTransactionIdempotencyKey,
   createPool, runMigrations, MIGRATIONS_DIR, BILLING_CATALOGUE_VERSION,
@@ -33,6 +36,41 @@ export async function startBillingTestDb(port: number) {
     pool, dbUrl: db.dbUrl,
     async stop() { await pool.end(); await db.stop(); rmSync(dataDir, { recursive: true, force: true }); },
   };
+}
+
+/**
+ * TEST FIXTURE ONLY: mark the CONNECTED test database as a sandbox target,
+ * exactly as an operator would (`COMMENT ON DATABASE … IS 'veltrixeye:billing-sandbox:v1'`),
+ * and return the explicit identity expectation a sandbox run must name. Nothing
+ * outside the embedded test database is ever touched.
+ */
+export async function markSandboxDatabase(pool: Pool): Promise<SandboxDatabaseIdentityExpectation> {
+  const { rows } = await pool.query(
+    'SELECT current_database() AS name, (SELECT system_identifier::text FROM pg_control_system()) AS sid',
+  );
+  const name = rows[0].name as string;
+  const sid = rows[0].sid as string;
+  await pool.query(`COMMENT ON DATABASE "${name.replace(/"/g, '""')}" IS '${BILLING_SANDBOX_DATABASE_MARKER}'`);
+  return { databaseName: name, systemIdentifier: sid };
+}
+
+/**
+ * TEST FIXTURE ONLY: record a source approval for a publication reference so a
+ * suite can publish through the real, approval-enforcing `publish()`. This is
+ * not an external approval and is never used outside a test database.
+ */
+export async function fxSourceApprovalFor(
+  pool: Pool,
+  sourceReference: string,
+  source: 'ops' | 'import' = 'ops',
+): Promise<string> {
+  const approval = await new BillingFxSourceApprovalStore(pool).recordApproval({
+    source,
+    sourceReference,
+    approvedBy: 'test-fixture-operator',
+    reason: 'test fixture: recorded source approval for a publication under test',
+  });
+  return approval.approvalId;
 }
 
 export async function insertFx(pool: Pool, rateScaled = 12_500_000) {

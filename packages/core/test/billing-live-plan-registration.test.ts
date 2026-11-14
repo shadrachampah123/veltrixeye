@@ -39,6 +39,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Pool } from 'pg';
+import type { SandboxDatabaseIdentityExpectation } from '../src/index.js';
 import {
   BILLING_CATALOGUE_VERSION,
   BILLING_PRICING_POLICY_VERSION,
@@ -64,7 +65,7 @@ import {
   buildLivePlanRegistrationEvidence,
   prepareSandboxProvisioningBatch,
 } from '../src/index.js';
-import { retireActiveEpochs, seedCommercialSubscription, startBillingTestDb, insertUser } from './helpers/billing-checkout.js';
+import { retireActiveEpochs, seedCommercialSubscription, startBillingTestDb, insertUser, fxSourceApprovalFor, markSandboxDatabase } from './helpers/billing-checkout.js';
 
 // Unique per suite file: every DB-backed core suite binds its own port.
 const DB_PORT = 5533;
@@ -76,10 +77,13 @@ const REASON = 'register the four live Paystack plan epochs for the go-live revi
 const REFERENCE = 'paystack-dashboard-live-plans-2026-09-29';
 
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
+/** The marked sandbox database's explicit identity expectation (set in before()). */
+let SANDBOX_IDENT: SandboxDatabaseIdentityExpectation;
 let pool: Pool;
 
 before(async () => {
   db = await startBillingTestDb(DB_PORT);
+  SANDBOX_IDENT = await markSandboxDatabase(db.pool);
   pool = db.pool;
 }, { timeout: 180_000 });
 
@@ -119,6 +123,7 @@ async function publishFx(rateScaled = 12_500_000n, capturedSecondsBefore = 120) 
     capturedAt,
     source: 'ops',
     sourceReference: 'ops-live-fx-board-1',
+    sourceApprovalId: await fxSourceApprovalFor(pool, 'ops-live-fx-board-1'),
     createdBy: OPERATOR,
   });
 }
@@ -138,6 +143,7 @@ async function publishFxNow(capturedSecondsBefore = 30) {
     capturedAt,
     source: 'ops',
     sourceReference: 'ops-live-fx-board-1',
+    sourceApprovalId: await fxSourceApprovalFor(pool, 'ops-live-fx-board-1'),
     createdBy: OPERATOR,
   });
 }
@@ -785,7 +791,7 @@ describe('live plan registration — the sandbox path is unchanged', () => {
 
     const auditsBefore = await auditCount();
     const service = new BillingPlanProvisioningService({ db: pool, mode: 'test', now: () => REGISTERED_AT });
-    const registered = await service.registerSandboxPlanEpochs({ fxRateVersionId: fx.id, evidence });
+    const registered = await service.registerSandboxPlanEpochs({ databaseIdentity: SANDBOX_IDENT, fxRateVersionId: fx.id, evidence });
     assert.equal(registered.length, 4);
     for (const epoch of registered) assert.equal(epoch.mode, 'test');
     assert.equal((await epochRows('test')).length, 4);

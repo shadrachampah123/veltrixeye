@@ -54,6 +54,8 @@ import {
 } from '../src/index.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+/** A fixture identity expectation: these suites never connect, so it is only a well-formed value. */
+const SANDBOX_IDENT = { databaseName: 'veltrixeye_sandbox', systemIdentifier: '7000000000000000001' } as const;
 const FX_VERSION_ID = '3f7a6b0e-6b2f-4e58-9a1f-2c6d5b8e9a01';
 const REGISTERED_AT = new Date('2026-09-22T12:00:00.000Z');
 const CAPTURED_AT = new Date('2026-09-22T11:55:00.000Z'); // 300 s old at registration
@@ -686,7 +688,7 @@ describe('Step 4 — the service refuses malformed requests before any database 
   test('a malformed fx_rate_version_id is refused', async () => {
     for (const bad of ['not-a-uuid', 'FX-2026-09-22', '', 42]) {
       await assert.rejects(
-        serviceThatMustNotConnect().registerSandboxPlanEpochs({ fxRateVersionId: bad, evidence: fullEvidence() }),
+        serviceThatMustNotConnect().registerSandboxPlanEpochs({ databaseIdentity: SANDBOX_IDENT, fxRateVersionId: bad, evidence: fullEvidence() }),
         (error: unknown) => {
           assert.ok(isBillingProvisioningError(error), `expected BillingProvisioningError, got ${String(error)}`);
           return error.reason === 'invalid_evidence';
@@ -698,18 +700,18 @@ describe('Step 4 — the service refuses malformed requests before any database 
   test('an empty or non-array evidence payload is refused', async () => {
     const service = serviceThatMustNotConnect();
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: randomUUID(), evidence: [] }),
+      service.registerSandboxPlanEpochs({ databaseIdentity: SANDBOX_IDENT, fxRateVersionId: randomUUID(), evidence: [] }),
       (error: unknown) => (error as { reason?: string }).reason === 'invalid_evidence',
     );
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: randomUUID(), evidence: 'PLN_something' }),
+      service.registerSandboxPlanEpochs({ databaseIdentity: SANDBOX_IDENT, fxRateVersionId: randomUUID(), evidence: 'PLN_something' }),
       (error: unknown) => (error as { reason?: string }).reason === 'invalid_evidence',
     );
     await assert.rejects(service.registerSandboxPlanEpochs(null), (error: unknown) =>
       (error as { reason?: string }).reason === 'invalid_evidence',
     );
     await assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: randomUUID(), evidence: fullEvidence(), extra: true }),
+      service.registerSandboxPlanEpochs({ databaseIdentity: SANDBOX_IDENT, fxRateVersionId: randomUUID(), evidence: fullEvidence(), extra: true }),
       (error: unknown) => (error as { reason?: string }).reason === 'invalid_evidence',
       'unknown envelope keys are refused (.strict) — never silently dropped',
     );
@@ -724,7 +726,7 @@ describe('Step 4 — the service refuses malformed requests before any database 
       now: () => new Date('not a date'),
     });
     return assert.rejects(
-      service.registerSandboxPlanEpochs({ fxRateVersionId: randomUUID(), evidence: fullEvidence() }),
+      service.registerSandboxPlanEpochs({ databaseIdentity: SANDBOX_IDENT, fxRateVersionId: randomUUID(), evidence: fullEvidence() }),
       (error: unknown) => (error as { reason?: string }).reason === 'invalid_instant',
     );
   });

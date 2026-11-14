@@ -41,6 +41,7 @@ import {
   verifyPricingSnapshot,
   type BillingCheckoutRequest,
 } from '../src/index.js';
+import type { SandboxDatabaseIdentityExpectation } from '../src/index.js';
 import {
   startBillingTestDb,
   insertEpoch,
@@ -48,18 +49,20 @@ import {
   insertUser,
   retireActiveEpochs,
   retireEpoch,
-  AS_OF,
-} from './helpers/billing-checkout.js';
+  AS_OF, fxSourceApprovalFor, markSandboxDatabase } from './helpers/billing-checkout.js';
 
 const DB_PORT = 5496;
 const ELITE_ANNUAL = { cataloguePlan: 'elite', interval: 'annual' } as const;
 const EXCLUDED_EVIDENCE_PLAN = ['PLN', 'u0l4961hhipl6ek'].join('_');
 
 let db: Awaited<ReturnType<typeof startBillingTestDb>>;
+/** The marked sandbox database's explicit identity expectation (set in before()). */
+let SANDBOX_IDENT: SandboxDatabaseIdentityExpectation;
 let calls: BillingCheckoutRequest[];
 let service: BillingCheckoutService;
 before(async () => {
   db = await startBillingTestDb(DB_PORT);
+  SANDBOX_IDENT = await markSandboxDatabase(db.pool);
 }, { timeout: 180_000 });
 beforeEach(async () => {
   await retireActiveEpochs(db.pool);
@@ -112,6 +115,7 @@ async function provisionSandboxEpochs(rateScaled = 12_500_000n) {
     capturedAt: new Date(registeredAt.getTime() - 300_000),
     source: 'ops',
     sourceReference: 'ops-sandbox-fx-1',
+    sourceApprovalId: await fxSourceApprovalFor(db.pool, 'ops-sandbox-fx-1'),
     createdBy: 'ops@example.com',
   });
   const combos: ReadonlyArray<['pro' | 'elite', 'monthly' | 'annual']> = [
@@ -142,7 +146,7 @@ async function provisionSandboxEpochs(rateScaled = 12_500_000n) {
     };
   });
   const provisioningService = new BillingPlanProvisioningService({ db: db.pool, now: () => registeredAt });
-  const epochs = await provisioningService.registerSandboxPlanEpochs({
+  const epochs = await provisioningService.registerSandboxPlanEpochs({ databaseIdentity: SANDBOX_IDENT,
     fxRateVersionId: fx.id,
     evidence,
   });

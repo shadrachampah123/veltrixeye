@@ -138,7 +138,19 @@ export type BillingProvisioningFailureReason =
    * written without a named operator, a stated reason and the transactional
    * audit event that records both.
    */
-  | 'audit_required';
+  | 'audit_required'
+  /**
+   * The connected database could not be POSITIVELY identified as a sandbox
+   * target: no expectation was supplied for a test-mode run, the identity
+   * could not be read, or the database carries no sandbox marker. Fail closed.
+   */
+  | 'database_identity_unverified'
+  /**
+   * The connected database IS identified and it is not the expected sandbox
+   * target: its name, its cluster identifier or its marker differ from the
+   * operator's explicit expectation. Nothing is written.
+   */
+  | 'database_identity_mismatch';
 
 export class BillingProvisioningError extends Error {
   readonly code = 'billing_provisioning_refused' as const;
@@ -788,6 +800,118 @@ export interface RegisterSandboxPlanEpochsInput {
    * `billing.provider_plans_registered` audit event. MANDATORY in live mode.
    */
   audit?: ProvisioningAuditDescriptor;
+  /**
+   * The operator's EXPLICIT expectation of the sandbox database this run may
+   * touch. MANDATORY for a test-mode (sandbox) run: it is verified against the
+   * CONNECTED database (name, cluster identifier and the sandbox marker) on
+   * both the dry-run and the write path, and — on the write path — inside the
+   * same transaction as every INSERT. Absent, malformed or unmatched ⇒ refused.
+   */
+  databaseIdentity?: SandboxDatabaseIdentityExpectation;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Sandbox database identity guard                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The sandbox-only identity marker. An operator who owns a NON-PRODUCTION
+ * database sets it once, out of band, with
+ * `COMMENT ON DATABASE <name> IS 'veltrixeye:billing-sandbox:v1';`
+ * The tool never sets it and no migration writes it: a database that does not
+ * carry this exact comment cannot be provisioned by this workflow. A
+ * production database has no reason to carry it, and a tunnel to one would
+ * not carry it either.
+ */
+export const BILLING_SANDBOX_DATABASE_MARKER = 'veltrixeye:billing-sandbox:v1' as const;
+
+/**
+ * The explicit allowlist entry the operator supplies per run: the database
+ * name AND the cluster system identifier (`pg_control_system().system_identifier`)
+ * the run is permitted to write. Both must match the connected database, and
+ * the marker must be present — three independent facts, none inferred from
+ * the connection string (a `localhost` port-forward can carry any of them).
+ */
+export interface SandboxDatabaseIdentityExpectation {
+  readonly databaseName: string;
+  readonly systemIdentifier: string;
+}
+
+const sandboxDatabaseIdentitySchema = z
+  .object({
+    databaseName: z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$/, 'a database name is required'),
+    systemIdentifier: z.string().regex(/^[0-9]{1,20}$/, 'a cluster system identifier is required'),
+  })
+  .strict();
+
+/**
+ * Verify the CONNECTED database identity on the caller's connection. Read-only:
+ * it issues two catalogue SELECTs and nothing else. Returns normally only when
+ * ALL of the following hold; every other outcome throws a typed refusal whose
+ * message echoes no database name, identifier or credential.
+ *
+ *  1. a marker is present (absent ⇒ `database_identity_unverified`);
+ *  2. the marker is exactly {@link BILLING_SANDBOX_DATABASE_MARKER}
+ *     (anything else ⇒ `database_identity_mismatch`);
+ *  3. the current database name equals the expectation (⇒ mismatch);
+ *  4. the cluster system identifier equals the expectation (⇒ mismatch).
+ *
+ * Any read failure is `database_identity_unverified`: an identity that cannot
+ * be read is never assumed to be the sandbox.
+ */
+export async function verifySandboxDatabaseIdentity(
+  runner: Pick<PoolClient, 'query'>,
+  expected: SandboxDatabaseIdentityExpectation,
+): Promise<void> {
+  let row: { name: string; marker: string | null; system_identifier: string } | undefined;
+  try {
+    const { rows } = await runner.query(
+      `SELECT current_database() AS name,
+              pg_catalog.shobj_description(d.oid, 'pg_database') AS marker,
+              (SELECT c.system_identifier::text FROM pg_catalog.pg_control_system() c) AS system_identifier
+         FROM pg_catalog.pg_database d
+        WHERE d.datname = current_database()`,
+    );
+    row = rows[0] as typeof row;
+  } catch (error) {
+    throw new BillingProvisioningError(
+      'database_identity_unverified',
+      'The connected database identity could not be read, so it cannot be established as the sandbox ' +
+        'target. Nothing was written.',
+      { cause: error },
+    );
+  }
+  if (row === undefined || typeof row.name !== 'string' || typeof row.system_identifier !== 'string') {
+    throw new BillingProvisioningError(
+      'database_identity_unverified',
+      'The connected database identity could not be read. Nothing was written.',
+    );
+  }
+  if (row.marker === null || row.marker === '') {
+    throw new BillingProvisioningError(
+      'database_identity_unverified',
+      'The connected database carries no sandbox marker. Only a database that an operator has explicitly ' +
+        'marked as non-production can be provisioned. Nothing was written.',
+    );
+  }
+  if (row.marker !== BILLING_SANDBOX_DATABASE_MARKER) {
+    throw new BillingProvisioningError(
+      'database_identity_mismatch',
+      'The connected database carries a marker that is not the sandbox marker. Nothing was written.',
+    );
+  }
+  if (row.name !== expected.databaseName) {
+    throw new BillingProvisioningError(
+      'database_identity_mismatch',
+      'The connected database name is not the database this run was authorized for. Nothing was written.',
+    );
+  }
+  if (row.system_identifier !== expected.systemIdentifier) {
+    throw new BillingProvisioningError(
+      'database_identity_mismatch',
+      'The connected database cluster identifier is not the one this run was authorized for. Nothing was written.',
+    );
+  }
 }
 
 const registerSandboxPlanEpochsInputSchema = z
@@ -795,6 +919,7 @@ const registerSandboxPlanEpochsInputSchema = z
     fxRateVersionId: z.string().guid(),
     evidence: z.array(z.unknown()).min(1),
     audit: provisioningAuditDescriptorSchema.optional(),
+    databaseIdentity: sandboxDatabaseIdentitySchema.optional(),
   })
   .strict();
 
@@ -876,6 +1001,14 @@ export class BillingPlanProvisioningService {
     const client = await this.db.connect();
     try {
       await client.query('BEGIN');
+
+      // THE DATABASE IDENTITY GUARD, on the write transaction's own connection:
+      // the connected database is proven to be the sandbox this run was
+      // authorized for BEFORE the FX row is read or a single INSERT is issued.
+      // A failure throws, the catch below rolls the transaction back, and no
+      // epoch or audit row can exist. (A pre-connection check cannot prove
+      // what a port-forward actually reaches; this one does.)
+      await this.assertSandboxDatabaseIdentity(client, request);
 
       // The WHOLE batch — the selected authoritative FX row plus every Step 4
       // admission rule — validates here, before the first INSERT. The SAME
@@ -990,6 +1123,9 @@ export class BillingPlanProvisioningService {
 
     const client = await this.db.connect();
     try {
+      // Read-only identity verification first (catalogue SELECTs only), so a
+      // dry run against an unexpected database never reads its FX or epochs.
+      await this.assertSandboxDatabaseIdentity(client, request);
       // Read-only: the shared preparation routine above a single SELECT — no
       // transaction is opened, so nothing in this path can write.
       return await this.prepareSelectedBatch(
@@ -1012,6 +1148,7 @@ export class BillingPlanProvisioningService {
     fxRateVersionId: string;
     evidence: readonly unknown[];
     audit?: ProvisioningAuditDescriptor;
+    databaseIdentity?: SandboxDatabaseIdentityExpectation;
   } {
     const parsed = registerSandboxPlanEpochsInputSchema.safeParse(input);
     if (!parsed.success) {
@@ -1040,7 +1177,38 @@ export class BillingPlanProvisioningService {
     if (parsed.data.audit !== undefined) {
       assertAuditTextIsNotCredentialShaped(parsed.data.audit);
     }
+    // SANDBOX IDENTITY (pre-connection half): a test-mode run must name the
+    // database it is authorized for. Refused here — before any connection —
+    // so an unnamed run cannot even reach the verification below. The
+    // authoritative check still runs on the connected database.
+    if (this.mode === 'test' && parsed.data.databaseIdentity === undefined) {
+      throw new BillingProvisioningError(
+        'database_identity_unverified',
+        'A sandbox (test-mode) provisioning run requires the explicit database identity expectation ' +
+          '(the database name and the cluster system identifier). Nothing was connected or written.',
+      );
+    }
     return parsed.data;
+  }
+
+  /**
+   * SANDBOX IDENTITY (connected half): verify the database this run actually
+   * connected to, on the caller's connection. Test mode only — the live path
+   * is unchanged. Called on the write path INSIDE the transaction, before the
+   * first INSERT, and on the dry-run path before any business read.
+   */
+  private async assertSandboxDatabaseIdentity(
+    runner: PoolClient,
+    request: { databaseIdentity?: SandboxDatabaseIdentityExpectation },
+  ): Promise<void> {
+    if (this.mode !== 'test') return;
+    if (request.databaseIdentity === undefined) {
+      throw new BillingProvisioningError(
+        'database_identity_unverified',
+        'A sandbox (test-mode) provisioning run requires the explicit database identity expectation.',
+      );
+    }
+    await verifySandboxDatabaseIdentity(runner, request.databaseIdentity);
   }
 
   /** ONE finite registration instant per run: the freshness anchor. */
