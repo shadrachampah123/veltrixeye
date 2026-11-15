@@ -33,7 +33,9 @@ async function main(): Promise<void> {
     sslMode: config.DATABASE_SSL_MODE,
   });
 
-  await timePhase('db-connect', () => waitForDatabase(pool, 30));
+  await timePhase('db-connect', () =>
+    waitForDatabase(pool, 30, { totalTimeoutMs: config.DATABASE_STARTUP_TIMEOUT_MS }),
+  );
 
   const migrations = await timePhase('migrations', () => runMigrations(pool, MIGRATIONS_DIR));
   if (migrations.applied.length > 0) {

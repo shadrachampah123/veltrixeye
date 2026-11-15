@@ -354,6 +354,149 @@ describe('waitForDatabase', () => {
     assert.equal(joined.includes('secret'), false);
     assert.ok(joined.includes('[startup]'));
   });
+
+  test('respects the overall deadline and clamps per-attempt probe timeouts', async () => {
+    const { logger } = capturingLogger();
+    const pool = new pg.Pool({ connectionString: 'postgres://u:p@127.0.0.1:1/db', max: 1 });
+    const timeouts: number[] = [];
+    const start = Date.now();
+    try {
+      // A probe that "hangs" until its (clamped) timeout, simulating a
+      // black-hole host. The per-attempt timeout must be clamped to the
+      // remaining overall budget and the whole wait must stop at the deadline.
+      await assert.rejects(
+        () =>
+          waitForDatabase(
+            pool,
+            30,
+            {
+              probeTimeoutMs: 5_000,
+              sleepMs: 1_000,
+              totalTimeoutMs: 120,
+              probeFn: (timeoutMs) => {
+                timeouts.push(timeoutMs);
+                return new Promise<void>((_resolve, reject) =>
+                  setTimeout(() => reject(new Error('probe timed out')), timeoutMs),
+                );
+              },
+            },
+            logger,
+          ),
+        (err: Error) => {
+          assert.match(err.message, /Timed out waiting for the database/);
+          assert.match(err.message, /deadline 120ms/);
+          return true;
+        },
+      );
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 2_000, `should be bounded by the deadline, took ${elapsed}ms`);
+      assert.equal(pool.ended, true, 'the pool is ended on deadline failure');
+      assert.ok(timeouts.length >= 1);
+      assert.ok(
+        Math.max(...timeouts) <= 120,
+        `probe timeout ${Math.max(...timeouts)} exceeded the overall deadline`,
+      );
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  });
+
+  test('clamps retry sleeps to the overall deadline', async () => {
+    const { logger } = capturingLogger();
+    const pool = new pg.Pool({ connectionString: 'postgres://u:p@127.0.0.1:1/db', max: 1 });
+    const start = Date.now();
+    try {
+      // Probes fail fast; the large sleepMs must be clamped so the wait is
+      // still bounded by the overall deadline.
+      await assert.rejects(
+        () =>
+          waitForDatabase(
+            pool,
+            30,
+            {
+              probeTimeoutMs: 1,
+              sleepMs: 10_000,
+              totalTimeoutMs: 150,
+              probeFn: () => Promise.reject(new Error('ECONNREFUSED')),
+            },
+            logger,
+          ),
+        (err: Error) => {
+          assert.match(err.message, /Timed out waiting for the database/);
+          return true;
+        },
+      );
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 2_000, `sleep must be clamped to the deadline, took ${elapsed}ms`);
+      assert.equal(pool.ended, true, 'the pool is ended on deadline failure');
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  });
+
+  test('terminates on exhausted attempts (not the deadline) and ends the pool', async () => {
+    const { logger } = capturingLogger();
+    const pool = new pg.Pool({ connectionString: 'postgres://u:p@127.0.0.1:1/db', max: 1 });
+    let calls = 0;
+    try {
+      // A generous deadline: termination is driven by the attempt count, not
+      // the deadline, so the error must report exhausted attempts.
+      await assert.rejects(
+        () =>
+          waitForDatabase(
+            pool,
+            3,
+            {
+              probeTimeoutMs: 1,
+              sleepMs: 1,
+              totalTimeoutMs: 10_000,
+              probeFn: () => {
+                calls += 1;
+                return Promise.reject(new Error('ECONNREFUSED'));
+              },
+            },
+            logger,
+          ),
+        (err: Error) => {
+          assert.match(err.message, /Could not connect to the database after 3 attempt/);
+          assert.equal(err.message.includes('Timed out'), false);
+          return true;
+        },
+      );
+      assert.equal(calls, 3, 'exactly the requested attempts are attempted');
+      assert.equal(pool.ended, true, 'the pool is ended on failure');
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  });
+
+  test('succeeds within the overall deadline and reports timedOut=false', async () => {
+    const { logger } = capturingLogger();
+    const pool = new pg.Pool({ connectionString: 'postgres://u:p@127.0.0.1:1/db', max: 1 });
+    let calls = 0;
+    try {
+      const result = await waitForDatabase(
+        pool,
+        10,
+        {
+          probeTimeoutMs: 1_000,
+          sleepMs: 1,
+          totalTimeoutMs: 10_000,
+          probeFn: () => {
+            calls += 1;
+            return calls >= 2 ? Promise.resolve() : Promise.reject(new Error('not yet'));
+          },
+        },
+        logger,
+      );
+      assert.equal(result.attemptsUsed, 2);
+      assert.equal(result.timedOut, false);
+      assert.ok(result.elapsedMs >= 0);
+      assert.equal(calls, 2);
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

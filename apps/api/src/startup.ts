@@ -17,6 +17,12 @@
  * reachability, and `runMigrations` follows immediately to surface any
  * deeper unavailability.
  *
+ * The whole database wait is additionally bounded by a single overall
+ * deadline (`totalTimeoutMs`, default `DEFAULT_DATABASE_STARTUP_TIMEOUT_MS`):
+ * each per-attempt probe timeout and each retry sleep is clamped to the
+ * remaining budget, so the database phase can never overrun a deployment's
+ * startup deadline (e.g. Render) when the database is unreachable.
+ *
  * Supported connection-string formats for the probe. The target is resolved
  * from the **driver's own parser** (`pg-connection-string`, the parser
  * `node-postgres` uses internally) over the raw string stored on the pool, so
@@ -45,6 +51,7 @@
 import net from 'node:net';
 import type pg from 'pg';
 import { parse as parseConnectionString } from 'pg-connection-string';
+import { DEFAULT_DATABASE_STARTUP_TIMEOUT_MS } from '@veltrixeye/contracts';
 
 /** Minimal structured logger (compatible with `console`). */
 export interface StartupLogger {
@@ -60,11 +67,26 @@ const MAX_SANITIZED_MESSAGE_LENGTH = 200;
 export interface WaitForDatabaseOptions {
   /**
    * Hard timeout for each readiness probe. A probe that does not complete
-   * within this window is abandoned and its socket is destroyed.
+   * within this window is abandoned and its socket is destroyed. Clamped so
+   * it cannot run past `totalTimeoutMs`.
    */
   probeTimeoutMs?: number;
-  /** Delay between retry attempts (milliseconds). */
+  /** Delay between retry attempts (milliseconds). Clamped so it cannot run
+   * past `totalTimeoutMs`. */
   sleepMs?: number;
+  /**
+   * Overall wall-clock deadline for the entire database wait. Both each
+   * probe and each retry sleep are clamped to the remaining budget, so
+   * `waitForDatabase` returns (on success) or rejects (on failure) no later
+   * than this many milliseconds after it started. Defaults to
+   * `DEFAULT_DATABASE_STARTUP_TIMEOUT_MS` (60s).
+   */
+  totalTimeoutMs?: number;
+  /**
+   * Test seam: the per-attempt probe. Defaults to the real `probeDatabase`.
+   * Not part of the deployment configuration surface.
+   */
+  probeFn?: (timeoutMs: number) => Promise<void>;
 }
 
 export interface WaitForDatabaseResult {
@@ -72,18 +94,24 @@ export interface WaitForDatabaseResult {
   attemptsUsed: number;
   /** Total wall-clock time spent waiting, in milliseconds. */
   elapsedMs: number;
+  /** Always `false` on success; a successful return never hits the deadline. */
+  timedOut: boolean;
 }
 
 /**
  * Wait for the database to accept connections, retrying with bounded, timed
- * attempts.
+ * attempts that are all clamped to a single overall deadline.
  *
- * - Each probe is a raw socket connect bounded by `probeTimeoutMs`; on expiry
- *   the probe socket is destroyed so it cannot linger or accumulate.
+ * - Each probe is a raw socket connect bounded by `probeTimeoutMs`, further
+ *   clamped to the remaining overall budget; on expiry the probe socket is
+ *   destroyed so it cannot linger or accumulate.
+ * - Each retry sleep is clamped so it cannot run past the overall deadline.
  * - Each attempt and the final outcome are logged with timing so a slow or
  *   unreachable database is visible in the startup log.
- * - On final failure the thrown error names the attempt count and total
- *   elapsed time, and the pool is ended before throwing.
+ * - The loop stops at the earlier of `attempts` exhausted or the overall
+ *   deadline. On final failure the thrown error distinguishes a deadline
+ *   expiry from an exhausted attempt budget, names the elapsed time, and the
+ *   pool is ended before throwing.
  */
 export async function waitForDatabase(
   pool: pg.Pool,
@@ -93,18 +121,27 @@ export async function waitForDatabase(
 ): Promise<WaitForDatabaseResult> {
   const probeTimeoutMs = options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
   const sleepMs = options.sleepMs ?? DEFAULT_RETRY_SLEEP_MS;
+  const totalTimeoutMs = options.totalTimeoutMs ?? DEFAULT_DATABASE_STARTUP_TIMEOUT_MS;
+  const probe = options.probeFn ?? ((timeoutMs: number) => probeDatabase(pool, timeoutMs));
+
   const startedAt = Date.now();
+  const deadline = startedAt + totalTimeoutMs;
   let lastErr: unknown;
+  let attemptsUsed = 0;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break; // overall deadline reached before the next probe
+    attemptsUsed = attempt;
     const attemptStart = Date.now();
     try {
-      await probeDatabase(pool, probeTimeoutMs);
+      // Clamp the probe so it cannot run past the overall deadline.
+      await probe(Math.min(probeTimeoutMs, remaining));
       const elapsedMs = Date.now() - startedAt;
       if (attempt > 1) {
         logger.info(`[startup] database ready after ${attempt} attempt(s) in ${elapsedMs}ms`);
       }
-      return { attemptsUsed: attempt, elapsedMs };
+      return { attemptsUsed: attempt, elapsedMs, timedOut: false };
     } catch (err) {
       lastErr = err;
       const attemptElapsed = Date.now() - attemptStart;
@@ -112,17 +149,23 @@ export async function waitForDatabase(
         `[startup] database not ready (attempt ${attempt}/${attempts}, ${attemptElapsed}ms): ` +
           `${messageOf(err)}`,
       );
-      if (attempt < attempts) {
-        await sleep(sleepMs);
-      }
+      const afterProbe = deadline - Date.now();
+      if (attempt >= attempts || afterProbe <= 0) break;
+      // Clamp the retry sleep so it cannot run past the overall deadline.
+      await sleep(Math.min(sleepMs, afterProbe));
     }
   }
 
   await pool.end().catch(() => {});
   const elapsedMs = Date.now() - startedAt;
+  const timedOut = Date.now() >= deadline;
+  const detail = lastErr === undefined ? 'no probe was attempted' : messageOf(lastErr);
   throw new Error(
-    `Could not connect to the database after ${attempts} attempt(s) in ${elapsedMs}ms: ` +
-      `${messageOf(lastErr)}`,
+    timedOut
+      ? `Timed out waiting for the database after ${elapsedMs}ms (deadline ${totalTimeoutMs}ms); ` +
+        `the database did not accept connections (${detail})`
+      : `Could not connect to the database after ${attemptsUsed} attempt(s) in ${elapsedMs}ms: ` +
+        `${detail}`,
   );
 }
 
