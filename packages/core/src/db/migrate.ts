@@ -17,6 +17,13 @@ export interface MigrationRecord {
 export interface RunMigrationsResult {
   applied: string[];
   alreadyApplied: string[];
+  /**
+   * Wall-clock time spent acquiring the migration advisory lock (the acquire
+   * query plus any contention wait), in milliseconds. Small for an
+   * uncontended run; large when a concurrent runner held the lock. Reported
+   * so a boot-time migration delayed by lock contention is visible.
+   */
+  lockWaitMs: number;
 }
 
 /** A `NNNN_name.sql` migration file shipped with this build. */
@@ -145,11 +152,17 @@ export async function migrationStatus(pool: pg.Pool, migrationsDir: string): Pro
  * - Migrations are additive only: this runner never drops, truncates or
  *   rewrites data, and it has no "reset" path.
  */
-export async function runMigrations(pool: pg.Pool, migrationsDir: string): Promise<RunMigrationsResult> {
+export async function runMigrations(
+  pool: pg.Pool,
+  migrationsDir: string,
+  options: { lockWaitMs?: number } = {},
+): Promise<RunMigrationsResult> {
   const client = await pool.connect();
   let locked = false;
   try {
-    await acquireMigrationLock(client);
+    const lockStart = Date.now();
+    await acquireMigrationLock(client, options.lockWaitMs);
+    const lockWaitMs = Date.now() - lockStart;
     locked = true;
 
     await client.query(`
@@ -163,7 +176,7 @@ export async function runMigrations(pool: pg.Pool, migrationsDir: string): Promi
 
     const migrations = await listMigrationFiles(migrationsDir);
 
-    const result: RunMigrationsResult = { applied: [], alreadyApplied: [] };
+    const result: RunMigrationsResult = { applied: [], alreadyApplied: [], lockWaitMs };
 
     for (const m of migrations) {
       const sql = await readFile(m.file, 'utf8');
@@ -218,8 +231,8 @@ export async function runMigrations(pool: pg.Pool, migrationsDir: string): Promi
  * A bounded wait means a stuck lock produces a clear error instead of a
  * process that silently never finishes booting.
  */
-async function acquireMigrationLock(client: pg.PoolClient): Promise<void> {
-  const deadline = Date.now() + MIGRATION_LOCK_WAIT_MS;
+async function acquireMigrationLock(client: pg.PoolClient, lockWaitMs = MIGRATION_LOCK_WAIT_MS): Promise<void> {
+  const deadline = Date.now() + lockWaitMs;
   for (;;) {
     const res = await client.query<{ locked: boolean }>('SELECT pg_try_advisory_lock($1) AS locked', [
       MIGRATION_LOCK_KEY,
