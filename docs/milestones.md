@@ -32,7 +32,7 @@ and blocking gates without a stable denominator.
   `false`. The platform webhook receiver (core `BillingWebhookReceiver` +
   `/api/billing/webhook`) was already fully wired through `buildApp()` →
   `billingRoutes()` → `registerBillingWebhookRoutes()`, so no webhook repair
-  was necessary. No application-code behaviour, environment or secret change.
+  was necessary. No payment-confirmation, entitlement-activation, execution-granting or webhook-processing behaviour, environment or secret change.
 - **PR #159 — startup timing, bounded DB waits, and migration-lock reporting:
   MERGED.** Adds a configurable overall database startup timeout
   (`DATABASE_STARTUP_TIMEOUT_MS`, default 60 s) with per-probe/retry clamping
