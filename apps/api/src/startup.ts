@@ -17,14 +17,24 @@
  * reachability, and `runMigrations` follows immediately to surface any
  * deeper unavailability.
  *
- * Supported connection-string formats for the probe:
- *  - `postgres://[user:password@]host[:port][/db]` — probed over TCP to
- *    `host:port` (default port 5432). This is the format every deployment
- *    this codebase uses (managed Postgres, embedded Postgres).
- *  - `postgres:///path/to/socket` (empty host) — probed over a Unix domain
- *    socket at `path`. Also genuinely cancellable via socket `destroy()`.
- * A connection string with neither a host nor a socket path cannot be probed
- * and fails the readiness check with a clear, credential-free error.
+ * Supported connection-string formats for the probe. The target is resolved
+ * from the **driver's own parser** (`pg-connection-string`, the parser
+ * `node-postgres` uses internally) over the raw string stored on the pool, so
+ * the probe always targets exactly where the driver would connect:
+ *  - `postgres://[user:password@]host[:port][/db]` — a non-empty `host` that
+ *    is not a path is probed over TCP to `host:port` (default port 5432).
+ *    This is the format every deployment this codebase uses (managed Postgres,
+ *    embedded Postgres).
+ *  - `postgres://user:password@/db?host=/var/run/postgresql` — a Unix domain
+ *    socket. The socket directory is given via the `host` **query parameter**
+ *    and the pathname is the database name (the standard libpq URI form). The
+ *    probe targets the driver's socket file `<host>/.s.PGSQL.<port>`.
+ * A connection string with no host and no socket directory (e.g. a bare
+ * `postgres:///dbname`, or a pathname mistaken for a socket path — the
+ * pathname is the database, not a socket) cannot be probed and fails the
+ * readiness check with a clear, credential-free error. Formats the driver
+ * cannot parse, or that have no determinable endpoint, are reported as
+ * unsupported rather than guessed at.
  *
  * Everything logged here is secret-free: no connection string, no provider
  * key, no tenant identifier, no raw error object or stack. Error messages are
@@ -34,6 +44,7 @@
  */
 import net from 'node:net';
 import type pg from 'pg';
+import { parse as parseConnectionString } from 'pg-connection-string';
 
 /** Minimal structured logger (compatible with `console`). */
 export interface StartupLogger {
@@ -143,6 +154,20 @@ export async function timePhase<T>(
 }
 
 /**
+ * Log a fatal boot error as a single sanitized line — never the raw error
+ * object or its stack.
+ *
+ * The top-level fatal handler (`main().catch`) calls this so a boot that
+ * fails with an error carrying credentials, a connection string or a stack
+ * emits only the redacted message. The raw error is not logged here (and is
+ * not retained for logging elsewhere), so sensitive values cannot reach the
+ * log through the fatal path.
+ */
+export function logFatalBootError(err: unknown, logger: StartupLogger = console): void {
+  logger.error(`[api] fatal boot error: ${messageOf(err)}`);
+}
+
+/**
  * Run one readiness probe against the database described by the pool's
  * connection string. The probe target is resolved to a raw socket (TCP or
  * Unix domain); there is no pooled-query fallback, because a pooled query
@@ -152,8 +177,8 @@ async function probeDatabase(pool: pg.Pool, timeoutMs: number): Promise<void> {
   const target = parseProbeTarget(pool.options.connectionString);
   if (!target) {
     throw new Error(
-      'Database probe: unsupported connection-string format (expected ' +
-        "'postgres://host:port/db' or 'postgres:///socket-path').",
+      'Database probe: unsupported or incomplete connection-string format ' +
+        "(expected 'postgres://host:port/db' or 'postgres://user:pass@/db?host=/socket-dir').",
     );
   }
   await probeSocket(target, timeoutMs);
@@ -163,37 +188,41 @@ async function probeDatabase(pool: pg.Pool, timeoutMs: number): Promise<void> {
 export type ProbeTarget = { host: string; port: number } | { path: string };
 
 /**
- * Extract a probe target from a `postgres://` connection string.
+ * Extract a probe target from a `postgres://` connection string, using the
+ * driver's own parser (`pg-connection-string`) so the probe targets exactly
+ * where `node-postgres` would connect.
  *
- * - A non-empty host yields a TCP target (`host`, default port 5432).
- * - An empty host with a non-empty path yields a Unix domain socket target.
- * - Anything else (or an unparseable string) yields `null`, which the probe
- *   rejects with a clear, credential-free error.
+ * - A non-empty `host` that is not a path → TCP target (`host`, default
+ *   port 5432 when the URI omits the port).
+ * - A `host` that is a path (starts with `/`) → Unix domain socket target at
+ *   the driver's socket file `<host>/.s.PGSQL.<port>` (pg connects there;
+ *   see `pg/lib/client.js`). This is the standard libpq form, where the socket
+ *   directory arrives via the `host` query parameter and the pathname is the
+ *   database name — not a socket path.
+ * - A missing/empty host, an unparseable string, or an invalid port yields
+ *   `null`, which the probe rejects with a clear, credential-free error. No
+ *   format is claimed to be supported if the driver does not parse it into a
+ *   determinable endpoint.
  */
-function parseProbeTarget(connectionString: string | undefined): ProbeTarget | null {
+export function parseProbeTarget(connectionString: string | undefined): ProbeTarget | null {
   if (!connectionString) return null;
+  let parsed: ReturnType<typeof parseConnectionString>;
   try {
-    const url = new URL(connectionString);
-    if (url.hostname) {
-      const port = url.port ? Number(url.port) : DEFAULT_PG_PORT;
-      if (!Number.isFinite(port) || port <= 0) return null;
-      return { host: url.hostname, port };
-    }
-    // Empty host: treat the path as a Unix domain socket path.
-    const rawPath = url.pathname && url.pathname !== '/' ? url.pathname : null;
-    if (rawPath) {
-      let socketPath: string;
-      try {
-        socketPath = decodeURIComponent(rawPath);
-      } catch {
-        socketPath = rawPath;
-      }
-      return { path: socketPath };
-    }
-    return null;
+    parsed = parseConnectionString(connectionString);
   } catch {
     return null;
   }
+  const host = parsed.host;
+  if (!host) return null;
+
+  const port = parsed.port ? Number(parsed.port) : DEFAULT_PG_PORT;
+  if (!Number.isFinite(port) || port <= 0 || port > 65535) return null;
+
+  if (host.startsWith('/')) {
+    // Unix domain socket: pg connects to <socketDir>/.s.PGSQL.<port>.
+    return { path: `${host}/.s.PGSQL.${port}` };
+  }
+  return { host, port };
 }
 
 /**

@@ -11,7 +11,7 @@ import { startScannerWorkerTicker, consoleScannerLogger } from './scanner-worker
 import { consoleFxSourceLogger, startFxSourceTicker } from './fx-source-runner.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 import { createTwelveDataProvider } from '@veltrixeye/provider-twelve-data';
-import { waitForDatabase, timePhase } from './startup.js';
+import { waitForDatabase, timePhase, logFatalBootError, messageOf } from './startup.js';
 
 /**
  * API entrypoint.
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
     const removed = await timePhase('startup-housekeeping', () => runStartupHousekeeping(ctx));
     if (removed > 0) console.info(`[db] removed ${removed} expired session(s) at startup`);
   } catch (err) {
-    console.warn('[api] expired-session cleanup failed (continuing):', (err as Error)?.message);
+    console.warn('[api] expired-session cleanup failed (continuing):', messageOf(err));
   }
 
   // M2 primary market-data provider. The API boots without a key on purpose
@@ -115,7 +115,7 @@ async function main(): Promise<void> {
       );
     }
   } catch (err) {
-    console.warn('[api] delivery recovery failed (continuing):', (err as Error)?.message);
+    console.warn('[api] delivery recovery failed (continuing):', messageOf(err));
   }
 
   // M7.5 / F3 — scanner recovery: mark stale running scanner runs as failed after restart.
@@ -127,7 +127,7 @@ async function main(): Promise<void> {
       console.info(`[api] scanner recovery: ${scannerRecovery.recovered} stale run(s) marked failed`);
     }
   } catch (err) {
-    console.warn('[api] scanner recovery failed (continuing):', (err as Error)?.message);
+    console.warn('[api] scanner recovery failed (continuing):', messageOf(err));
   }
 
   const app = await timePhase('app-build', () => buildApp(config, ctx));
@@ -227,6 +227,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-    console.error('[api] fatal boot error:', err);
-  process.exit(1);
-});
+    // Sanitized, single-line fatal log: never the raw error object or stack,
+    // so credentials or connection strings cannot leak through the fatal path.
+    logFatalBootError(err);
+    process.exit(1);
+  });

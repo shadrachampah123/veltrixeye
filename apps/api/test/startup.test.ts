@@ -11,13 +11,18 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync } from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 
 import pg from 'pg';
 import {
   waitForDatabase,
   timePhase,
   probeSocket,
+  parseProbeTarget,
+  logFatalBootError,
   sanitizeErrorMessage,
   type StartupLogger,
 } from '../src/startup.js';
@@ -137,6 +142,53 @@ describe('probeSocket', () => {
 // sanitizeErrorMessage — secret-safe redaction
 // ---------------------------------------------------------------------------
 
+describe('parseProbeTarget', () => {
+  test('TCP with an explicit port', () => {
+    assert.deepEqual(parseProbeTarget('postgres://u:p@127.0.0.1:5433/db'), {
+      host: '127.0.0.1',
+      port: 5433,
+    });
+  });
+
+  test('TCP with no port defaults to 5432', () => {
+    assert.deepEqual(parseProbeTarget('postgres://u:p@db.internal/db'), {
+      host: 'db.internal',
+      port: 5432,
+    });
+  });
+
+  test('Unix domain socket via the host query parameter (correct libpq form)', () => {
+    // The socket directory arrives via ?host=; the pathname is the database.
+    const target = parseProbeTarget('postgres://u:p@/dbname?host=/var/run/postgresql');
+    assert.deepEqual(target, { path: '/var/run/postgresql/.s.PGSQL.5432' });
+  });
+
+  test('Unix domain socket honours an explicit port', () => {
+    const target = parseProbeTarget('postgres://u:p@/dbname?host=/tmp&port=6000');
+    assert.deepEqual(target, { path: '/tmp/.s.PGSQL.6000' });
+  });
+
+  test('bare postgres:///dbname (no host, no socket dir) is unsupported', () => {
+    // The pathname is the database, not a socket path — nothing to probe.
+    assert.equal(parseProbeTarget('postgres:///dbname'), null);
+  });
+
+  test('a pathname mistaken for a socket path is NOT treated as a socket', () => {
+    // This parses as host="" with database="var/run/postgresql/.s.PGSQL.5432";
+    // we must not claim it is a Unix socket.
+    assert.equal(parseProbeTarget('postgres:///var/run/postgresql/.s.PGSQL.5432'), null);
+  });
+
+  test('empty and undefined connection strings are unsupported', () => {
+    assert.equal(parseProbeTarget(''), null);
+    assert.equal(parseProbeTarget(undefined), null);
+  });
+
+  test('an invalid port is unsupported', () => {
+    assert.equal(parseProbeTarget('postgres://u:p@host:notaport/db'), null);
+  });
+});
+
 describe('sanitizeErrorMessage', () => {
   test('redacts a full connection string with embedded credentials', () => {
     const out = sanitizeErrorMessage(
@@ -209,6 +261,41 @@ describe('waitForDatabase', () => {
     // the server-side 'close' event propagate before asserting.
     await sleep(50);
     assert.equal(server.openSockets.size, 0, 'probe socket was not cleaned up');
+  });
+
+  test('probes a Unix domain socket via the host query parameter', async () => {
+    const { logger, lines } = capturingLogger();
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'veltrix-unix-'));
+    const port = 5432; // default port → socket file .s.PGSQL.5432
+    const socketPath = path.join(dir, `.s.PGSQL.${port}`);
+    const openSockets = new Set<net.Socket>();
+    const server = net.createServer((socket) => {
+      openSockets.add(socket);
+      const drop = () => openSockets.delete(socket);
+      socket.on('close', drop);
+      socket.on('error', drop);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen({ path: socketPath }, resolve);
+    });
+    // Correct libpq form: socket directory via ?host=, pathname is the db.
+    const pool = new pg.Pool({
+      connectionString: `postgres://u:p@/dbname?host=${dir}`,
+      max: 2,
+    });
+    try {
+      const result = await waitForDatabase(pool, 3, { probeTimeoutMs: 500, sleepMs: 1 }, logger);
+      assert.equal(result.attemptsUsed, 1);
+      assert.equal(lines.some((l) => l.includes('database ready after')), false);
+    } finally {
+      await pool.end().catch(() => {});
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+    // The probe socket was destroyed: nothing leaks on the server side.
+    await sleep(50);
+    assert.equal(openSockets.size, 0, 'probe socket was not cleaned up');
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test('retries through connection delays and succeeds once the server is up', async () => {
@@ -325,5 +412,54 @@ describe('timePhase', () => {
     assert.equal(failure.includes('postgres://'), false, 'connection string must not leak');
     assert.equal(failure.includes('db.host'), false, 'host from connection string must not leak');
     assert.match(failure, /redacted/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// logFatalBootError — top-level fatal handler is secret-safe
+// ---------------------------------------------------------------------------
+
+describe('logFatalBootError', () => {
+  test('logs a single sanitized line and never the raw error or stack', () => {
+    const { logger, lines } = capturingLogger();
+    const err = new Error('fatal: connect failed postgres://admin:hunter2@db.host:5432/prod');
+    // A realistic error carries a multi-frame stack.
+    assert.ok(err.stack && err.stack.includes('at '));
+    logFatalBootError(err, logger);
+    assert.equal(lines.length, 1, 'exactly one fatal log line');
+    const line = lines[0];
+    assert.ok(line, 'expected a fatal log line');
+    assert.match(line, /\[api\] fatal boot error:/);
+    // No credential, no connection string, no host from the string.
+    assert.equal(line.includes('hunter2'), false);
+    assert.equal(line.includes('postgres://'), false);
+    assert.equal(line.includes('admin'), false);
+    assert.equal(line.includes('db.host'), false);
+    // No raw error dump, no stack frames.
+    assert.equal(line.includes('Error:'), false);
+    assert.equal(line.includes('at '), false);
+    // Single line.
+    assert.equal(line.includes('\n'), false);
+    assert.match(line, /redacted/);
+  });
+
+  test('redacts key/value credentials from a non-Error thrown value', () => {
+    const { logger, lines } = capturingLogger();
+    logFatalBootError('boot failed password=letmein token=abc123', logger);
+    const line = lines[0];
+    assert.ok(line, 'expected a fatal log line');
+    assert.equal(line.includes('letmein'), false);
+    assert.equal(line.includes('abc123'), false);
+    assert.match(line, /password=\[redacted\]/);
+    assert.match(line, /token=\[redacted\]/);
+  });
+
+  test('handles an error with no message gracefully', () => {
+    const { logger, lines } = capturingLogger();
+    logFatalBootError(new Error(''), logger);
+    assert.equal(lines.length, 1);
+    const line = lines[0];
+    assert.ok(line, 'expected a fatal log line');
+    assert.match(line, /\[api\] fatal boot error: /);
   });
 });
