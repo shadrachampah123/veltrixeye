@@ -132,11 +132,13 @@ import {
  *                             becomes the canonical `unrecognized` event, and a
  *                             supported event with a malformed payload is
  *                             refused. It performs no verification, no
- *                             confirmation and no I/O. THERE IS STILL NO
- *                             WEBHOOK RECEIVER: nothing in this repository
- *                             accepts a delivery, verifies a signature or
- *                             persists an event — that is the next step, and it
- *                             is what will call this normalizer.
+ *                             confirmation and no I/O. Event RECEIVING and
+ *                             SIGNATURE VERIFICATION are NOT the adapter's job:
+ *                             the platform webhook receiver (core
+ *                             BillingWebhookReceiver, wired through the API
+ *                             app) accepts deliveries, verifies the delivery
+ *                             signature over the exact received bytes, records
+ *                             the ledger, then calls this normalizer.
  *
  * ---------------------------------------------------------------------------
  * WHAT IT DELIBERATELY DOES NOT IMPLEMENT (and why)
@@ -389,14 +391,16 @@ export class PaystackBillingProvider implements BillingProvider {
         grantsExecution: false,
       },
       /**
-       * Operator-facing summary of the event contract. `receiver: 'none'` is
-       * the honest state of this build: the normalizer exists, nothing accepts
-       * a delivery yet, and normalizing one would neither confirm a payment nor
-       * grant anything.
+       * Operator-facing summary of the event CONTRACT the adapter satisfies.
+       * The adapter NORMALIZES delivered event payloads (a pure function). It
+       * does NOT receive deliveries or verify signatures: receiving and
+       * signature verification are the platform webhook receiver's job (core
+       * BillingWebhookReceiver + the /api/billing/webhook route, composed
+       * separately and reported in the composition status). Normalizing an
+       * event confirms no payment and grants nothing.
        */
       events: {
-        receiver: 'none',
-        signatureVerification: 'none',
+        normalizer: 'implemented',
         confirmsPayment: false,
         grantsExecution: false,
         supported: [...PAYSTACK_SUPPORTED_EVENTS],

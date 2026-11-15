@@ -127,7 +127,7 @@ below) implements it as follows:
 
 | Operation | State | Documented operation used |
 | --- | --- | --- |
-| `describe()` | **implemented** | `{ provider: 'paystack', baseUrl: 'https://api.paystack.co', mode: 'test', live: false, implemented: false, timeoutMs, operations: { implemented: [...], unimplemented: [...] }, verification: { operation: 'transaction.verify', subscriptionRead: 'none', reportedLifecycleState: 'unknown', grantsEntitlements: false, grantsExecution: false }, events: { receiver: 'none', signatureVerification: 'none', confirmsPayment: false, grantsExecution: false, supported: [...], canonicalEventTypes: {...}, unsupported: [...] } }` — the key is never included |
+| `describe()` | **implemented** | `{ provider: 'paystack', baseUrl: 'https://api.paystack.co', mode: 'test', live: false, implemented: false, timeoutMs, operations: { implemented: [...], unimplemented: [...] }, verification: { operation: 'transaction.verify', subscriptionRead: 'none', reportedLifecycleState: 'unknown', grantsEntitlements: false, grantsExecution: false }, events: { normalizer: 'implemented', confirmsPayment: false, grantsExecution: false, supported: [...], canonicalEventTypes: {...}, unsupported: [...] } }` — the key is never included. Note: `events` describes the adapter's **event-normalization** contract only; receiving deliveries and verifying the webhook signature is the platform webhook receiver's job (core `BillingWebhookReceiver` + `/api/billing/webhook`), reported in the composition status, not by the adapter |
 | `findCustomer` | **implemented** | `GET /customer/:email_or_code` |
 | `createCustomer` | **implemented** | `POST /customer` |
 | `initializeCheckout` | **implemented** | `POST /transaction/initialize` |

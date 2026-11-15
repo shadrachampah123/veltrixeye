@@ -316,11 +316,10 @@ describe('the verified Paystack event vocabulary', () => {
     assert.deepEqual(unimplemented.unimplemented, ['synchronizeSubscription']);
   });
 
-  it('reports the event contract, and that nothing receives or confirms anything yet', () => {
+  it('reports the event CONTRACT: the adapter normalizes events and claims nothing else', () => {
     const described = provider.describe();
     assert.deepEqual(described['events'], {
-      receiver: 'none',
-      signatureVerification: 'none',
+      normalizer: 'implemented',
       confirmsPayment: false,
       grantsExecution: false,
       supported: [...PAYSTACK_SUPPORTED_EVENTS],
@@ -332,6 +331,27 @@ describe('the verified Paystack event vocabulary', () => {
     assert.equal(described['live'], false);
     assert.equal(described['implemented'], false);
     assert.equal(described['provider'], 'paystack');
+  });
+
+  it('regression: the event contract no longer claims "no webhook receiver"', () => {
+    // The platform webhook receiver (core BillingWebhookReceiver + the
+    // /api/billing/webhook route) DOES receive deliveries and verify the
+    // HMAC-SHA512 signature. The adapter only normalizes payloads, so its
+    // describe() must not report receiving/verification as missing — that was
+    // the stale `receiver: 'none', signatureVerification: 'none'` that wrongly
+    // implied no webhook handling existed anywhere in the platform.
+    const described = provider.describe();
+    const events = described['events'] as Record<string, unknown>;
+    assert.equal(events['receiver'], undefined, 'the adapter must not report a receiver capability');
+    assert.equal(
+      events['signatureVerification'],
+      undefined,
+      'the adapter must not report a signature-verification capability',
+    );
+    assert.equal(events['normalizer'], 'implemented');
+    // Normalizing never confirms a payment and never grants execution.
+    assert.equal(events['confirmsPayment'], false);
+    assert.equal(events['grantsExecution'], false);
   });
 });
 

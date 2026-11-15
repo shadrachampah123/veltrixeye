@@ -188,11 +188,15 @@ describe('Paystack provider — honest capability reporting', () => {
       grantsEntitlements: false,
       grantsExecution: false,
     });
-    // Event normalization is covered by provider-events.test.ts; this build
-    // still receives nothing, verifies no signature and confirms no payment.
-    assert.deepEqual((described.events as Record<string, unknown>)['receiver'], 'none');
-    assert.deepEqual((described.events as Record<string, unknown>)['confirmsPayment'], false);
-    assert.deepEqual((described.events as Record<string, unknown>)['grantsExecution'], false);
+    // Event normalization is covered by provider-events.test.ts. The adapter
+    // itself still receives no delivery and verifies no signature (that is the
+    // platform webhook receiver's job) and confirms no payment.
+    const events = described.events as Record<string, unknown>;
+    assert.equal(events['normalizer'], 'implemented');
+    assert.equal(events['receiver'], undefined);
+    assert.equal(events['signatureVerification'], undefined);
+    assert.equal(events['confirmsPayment'], false);
+    assert.equal(events['grantsExecution'], false);
     assert.equal(JSON.stringify(described).includes(TEST_KEY), false);
   });
 
