@@ -14,7 +14,7 @@
 | No **automatic snapshot/backup schedule** is configured | previous owner inspection | **not re-verified** here |
 | Production compute was reported **exhausted**, blocking any read-only production check | owner evidence recorded in [deployment.md](./deployment.md) | carried forward; no production probe was attempted |
 | Migrations are **forward-only** and checksum-guarded (`schema_migrations` records version/name/checksum; a changed file fails the runner) | `packages/core/src/db/migrate.ts` | verified in code |
-| Repository schema currently ships migrations `0001`–`0038` | `packages/core/src/db/migrations/` | verified in code |
+| Repository schema currently ships migrations `0001`–`0040` | `packages/core/src/db/migrations/` | verified in code |
 
 Because the console state could not be independently read, the honest summary is:
 **recovery capability is currently unverified, and the previously observed state

@@ -1,11 +1,12 @@
 # Milestone Boundaries
 
-## Current roadmap and release-status reconciliation (2026-11-14)
+## Current roadmap and release-status reconciliation (2026-11-15)
 
 This is the canonical roadmap/status record. Implemented code, merged PRs,
 successful deployments, production health, and release approval are distinct
 evidence categories. This checkpoint is based on the current `main` tip
-`56a8cac72c08f5d9b7e21e50ab43b24149209c1b` (PR #156 merge; follows PR #155 and includes the reconciled November 14 deployment status), GitHub PR
+`3881bedfed3e8847f9e7ab2c8904ad0d5856fd10` (PR #160 merge; follows PR #159 and
+includes the reconciled November 14–15 deployment status), GitHub PR
 metadata, Render deployment records, and the owner's Vercel dashboard
 screenshot. It is a read-only reconciliation; it does not authorize production
 operations. No overall completion percentage is stated because the roadmap
@@ -14,10 +15,35 @@ and blocking gates without a stable denominator.
 
 ### Current repository and PR status
 
-- **Latest main:** `56a8cac72c08f5d9b7e21e50ab43b24149209c1b`, verified from
-  GitHub's `main` branch record. It is the merge commit for PR #156, which
-  reconciles the November 14 deployment status and advances the checkpoint
-  after PR #155.
+- **Latest main:** `3881bedfed3e8847f9e7ab2c8904ad0d5856fd10`, verified from
+  GitHub's `main` branch record. It is the merge commit for PR #160, which
+  corrects the stale Paystack `describe()` event contract in
+  `packages/providers/paystack/src/provider.ts` and advances the checkpoint
+  after PR #159.
+- **PR #160 — Paystack `describe()` event-contract correction: MERGED.**
+  Paystack adapter metadata-contract correction and regression tests. Updated
+  `describe()` to report event normalization accurately. No payment
+  confirmation, entitlement activation, execution-granting or webhook-processing
+  behaviour changed. The adapter's `describe()` no longer reports
+  the stale `events.receiver: 'none'` / `events.signatureVerification: 'none'`
+  (which wrongly implied no webhook handling existed); it now reports the
+  adapter's real event-normalization contract (`events.normalizer:
+  'implemented'`), with `confirmsPayment`/`grantsExecution` still pinned
+  `false`. The platform webhook receiver (core `BillingWebhookReceiver` +
+  `/api/billing/webhook`) was already fully wired through `buildApp()` →
+  `billingRoutes()` → `registerBillingWebhookRoutes()`, so no webhook repair
+  was necessary. No payment-confirmation, entitlement-activation, execution-granting or webhook-processing behaviour, environment or secret change.
+- **PR #159 — startup timing, bounded DB waits, and migration-lock reporting:
+  MERGED.** Adds a configurable overall database startup timeout
+  (`DATABASE_STARTUP_TIMEOUT_MS`, default 60 s) with per-probe/retry clamping
+  to the overall deadline, and migration-lock timing reporting. No billing,
+  execution or production-configuration change.
+- **PR #158 — optional CA certificate support for the database pool SSL
+  config: MERGED.** Adds an optional `ca` to the PostgreSQL pool config. No
+  billing, execution or production-configuration change.
+- **PR #157 — roadmap checkpoint advance after PR #156: MERGED.**
+  Documentation-only checkpoint advancement. No application code or production
+  operation.
 - **PR #156 — November 14 deployment-status reconciliation: MERGED.**
   Documentation-only update to `docs/deployment.md` and `docs/milestones.md`;
   no application code or production operation.
@@ -948,6 +974,42 @@ Completes the final M8 milestone with all remaining risk/safety controls.
 - **Migration 0022** (additive; no prior constraint altered): drawdown columns on `risk_policies` and `risk_account_states` (peak equity, daily high, weekly open, cumulative realized P&L, initialization flag).
 - **M8.7 changes no execution capability**: live execution remains impossible (0016 CHECK intact), no broker connectivity, no credentials, automation OFF for every plan, DisabledMT5Transport disabled.
 
+## M8.8 — delivered (Subscription Entitlement / Catalogue Alignment)
+
+Merged via **PR #133 — "Align strategy entitlements with subscription
+catalogue"** (branch `arena/2c4fe40e-veltrixeye`, merged 2026-11-01). This
+slice aligns the server-enforced active-strategy ceilings with the commercial
+catalogue and was missing from this roadmap; the implementation is on `main`.
+Evidence report: [m8.8-entitlement-alignment.md](./reports/m8.8-entitlement-alignment.md).
+
+- **Aligned strategy ceilings** — `packages/core/src/billing/entitlements.ts`
+  maps Free/Starter to `maxStrategies: 1`, Pro to `maxStrategies: 5`, and
+  Elite/internal `premium` to the explicit unlimited sentinel `null`
+  (`maxStrategies: null`). Other quota values and feature flags are unchanged;
+  automation remains disabled (`canAccessAutomation` false on every plan).
+- **Kept internal plan identifiers and existing customer/subscription/strategy
+  records intact** — no data migration, no production database change, no
+  price-catalogue change (Pro GH₵451.62/mo · GH₵4,516.20/yr; Elite
+  GH₵1,146.42/mo · GH₵11,464.20/yr unchanged).
+- **Concurrency safety** — strategy creation is serialized per account with a
+  transaction-scoped PostgreSQL advisory lock acquired before entitlement and
+  count reads (a Free account with no `subscriptions` row would otherwise not
+  be locked by `SELECT … FOR UPDATE`, letting two concurrent creations both
+  see a below-limit count). A real-PostgreSQL regression test starts two
+  concurrent Free creations for a user with no subscription row: exactly one
+  succeeds, one is refused at the Free limit, and the persisted count is one.
+- **Honest UI** — the billing entitlement DTO and subscription UI represent
+  unlimited accurately and clarify that Starter is not separately purchasable
+  even though the free fallback shares its one-strategy allowance.
+- **Scope boundary** — this is the entitlement/catalogue alignment slice only.
+  It is not a production-readiness assessment: notification delivery
+  reliability, Paystack test-mode end-to-end operational audit, scanner/data
+  freshness and paper-trading validation, health checks, security/backups/
+  monitoring/deployment and the comprehensive production-readiness report
+  remain separate work. The AI/ChatGPT Strategy Builder remains deferred.
+- **No execution capability change** — automation stays OFF, trading stays
+  paper-only, payments stay test-only; no live payment or trading activation.
+
 ## M9.1 — delivered (Notification Preferences, Routing, Webhook Tenant Integrity, Durable Fairness)
 
 Completes the second notification channel and preference system, plus durable fairness remediation.
@@ -1173,12 +1235,13 @@ canonical billing contracts and the Paystack provider seam — see
 2. **Billing** (provider adapter, webhooks, checkout/portal) — provider, catalogue, persistence model and provider seam are in place (Paystack, USD, Starter/Pro/Elite, migration 0031), and the sandbox path runs through verified evidence and out-of-band activation (Steps 6–8, migrations 0033–0034), with checkout and read-only portal surfaces delivered. Billing Step 9b-R1 now adds a bounded, authenticated-user/provider-mode-scoped **Verified Payment Records** view from `billing_verified_transactions`; it is not an invoice feature and does not call Paystack, recalculate FX or change authority. C-1 continues to defer customer-facing cancellation; provider-issued invoices are not approved; payment-method management and plan changes are out of scope. Refunds/proration/dunning execution, production credentials and Starter sellability (Step 10a records Starter as **not sold** and "Not available yet"; see [the Starter disposition](./billing.md#starter-disposition-billing-step-10a)) remain deferred; see [billing.md](./billing.md#later-billing-prs).
 3. **More channels** (SMS/Telegram) behind same registry if needed.
 
-## Production infrastructure & deployment reliability (2026-11-14)
+## Production infrastructure & deployment reliability (2026-11-15)
 
 **Status: deployment baseline observed; reliability follow-ups remain open.** This workstream is separate from billing and does not authorize production database checks, migrations, configuration changes, or deployments.
 
-- **Render API:** latest observed live deployment `dep-dbs8nc15efls73efnrrg` runs commit `9b1de75a5e8f83c9e43beae969fc410e5e602826` (PR #151 merge), completed successfully at `2026-11-14T16:27:17.558055Z`.
-- **Vercel web:** owner-provided dashboard evidence shows the same short commit `9b1de75` in Production / Ready. PR #152 merge (`bdab81a`) is also shown as Production / Ready, with Preview deployments visible as Ready. This establishes deployment alignment for the latest commit, not end-to-end or database health.
+- **Latest verified deployed commit:** `3881bedfed3e8847f9e7ab2c8904ad0d5856fd10` (PR #160 merge). The owner-verified baseline confirms the Render API deployment for this commit was live. This is the current verified deployment checkpoint and is distinct from the historical evidence below; it does not establish end-to-end application health, billing readiness, or current database health (production verification remains BLOCKED — see the Neon resource-constraint note above).
+- **Render API (historical evidence):** an earlier observed live deployment `dep-dbs8nc15efls73efnrrg` ran commit `9b1de75a5e8f83c9e43beae969fc410e5e602826` (PR #151 merge), completed successfully at `2026-11-14T16:27:17.558055Z`. This remains historical deployment-alignment evidence, not current production health.
+- **Vercel web (historical evidence):** owner-provided dashboard evidence shows the same short commit `9b1de75` in Production / Ready. PR #152 merge (`bdab81a`) is also shown as Production / Ready, with Preview deployments visible as Ready. This establishes deployment alignment for that commit, not end-to-end or database health.
 - **Historical Render issue:** the November 10 deployment for `8ec2fe978f49e57cb74c7748f6e566b7f94af0f4` built successfully but timed out during deployment handover. Logs do not establish the root cause. Keep this as an unresolved reliability investigation; do not claim it is fixed merely because the November 14 deployment succeeded.
 - **Startup/migration coupling:** API startup waits for the database and runs migrations before listening. The migration runner has advisory-lock, transaction, rollback, and checksum-drift safeguards. Startup-coupled migrations may nevertheless delay readiness on the Free single-instance service. Evaluate a controlled release/deploy migration step as future architecture work; no implementation change is included in this audit.
 - **SSL warning:** PostgreSQL connection-string parsing emitted a compatibility warning for SSL mode aliases in November 10 and November 14 logs. Current Render configuration uses `DATABASE_SSL_MODE=require`; no causal link to the timeout is established. Track for deliberate dependency/configuration review, without changing production settings in this workstream.

@@ -17,7 +17,7 @@ October report also recorded Free compute usage above its monthly allowance;
 the current remaining compute balance has not been remeasured.
 
 The latest repository `main` checkpoint at this documentation review is
-`56a8cac72c08f5d9b7e21e50ab43b24149209c1b` (PR #156 merge, 2026-11-14).
+`3881bedfed3e8847f9e7ab2c8904ad0d5856fd10` (PR #160 merge, 2026-11-15).
 This is repository metadata only and does not establish a production
 deployment or application-health state.
 
@@ -777,15 +777,16 @@ domains and autoscaling are operational hardening items listed in
 [milestones.md](./milestones.md). M1 delivers the deployment target, the
 migration safety and the web↔API wiring only.
 
-## Production infrastructure reliability audit (2026-11-14 UTC)
+## Production infrastructure reliability audit (2026-11-15 UTC)
 
-**Scope:** read-only deployment and configuration review across Render and Vercel. Billing operations, production database probes, migrations, secret/environment-variable changes, and deployments were not part of the audit. No production settings or application resources were changed by the review. The latest repository checkpoint at the time of this follow-up is main SHA `56a8cac72c08f5d9b7e21e50ab43b24149209c1b` (PR #156 merge); this does not imply a new production deployment.
+**Scope:** read-only deployment and configuration review across Render and Vercel. Billing operations, production database probes, migrations, secret/environment-variable changes, and deployments were not part of the audit. No production settings or application resources were changed by the review. The latest repository checkpoint at the time of this follow-up is main SHA `3881bedfed3e8847f9e7ab2c8904ad0d5856fd10` (PR #160 merge); this does not imply a new production deployment.
 
 ### Deployment evidence
 
-- **Render API:** latest observed deployment `dep-dbs8nc15efls73efnrrg`, commit `9b1de75a5e8f83c9e43beae969fc410e5e602826` (PR #151 merge). Render reported build and deployment success; it became live at `2026-11-14T16:27:17.558055Z`.
-- **Vercel web app:** owner-provided dashboard screenshot dated 2026-11-14 shows PR #151 in **Production / Ready** at short SHA `9b1de75`. It also shows PR #152 in **Production / Ready** at `bdab81a`, plus multiple Preview deployments marked Ready.
-- **Cross-platform alignment:** Vercel Production SHA `9b1de75` matches the full Render API commit above. This confirms both platforms deployed the same latest mainline commit. The screenshot is owner-provided evidence, not a direct Vercel connector inspection.
+- **Latest verified deployed commit:** `3881bedfed3e8847f9e7ab2c8904ad0d5856fd10` (PR #160 merge). The owner-verified baseline confirms the Render API deployment for this commit was live. This is the current verified deployment checkpoint; it is distinct from the historical evidence below and does not establish end-to-end application health, billing readiness, or current database health (production verification remains BLOCKED — see the Neon gate above).
+- **Render API (historical evidence):** an earlier observed deployment `dep-dbs8nc15efls73efnrrg`, commit `9b1de75a5e8f83c9e43beae969fc410e5e602826` (PR #151 merge). Render reported build and deployment success; it became live at `2026-11-14T16:27:17.558055Z`. This remains historical deployment-alignment evidence.
+- **Vercel web app (historical evidence):** owner-provided dashboard screenshot dated 2026-11-14 shows PR #151 in **Production / Ready** at short SHA `9b1de75`. It also shows PR #152 in **Production / Ready** at `bdab81a`, plus multiple Preview deployments marked Ready.
+- **Cross-platform alignment (historical):** Vercel Production SHA `9b1de75` matches the full Render API commit above. This confirms both platforms deployed the same latest mainline commit at that time. The screenshot is owner-provided evidence, not a direct Vercel connector inspection.
 - **Limit:** a Ready deployment or successful container rollout is not general application-health, database-integrity, billing, or end-to-end verification. No production health endpoint or Neon query was run in this audit.
 
 ### Render reliability observations
