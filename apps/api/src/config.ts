@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import {
+  DEFAULT_DATABASE_STARTUP_TIMEOUT_MS,
   DEFAULT_NOTIFICATION_BASE_BACKOFF_MS,
   DEFAULT_NOTIFICATION_BATCH_SIZE,
   DEFAULT_NOTIFICATION_JITTER_MS,
@@ -105,6 +106,13 @@ const baseEnvSchema = z.object({
   DATABASE_SSL_MODE: z.enum(['disable', 'require', 'verify-full']).default('disable'),
   /** Max pool size for the database. */
   DATABASE_POOL_MAX: z.coerce.number().int().positive().max(50).default(10),
+  /**
+   * Overall wall-clock budget (ms) for the boot-time database readiness wait.
+   * Each per-attempt probe timeout and retry sleep is clamped so the whole
+   * database phase cannot overrun the deployment startup deadline. Bounds
+   * keep it well under any platform startup budget.
+   */
+  DATABASE_STARTUP_TIMEOUT_MS: intEnv(1_000, 300_000, DEFAULT_DATABASE_STARTUP_TIMEOUT_MS),
   /** Session cookie name (renaming requires re-login). */
   SESSION_COOKIE_NAME: z.string().min(3).max(64).default('ve_session'),
   /**

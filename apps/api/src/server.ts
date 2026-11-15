@@ -11,6 +11,7 @@ import { startScannerWorkerTicker, consoleScannerLogger } from './scanner-worker
 import { consoleFxSourceLogger, startFxSourceTicker } from './fx-source-runner.js';
 import { createPool, runMigrations, MIGRATIONS_DIR } from '@veltrixeye/core';
 import { createTwelveDataProvider } from '@veltrixeye/provider-twelve-data';
+import { waitForDatabase, timePhase, logFatalBootError, messageOf } from './startup.js';
 
 /**
  * API entrypoint.
@@ -23,6 +24,7 @@ import { createTwelveDataProvider } from '@veltrixeye/provider-twelve-data';
  *  4. Start listening.
  */
 async function main(): Promise<void> {
+  const bootStart = Date.now();
   loadDotEnv();
   const config = loadConfig();
   const pool = createPool({
@@ -31,11 +33,16 @@ async function main(): Promise<void> {
     sslMode: config.DATABASE_SSL_MODE,
   });
 
-  await waitForDatabase(pool, 30);
+  await timePhase('db-connect', () =>
+    waitForDatabase(pool, 30, { totalTimeoutMs: config.DATABASE_STARTUP_TIMEOUT_MS }),
+  );
 
-  const migrations = await runMigrations(pool, MIGRATIONS_DIR);
+  const migrations = await timePhase('migrations', () => runMigrations(pool, MIGRATIONS_DIR));
   if (migrations.applied.length > 0) {
         console.info(`[db] applied ${migrations.applied.length} migration(s): ${migrations.applied.join(', ')}`);
+  }
+  if (migrations.lockWaitMs > 0) {
+    console.info(`[startup] migration lock acquired in ${migrations.lockWaitMs}ms`);
   }
 
   const ctx = createAppContext(pool, config);
@@ -44,10 +51,10 @@ async function main(): Promise<void> {
   // design, so boot is the cleanup point). Never throws: a cleanup failure
   // must not block boot — the queries are trivial DELETEs.
   try {
-    const removed = await runStartupHousekeeping(ctx);
+    const removed = await timePhase('startup-housekeeping', () => runStartupHousekeeping(ctx));
     if (removed > 0) console.info(`[db] removed ${removed} expired session(s) at startup`);
   } catch (err) {
-    console.warn('[api] expired-session cleanup failed (continuing):', (err as Error)?.message);
+    console.warn('[api] expired-session cleanup failed (continuing):', messageOf(err));
   }
 
   // M2 primary market-data provider. The API boots without a key on purpose
@@ -103,29 +110,33 @@ async function main(): Promise<void> {
   // Recover jobs a previous process claimed but never finished (crash, deploy,
   // scale-down). Cheap: two bounded UPDATEs, no provider I/O. Never throws.
   try {
-    const recovery = await runStartupDeliveryRecovery(ctx);
+    const recovery = await timePhase('delivery-recovery', () => runStartupDeliveryRecovery(ctx));
     if (recovery.recovered > 0 || recovery.deadLettered > 0) {
       console.info(
         `[api] delivery recovery: ${recovery.recovered} job(s) re-queued, ${recovery.deadLettered} dead-lettered`,
       );
     }
   } catch (err) {
-    console.warn('[api] delivery recovery failed (continuing):', (err as Error)?.message);
+    console.warn('[api] delivery recovery failed (continuing):', messageOf(err));
   }
 
   // M7.5 / F3 — scanner recovery: mark stale running scanner runs as failed after restart.
   try {
-    const scannerRecovery = await runStartupScannerRecovery(ctx, config.scanner.leaseMs);
+    const scannerRecovery = await timePhase('scanner-recovery', () =>
+      runStartupScannerRecovery(ctx, config.scanner.leaseMs),
+    );
     if (scannerRecovery.recovered > 0) {
       console.info(`[api] scanner recovery: ${scannerRecovery.recovered} stale run(s) marked failed`);
     }
   } catch (err) {
-    console.warn('[api] scanner recovery failed (continuing):', (err as Error)?.message);
+    console.warn('[api] scanner recovery failed (continuing):', messageOf(err));
   }
 
-  const app = await buildApp(config, ctx);
+  const app = await timePhase('app-build', () => buildApp(config, ctx));
 
-  await app.listen({ port: config.PORT, host: config.HOST });
+  await timePhase('listen', () => app.listen({ port: config.PORT, host: config.HOST }));
+
+  console.info(`[startup] API ready on ${config.HOST}:${config.PORT} after ${Date.now() - bootStart}ms`);
 
   // Drain the outbox on an interval. An external scheduler can do the same
   // through the token-protected internal endpoint; both are safe together.
@@ -217,23 +228,9 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => void shutdown('SIGINT'));
 }
 
-async function waitForDatabase(pool: ReturnType<typeof createPool>, attempts: number): Promise<void> {
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      await pool.query('SELECT 1');
-      return;
-    } catch (err) {
-      lastErr = err;
-            console.info(`[api] database not ready, retrying (${i + 1}/${attempts})`);
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-  }
-  await pool.end();
-  throw new Error(`Could not connect to the database after ${attempts} attempts: ${(lastErr as Error)?.message}`);
-}
-
 main().catch((err) => {
-    console.error('[api] fatal boot error:', err);
-  process.exit(1);
-});
+    // Sanitized, single-line fatal log: never the raw error object or stack,
+    // so credentials or connection strings cannot leak through the fatal path.
+    logFatalBootError(err);
+    process.exit(1);
+  });
