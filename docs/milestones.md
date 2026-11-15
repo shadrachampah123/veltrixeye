@@ -21,7 +21,10 @@ and blocking gates without a stable denominator.
   `packages/providers/paystack/src/provider.ts` and advances the checkpoint
   after PR #159.
 - **PR #160 — Paystack `describe()` event-contract correction: MERGED.**
-  Documentation and test change: the adapter's `describe()` no longer reports
+  Paystack adapter metadata-contract correction and regression tests. Updated
+  `describe()` to report event normalization accurately. No payment
+  confirmation, entitlement activation, execution-granting or webhook-processing
+  behaviour changed. The adapter's `describe()` no longer reports
   the stale `events.receiver: 'none'` / `events.signatureVerification: 'none'`
   (which wrongly implied no webhook handling existed); it now reports the
   adapter's real event-normalization contract (`events.normalizer:
